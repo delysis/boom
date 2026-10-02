@@ -66,7 +66,27 @@ struct StoredProposal: Codable, Identifiable {
   private var epoch: UInt64 = 0
   private(set) var caret = 0
   weak var editor: MarkdownTextView?
-  private var paneWidth: CGFloat = 1190
+  @Published private(set) var paneWidth: CGFloat = 1190
+  @Published private var compactPane = "document"
+  @Published private var mediumHiddenPane = "library"
+  var showsLibrary: Bool {
+    if paneWidth < 820 { return compactPane == "library" }
+    return state.showLibrary && !(paneWidth < 1000 && allPanesRequested
+      && mediumHiddenPane == "library")
+  }
+  var showsDocument: Bool {
+    if paneWidth < 820 { return compactPane == "document" }
+    return state.showDocument && !(paneWidth < 1000 && allPanesRequested
+      && mediumHiddenPane == "document")
+  }
+  var showsChat: Bool {
+    if paneWidth < 820 { return compactPane == "chat" }
+    return state.showChat && !(paneWidth < 1000 && allPanesRequested
+      && mediumHiddenPane == "chat")
+  }
+  private var allPanesRequested: Bool {
+    state.showLibrary && state.showDocument && state.showChat
+  }
 
   init() throws {
     store = try WorkspaceStore()
@@ -77,6 +97,7 @@ struct StoredProposal: Codable, Identifiable {
     selectedChatIDs = Set(state.selectedChat.map { [$0] } ?? [])
     if documents.isEmpty { try newDocument() }
     if state.chats.isEmpty { try newChat() }
+    compactPane = state.showDocument ? "document" : state.showChat ? "chat" : "library"
     #if BOOM_UI_TEST
     if let index = state.chats.firstIndex(where: { $0.id == state.selectedChat }),
       state.chats[index].messages.isEmpty {
@@ -156,7 +177,7 @@ struct StoredProposal: Codable, Identifiable {
     state.selectedDocument = document.id
     selectedDocumentIDs = [document.id]
     state.showDocument = true
-    if paneWidth < 820 { state.showLibrary = false; state.showChat = false }
+    compactPane = "document"
     invalidateGhost()
     try flush()
   }
@@ -173,7 +194,7 @@ struct StoredProposal: Codable, Identifiable {
     selectedChatIDs = [chat.id]
     composerFocusEpoch &+= 1
     state.showChat = true
-    if paneWidth < 820 { state.showLibrary = false; state.showDocument = false }
+    compactPane = "chat"
     pendingAttachments = []
     draft = ""
     mode = .ask
@@ -271,7 +292,7 @@ struct StoredProposal: Codable, Identifiable {
       state.selectedDocument = id
       if !preservingSelection { selectedDocumentIDs = [id] }
       state.showDocument = true
-      if paneWidth < 820 { state.showLibrary = false; state.showChat = false }
+      compactPane = "document"
       caret = 0
       invalidateGhost()
       scheduleSave()
@@ -285,7 +306,7 @@ struct StoredProposal: Codable, Identifiable {
     if !preservingSelection { selectedChatIDs = [id] }
     composerFocusEpoch &+= 1
     state.showChat = true
-    if paneWidth < 820 { state.showLibrary = false; state.showDocument = false }
+    compactPane = "chat"
     pendingAttachments = []
     draft = ""
     mode = .ask
@@ -411,6 +432,17 @@ struct StoredProposal: Codable, Identifiable {
     editor?.clearGhost()
   }
   func toggle(_ pane: String) {
+    if paneWidth < 820 {
+      compactPane = compactPane == pane ? (pane == "document" ? "chat" : "document") : pane
+      if compactPane != "document" { finishComposition(); invalidateGhost() }
+      return
+    }
+    if paneWidth < 1000, allPanesRequested,
+      !((pane == "library" && showsLibrary) || (pane == "document" && showsDocument)
+        || (pane == "chat" && showsChat)) {
+      mediumHiddenPane = pane == "library" ? "chat" : "library"
+      return
+    }
     switch pane {
     case "library": state.showLibrary.toggle()
     case "document":
@@ -420,36 +452,10 @@ struct StoredProposal: Codable, Identifiable {
     default: state.showChat.toggle()
     }
     if !state.showLibrary && !state.showDocument && !state.showChat { state.showDocument = true }
-    if paneWidth < 820 {
-      if pane == "library", state.showLibrary {
-        state.showDocument = false
-        state.showChat = false
-      } else if pane == "document", state.showDocument {
-        state.showLibrary = false
-        state.showChat = false
-      } else if pane == "chat", state.showChat {
-        state.showLibrary = false
-        state.showDocument = false
-      }
-    } else if paneWidth < 1000, state.showLibrary, state.showDocument, state.showChat {
-      if pane == "library" { state.showChat = false } else { state.showLibrary = false }
-    }
     scheduleSave()
   }
   func fitPanes(to width: CGFloat) {
-    paneWidth = width
-    let before = (state.showLibrary, state.showDocument, state.showChat)
-    if width < 820 {
-      if state.showDocument {
-        state.showLibrary = false
-        state.showChat = false
-      } else if state.showChat {
-        state.showLibrary = false
-      }
-    } else if width < 1000, state.showLibrary, state.showDocument, state.showChat {
-      state.showLibrary = false
-    }
-    if before != (state.showLibrary, state.showDocument, state.showChat) { scheduleSave() }
+    if paneWidth != width { paneWidth = width }
   }
   func setTheme(_ theme: String) {
     state.theme = theme
@@ -1003,6 +1009,7 @@ struct StoredProposal: Codable, Identifiable {
         state.selectedDocument = document.id
       }
       state.showDocument = true
+      compactPane = "document"
       invalidateGhost()
       try flush()
     } catch { report(error) }

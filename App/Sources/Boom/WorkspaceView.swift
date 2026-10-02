@@ -18,10 +18,10 @@ struct WorkspaceView: View {
   var body: some View {
     GeometryReader { geometry in
       HSplitView {
-        if model.state.showLibrary {
+        if model.showsLibrary {
           LibraryView(model: model).frame(minWidth: 170, idealWidth: 210, maxWidth: 320)
         }
-        if model.state.showDocument {
+        if model.showsDocument {
           if let document = model.selectedDocument {
             VStack(spacing: 0) {
               MarkdownEditor(model: model, document: document)
@@ -31,9 +31,9 @@ struct WorkspaceView: View {
               minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
           }
         }
-        if model.state.showChat {
+        if model.showsChat {
           ChatPane(model: model).frame(
-            minWidth: 280, idealWidth: 370, maxWidth: model.state.showDocument ? 620 : .infinity)
+            minWidth: 280, idealWidth: 370, maxWidth: model.showsDocument ? 620 : .infinity)
         }
       }
       .onChange(of: geometry.size.width, initial: true) { _, width in

@@ -46,11 +46,13 @@ native UI review, separate from Swift core tests and the real-model smoke.
 
 The window once kept three minimum-width panes visible until a resize event
 crossed one threshold. Opening a pane from the toolbar or library at the same
-width bypassed that check, leaving the composer clipped. Keep width constraints
-in the pane state transitions as well as resize handling. At the minimum window
-width, open each of library, document and chat in turn. Confirm every chat
-control and the send button remain fully visible and clickable. Check both a
-fresh window and a window narrowed after launch.
+width bypassed that check, leaving the composer clipped. Derive visible panes
+from window width and the requested pane set; do not persist a temporary resize
+collapse as the user's preference. At the minimum window width, open each of
+library, document and chat in turn. Confirm every chat control and the send
+button remain fully visible and clickable. Widen again and confirm the panes
+requested before narrowing return. Check both a fresh window and a window
+narrowed after launch.
 
 The Markdown editor stores plain UTF-8. A font trait changed only temporary
 display attributes, so it could never be an authoring command. All formatting

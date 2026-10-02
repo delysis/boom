@@ -205,9 +205,9 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
   }
   private func refreshToolbar() {
     guard let model else { return }
-    buttons["library"]?.state = model.state.showLibrary ? .on : .off
-    buttons["document"]?.state = model.state.showDocument ? .on : .off
-    buttons["chat"]?.state = model.state.showChat ? .on : .off
+    buttons["library"]?.state = model.showsLibrary ? .on : .off
+    buttons["document"]?.state = model.showsDocument ? .on : .off
+    buttons["chat"]?.state = model.showsChat ? .on : .off
     window?.title = model.selectedDocument?.title ?? model.selectedChat?.title ?? "Boom"
   }
   private func makeMenu() -> NSMenu {
@@ -298,9 +298,9 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
   func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
     guard let model else { return false }
     switch menuItem.action {
-    case #selector(toggleLibrary): menuItem.state = model.state.showLibrary ? .on : .off
-    case #selector(toggleDocument): menuItem.state = model.state.showDocument ? .on : .off
-    case #selector(toggleChat): menuItem.state = model.state.showChat ? .on : .off
+    case #selector(toggleLibrary): menuItem.state = model.showsLibrary ? .on : .off
+    case #selector(toggleDocument): menuItem.state = model.showsDocument ? .on : .off
+    case #selector(toggleChat): menuItem.state = model.showsChat ? .on : .off
     case #selector(toggleCompletion): menuItem.state = model.state.autocomplete ? .on : .off
     case #selector(changeTheme(_:)):
       menuItem.state = (menuItem.representedObject as? String) == model.state.theme ? .on : .off
