@@ -1,0 +1,9 @@
+.deps/
+Core/.build/
+App/.build/
+RustBridge/target/
+out/
+.DS_Store
+
+.build-support/
+target/

@@ -1,0 +1,31 @@
+[package]
+name = "attachment-native-inspect"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Content-first, bounded, iterative attachment container inspection"
+publish = false
+
+[dependencies]
+attachment-native-types.workspace = true
+crabz2.workspace = true
+flate2.workspace = true
+hex.workspace = true
+infer.workspace = true
+libarchive_oxide.workspace = true
+mail-parser.workspace = true
+lopdf.workspace = true
+lzma-rust2.workspace = true
+ruzstd.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+zip.workspace = true
+
+[lints]
+workspace = true

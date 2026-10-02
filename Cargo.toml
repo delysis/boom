@@ -1,0 +1,58 @@
+[workspace]
+members = [
+  "crates/attachment-native-document",
+  "crates/attachment-native-host",
+  "crates/attachment-native-inspect",
+  "crates/attachment-native-plan",
+  "crates/attachment-native-types",
+]
+exclude = ["RustBridge"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/delysis/boom"
+publish = false
+
+[workspace.dependencies]
+attachment-native-document = { path = "crates/attachment-native-document" }
+attachment-native-host = { path = "crates/attachment-native-host" }
+attachment-native-inspect = { path = "crates/attachment-native-inspect" }
+attachment-native-plan = { path = "crates/attachment-native-plan" }
+attachment-native-types = { path = "crates/attachment-native-types" }
+crabz2 = { version = "0.2.0", default-features = false }
+csv = "1.4.0"
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
+hex = "0.4.3"
+html-to-markdown-rs = { version = "=3.10.6", default-features = false }
+hound = "3.5.1"
+imagesize = { version = "0.15.0", default-features = false, features = ["bmp", "gif", "heif", "jpeg", "png", "tiff", "webp"] }
+infer = { version = "0.22.0", default-features = false, features = ["std"] }
+libarchive_oxide = { version = "=0.2.0", default-features = false, features = ["sevenz"] }
+lopdf = { version = "0.44.0", default-features = false }
+lzma-rust2 = { version = "0.18.1", default-features = false, features = ["std", "xz"] }
+mail-parser = { version = "0.11.5", default-features = false }
+quick-xml = { version = "0.41.0", default-features = false, features = ["serialize"] }
+ruzstd = { version = "0.9.0", default-features = false, features = ["hash", "std"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+sha2 = "0.10.9"
+tar = { version = "0.4.46", default-features = false }
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2", "deflate64"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused_lifetimes = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"

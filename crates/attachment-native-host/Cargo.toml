@@ -1,0 +1,21 @@
+[package]
+name = "attachment-native-host"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Attachment processor registry and orchestration"
+publish = false
+
+[dependencies]
+attachment-native-document.workspace = true
+attachment-native-inspect.workspace = true
+attachment-native-plan.workspace = true
+attachment-native-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "boom-attachment-ffi"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace]
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+attachment-native-host = { path = "../crates/attachment-native-host" }
+attachment-native-types = { path = "../crates/attachment-native-types" }
+serde_json = "=1.0.145"
+sha2 = "=0.10.9"
+
+[profile.release]
+panic = "unwind"
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

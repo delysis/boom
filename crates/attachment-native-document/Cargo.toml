@@ -1,0 +1,30 @@
+[package]
+name = "attachment-native-document"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bounded document-to-canonical-text processors"
+publish = false
+
+[dependencies]
+attachment-native-types.workspace = true
+csv.workspace = true
+html-to-markdown-rs.workspace = true
+hound.workspace = true
+imagesize.workspace = true
+image = { version = "0.25.9", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
+lopdf.workspace = true
+mail-parser.workspace = true
+quick-xml.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+attachment-native-inspect.workspace = true
+zip.workspace = true
+
+[lints]
+workspace = true
