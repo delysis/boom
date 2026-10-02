@@ -113,6 +113,71 @@ struct CompletionResult: Sendable {
   let window: CompletionWindow
   var cachedTokens: Int { output.cachedTokens }
 }
+struct FittedConversation: Sendable {
+  let history: [ChatMessage]
+  let context: String
+  let omittedHistoryCount: Int
+  let omittedContextCharacters: Int
+}
+extension GemmaRunner {
+  /// Use the loaded tokenizer and compiled graph limit. Historic messages are
+  /// dropped oldest first only if even a middle excerpt of current sources
+  /// cannot fit. The current request and edit authority are never truncated.
+  func fitConversation(
+    prefixes: [String?], history: [ChatMessage], instructions: String,
+    context: String, request: String, maxOutputTokens: Int, flag: CancellationFlag
+  ) async throws -> FittedConversation {
+    try await withCheckedThrowingContinuation { continuation in
+      queue.async {
+        do {
+          try flag.check()
+          let capacity = self.identity.contextLength - maxOutputTokens
+          guard capacity > 0 else { throw BoomError.budget("The model has no room for a reply.") }
+          let checkedPrefixes: [String?] = prefixes.isEmpty ? [nil] : prefixes
+          func fits(_ history: [ChatMessage], _ suppliedContext: String) -> Bool {
+            let joined = [instructions, suppliedContext, request]
+              .filter { !$0.isEmpty }.joined(separator: "\n\n")
+            return checkedPrefixes.allSatisfy { prefix in
+              let prompt = GemmaPrompt.conversation(
+                prefix: prefix, history: history, request: joined)
+              return self.model.boomEncode(prompt).count <= capacity
+            }
+          }
+          for dropped in 0...history.count {
+            try flag.check()
+            let kept = Array(history.dropFirst(dropped))
+            if fits(kept, context) {
+              continuation.resume(returning: FittedConversation(
+                history: kept, context: context, omittedHistoryCount: dropped,
+                omittedContextCharacters: 0))
+              return
+            }
+            guard !context.isEmpty, fits(kept, ContextExcerpt.middle(context, keeping: 0))
+            else { continue }
+            var low = 0
+            var high = context.count
+            while low < high {
+              try flag.check()
+              let middle = low + (high - low + 1) / 2
+              if fits(kept, ContextExcerpt.middle(context, keeping: middle)) {
+                low = middle
+              } else {
+                high = middle - 1
+              }
+            }
+            let excerpt = ContextExcerpt.middle(context, keeping: low)
+            continuation.resume(returning: FittedConversation(
+              history: kept, context: excerpt, omittedHistoryCount: dropped,
+              omittedContextCharacters: context.count - low))
+            return
+          }
+          throw BoomError.budget(
+            "The current request and selected persona exceed this model's context. The request was retained; shorten it or select another model.")
+        } catch { continuation.resume(throwing: error) }
+      }
+    }
+  }
+}
 extension GemmaRunner {
   /// One encrypted disk slot plus one immutable memory snapshot. Switching the
   /// followed-document set replaces a VALID derived cache; corrupt records are
@@ -121,7 +186,6 @@ extension GemmaRunner {
     document: DocumentSnapshot, caret: Int, context: ContextPlan, vault: Vault,
     flag: CancellationFlag, onText: @escaping @Sendable (String) -> Void
   ) async throws -> CompletionResult {
-    let prefix = GemmaPrompt.followedPrefix(context)
     return try await withTaskCancellationHandler(
       operation: {
         try await withCheckedThrowingContinuation { continuation in
@@ -129,23 +193,44 @@ extension GemmaRunner {
             do {
               try flag.check()
               var before = 2048
-              var after = 512
-              var prompt = try GemmaPrompt.completion(
-                document: document, caretUTF16: caret, context: context, prefixCharacters: before,
-                suffixCharacters: after)
-              while self.model.boomEncode(prompt).count + 64 > self.identity.contextLength {
+              let after = 512
+              let totalSourceCharacters = context.documents.reduce(0) { $0 + $1.text.count }
+              var sourceCharacters: Int? = context.documents.isEmpty
+                ? nil : totalSourceCharacters
+              func promptFor(_ draftCharacters: Int, _ sourceCharacters: Int?) throws -> String {
+                try GemmaPrompt.completion(
+                  document: document, caretUTF16: caret, context: context,
+                  prefixCharacters: draftCharacters, suffixCharacters: after,
+                  sourceBodyCharacters: sourceCharacters)
+              }
+              func fits(_ prompt: String) -> Bool {
+                self.model.boomEncode(prompt).count + 64 <= self.identity.contextLength
+              }
+              var prompt = try promptFor(before, sourceCharacters)
+              if !fits(prompt), totalSourceCharacters > 0 {
+                var low = 0
+                var high = totalSourceCharacters
+                while low < high {
+                  try flag.check()
+                  let middle = low + (high - low + 1) / 2
+                  if fits(try promptFor(before, middle)) { low = middle }
+                  else { high = middle - 1 }
+                }
+                sourceCharacters = low
+                prompt = try promptFor(before, sourceCharacters)
+              }
+              while !fits(prompt) {
                 try flag.check()
-                guard before > 0 || after > 0 else {
+                guard before > 1 else {
                   throw BoomError.budget(
-                    "Followed documents and the draft prefix exceed this bundle's token context. Unlink references; linked sources were not silently truncated."
+                    "Source identities and the text at the caret exceed this model's context. Unlink a reference or select a larger model."
                   )
                 }
-                before /= 2
-                after /= 2
-                prompt = try GemmaPrompt.completion(
-                  document: document, caretUTF16: caret, context: context, prefixCharacters: before,
-                  suffixCharacters: after)
+                before = max(1, before / 2)
+                prompt = try promptFor(before, sourceCharacters)
               }
+              let prefix = GemmaPrompt.followedPrefix(
+                context, bodyCharacters: sourceCharacters)
               let window = try CompletionWindow(
                 document: document, caretUTF16: caret, prefixCharacters: before,
                 suffixCharacters: after)

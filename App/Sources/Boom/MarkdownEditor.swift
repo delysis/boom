@@ -12,6 +12,15 @@ import SwiftUI
   private var displayContainer: NSTextContainer?
   private var visibleStamp: GhostStamp?
   private var displayGhostLength = 0
+  private struct AcceptedStep {
+    let documentID: UUID
+    let revision: String
+    let caret: Int
+    let accepted: String
+    let previous: String
+    let sources: [SourceReference]
+  }
+  private var acceptedSteps: [AcceptedStep] = []
   override var undoManager: UndoManager? { documentUndo }
   override var acceptsFirstResponder: Bool { true }
 
@@ -103,8 +112,51 @@ import SwiftUI
     // field as first responder. Ensure the insertion point owns subsequent keys.
     if window?.firstResponder !== self { window?.makeFirstResponder(self) }
     owner?.invalidateGhost()
+    acceptedSteps.removeAll()
   }
   override func keyDown(with event: NSEvent) {
+    let modifiers = event.modifierFlags.intersection([.shift, .control, .command, .option])
+    if modifiers == [.option], !hasMarkedText(), selectedRange().length == 0 {
+      switch event.keyCode {
+      case 124: // Option-Right: accept the next word of the visible completion.
+        let position = selectedRange().location
+        if let segment = owner?.takeGhostChunk(documentID: documentID, caret: position),
+          !segment.accepted.isEmpty {
+          insertText(segment.accepted, replacementRange: selectedRange())
+          if let document = owner?.selectedDocument {
+            acceptedSteps.append(AcceptedStep(
+              documentID: documentID, revision: document.revision,
+              caret: selectedRange().location, accepted: segment.accepted,
+              previous: segment.whole, sources: segment.sources))
+          }
+          owner?.resumeGhost(segment.remaining, documentID: documentID,
+            caret: selectedRange().location, sources: segment.sources)
+          return
+        }
+      case 123: // Option-Left: reverse only the last completion acceptance.
+        if let step = acceptedSteps.last, step.documentID == documentID,
+          owner?.selectedDocument?.revision == step.revision,
+          selectedRange().location == step.caret {
+          let length = (step.accepted as NSString).length
+          let range = NSRange(location: step.caret - length, length: length)
+          let source = string as NSString
+          if range.location >= 0, NSMaxRange(range) <= source.length,
+            source.substring(with: range) == step.accepted {
+            acceptedSteps.removeLast()
+            insertText("", replacementRange: range)
+            owner?.resumeGhost(step.previous, documentID: documentID,
+              caret: selectedRange().location, sources: step.sources)
+            return
+          }
+        }
+        if owner?.ghostStamp != nil { return }
+      case 125, 126: // Option-Down/Up: completion candidates, never caret movement.
+        owner?.navigateGhost(event.keyCode == 125 ? 1 : -1)
+        return
+      default: break
+      }
+    }
+    acceptedSteps.removeAll()
     if event.keyCode == 48, selectedRange().length == 0, !hasMarkedText(),
       event.modifierFlags.intersection([.shift, .control, .command, .option]).isEmpty,
       let completion = owner?.takeGhost(documentID: documentID, caret: selectedRange().location)
@@ -197,6 +249,17 @@ import SwiftUI
   @objc func markdownHeading(_ sender: Any?) { prefixLines("## ") }
   @objc func markdownQuote(_ sender: Any?) { prefixLines("> ") }
   @objc func markdownList(_ sender: Any?) { prefixLines("- ") }
+  @objc func attachDocumentFiles(_ sender: Any?) {
+    guard let owner, let destination = attachmentDestination else { return }
+    owner.chooseAttachmentFiles(to: destination)
+  }
+  private var attachmentDestination: AttachmentDestination? {
+    owner?.documentAttachmentDestination(id: documentID, range: selectedRange())
+  }
+  private func attach(_ inputs: [AttachmentInput]) {
+    guard let owner, let destination = attachmentDestination else { return }
+    owner.attach(inputs, to: destination)
+  }
   override func menu(for event: NSEvent) -> NSMenu? {
     let menu = NSMenu()
     if #available(macOS 15.2, *) { menu.automaticallyInsertsWritingToolsItems = false }
@@ -220,6 +283,12 @@ import SwiftUI
     let formatItem = NSMenuItem(title: "Format as Markdown", action: nil, keyEquivalent: "")
     formatItem.submenu = format
     menu.addItem(formatItem)
+    menu.addItem(.separator())
+    let attach = NSMenuItem(
+      title: "Attach files to document…", action: #selector(attachDocumentFiles(_:)),
+      keyEquivalent: "")
+    attach.target = self
+    menu.addItem(attach)
     return menu
   }
   func menuWillOpen(_ menu: NSMenu) {
@@ -259,32 +328,19 @@ import SwiftUI
       NSRange(location: min(selection.location, (value as NSString).length), length: 0))
   }
   override func paste(_ sender: Any?) {
-    let pasteboard = NSPasteboard.general
-    if let urls = pasteboard.readObjects(
-      forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty
-    {
-      owner?.attachFiles(urls)
-      return
-    }
-    if let data = pasteboard.data(forType: .png) {
-      owner?.attachPasted(data, name: "Pasted image.png")
-      return
-    }
-    if let data = pasteboard.data(forType: .tiff) {
-      owner?.attachPasted(data, name: "Pasted image.tiff")
+    if let inputs = AttachmentInput.read(.general) {
+      attach(inputs)
       return
     }
     super.pasteAsPlainText(sender)
   }
   override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-    if sender.draggingPasteboard.availableType(from: [.fileURL]) != nil { return .copy }
+    if AttachmentInput.canRead(sender.draggingPasteboard) { return .copy }
     return super.draggingEntered(sender)
   }
   override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-    if let urls = sender.draggingPasteboard.readObjects(
-      forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty
-    {
-      owner?.attachFiles(urls)
+    if let inputs = AttachmentInput.read(sender.draggingPasteboard) {
+      attach(inputs)
       return true
     }
     return super.performDragOperation(sender)
@@ -417,7 +473,7 @@ struct MarkdownEditor: NSViewRepresentable {
     text.writingToolsBehavior = .none
     text.isContinuousSpellCheckingEnabled = true
     text.usesFindBar = true
-    text.registerForDraggedTypes([NSPasteboard.PasteboardType.fileURL, NSPasteboard.PasteboardType.string])
+    text.registerForDraggedTypes([.fileURL, .png, .tiff, .string])
     text.setAccessibilityLabel("Markdown document")
     let scroll = MarkdownScrollView()
     scroll.hasVerticalScroller = true
@@ -474,24 +530,6 @@ struct MarkdownEditor: NSViewRepresentable {
       guard let view, !view.applyingExternal else { return }
       if view.selectedRange().length > 0 { model.invalidateGhost() }
       model.movedCaret(view.selectedRange().location, hasMarkedText: view.hasMarkedText())
-    }
-  }
-}
-
-extension WorkspaceModel {
-  func attachPasted(_ data: Data, name: String) {
-    guard !isBusy, pendingAttachments.count < 8 else { return }
-    work("Inspecting pasted attachment…") { [weak self] flag in
-      guard let self else { return }
-      let imported = try await detachedWork(priority: .utility) {
-        try AttachmentProcessor.inspect(name: name, data: data)
-      }
-      try flag.check()
-      try self.store.vault.put(data, kind: .attachment, id: imported.record.id)
-      try self.store.vault.put(imported.receipt, kind: .receipt, id: imported.record.id)
-      self.state.attachments.append(imported.record)
-      self.pendingAttachments.append(imported.record.id)
-      self.status = "Pasted attachment inspected locally"
     }
   }
 }

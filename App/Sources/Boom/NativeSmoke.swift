@@ -107,6 +107,20 @@ enum NativeSmoke {
       details["first_token_divergence"] = firstDifference.map { $0 as Any } ?? NSNull()
       try record("running")
       try require(cold.tokenIDs == warm.tokenIDs, "cold_equals_disk_restored_token_ids")
+      let longContext = "BEGIN SOURCE " + String(repeating: "middle data ", count: 1_000)
+        + " END SOURCE"
+      let fitted = try await second.fitConversation(
+        prefixes: [], history: [], instructions: "", context: longContext,
+        request: "Continue briefly.", maxOutputTokens: 64, flag: CancellationFlag())
+      let fittedPrompt = GemmaPrompt.conversation(
+        history: fitted.history, request: fitted.context + "\n\nContinue briefly.")
+      let fittedRun = try await second.run(
+        prompt: fittedPrompt, maxTokens: 1, flag: CancellationFlag(), onText: { _ in })
+      try require(
+        fitted.omittedContextCharacters > 0 && fitted.context.contains("BEGIN SOURCE")
+          && fitted.context.contains("END SOURCE") && !fittedRun.tokenIDs.isEmpty,
+        "oversize_source_middle_excerpt_fits_real_model")
+      details["omitted_context_characters"] = fitted.omittedContextCharacters
       let reference = DocumentSnapshot(
         title: "Voice", text: "Use plain, short sentences and concrete nouns.")
       let draft = DocumentSnapshot(title: "Draft", text: "[[Voice]]\nThe lighthouse is ")
@@ -131,6 +145,23 @@ enum NativeSmoke {
         "followed_document_cold_disk_token_parity")
       details["followed_cached_tokens"] = followedColdDisk.cachedTokens
       details["followed_completion_text"] = followed.output.text
+      let longReference = DocumentSnapshot(
+        title: "Long", text: "BEGIN FOLLOWED "
+          + String(repeating: "middle source data ", count: 1_000) + " END FOLLOWED")
+      let longDraft = DocumentSnapshot(title: "Draft", text: "[[Long]]\nContinue this thought ")
+      let longPlan = try ContextGraph.resolve(root: longDraft, all: [longDraft, longReference])
+      let longCompletion = try await second.complete(
+        document: longDraft, caret: longDraft.text.utf16.count, context: longPlan,
+        vault: vault, flag: CancellationFlag(), onText: { _ in })
+      let longCache: StoredFollowCache = try vault.decode(
+        StoredFollowCache.self, kind: .followCache, id: Vault.followCacheID,
+        limit: 1_100_000_000)
+      try require(
+        !longCompletion.output.tokenIDs.isEmpty
+          && longCache.prefix.contains("BEGIN FOLLOWED")
+          && longCache.prefix.contains("END FOLLOWED")
+          && longCache.prefix.contains("source characters omitted from the middle"),
+        "oversize_followed_document_middle_excerpt_fits_real_model")
       let unrelated = GemmaPrompt.conversation(
         history: [], request: "Name two kinds of trees. Answer briefly.")
       let unrelatedCold = try await second.run(

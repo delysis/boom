@@ -67,3 +67,70 @@ file away while Boom is closed. Reopen with the existing workspace index and
 confirm the window opens, the missing document is absent from the library, and
 saved chat messages remain. Do not treat a corrupt or unreadable existing file
 as missing; that should still stop with a clear error and leave its bytes intact.
+
+## Composer, attachment and privacy review
+
+Attachment ownership is chosen by the receiving surface, before inspection or
+any asynchronous work. The document editor captures its document ID, revision
+and insertion range; the chat composer captures its chat ID. The shared
+paste/drop decoder identifies file URLs or image bytes but cannot choose a
+destination. Import has no default destination. Menu commands name their
+destination explicitly. If a target disappears or changes during import, stop
+with a stale-target error; never silently move the attachment to the other
+surface. When changing input code, inspect every cell in this routing matrix:
+
+| Input | Document editor | Chat composer |
+| --- | --- | --- |
+| File paste | Markdown link and document chip | Chat attachment chip |
+| Image paste | Markdown link and document chip | Chat attachment chip |
+| File drop | Markdown link and document chip | Chat attachment chip |
+| Image drop | Markdown link and document chip | Chat attachment chip |
+| File menu | Explicit document target | Explicit chat target |
+
+Verify the saved document bytes and chat's pending attachments, then switch
+between documents/chats before an import completes and check that neither
+destination receives the other's payload. Re-run this matrix after adding a
+new attachment type or input surface. A passing compiler check cannot prove
+the route, and a chip alone cannot prove the saved document owns the file.
+
+The composer actions occupy exactly one row. Use measured fitting to move
+controls into the overflow menu only when the current width requires it; do
+not select a layout from a fixed window-width cutoff. Inspect the narrowest
+chat-only pane and a wide three-pane layout. Confirm all actions remain
+reachable and no control is clipped or moved to a second row.
+
+Drop or choose a file while the document editor has focus and inspect the saved
+Markdown link and the document chip. Reopen the document and its attachment
+preview, then check the retained original, extracted text and coverage. Repeat
+through chat and confirm the two destinations are distinct. For audio, use a
+short known-word local fixture and verify actual transcript content, not merely
+that a file chip appears. Missing speech assets and failed segments must
+produce a specific local error. A long recording must retain its original and
+expose explicit full transcription rather than silently claiming complete
+coverage.
+
+Launch the sealed `.app` through LaunchServices and verify its signature binds
+`Info.plist` and seals resources. A direct executable launch is not a privacy
+permission acceptance test. On macOS 26+, test with the speech asset missing
+and installed; no legacy recognition fallback is permitted. On older systems,
+verify both the on-device capability check and the required on-device request
+flag. Check the microphone flow separately from file audio.
+
+## Completion navigation and context review
+
+With a real model loaded, create a visible ghost suggestion. Option-Right must
+accept one word and its following space without moving the caret elsewhere;
+Option-Left must reverse only that acceptance. Repeat twice in each direction,
+then type ordinary text, switch documents and check that old acceptances cannot
+be reversed into a new state. Option-Up/Down must not move the document caret.
+Do not mark alternative-candidate navigation as working until the backend
+actually exposes multiple candidates; the current compiled graph returns only
+argmax tokens. After partial acceptance, new generation must use the accepted
+prefix rather than the original prefix.
+
+Exercise a chat with a long attached document and autocomplete with a long
+followed document against the loaded model. Inspect the captured context: the
+beginning and end excerpts and an omission marker must correspond to the bytes
+actually sent. Keep the current chat request; if it cannot fit, refuse visibly.
+The bundle's measured compiled token limit takes precedence over advertised
+model architecture or a hardware sizing recommendation.

@@ -6,6 +6,20 @@ import SwiftUI
 
 @main @MainActor enum BoomMain {
   static func main() {
+    #if BOOM_UI_TEST
+    if CommandLine.arguments.contains("--attachment-route-smoke") {
+      Task {
+        do {
+          try await AttachmentRouteSmoke.run()
+          exit(0)
+        } catch {
+          fputs("Attachment routing failed: \(error.localizedDescription)\n", stderr)
+          exit(1)
+        }
+      }
+      dispatchMain()
+    }
+    #endif
     if CommandLine.arguments.contains("--runtime-preflight") {
       print(AppleModel.availabilityMessage)
       exit(0)
@@ -17,32 +31,6 @@ import SwiftUI
           exit(0)
         } catch {
           fputs("Apple smoke unavailable or failed: \(error.localizedDescription)\n", stderr)
-          exit(1)
-        }
-      }
-      dispatchMain()
-    }
-    if let index = CommandLine.arguments.firstIndex(of: "--speech-smoke") {
-      Task {
-        do {
-          guard index + 1 < CommandLine.arguments.count else {
-            throw BoomError.invalid("Use --speech-smoke ABSOLUTE_LOCAL_AUDIO_FILE.")
-          }
-          let path = CommandLine.arguments[index + 1]
-          guard path.hasPrefix("/") else {
-            throw BoomError.invalid("Speech smoke requires an absolute file path.")
-          }
-          let file = URL(fileURLWithPath: path).standardizedFileURL
-          let attributes = try FileManager.default.attributesOfItem(atPath: file.path)
-          guard attributes[.type] as? FileAttributeType == .typeRegular,
-            let size = attributes[.size] as? NSNumber, size.int64Value > 4_096,
-            size.int64Value <= 67_108_864 else {
-            throw BoomError.budget("Speech smoke accepts a regular local audio file up to 64 MiB.")
-          }
-          print(try await VoiceInput().transcribe(file))
-          exit(0)
-        } catch {
-          fputs("Speech smoke unavailable or failed: \(error.localizedDescription)\n", stderr)
           exit(1)
         }
       }
@@ -108,7 +96,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
       self.model = model
       model.setTheme(model.state.theme)
       #if BOOM_UI_TEST
-      let initialWidth: CGFloat = 760
+      let initialWidth: CGFloat = 340
       #else
       let initialWidth: CGFloat = 1190
       #endif
@@ -116,7 +104,11 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
         contentRect: NSRect(x: 0, y: 0, width: initialWidth, height: 780),
         styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered,
         defer: false)
+      #if BOOM_UI_TEST
+      window.contentMinSize = NSSize(width: 300, height: 440)
+      #else
       window.contentMinSize = NSSize(width: 750, height: 440)
+      #endif
       window.title = "Boom"
       window.backgroundColor = BoomChrome.sidebarBackground
       window.titlebarAppearsTransparent = true
@@ -128,7 +120,11 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
       toolbar.displayMode = .iconOnly
       toolbar.allowsUserCustomization = false
       window.toolbar = toolbar
+      #if BOOM_UI_TEST
+      window.minSize = NSSize(width: 310, height: 500)
+      #else
       window.minSize = NSSize(width: 760, height: 500)
+      #endif
       self.window = window
       NSApp.mainMenu = makeMenu()
       observer = model.objectWillChange.sink { [weak self] _ in
@@ -241,7 +237,10 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
     file.addItem(item("Import Markdown…", #selector(importDocument), "o", target: self))
     file.addItem(
       item("Export Markdown…", #selector(exportDocument), "s", [.command, .shift], target: self))
-    file.addItem(item("Attach Files…", #selector(attach), "a", [.command, .shift], target: self))
+    file.addItem(item(
+      "Attach Files to Document…", #selector(attachDocument), "a", [.command, .shift],
+      target: self))
+    file.addItem(item("Attach Files to Chat…", #selector(attachChat), target: self))
     let edit = submenu("Edit")
     if #available(macOS 15.2, *) { edit.automaticallyInsertsWritingToolsItems = false }
     edit.delegate = self
@@ -304,7 +303,8 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
     case #selector(toggleCompletion): menuItem.state = model.state.autocomplete ? .on : .off
     case #selector(changeTheme(_:)):
       menuItem.state = (menuItem.representedObject as? String) == model.state.theme ? .on : .off
-    case #selector(attach): return !model.isBusy
+    case #selector(attachDocument): return !model.isBusy && model.selectedDocument != nil
+    case #selector(attachChat): return !model.isBusy
     case #selector(clearFollowCache): return !model.isBusy && model.modelReady
     default: break
     }
@@ -319,7 +319,8 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
   @objc private func newChat() { do { try model?.newChat() } catch { model?.report(error) } }
   @objc private func importDocument() { model?.importDocument() }
   @objc private func exportDocument() { model?.exportDocument() }
-  @objc private func attach() { model?.attachFiles() }
+  @objc private func attachDocument() { model?.chooseDocumentAttachmentFiles() }
+  @objc private func attachChat() { model?.chooseChatAttachmentFiles() }
   @objc private func models() { model?.showingModels = true }
   @objc private func toggleCompletion() {
     guard let model else { return }

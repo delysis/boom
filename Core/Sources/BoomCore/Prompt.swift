@@ -49,13 +49,14 @@ public enum GemmaPrompt {
   /// A checkpoint within the first user turn, not a synthetic assistant answer.
   /// It excludes the current draft, so editing that draft does not rewrite the
   /// followed-document cache. Token-prefix equality is checked by the runtime.
-  public static func followedPrefix(_ context: ContextPlan) -> String? {
+  public static func followedPrefix(_ context: ContextPlan, bodyCharacters: Int? = nil) -> String? {
     guard !context.documents.isEmpty else { return nil }
-    return "<bos>" + safe(context.text) + "\n\n"
+    return "<bos>" + safe(bodyCharacters.map { context.excerpt(keeping: $0) } ?? context.text)
+      + "\n\n"
   }
   public static func completion(
     document: DocumentSnapshot, caretUTF16: Int, context: ContextPlan, prefixCharacters: Int = 2048,
-    suffixCharacters: Int = 512
+    suffixCharacters: Int = 512, sourceBodyCharacters: Int? = nil
   ) throws -> String {
     let window = try CompletionWindow(
       document: document, caretUTF16: caretUTF16, prefixCharacters: prefixCharacters,
@@ -65,7 +66,7 @@ public enum GemmaPrompt {
     }
     // Only the model's beginning-of-sequence marker and authored source text
     // are supplied. No chat turn, role, or instruction surrounds the draft.
-    if let prefix = followedPrefix(context) {
+    if let prefix = followedPrefix(context, bodyCharacters: sourceBodyCharacters) {
       return prefix + safe(window.before)
     }
     return "<bos>" + safe(window.before)
@@ -81,6 +82,20 @@ public enum GemmaPrompt {
     let paragraph = text.components(separatedBy: "\n\n").first ?? ""
     let visible = paragraph.components(separatedBy: "\n").prefix(3).joined(separator: "\n")
     return admissibleCompletion(visible) ? visible : nil
+  }
+}
+
+public enum ContextExcerpt {
+  /// Keep the beginning and end of a source in authored order. The marker is
+  /// part of the actual captured prompt, so omission cannot masquerade as a
+  /// complete document or an exact quotation.
+  public static func middle(_ text: String, keeping characters: Int) -> String {
+    guard characters >= 0, characters < text.count else { return text }
+    let first = (characters + 1) / 2
+    let last = characters / 2
+    return String(text.prefix(first))
+      + "\n[\(text.count - characters) source characters omitted from the middle]\n"
+      + String(text.suffix(last))
   }
 }
 

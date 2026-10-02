@@ -224,5 +224,78 @@ final class BoundaryTests: XCTestCase {
       GemmaPrompt.visibleCompletion("100 feet tall.\n\n[[Voice]]"), "100 feet tall.")
     XCTAssertNil(GemmaPrompt.visibleCompletion("<|turn>model"))
   }
+  func testDocumentAttachmentLinksAreStableAndDeduplicated() throws {
+    let id = UUID()
+    let text = "[Attachment: file.doc](boom-attachment:\(id.uuidString))\n"
+      + "[same file](boom-attachment:\(id.uuidString))\n"
+      + "[bad](boom-attachment:not-a-uuid)"
+    XCTAssertEqual(AttachmentLink.ids(in: text), [id])
+    XCTAssertTrue(try ReferenceParser.wiki(text).isEmpty)
+  }
+
+  func testAutomaticGemmaSizeUsesPhysicalMemoryAndMobileFootprints() {
+    func recommendation(_ gb: UInt64) -> GemmaSize? {
+      ModelMemoryPolicy.recommendedSize(physicalBytes: gb * 1_000_000_000)
+    }
+    XCTAssertEqual(recommendation(32), .b31)
+    XCTAssertEqual(recommendation(16), .b12)
+    XCTAssertEqual(recommendation(8), .e4b)
+    XCTAssertEqual(recommendation(4), .e2b)
+    XCTAssertNil(recommendation(2))
+    XCTAssertEqual(recommendation(128), .b31)
+    XCTAssertEqual(GemmaSize.b31.qatRepository, "google/gemma-4-31B-it-qat-q4_0-gguf")
+    XCTAssertEqual(
+      GemmaSize.b31.qatAssistantRepository,
+      "google/gemma-4-31B-it-qat-q4_0-unquantized-assistant")
+    XCTAssertEqual(
+      GemmaSize.e2b.mobileRepository,
+      "google/gemma-4-E2B-it-qat-mobile-transformers")
+  }
+  func testContextBudgetReservesWorkingMemoryAndHonorsModelLimit() {
+    XCTAssertEqual(
+      ModelMemoryPolicy.maximumContext(
+        architectureLimit: 262_144, workingSetBytes: 32_000_000_000,
+        residentBytes: 20_000_000_000, kvBytesPerToken: 1_000_000), 8_800)
+    XCTAssertEqual(
+      ModelMemoryPolicy.maximumContext(
+        architectureLimit: 2048, workingSetBytes: 32_000_000_000,
+        residentBytes: 20_000_000_000, kvBytesPerToken: 1_000_000), 2048)
+    XCTAssertEqual(
+      ModelMemoryPolicy.maximumContext(
+        architectureLimit: 262_144, workingSetBytes: 16_000_000_000,
+        residentBytes: 15_000_000_000, kvBytesPerToken: 1_000_000), 0)
+  }
+  func testMiddleExcerptKeepsBothEndsAndNamesOmission() {
+    let source = "ABCDEFGHIJ"
+    XCTAssertEqual(ContextExcerpt.middle(source, keeping: 10), source)
+    XCTAssertEqual(
+      ContextExcerpt.middle(source, keeping: 4),
+      "AB\n[6 source characters omitted from the middle]\nIJ")
+    XCTAssertEqual(ContextExcerpt.middle("👩🏽‍💻AéZ", keeping: 2).first, "👩🏽‍💻")
+  }
+  func testFollowedSourceExcerptKeepsEveryIdentityAndBothEnds() throws {
+    let a = DocumentSnapshot(title: "A", text: "FIRST" + String(repeating: "a", count: 200) + "LAST")
+    let b = DocumentSnapshot(title: "B", text: "START" + String(repeating: "b", count: 200) + "END")
+    let root = DocumentSnapshot(title: "Draft", text: "[[A]] [[B]]\nContinue")
+    let plan = try ContextGraph.resolve(root: root, all: [root, a, b])
+    let excerpt = plan.excerpt(keeping: 32)
+    XCTAssertTrue(excerpt.contains("ID \(a.id.uuidString)"))
+    XCTAssertTrue(excerpt.contains("ID \(b.id.uuidString)"))
+    XCTAssertTrue(excerpt.contains("FIRST"))
+    XCTAssertTrue(excerpt.contains("LAST"))
+    XCTAssertTrue(excerpt.contains("START"))
+    XCTAssertTrue(excerpt.contains("END"))
+    XCTAssertTrue(excerpt.contains("source characters omitted from the middle"))
+    XCTAssertEqual(plan.excerpt(keeping: Int.max), plan.text)
+  }
+  func testCompletionChunkPreservesWhitespaceAndGraphemes() {
+    let first = CompletionNavigation.nextChunk("  👩🏽‍💻 hello  world")
+    XCTAssertEqual(first.accepted, "  👩🏽‍💻 ")
+    XCTAssertEqual(first.remaining, "hello  world")
+    let second = CompletionNavigation.nextChunk(first.remaining)
+    XCTAssertEqual(second.accepted, "hello  ")
+    XCTAssertEqual(second.remaining, "world")
+    XCTAssertEqual(CompletionNavigation.nextChunk("\n\t").accepted, "\n\t")
+  }
 
 }

@@ -24,6 +24,26 @@ struct WorkspaceView: View {
         if model.showsDocument {
           if let document = model.selectedDocument {
             VStack(spacing: 0) {
+              let attachments = model.documentAttachments(document)
+              if !attachments.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                  HStack(spacing: 8) {
+                    ForEach(attachments) { attachment in
+                      Button {
+                        model.previewReceipt = false
+                        model.previewAttachment = attachment.id
+                      } label: {
+                        Label(attachment.name, systemImage: attachment.text.isEmpty
+                          ? "exclamationmark.circle" : "paperclip")
+                          .lineLimit(1)
+                      }.buttonStyle(.plain).font(.system(size: 11))
+                        .foregroundStyle(attachment.text.isEmpty ? .secondary : .primary)
+                        .help(attachment.coverage)
+                    }
+                  }.padding(.horizontal, 20).padding(.vertical, 8)
+                }
+                Divider()
+              }
               MarkdownEditor(model: model, document: document)
             }.frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
           } else {
@@ -264,16 +284,8 @@ struct ChatPane: View {
         }
         Divider()
       }
-      Button("Choose files…") { model.attachFiles() }
-      Button("Paste image") {
-        if let data = NSPasteboard.general.data(forType: .png) {
-          model.attachPasted(data, name: "Pasted image.png")
-        } else if let data = NSPasteboard.general.data(forType: .tiff) {
-          model.attachPasted(data, name: "Pasted image.tiff")
-        } else {
-          model.report(BoomError.unavailable("The clipboard has no image to attach."))
-        }
-      }
+      Button("Choose files…") { model.chooseChatAttachmentFiles() }
+      Button("Paste image") { model.pasteImageIntoCurrentChat() }
     } label: {
       Image(systemName: "paperclip").frame(width: 22, height: 22)
     }.menuStyle(.borderlessButton).fixedSize().disabled(model.isBusy)
@@ -333,44 +345,105 @@ struct ChatPane: View {
       }
     }
   }
-  private var composerControls: some View {
-    GeometryReader { geometry in
-      let compact = geometry.size.width < 450
-      VStack(alignment: .leading, spacing: 5) {
-        HStack(spacing: 6) {
-        Menu {
-          Button("New chat") {
-            do { try model.newChat() } catch { model.report(error) }
-          }
-          if let document = model.selectedDocument {
-            Button("New chat about \(document.title)") {
-              do { try model.newChat(about: document.id) } catch { model.report(error) }
-            }
-          }
-        } label: {
-          Image(systemName: "square.and.pencil").frame(width: 22, height: 22)
-        }.menuStyle(.borderlessButton).fixedSize().disabled(model.isBusy)
-          .accessibilityLabel("New chat").help("Start a chat, optionally about the current document")
-        authorityMenu(compact: compact)
-        attachmentMenu
-        Spacer(minLength: 0)
-        if !compact {
-          modelMenu(compact: geometry.size.width < 550)
-          dictationButton
-          conversationButton
+  private enum ComposerControl: Hashable {
+    case newChat, authority, attachment, model, dictation, conversation
+  }
+  private var newChatMenu: some View {
+    Menu {
+      Button("New chat") {
+        do { try model.newChat() } catch { model.report(error) }
+      }
+      if let document = model.selectedDocument {
+        Button("New chat about \(document.title)") {
+          do { try model.newChat(about: document.id) } catch { model.report(error) }
         }
+      }
+    } label: {
+      Image(systemName: "square.and.pencil").frame(width: 22, height: 22)
+    }.menuStyle(.borderlessButton).fixedSize().disabled(model.isBusy)
+      .accessibilityLabel("New chat").help("Start a chat, optionally about the current document")
+  }
+  private func overflowMenu(_ hidden: Set<ComposerControl>) -> some View {
+    Menu {
+      if hidden.contains(.newChat) {
+        Button("New chat") {
+          do { try model.newChat() } catch { model.report(error) }
+        }
+        if let document = model.selectedDocument {
+          Button("New chat about \(document.title)") {
+            do { try model.newChat(about: document.id) } catch { model.report(error) }
+          }
+        }
+      }
+      if hidden.contains(.authority) {
+        Menu("Message authority") {
+          Button("Ask") { model.mode = .ask }
+          Button("Propose · review edits") { model.mode = .propose }
+          Button("Edit · apply edits") { model.mode = .edit }
+        }
+      }
+      if hidden.contains(.attachment) {
+        Button("Choose files…") { model.chooseChatAttachmentFiles() }
+        Button("Paste image") { model.pasteImageIntoCurrentChat() }
+      }
+      if hidden.contains(.model) {
+        Menu("Model · \(model.inferenceName)") {
+          Button("Automatic") { model.chooseModel(.automatic) }
+          Button("Apple Foundation Model") { model.chooseModel(.apple) }
+            .disabled(!AppleModel.isAvailable)
+          Button("Gemma 4 E2B") { model.chooseModel(.gemma) }
+            .disabled(model.runner == nil)
+          Divider()
+          Button("Manage models…") { model.showingModels = true }
+        }
+      }
+      if hidden.contains(.dictation) {
+        Button(voice.purpose == .dictation ? "Stop dictation" : "Dictate into message") {
+          toggleVoice(.dictation)
+        }.disabled((model.isBusy && !voice.isRecording) || voice.starting || voice.transcribing ||
+          (voice.isRecording && voice.purpose != .dictation))
+      }
+      if hidden.contains(.conversation) {
+        Button(voice.purpose == .conversation ? "Stop voice recording" : "Start voice conversation") {
+          toggleVoice(.conversation)
+        }.disabled((model.isBusy && !voice.isRecording) || voice.starting || voice.transcribing ||
+          (voice.isRecording && voice.purpose != .conversation))
+      }
+    } label: {
+      Image(systemName: "ellipsis").frame(width: 22, height: 22)
+    }.menuStyle(.borderlessButton).fixedSize()
+      .accessibilityLabel("More message controls")
+  }
+  private func controlRow(
+    hidden: Set<ComposerControl> = [], compactLabels: Bool = false
+  ) -> some View {
+    HStack(spacing: 6) {
+      HStack(spacing: 6) {
+        if !hidden.contains(.newChat) { newChatMenu }
+        if !hidden.contains(.authority) { authorityMenu(compact: compactLabels) }
+        if !hidden.contains(.attachment) { attachmentMenu }
+      }.fixedSize()
+      Spacer(minLength: 0)
+      HStack(spacing: 6) {
+        if !hidden.contains(.model) { modelMenu(compact: compactLabels) }
+        if !hidden.contains(.dictation) { dictationButton }
+        if !hidden.contains(.conversation) { conversationButton }
+        if !hidden.isEmpty { overflowMenu(hidden) }
         sendButton
-        }
-        if compact {
-          HStack(spacing: 12) {
-            modelMenu(compact: geometry.size.width < 290)
-            Spacer(minLength: 0)
-            dictationButton
-            conversationButton
-          }
-        }
-      }.frame(width: geometry.size.width, alignment: .leading)
-    }.frame(height: 58)
+      }.fixedSize()
+    }
+  }
+  private var composerControls: some View {
+    ViewThatFits(in: .horizontal) {
+      controlRow()
+      controlRow(compactLabels: true)
+      controlRow(hidden: [.newChat], compactLabels: true)
+      controlRow(hidden: [.newChat, .attachment], compactLabels: true)
+      controlRow(hidden: [.newChat, .attachment, .dictation], compactLabels: true)
+      controlRow(hidden: [.newChat, .attachment, .dictation, .conversation], compactLabels: true)
+      controlRow(hidden: [.newChat, .attachment, .dictation, .conversation, .authority], compactLabels: true)
+      controlRow(hidden: [.newChat, .attachment, .dictation, .conversation, .authority, .model], compactLabels: true)
+    }.frame(height: 28)
   }
   private func assistantName(_ message: ChatMessage) -> String {
     message.personaID.flatMap { id in
@@ -567,13 +640,10 @@ struct ChatPane: View {
         }
         ChatComposer(
           text: $model.draft, focusRequest: composerFocusRequest,
-          onSend: { model.send() }, onCancel: { model.cancel() }
+          onSend: { model.send() }, onCancel: { model.cancel() },
+          onAttachments: { model.attachToCurrentChat($0) }
         ).frame(height: CGFloat(50 + 18 * min(3, model.draft.filter { $0 == "\n" }.count)))
         composerControls
-        if model.isBusy || voice.isRecording || voice.starting || voice.transcribing {
-          Text(model.status).font(.system(size: 10)).foregroundStyle(.tertiary).lineLimit(1)
-            .help(model.status)
-        }
       }.padding(10)
         .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.primary.opacity(0.07)))
@@ -671,7 +741,7 @@ struct ModelSetupView: View {
         }.font(.caption)
       }
       Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 1)
-      Text("Gemma 4 E2B · CoreML · 2048 context tokens")
+      Text("Gemma 4 E2B · CoreML")
         .font(.system(size: 13, weight: .medium))
       HStack {
         Button("Download Gemma 4 E2B") { model.downloadModel() }
@@ -680,7 +750,6 @@ struct ModelSetupView: View {
       Text(
         "Verified files are reused from the Hugging Face cache; new downloads go there too. Native persona caches require Gemma."
       ).font(.caption).foregroundStyle(.tertiary)
-      Text(model.status).font(.caption).textSelection(.enabled)
       HStack {
         if model.isBusy {
           ProgressView().controlSize(.small)
@@ -735,14 +804,21 @@ struct AttachmentPreview: View {
         }
         if let failure { Text(failure).font(.caption).foregroundStyle(.secondary) }
         HStack {
-          Button("Prepare locally") { model.prepareAttachment(id) }.disabled(model.isBusy)
+          if record.text.isEmpty {
+            Button(record.coverage.contains("Long recording")
+              ? "Transcribe full recording" : "Retry local conversion") {
+                model.prepareAttachment(id)
+              }.disabled(model.isBusy)
+          }
           Button("Export original…") { exportOriginal() }.disabled(bytes == nil)
+          if model.isBusy {
+            ProgressView().controlSize(.small)
+            Text(model.status).font(.caption).foregroundStyle(.secondary)
+            Button("Stop") { model.cancel() }
+          }
           Spacer()
           Button("Done") { model.previewAttachment = nil }.keyboardShortcut(.cancelAction)
         }
-        Text(
-          "Native PDF text, first image/frame descriptions, bounded audio excerpts, or four self-contained MP4 frames. No automatic OCR, external links or network decoders."
-        ).font(.system(size: 10)).foregroundStyle(.tertiary)
       }
     }.padding(20).frame(width: 680, height: 600)
       .task {

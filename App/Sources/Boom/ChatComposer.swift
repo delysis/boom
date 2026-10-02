@@ -4,6 +4,7 @@ import SwiftUI
 @MainActor final class ChatTextView: NSTextView {
   var onSend: (() -> Void)?
   var onCancel: (() -> Void)?
+  var onAttachments: (([AttachmentInput]) -> Void)?
   private let placeholderStorage = NSTextStorage()
   private let placeholderLayout = NSLayoutManager()
   private let placeholderContainer = NSTextContainer(size: .zero)
@@ -46,6 +47,24 @@ import SwiftUI
     }
     super.keyDown(with: event)
   }
+  override func paste(_ sender: Any?) {
+    if let inputs = AttachmentInput.read(.general) {
+      onAttachments?(inputs)
+      return
+    }
+    super.pasteAsPlainText(sender)
+  }
+  override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+    AttachmentInput.canRead(sender.draggingPasteboard)
+      ? .copy : super.draggingEntered(sender)
+  }
+  override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+    if let inputs = AttachmentInput.read(sender.draggingPasteboard) {
+      onAttachments?(inputs)
+      return true
+    }
+    return super.performDragOperation(sender)
+  }
 }
 
 struct ChatComposer: NSViewRepresentable {
@@ -53,6 +72,7 @@ struct ChatComposer: NSViewRepresentable {
   let focusRequest: Int
   let onSend: () -> Void
   let onCancel: () -> Void
+  let onAttachments: ([AttachmentInput]) -> Void
 
   func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
 
@@ -90,6 +110,8 @@ struct ChatComposer: NSViewRepresentable {
     view.delegate = context.coordinator
     view.onSend = onSend
     view.onCancel = onCancel
+    view.onAttachments = onAttachments
+    view.registerForDraggedTypes([.fileURL, .png, .tiff])
     view.setAccessibilityLabel("Chat message; Command Return sends")
     view.setAccessibilityPlaceholderValue("Message")
     view.preparePlaceholder()
@@ -110,6 +132,7 @@ struct ChatComposer: NSViewRepresentable {
     context.coordinator.text = $text
     view.onSend = onSend
     view.onCancel = onCancel
+    view.onAttachments = onAttachments
     if view.string != text, !view.hasMarkedText() {
       view.string = text
       view.setSelectedRange(NSRange(location: (text as NSString).length, length: 0))

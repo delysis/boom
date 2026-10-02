@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Combine
 import CoreMLLLM
 import BoomCore
@@ -13,6 +14,17 @@ struct StoredProposal: Codable, Identifiable {
   let documents: [SourceReference]
   let attachments: [SourceReference]
   var status: String
+}
+
+enum AttachmentDestination {
+  case chat(id: UUID)
+  case document(id: UUID, revision: String, range: NSRange)
+}
+struct CompletionSegment {
+  let accepted: String
+  let remaining: String
+  let whole: String
+  let sources: [SourceReference]
 }
 
 @MainActor final class WorkspaceModel: ObservableObject {
@@ -41,6 +53,58 @@ struct StoredProposal: Codable, Identifiable {
   let store: WorkspaceStore
   private(set) var runner: GemmaRunner?
   var selectedRunner: GemmaRunner? { modelChoice == .apple ? nil : runner }
+  func documentAttachments(_ document: DocumentSnapshot) -> [AttachmentRecord] {
+    AttachmentLink.ids(in: document.text).compactMap { id in
+      state.attachments.first { $0.id == id }
+    }
+  }
+  func documentAttachmentDestination(id: UUID, range: NSRange) -> AttachmentDestination? {
+    guard let document = documents.first(where: { $0.id == id }) else { return nil }
+    return .document(id: id, revision: document.revision, range: range)
+  }
+  private func chatAttachmentDestination() throws -> AttachmentDestination {
+    guard !isBusy else { throw BoomError.unavailable("Finish the current action before attaching a file.") }
+    if let id = state.selectedChat, state.chats.contains(where: { $0.id == id }) {
+      return .chat(id: id)
+    }
+    try flush()
+    var next = state
+    let chat = ChatRecord()
+    next.chats.append(chat)
+    next.selectedChat = chat.id
+    next.showChat = true
+    try store.persist(next)
+    state = next
+    selectedChatIDs = [chat.id]
+    compactPane = "chat"
+    return .chat(id: chat.id)
+  }
+  func attachToCurrentChat(_ inputs: [AttachmentInput]) {
+    do { attach(inputs, to: try chatAttachmentDestination()) }
+    catch { report(error) }
+  }
+  func pasteImageIntoCurrentChat() {
+    guard let input = AttachmentInput.readImage(.general) else {
+      report(BoomError.unavailable("The clipboard has no image to attach."))
+      return
+    }
+    attachToCurrentChat([input])
+  }
+  func chooseChatAttachmentFiles() {
+    do { chooseAttachmentFiles(to: try chatAttachmentDestination()) }
+    catch { report(error) }
+  }
+  func chooseDocumentAttachmentFiles() {
+    guard let document = selectedDocument else {
+      report(BoomError.unavailable("Open a document before attaching a file to it."))
+      return
+    }
+    let range: NSRange
+    if let editor, editor.documentID == document.id { range = editor.selectedRange() }
+    else { range = NSRange(location: document.text.utf16.count, length: 0) }
+    guard let destination = documentAttachmentDestination(id: document.id, range: range) else { return }
+    chooseAttachmentFiles(to: destination)
+  }
   var canInfer: Bool { selectedRunner != nil || (modelChoice != .gemma && AppleModel.isAvailable) }
   var inferenceName: String {
     if selectedRunner != nil { return "Gemma 4 E2B" }
@@ -566,7 +630,7 @@ struct StoredProposal: Codable, Identifiable {
       let graph = try ContextGraph.resolveChat(
         request: request, attachedDocumentID: chat.attachedDocumentID, all: documents)
       let sourceDocuments = graph.sources
-      let attachments = try pendingAttachments.map { id -> AttachmentRecord in
+      let selectedAttachments = try pendingAttachments.map { id -> AttachmentRecord in
         guard let attachment = state.attachments.first(where: { $0.id == id }),
           !attachment.text.isEmpty
         else {
@@ -576,13 +640,22 @@ struct StoredProposal: Codable, Identifiable {
         }
         return attachment
       }
+      let inheritedIDs = graph.documents.flatMap { AttachmentLink.ids(in: $0.text) }
+      let inheritedAttachments = inheritedIDs.compactMap { id in
+        state.attachments.first { $0.id == id }
+      }
+      let attachments = (selectedAttachments + inheritedAttachments).reduce(
+        into: [AttachmentRecord]()) { records, attachment in
+          if !records.contains(where: { $0.id == attachment.id }) { records.append(attachment) }
+        }
       guard attachments.count <= 8 else {
         throw BoomError.budget("At most eight attachments per turn.")
       }
       let attachmentSources = attachments.map(\.reference)
       let sources = sourceDocuments + attachmentSources
       let attachmentText = attachments.map {
-        "ATTACHMENT \($0.name)\nID \($0.id)\nDIGEST \($0.digest)\nCOVERAGE \($0.coverage)\n\($0.transform ?? "")\n\($0.text)"
+        "ATTACHMENT \($0.name)\nID \($0.id)\nDIGEST \($0.digest)\nCOVERAGE \($0.coverage)\n\($0.transform ?? "")\n"
+          + ($0.text.isEmpty ? "No readable text was extracted from this attachment." : $0.text)
       }.joined(separator: "\n\n")
       let contextParts = [graph.text, attachmentText].filter { !$0.isEmpty }
       let context = contextParts.isEmpty ? "" : "REFERENCE DATA:\n" + contextParts.joined(separator: "\n\n")
@@ -635,6 +708,22 @@ struct StoredProposal: Codable, Identifiable {
         }
         try self.flush()
         self.streamingChat = chatID
+        let instructions = interaction == .ask ? "" : DocumentTools.instructions
+        let fitted: FittedConversation?
+        if let runner = self.selectedRunner {
+          let prefixes = try personas.map { try GemmaPrompt.prefix($0.messages) }
+          fitted = try await runner.fitConversation(
+            prefixes: prefixes.map(Optional.some), history: oldHistory,
+            instructions: instructions, context: context, request: request,
+            maxOutputTokens: 512, flag: flag)
+          if let fitted, fitted.context != context {
+            guard let current = self.state.chats[index].messages.indices.last else {
+              throw BoomError.invalid("The current chat message disappeared.")
+            }
+            self.state.chats[index].messages[current].context = fitted.context
+            try self.flush()
+          }
+        } else { fitted = nil }
         let consultations: [Persona?] = personas.isEmpty ? [nil] : personas.map { Optional($0) }
         for persona in consultations {
           try flag.check()
@@ -648,7 +737,6 @@ struct StoredProposal: Codable, Identifiable {
               try runner.restorePersona(persona, vault: vault)
             }
           }
-          let instructions = interaction == .ask ? "" : DocumentTools.instructions
           self.streamingText = ""
           var responseRecorded = false
           do {
@@ -656,8 +744,8 @@ struct StoredProposal: Codable, Identifiable {
             let resultStatus: String
             if let runner = self.selectedRunner {
               let prompt = GemmaPrompt.conversation(
-                prefix: prefix, history: oldHistory,
-                request: [instructions, context, request].filter { !$0.isEmpty }
+                prefix: prefix, history: fitted?.history ?? oldHistory,
+                request: [instructions, fitted?.context ?? context, request].filter { !$0.isEmpty }
                   .joined(separator: "\n\n"))
               let result = try await runner.run(
                 prompt: prompt, restore: cache, maxTokens: 512, flag: flag
@@ -669,6 +757,8 @@ struct StoredProposal: Codable, Identifiable {
               }
               generated = result.text
               resultStatus = "Local Gemma · \(result.promptTokens) prompt tokens · \(result.cachedTokens) restored"
+                + ((fitted?.omittedContextCharacters ?? 0) > 0
+                  || (fitted?.omittedHistoryCount ?? 0) > 0 ? " · earlier context shortened" : "")
                 + (result.endedByEOS ? "" : " · output limit")
             } else {
               let prompt = try AppleModel.conversation(
@@ -983,6 +1073,33 @@ struct StoredProposal: Codable, Identifiable {
     invalidateGhost()
     return value
   }
+  func takeGhostChunk(documentID: UUID, caret: Int) -> CompletionSegment? {
+    let sources = ghostSources
+    guard let whole = takeGhost(documentID: documentID, caret: caret) else { return nil }
+    let chunk = CompletionNavigation.nextChunk(whole)
+    return CompletionSegment(
+      accepted: chunk.accepted, remaining: chunk.remaining, whole: whole, sources: sources)
+  }
+  func resumeGhost(_ text: String, documentID: UUID, caret: Int,
+    sources: [SourceReference]) {
+    guard !text.isEmpty, let document = selectedDocument, document.id == documentID,
+      self.caret == caret, editor?.selectedRange().location == caret,
+      editor?.selectedRange().length == 0, editor?.string == document.text,
+      (try? revalidate(sources, attachments: [])) != nil,
+      (try? store.checkDisk(documentID)) != nil,
+      let stamp = try? GhostStamp(document: document, caretUTF16: caret, epoch: epoch)
+    else { return }
+    ghostSources = sources
+    ghostStamp = stamp
+    ghostText = text
+    editor?.showGhost(text, stamp: stamp)
+  }
+  func navigateGhost(_ direction: Int) {
+    guard !ghostText.isEmpty else { scheduleCompletion(); return }
+    // The admitted CoreML decode graph returns only argmax, so retrying the
+    // identical prefix cannot produce an independent candidate.
+    status = "This model provides one deterministic completion at this position."
+  }
   func importDocument() {
     finishComposition()
     cancel()
@@ -1027,103 +1144,207 @@ struct StoredProposal: Codable, Identifiable {
   func revealDocument(_ id: UUID) {
     NSWorkspace.shared.activateFileViewerSelecting([store.documentURL(id)])
   }
-  func attachFiles(_ urls: [URL]? = nil) {
-    guard !isBusy else { return }
-    let chosen: [URL]
-    if let urls {
-      chosen = urls
-    } else {
-      let panel = NSOpenPanel()
-      panel.allowsMultipleSelection = true
-      panel.canChooseDirectories = false
-      guard panel.runModal() == .OK else { return }
-      chosen = panel.urls
+  private func insertAttachmentLinks(
+    _ attachments: [AttachmentRecord], into destination: AttachmentDestination
+  ) throws {
+    guard case .document(let id, let revision, let range) = destination else {
+      throw BoomError.invalid("A document destination is required for Markdown links.")
     }
-    guard chosen.count + pendingAttachments.count <= 8 else {
+    guard let index = documents.firstIndex(where: { $0.id == id }) else {
+      throw BoomError.stale("The attachment's document was removed.")
+    }
+    guard !attachments.isEmpty else { return }
+    let links = attachments.map { attachment in
+      let name = attachment.name.replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "]", with: "\\]")
+        .replacingOccurrences(of: "\n", with: " ")
+      return "[Attachment: \(name)](boom-attachment:\(attachment.id.uuidString))"
+    }.joined(separator: "\n") + "\n"
+    let current = documents[index]
+    let insertion = current.revision == revision
+      ? Range(range, in: current.text) : nil
+    let replacement = insertion ?? current.text.endIndex..<current.text.endIndex
+    let prefix = insertion == nil && !current.text.isEmpty ? "\n" : ""
+    let value = prefix + links
+    if state.selectedDocument == id, let editor, editor.documentID == id,
+      editor.string == current.text,
+      let native = NSRange(replacement, in: current.text) as NSRange? {
+      editor.insertText(value, replacementRange: native)
+    } else {
+      documents[index].text.replaceSubrange(replacement, with: value)
+      dirty.insert(id)
+      scheduleSave()
+    }
+  }
+  func chooseAttachmentFiles(to destination: AttachmentDestination) {
+    guard !isBusy else { return }
+    let panel = NSOpenPanel()
+    panel.allowsMultipleSelection = true
+    panel.canChooseDirectories = false
+    guard panel.runModal() == .OK else { return }
+    attach(panel.urls.map(AttachmentInput.file), to: destination)
+  }
+  func attach(_ inputs: [AttachmentInput], to destination: AttachmentDestination) {
+    guard !isBusy, !inputs.isEmpty else { return }
+    let alreadyPending: Int
+    switch destination {
+    case .chat(let id):
+      guard state.selectedChat == id else { report(BoomError.stale("Chat changed.")); return }
+      alreadyPending = pendingAttachments.count
+    case .document(let id, _, _):
+      guard documents.contains(where: { $0.id == id }) else {
+        report(BoomError.stale("Document was removed.")); return
+      }
+      alreadyPending = 0
+    }
+    guard inputs.count + alreadyPending <= 8 else {
       report(BoomError.budget("At most eight attachments per turn."))
       return
     }
     work("Inspecting attachments locally…") { [weak self] flag in
       guard let self else { return }
-      for url in chosen {
+      var importedRecords: [AttachmentRecord] = []
+      for input in inputs {
         try flag.check()
-        let scope = url.startAccessingSecurityScopedResource()
-        defer { if scope { url.stopAccessingSecurityScopedResource() } }
-        let imported = try await detachedWork(priority: .utility) {
-          let bytes = try AttachmentProcessor.readGranted(url)
-          return try AttachmentProcessor.inspect(name: url.lastPathComponent, data: bytes)
+        let sourceURL: URL?
+        if case .file(let url) = input { sourceURL = url } else { sourceURL = nil }
+        let scope = sourceURL?.startAccessingSecurityScopedResource() ?? false
+        defer { if scope { sourceURL?.stopAccessingSecurityScopedResource() } }
+        let imported: AttachmentImport
+        switch input {
+        case .file(let url):
+          imported = try await detachedWork(priority: .utility) {
+            let bytes = try AttachmentProcessor.readGranted(url)
+            return try AttachmentProcessor.inspect(name: url.lastPathComponent, data: bytes)
+          }
+        case .bytes(let name, let data):
+          imported = try await detachedWork(priority: .utility) {
+            try AttachmentProcessor.inspect(name: name, data: data)
+          }
         }
         try flag.check()
         try self.store.vault.put(imported.original, kind: .attachment, id: imported.record.id)
         try self.store.vault.put(imported.receipt, kind: .receipt, id: imported.record.id)
-        self.state.attachments.append(imported.record)
-        self.pendingAttachments.append(imported.record.id)
+        var record = imported.record
+        if record.text.isEmpty {
+          do {
+            record = try await self.preparedRecord(
+              record, data: imported.original, sourceURL: sourceURL, flag: flag)
+          } catch is CancellationError { throw CancellationError() }
+          catch { record.coverage = "Unreadable locally: " + error.localizedDescription }
+        }
+        try flag.check()
+        self.state.attachments.append(record)
+        importedRecords.append(record)
       }
-      self.status = "Attachments inspected · no source URLs were fetched"
+      switch destination {
+      case .chat(let id):
+        guard self.state.selectedChat == id else { throw BoomError.stale("Chat changed.") }
+        self.pendingAttachments.append(contentsOf: importedRecords.map(\.id))
+      case .document:
+        try self.insertAttachmentLinks(importedRecords, into: destination)
+      }
+      self.status = importedRecords.allSatisfy { !$0.text.isEmpty }
+        ? "Attachments ready" : "Some attachments need a readable local conversion"
     }
   }
   func removePending(_ id: UUID) {
     guard !isBusy else { return }
     pendingAttachments.removeAll { $0 == id }
   }
+  private func preparedRecord(
+    _ attachment: AttachmentRecord, data: Data, sourceURL: URL?, flag: CancellationFlag
+  ) async throws -> AttachmentRecord {
+    var updated = attachment
+    let audioExtensions = ["mp3", "wav", "aiff", "aif", "flac"]
+    if audioExtensions.contains((attachment.name as NSString).pathExtension.lowercased()) {
+      if let sourceURL {
+        let audio = try AVAudioFile(forReading: sourceURL)
+        let seconds = Double(audio.length) / audio.processingFormat.sampleRate
+        if seconds > 120 {
+          throw BoomError.unavailable(
+            "Long recording (\(Int(seconds / 60)) min). Open this attachment to transcribe the full recording on device.")
+        }
+      }
+      let result: (text: String, coverage: String)
+      if let sourceURL {
+        result = try await VoiceInput().transcribeAttachment(sourceURL, flag: flag) {
+          [weak self] current, total in
+          self?.status = "Transcribing \(attachment.name) · \(current) of \(total)"
+        }
+      } else {
+        result = try await VoiceInput().transcribeAttachment(
+          data: data, extension: (attachment.name as NSString).pathExtension.lowercased(), flag: flag
+        ) { [weak self] current, total in
+          self?.status = "Transcribing \(attachment.name) · \(current) of \(total)"
+        }
+      }
+      updated.text = result.text
+      updated.transform = result.coverage
+      updated.coverage = result.coverage.hasPrefix("Partial")
+        ? "Partial local transcript" : "Local speech transcript"
+      return updated
+    }
+    let audioSeconds = runner?.audioSeconds ?? 0
+    let media = try await detachedWork(priority: .utility) {
+      try await NativeMedia.prepare(
+        data: data, name: attachment.name, audioSeconds: audioSeconds, flag: flag)
+    }
+    var text = ""
+    var note = ""
+    switch media {
+    case .text(let extracted, let coverage):
+      text = extracted
+      note = coverage
+    case .image(let image):
+      guard let runner, runner.supportsImages else {
+        throw BoomError.unavailable("No local image description model is ready.")
+      }
+      text = try await runner.describe(image: image, flag: flag, onText: { _ in }).text
+      note = "Local model description of the first image, resized to at most 1600 pixels. Machine-generated, not verified OCR or full image coverage."
+    case .audio(let samples, let coverage):
+      guard let runner, runner.supportsAudio else {
+        throw BoomError.unavailable("On-device speech could not read this file and no local audio model is ready.")
+      }
+      text = try await runner.describe(audio: samples, flag: flag, onText: { _ in }).text
+      note = coverage
+    case .video(let frames, let coverage):
+      guard let runner, runner.supportsImages else {
+        throw BoomError.unavailable("No local video-frame description model is ready.")
+      }
+      var descriptions: [String] = []
+      for frame in frames {
+        try flag.check()
+        let result = try await runner.describe(image: frame.image, flag: flag, onText: { _ in })
+        descriptions.append("[Frame at \(String(format: "%.2f", frame.seconds)) seconds]\n" + result.text)
+      }
+      text = descriptions.joined(separator: "\n\n")
+      note = coverage
+    }
+    try flag.check()
+    guard !text.isEmpty, text.utf8.count <= 262_144 else {
+      throw BoomError.invalid("Native transform returned no bounded text.")
+    }
+    updated.text = text
+    updated.transform = note
+    updated.coverage = "Partial native transform"
+    return updated
+  }
   func prepareAttachment(_ id: UUID) {
     guard !isBusy, let attachment = state.attachments.first(where: { $0.id == id }) else { return }
-    let runner = self.runner
     work("Preparing \(attachment.name) locally…") { [weak self] flag in
       guard let self else { return }
       let data = try self.store.vault.get(.attachment, id: id, limit: 67_108_864)
       guard Digest.sha256(data) == attachment.rootDigest else {
         throw BoomError.invalid("Stored attachment digest changed.")
       }
-      let media = try await detachedWork(priority: .utility) {
-        try await NativeMedia.prepare(
-          data: data, audioSeconds: runner?.audioSeconds ?? 0, flag: flag)
-      }
-      var text = ""
-      var note = ""
-      switch media {
-      case .text(let extracted, let coverage):
-        text = extracted
-        note = coverage
-      case .image(let image):
-        guard let runner, runner.supportsImages else {
-          throw BoomError.unavailable(
-            "Install the Gemma bundle's vision encoder to describe images locally.")
-        }
-        text = try await runner.describe(image: image, flag: flag, onText: { _ in }).text
-        note =
-          "Local Gemma description of the first image/frame, resized to at most 1600 pixels. Machine-generated, not verified OCR or full image coverage."
-      case .audio(let samples, let coverage):
-        guard let runner, runner.supportsAudio else {
-          throw BoomError.unavailable("This bundle has no usable local audio encoder.")
-        }
-        text = try await runner.describe(audio: samples, flag: flag, onText: { _ in }).text
-        note = coverage
-      case .video(let frames, let coverage):
-        guard let runner, runner.supportsImages else {
-          throw BoomError.unavailable("This bundle has no usable local vision encoder.")
-        }
-        var descriptions: [String] = []
-        for frame in frames {
-          try flag.check()
-          let result = try await runner.describe(image: frame.image, flag: flag, onText: { _ in })
-          descriptions.append(
-            "[Frame at \(String(format:"%.2f",frame.seconds)) seconds]\n" + result.text)
-        }
-        text = descriptions.joined(separator: "\n\n")
-        note = coverage
-      }
-      try flag.check()
-      guard !text.isEmpty, text.utf8.count <= 262_144 else {
-        throw BoomError.invalid("Native transform returned no bounded text.")
-      }
+      let updated = try await self.preparedRecord(
+        attachment, data: data, sourceURL: nil, flag: flag)
       guard let index = self.state.attachments.firstIndex(where: { $0.id == id }),
         self.state.attachments[index].digest == attachment.digest
       else { throw BoomError.stale(attachment.name) }
-      self.state.attachments[index].text = text
-      self.state.attachments[index].transform = note
-      self.state.attachments[index].coverage = "Partial native transform"
-      self.status = "Prepared locally · partial coverage retained"
+      self.state.attachments[index] = updated
+      self.status = "Attachment ready"
     }
   }
   private func releaseRunner() async {
@@ -1147,7 +1368,7 @@ struct StoredProposal: Codable, Identifiable {
       self.runner = loaded
       self.modelReady = true
       self.state.installedModel = url.lastPathComponent
-      self.status = "Gemma 4 E2B · local CoreML · \(loaded.identity.contextLength) context tokens"
+      self.status = "Gemma 4 E2B ready"
       self.showingModels = false
     }
   }

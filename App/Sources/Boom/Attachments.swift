@@ -6,10 +6,40 @@ import ImageIO
 import BoomCore
 import PDFKit
 
+/// Decode a paste or drop once, before either editor chooses its destination.
+/// Plain text remains the text view's own paste operation.
+enum AttachmentInput {
+  case file(URL)
+  case bytes(name: String, data: Data)
+
+  static func read(_ pasteboard: NSPasteboard) -> [AttachmentInput]? {
+    if let urls = pasteboard.readObjects(
+      forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL],
+      !urls.isEmpty {
+      return urls.map(AttachmentInput.file)
+    }
+    return readImage(pasteboard).map { [$0] }
+  }
+
+  static func readImage(_ pasteboard: NSPasteboard) -> AttachmentInput? {
+    if let data = pasteboard.data(forType: .png) {
+      return .bytes(name: "Pasted image.png", data: data)
+    }
+    if let data = pasteboard.data(forType: .tiff) {
+      return .bytes(name: "Pasted image.tiff", data: data)
+    }
+    return nil
+  }
+
+  static func canRead(_ pasteboard: NSPasteboard) -> Bool {
+    pasteboard.availableType(from: [.fileURL, .png, .tiff]) != nil
+  }
+}
+
 /// AVAudioConverter's input block is Sendable even for a synchronous convert.
 /// Serialize access to the one local buffer rather than exposing a mutable
 /// captured variable or passing the non-Sendable AVAudioPCMBuffer across tasks.
-private final class OneShotAudioInput: @unchecked Sendable {
+final class OneShotAudioInput: @unchecked Sendable {
   private let lock = NSLock()
   private let buffer: AVAudioPCMBuffer
   private var supplied = false
@@ -147,10 +177,37 @@ enum NativeMedia {
         kCGImageSourceShouldCacheImmediately: true,
       ] as CFDictionary)
   }
-  static func prepare(data: Data, audioSeconds: Double, flag: CancellationFlag) async throws
+  static func prepare(
+    data: Data, name: String, audioSeconds: Double, flag: CancellationFlag
+  ) async throws
     -> NativePreparedMedia
   {
     try flag.check()
+    // AppKit's document reader understands the legacy OLE Word container. The
+    // attachment remains in the vault; this is a bounded text view of it.
+    if (name as NSString).pathExtension.lowercased() == "doc",
+      data.starts(with: Data([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])) {
+      let document = try NSAttributedString(
+        data: data, options: [.documentType: NSAttributedString.DocumentType.docFormat],
+        documentAttributes: nil)
+      let source = document.string
+      guard !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        throw BoomError.invalid("This Word document contains no extractable text.")
+      }
+      var excerpt = ""
+      excerpt.reserveCapacity(min(source.utf8.count, 262_144))
+      var bytes = 0
+      for character in source {
+        let count = String(character).utf8.count
+        if bytes + count > 262_144 { break }
+        excerpt.append(character)
+        bytes += count
+      }
+      return .text(
+        excerpt,
+        "AppKit legacy Word text extraction; \(bytes) of \(source.utf8.count) UTF-8 bytes. "
+          + "Formatting, embedded media and later text are not represented when excerpted.")
+    }
     if data.starts(with: Data("%PDF-".utf8)) {
       guard let pdf = PDFDocument(data: data), !pdf.isLocked, pdf.pageCount <= 128 else {
         throw BoomError.budget(

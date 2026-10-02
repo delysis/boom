@@ -23,11 +23,13 @@ BIN="$(cd "$HERE/App" && swift build -c release --show-bin-path)"
 APP="$OUT/Boom.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN/Boom" "$APP/Contents/MacOS/Boom"
-# SwiftPM's generated accessors search Bundle.main.bundleURL, which is the
-# .app root. Keep their resource bundles there so the app is independent of
-# the developer's SwiftPM build directory. Never copy weights into the app.
-find "$BIN" -maxdepth 1 -name '*.bundle' -type d -exec cp -R {} "$APP/" \;
+# Keep package resources in the standard sealed location. Boom's supported
+# Gemma bundles include their tokenizer configuration; the Hub package's
+# GPT/T5 fallback resources are not part of Boom's model path.
+find "$BIN" -maxdepth 1 -name '*.bundle' -type d -exec cp -R {} "$APP/Contents/Resources/" \;
 cp "$HERE/Info.plist" "$APP/Contents/Info.plist"
+[[ -n "$(/usr/libexec/PlistBuddy -c 'Print :NSSpeechRecognitionUsageDescription' "$APP/Contents/Info.plist")" ]]
+[[ -n "$(/usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' "$APP/Contents/Info.plist")" ]]
 (
   cd "$HERE"
   { find App/Sources Core/Sources RuntimeAdditions RustBridge/src crates scripts -type f; printf '%s\n' App/Package.swift Core/Package.swift RustBridge/Cargo.toml Cargo.toml Info.plist; } | LC_ALL=C sort | while IFS= read -r path; do shasum -a 256 "$path"; done
@@ -48,13 +50,14 @@ swift "$HERE/scripts/collect-notices.swift" "$HERE" "$OUT/cargo-metadata.json" "
 # Review the exact lockfiles, missing notices, and license eligibility before distribution.
 cp "$HERE/RustBridge/Cargo.lock" "$OUT/Cargo.lock"
 cp "$HERE/App/Package.resolved" "$OUT/Package.resolved"
-# SwiftPM's resource-only bundles at the .app root prevent a valid whole-app
-# signature. The Swift linker ad-hoc signs the Mach-O; verify that exact input
-# and preserve its bytes in the local test bundle. Distribution requires a
-# different resource layout and a sealed app signature.
-codesign --verify --strict --verbose=2 "$BIN/Boom"
-cmp "$BIN/Boom" "$APP/Contents/MacOS/Boom"
-printf '%s\n' 'Linker ad-hoc signed executable verified; app bundle is unsealed and for local testing only.' > "$OUT/code-signing-scope.txt"
+# TCC reads the app's privacy descriptions from its signed bundle identity.
+# Signing only the SwiftPM executable leaves Info.plist unbound and can abort
+# Speech or microphone access when launched outside LaunchServices.
+codesign --force --deep --sign - "$APP"
+codesign --verify --strict --verbose=2 "$APP"
+codesign -dv --verbose=4 "$APP" > "$OUT/code-signing-scope.txt" 2>&1
+rg -q 'Info.plist entries=[1-9]' "$OUT/code-signing-scope.txt"
+rg -q 'Sealed Resources version=2' "$OUT/code-signing-scope.txt"
 otool -L "$APP/Contents/MacOS/Boom" > "$OUT/dynamic-dependencies.txt"
 shasum -a 256 "$APP/Contents/MacOS/Boom" > "$OUT/executable.sha256"
 du -sk "$APP" > "$OUT/bundle-size-kib.txt"

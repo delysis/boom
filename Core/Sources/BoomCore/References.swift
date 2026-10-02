@@ -107,6 +107,24 @@ public struct ContextPlan: Equatable, Sendable {
       "DOCUMENT \(d.title)\nID \(d.id.uuidString)\nREVISION \(d.revision)\n" + d.text
     }.joined(separator: "\n\n")
   }
+  /// A bounded view keeps every source identity and its authored ends. The
+  /// original snapshots and revisions remain intact for revalidation.
+  public func excerpt(keeping bodyCharacters: Int) -> String {
+    let lengths = documents.map { $0.text.count }
+    let total = lengths.reduce(0, +)
+    let budget = max(0, min(bodyCharacters, total))
+    let quotas = lengths.map { total == 0 ? 0 : $0 * budget / total }
+    var remainder = budget - quotas.reduce(0, +)
+    var granted = quotas
+    for index in documents.indices where remainder > 0 && granted[index] < lengths[index] {
+      granted[index] += 1
+      remainder -= 1
+    }
+    return zip(documents, granted).map { document, count in
+      "DOCUMENT \(document.title)\nID \(document.id.uuidString)\nREVISION \(document.revision)\n"
+        + ContextExcerpt.middle(document.text, keeping: count)
+    }.joined(separator: "\n\n")
+  }
   public var sources: [SourceReference] {
     documents.map {
       SourceReference(id: $0.id, title: $0.title, digest: $0.revision, kind: "document")
@@ -120,6 +138,24 @@ public struct ContextPlan: Equatable, Sendable {
     }
   }
 }
+/// Stable Markdown links to encrypted local originals. The filename in the
+/// label is presentation only; the UUID is resolved against workspace records.
+public enum AttachmentLink {
+  public static func ids(in text: String) -> [UUID] {
+    guard let pattern = try? NSRegularExpression(
+      pattern: #"\]\(boom-attachment:([0-9A-Fa-f-]{36})\)"#)
+    else { return [] }
+    let source = text as NSString
+    var seen = Set<UUID>()
+    return pattern.matches(in: text, range: NSRange(location: 0, length: source.length))
+      .compactMap { match in
+        guard let id = UUID(uuidString: source.substring(with: match.range(at: 1))),
+          seen.insert(id).inserted else { return nil }
+        return id
+      }
+  }
+}
+
 public enum ContextGraph {
   public struct Limits: Sendable {
     public var depth = 8, documents = 24, bytes = 262_144
