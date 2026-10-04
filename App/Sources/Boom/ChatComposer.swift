@@ -5,6 +5,7 @@ import SwiftUI
   var onSend: (() -> Void)?
   var onCancel: (() -> Void)?
   var onAttachments: (([AttachmentInput]) -> Void)?
+  var onFocus: (() -> Void)?
   private let placeholderStorage = NSTextStorage()
   private let placeholderLayout = NSLayoutManager()
   private let placeholderContainer = NSTextContainer(size: .zero)
@@ -34,6 +35,11 @@ import SwiftUI
   override func mouseDown(with event: NSEvent) {
     super.mouseDown(with: event)
     if window?.firstResponder !== self { window?.makeFirstResponder(self) }
+  }
+  override func becomeFirstResponder() -> Bool {
+    let accepted = super.becomeFirstResponder()
+    if accepted { onFocus?() }
+    return accepted
   }
 
   override func keyDown(with event: NSEvent) {
@@ -73,6 +79,7 @@ struct ChatComposer: NSViewRepresentable {
   let onSend: () -> Void
   let onCancel: () -> Void
   let onAttachments: ([AttachmentInput]) -> Void
+  let onFocus: () -> Void
 
   func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
 
@@ -111,6 +118,7 @@ struct ChatComposer: NSViewRepresentable {
     view.onSend = onSend
     view.onCancel = onCancel
     view.onAttachments = onAttachments
+    view.onFocus = onFocus
     view.registerForDraggedTypes([.fileURL, .png, .tiff])
     view.setAccessibilityLabel("Chat message; Command Return sends")
     view.setAccessibilityPlaceholderValue("Message")
@@ -133,6 +141,7 @@ struct ChatComposer: NSViewRepresentable {
     view.onSend = onSend
     view.onCancel = onCancel
     view.onAttachments = onAttachments
+    view.onFocus = onFocus
     if view.string != text, !view.hasMarkedText() {
       view.string = text
       view.setSelectedRange(NSRange(location: (text as NSString).length, length: 0))

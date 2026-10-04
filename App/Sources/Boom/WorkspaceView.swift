@@ -704,7 +704,8 @@ struct ChatPane: View {
         ChatComposer(
           text: $model.draft, focusRequest: composerFocusRequest,
           onSend: { model.send() }, onCancel: { model.cancel() },
-          onAttachments: { model.attachToCurrentChat($0) }
+          onAttachments: { model.attachToCurrentChat($0) },
+          onFocus: { model.noteInputFocus(.chat) }
         ).frame(height: CGFloat(50 + 18 * min(3, model.draft.filter { $0 == "\n" }.count)))
         composerControls
       }.padding(10)

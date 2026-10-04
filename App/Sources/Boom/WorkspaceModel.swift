@@ -29,6 +29,7 @@ struct CompletionSegment {
 
 @MainActor final class WorkspaceModel: ObservableObject {
   enum ModelChoice: String { case automatic = "Auto", apple = "Apple", gemma = "Gemma" }
+  enum InputPane: Equatable { case document, chat }
   @Published var state: WorkspaceState
   @Published var documents: [DocumentSnapshot]
   @Published var selectedDocumentIDs: Set<UUID> = []
@@ -157,22 +158,31 @@ struct CompletionSegment {
   private var epoch: UInt64 = 0
   private(set) var caret = 0
   weak var editor: MarkdownTextView?
-  @Published private(set) var paneWidth: CGFloat = 1190
+  private var lastInputPane: InputPane?
+  private var paneTransition: UInt64 = 0
+  private enum PaneFit: Equatable {
+    case compact, medium, wide
+
+    init(width: CGFloat) {
+      self = width < 820 ? .compact : width < 1000 ? .medium : .wide
+    }
+  }
+  @Published private var paneFit: PaneFit = .wide
   @Published private var compactPane = "document"
   @Published private var mediumHiddenPane = "library"
   var showsLibrary: Bool {
-    if paneWidth < 820 { return compactPane == "library" }
-    return state.showLibrary && !(paneWidth < 1000 && allPanesRequested
+    if paneFit == .compact { return compactPane == "library" }
+    return state.showLibrary && !(paneFit == .medium && allPanesRequested
       && mediumHiddenPane == "library")
   }
   var showsDocument: Bool {
-    if paneWidth < 820 { return compactPane == "document" }
-    return state.showDocument && !(paneWidth < 1000 && allPanesRequested
+    if paneFit == .compact { return compactPane == "document" }
+    return state.showDocument && !(paneFit == .medium && allPanesRequested
       && mediumHiddenPane == "document")
   }
   var showsChat: Bool {
-    if paneWidth < 820 { return compactPane == "chat" }
-    return state.showChat && !(paneWidth < 1000 && allPanesRequested
+    if paneFit == .compact { return compactPane == "chat" }
+    return state.showChat && !(paneFit == .medium && allPanesRequested
       && mediumHiddenPane == "chat")
   }
   private var allPanesRequested: Bool {
@@ -540,12 +550,12 @@ struct CompletionSegment {
     editor?.clearGhost()
   }
   func toggle(_ pane: String) {
-    if paneWidth < 820 {
+    if paneFit == .compact {
       compactPane = compactPane == pane ? (pane == "document" ? "chat" : "document") : pane
       if compactPane != "document" { finishComposition(); invalidateGhost() }
       return
     }
-    if paneWidth < 1000, allPanesRequested,
+    if paneFit == .medium, allPanesRequested,
       !((pane == "library" && showsLibrary) || (pane == "document" && showsDocument)
         || (pane == "chat" && showsChat)) {
       mediumHiddenPane = pane == "library" ? "chat" : "library"
@@ -563,8 +573,41 @@ struct CompletionSegment {
     scheduleSave()
   }
   func fitPanes(to width: CGFloat) {
-    if paneWidth != width { paneWidth = width }
+    let fit = PaneFit(width: width)
+    // The window relays out native views for each pixel on its own. Publish
+    // only when pane visibility can change, not for every drag event.
+    guard paneFit != fit else { return }
+    let previous = NSApp.keyWindow?.firstResponder
+    let focused: InputPane?
+    switch previous {
+    case is ChatTextView: focused = .chat
+    case is MarkdownTextView: focused = .document
+    case is NSTextField: focused = nil
+    default: focused = lastInputPane
+    }
+    paneTransition &+= 1
+    let transition = paneTransition
+    if fit == .compact, paneFit != .compact, let focused {
+      compactPane = focused == .chat ? "chat" : "document"
+    }
+    paneFit = fit
+    guard let focused else { return }
+    DispatchQueue.main.async { [weak self] in
+      guard let self, self.paneTransition == transition else { return }
+      let target: InputPane? = switch focused {
+      case .chat where self.showsChat: .chat
+      case .document where self.showsDocument: .document
+      default: self.showsDocument ? .document : self.showsChat ? .chat : nil
+      }
+      switch target {
+      case .document:
+        if let id = self.state.selectedDocument { self.focusEditor(id) }
+      case .chat: self.composerFocusEpoch &+= 1
+      case nil: break
+      }
+    }
   }
+  func noteInputFocus(_ pane: InputPane) { lastInputPane = pane }
   func setTheme(_ theme: String) {
     state.theme = theme
     NSApp.appearance =
