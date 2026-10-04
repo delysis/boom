@@ -46,7 +46,7 @@ enum AppleModel {
       .joined(separator: "\n\n")
     let prompt = [prior, context, request].filter { !$0.isEmpty }.joined(separator: "\n\n")
     guard prompt.utf8.count <= 16_384 else {
-      throw BoomError.budget("Apple model context exceeds Boom's 16 KiB text bound; use Gemma or shorten the request.")
+      throw BoomError.budget("Apple model context exceeds Bloom's 16 KiB text bound; use Gemma or shorten the request.")
     }
     return prompt
   }

@@ -12,7 +12,7 @@ enum NativeSmoke {
         index + 1 < arguments.count
       else {
         throw BoomError.invalid(
-          "Usage: Boom --smoke --model /absolute/verified/bundle --evidence /absolute/new/directory"
+          "Usage: Bloom --smoke --model /absolute/verified/bundle --evidence /absolute/new/directory"
         )
       }
       let value = arguments[index + 1]

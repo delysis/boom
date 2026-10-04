@@ -1,10 +1,31 @@
 import AVFoundation
 import AppKit
 import CAttachment
+import CoreImage
 import Foundation
 import ImageIO
 import BoomCore
 import PDFKit
+import UniformTypeIdentifiers
+
+/// Image identity is derived from bounded bytes, never from the filename or
+/// whether a text extractor happened to find words in the image.
+enum LocalImage {
+  static func decode(_ data: Data) throws -> CIImage {
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+      let type = CGImageSourceGetType(source) as String?,
+      UTType(type)?.conforms(to: .image) == true,
+      let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+      let width = properties[kCGImagePropertyPixelWidth] as? Int,
+      let height = properties[kCGImagePropertyPixelHeight] as? Int,
+      width > 0, height > 0, width <= 8_192, height <= 8_192,
+      width * height <= 32_000_000,
+      let image = CIImage(data: data)
+    else { throw BoomError.invalid("The selected image cannot be decoded locally.") }
+    return image
+  }
+  static func canDecode(_ data: Data) -> Bool { (try? decode(data)) != nil }
+}
 
 /// Decode a paste or drop once, before either editor chooses its destination.
 /// Plain text remains the text view's own paste operation.

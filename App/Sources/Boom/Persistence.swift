@@ -15,6 +15,7 @@ struct AttachmentRecord: Codable, Identifiable, Equatable {
   var text: String
   var coverage: String
   var transform: String?
+  var isImage: Bool? = nil
   var digest: String { Digest.sha256(rootDigest + "\n" + text + "\n" + (transform ?? "original")) }
   var reference: SourceReference {
     SourceReference(id: id, title: name, digest: digest, kind: "attachment")
@@ -185,6 +186,7 @@ final class Vault: @unchecked Sendable {
     guard path.hasPrefix("/") else { throw BoomError.invalid("UI test root must be absolute.") }
     root = URL(fileURLWithPath: path).standardizedFileURL
     #else
+    // Keep the existing workspace path when the app's public name changes.
     root = try FileManager.default.url(
       for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true
     ).appendingPathComponent("Boom", isDirectory: true)
@@ -299,11 +301,11 @@ final class Vault: @unchecked Sendable {
     guard let expected = diskRevisions[id] else { return }
     guard FileManager.default.fileExists(atPath: documentURL(id).path) else {
       throw BoomError.unavailable(
-        "This document's Markdown file was removed outside Boom. The open text is still in memory; copy it before closing the window.")
+        "This document's Markdown file was removed outside Bloom. The open text is still in memory; copy it before closing the window.")
     }
     guard Digest.sha256(try readDocument(id)) == expected else {
       throw BoomError.stale(
-        "Document was edited outside Boom. Export your current buffer before reloading it.")
+        "Document was edited outside Bloom. Export your current buffer before reloading it.")
     }
   }
   func saveDocument(_ document: DocumentSnapshot) throws {

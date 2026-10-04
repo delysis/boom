@@ -89,6 +89,40 @@ enum MLXNativeSmoke {
         if useDraft {
           try check(chat.proposedDraftTokens > 0, "matching_mtp_assistant_proposed_tokens")
         }
+        if arguments.contains("--image-file") {
+          let image = try Data(contentsOf: URL(fileURLWithPath: try argument("--image-file")))
+          let visual = try await runner.runChat(
+            history: [], request: "Describe this image in one sentence.", images: [image],
+            maxTokens: 128, flag: CancellationFlag(), onText: { _ in })
+          details["image_text"] = visual.text
+          details["image_prompt_tokens"] = visual.promptTokens
+          try check(visual.text.filter(\.isLetter).count >= 12,
+            "image_pixels_generated_response")
+        }
+        if arguments.contains("--edit-test") {
+          let document = DocumentSnapshot(title: "Test", text:
+            "The sky was blue. The sea was blue.")
+          let instruction = "Make the second sentence more vivid."
+          let plan = try ContextGraph.resolveChat(
+            request: instruction, attachedDocumentID: nil,
+            editingDocumentID: document.id, all: [document])
+          let body = [DocumentTools.instructions, plan.text, instruction]
+            .joined(separator: "\n\n")
+          let output = try await runner.run(
+            rawPrompt: MLXGemmaRunner.chatPrompt(history: [], request: body),
+            maxTokens: 4_096, flag: CancellationFlag(), useDraft: useDraft,
+            seed: seed, onText: { _ in })
+          details["edit_text"] = output.text
+          details["edit_output_tokens"] = output.outputTokens
+          let envelope = try AssistantEnvelope.decode(output.text)
+          guard let patch = envelope.edits.first else {
+            throw BoomError.invalid("Real model returned no edit patch.")
+          }
+          let changed = try DocumentTools.apply(patch,
+            grant: DocumentGrant(mode: .edit, snapshot: document), current: document)
+          details["edited_document"] = changed.text
+          try check(changed.text != document.text, "real_edit_applied")
+        }
       }
       if base {
         let document = DocumentSnapshot(title: "Draft", text: "The harbor lighthouse was built from")

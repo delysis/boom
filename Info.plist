@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-<key>CFBundleName</key><string>Boom</string>
-<key>CFBundleDisplayName</key><string>Boom</string>
-<key>CFBundleIdentifier</key><string>com.delysis.Boom</string>
-<key>CFBundleExecutable</key><string>Boom</string>
+<key>CFBundleName</key><string>Bloom</string>
+<key>CFBundleDisplayName</key><string>Bloom</string>
+<key>CFBundleIdentifier</key><string>com.delysis.Bloom</string>
+<key>CFBundleExecutable</key><string>Bloom</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>0.1</string>
 <key>CFBundleVersion</key><string>1</string>
@@ -12,6 +12,6 @@
 <key>NSHighResolutionCapable</key><true/>
 <key>NSSupportsAutomaticTermination</key><false/>
 <key>NSPrincipalClass</key><string>NSApplication</string>
-<key>NSMicrophoneUsageDescription</key><string>Boom records speech locally when you start voice conversation or dictation.</string>
-<key>NSSpeechRecognitionUsageDescription</key><string>Boom transcribes recorded speech on this Mac when you use voice conversation or dictation.</string>
+<key>NSMicrophoneUsageDescription</key><string>Bloom records speech locally when you start voice conversation or dictation.</string>
+<key>NSSpeechRecognitionUsageDescription</key><string>Bloom transcribes recorded speech on this Mac when you use voice conversation or dictation.</string>
 </dict></plist>

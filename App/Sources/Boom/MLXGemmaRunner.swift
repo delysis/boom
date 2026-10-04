@@ -257,15 +257,55 @@ final class MLXGemmaRunner: @unchecked Sendable {
     useDraft: Bool = true, seed: UInt64? = nil,
     onText: @escaping @Sendable (String) -> Void
   ) async throws -> Output {
+    try await run(input: .raw(rawPrompt), maxTokens: maxTokens, flag: flag,
+      useDraft: useDraft, seed: seed, onText: onText)
+  }
+
+  func runChat(
+    history: [ChatMessage], request: String, images: [Data],
+    maxTokens: Int, flag: CancellationFlag,
+    onText: @escaping @Sendable (String) -> Void
+  ) async throws -> Output {
+    try await run(input: .chat(history: history, request: request, images: images),
+      maxTokens: maxTokens, flag: flag, useDraft: false, onText: onText)
+  }
+
+  private enum PromptInput: Sendable {
+    case raw(String)
+    case chat(history: [ChatMessage], request: String, images: [Data])
+  }
+
+  private static func validatedImage(_ data: Data) throws -> UserInput.Image {
+    .ciImage(try LocalImage.decode(data))
+  }
+
+  private func run(
+    input prompt: PromptInput, maxTokens: Int, flag: CancellationFlag,
+    useDraft: Bool, seed: UInt64? = nil,
+    onText: @escaping @Sendable (String) -> Void
+  ) async throws -> Output {
     await gate.enter()
     do {
       let result = try await container.perform { context -> Output in
         try flag.check()
-        let ids = context.tokenizer.encode(text: rawPrompt, addSpecialTokens: false)
-        guard ids.count + maxTokens <= self.contextLength else {
+        let input: LMInput
+        let promptTokens: Int
+        switch prompt {
+        case .raw(let rawPrompt):
+          let ids = context.tokenizer.encode(text: rawPrompt, addSpecialTokens: false)
+          input = LMInput(tokens: MLXArray(ids))
+          promptTokens = ids.count
+        case .chat(let history, let request, let images):
+          let media = try images.map(Self.validatedImage)
+          let messages: [Chat.Message] = history.filter { $0.state == .complete }.map {
+            $0.role == .user ? .user($0.text) : .assistant($0.text)
+          } + [.user(request, images: media)]
+          input = try await context.processor.prepare(input: UserInput(chat: messages))
+          promptTokens = input.text.tokens.shape.last ?? 0
+        }
+        guard promptTokens + maxTokens <= self.contextLength else {
           throw BoomError.budget("The request exceeds available model context.")
         }
-        let input = LMInput(tokens: MLXArray(ids))
         let parameters = GenerateParameters(
           maxTokens: maxTokens, temperature: 0.7, topP: 0.95,
           repetitionPenalty: 1.1, repetitionContextSize: 64, seed: seed)
@@ -278,13 +318,13 @@ final class MLXGemmaRunner: @unchecked Sendable {
             input: input, mainModel: context.model, drafter: drafter,
             parameters: parameters, blockSize: 4)
           (stream, task) = generateTask(
-            promptTokenCount: ids.count, modelConfiguration: context.configuration,
+            promptTokenCount: promptTokens, modelConfiguration: context.configuration,
             tokenizer: context.tokenizer, iterator: iterator)
         } else {
           let iterator = try TokenIterator(
             input: input, model: context.model, parameters: parameters)
           (stream, task) = generateTask(
-            promptTokenCount: ids.count, modelConfiguration: context.configuration,
+            promptTokenCount: promptTokens, modelConfiguration: context.configuration,
             tokenizer: context.tokenizer, iterator: iterator)
         }
         var rawText = ""
@@ -323,7 +363,7 @@ final class MLXGemmaRunner: @unchecked Sendable {
           onText(text)
         }
         return Output(
-          text: text, promptTokens: ids.count, outputTokens: outputTokens,
+          text: text, promptTokens: promptTokens, outputTokens: outputTokens,
           endedByEOS: endedByEOS, proposedDraftTokens: proposed,
           acceptedDraftTokens: accepted)
       }

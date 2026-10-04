@@ -41,6 +41,7 @@ struct CompletionSegment {
   @Published var status = AppleModel.availabilityMessage
   @Published var appleAvailability = AppleModel.availabilityMessage
   @Published var errorMessage: String?
+  @Published var composerIssue: String?
   @Published var streamingText = ""
   @Published var streamingChat: UUID?
   @Published var showingModels = false
@@ -84,6 +85,7 @@ struct CompletionSegment {
     return .chat(id: chat.id)
   }
   func attachToCurrentChat(_ inputs: [AttachmentInput]) {
+    composerIssue = nil
     do { attach(inputs, to: try chatAttachmentDestination()) }
     catch { report(error) }
   }
@@ -572,12 +574,7 @@ struct CompletionSegment {
   }
   func insertReference(to id: UUID) {
     guard let document = documents.first(where: { $0.id == id }), let editor else { return }
-    let unique =
-      documents.filter {
-        $0.title.compare(document.title, options: [.caseInsensitive, .diacriticInsensitive])
-          == .orderedSame
-      }.count == 1
-    let link = unique ? "[[\(document.title)]]" : "[[\(document.title)|\(id.uuidString)]]"
+    let link = "[[\(document.title)|\(id.uuidString)]]"
     editor.insertText(link, replacementRange: editor.selectedRange())
     editor.window?.makeFirstResponder(editor)
   }
@@ -660,7 +657,8 @@ struct CompletionSegment {
   }
   func send() {
     ensureChatForDraft()
-    guard !isBusy, !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+    guard !isBusy,
+      !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !pendingAttachments.isEmpty,
       let chat = selectedChat, canInfer
     else {
       if !canInfer { showingModels = true }
@@ -673,15 +671,12 @@ struct CompletionSegment {
       let interaction = mode
       let document = selectedDocument
       let graph = try ContextGraph.resolveChat(
-        request: request, attachedDocumentID: chat.attachedDocumentID, all: documents)
+        request: request, attachedDocumentID: chat.attachedDocumentID,
+        editingDocumentID: interaction == .ask ? nil : document?.id, all: documents)
       let sourceDocuments = graph.sources
       let selectedAttachments = try pendingAttachments.map { id -> AttachmentRecord in
-        guard let attachment = state.attachments.first(where: { $0.id == id }),
-          !attachment.text.isEmpty
-        else {
-          throw BoomError.unavailable(
-            "A selected attachment has no admitted text. Prepare it locally, or remove it before sending."
-          )
+        guard let attachment = state.attachments.first(where: { $0.id == id }) else {
+          throw BoomError.stale("The selected attachment was removed.")
         }
         return attachment
       }
@@ -696,11 +691,25 @@ struct CompletionSegment {
       guard attachments.count <= 8 else {
         throw BoomError.budget("At most eight attachments per turn.")
       }
+      let imagePayloads = try attachments.compactMap { attachment -> (UUID, Data)? in
+        try imagePayload(for: attachment).map { (attachment.id, $0) }
+      }
+      let imageIDs = Set(imagePayloads.map { $0.0 })
+      let images = imagePayloads.map { $0.1 }
+      guard selectedAttachments.allSatisfy({ !$0.text.isEmpty || imageIDs.contains($0.id) }) else {
+        composerIssue = "This file has no readable local content. Remove it or prepare it locally."
+        return
+      }
+      guard images.isEmpty || selectedMLXRunner != nil else {
+        composerIssue = "Choose local Gemma to chat with images."
+        return
+      }
+      composerIssue = nil
       let attachmentSources = attachments.map(\.reference)
       let sources = sourceDocuments + attachmentSources
-      let attachmentText = attachments.map {
+      let attachmentText = attachments.filter { !$0.text.isEmpty }.map {
         "ATTACHMENT \($0.name)\nID \($0.id)\nDIGEST \($0.digest)\nCOVERAGE \($0.coverage)\n\($0.transform ?? "")\n"
-          + ($0.text.isEmpty ? "No readable text was extracted from this attachment." : $0.text)
+          + $0.text
       }.joined(separator: "\n\n")
       let contextParts = [graph.text, attachmentText].filter { !$0.isEmpty }
       let context = contextParts.isEmpty ? "" : "REFERENCE DATA:\n" + contextParts.joined(separator: "\n\n")
@@ -738,6 +747,7 @@ struct CompletionSegment {
         copy.context = ""
         return copy
       }
+      let outputLimit = interaction == .ask ? 512 : 4_096
       let chatID = chat.id
       draft = ""
       pendingAttachments = []
@@ -751,7 +761,8 @@ struct CompletionSegment {
         self.state.chats[index].messages.append(
           ChatMessage(role: .user, text: request, context: context, sources: sources))
         if self.state.chats[index].title == "New chat" {
-          self.state.chats[index].title = String(request.prefix(48))
+          self.state.chats[index].title = request.isEmpty
+            ? (selectedAttachments.first?.name ?? "Image chat") : String(request.prefix(48))
         }
         try self.flush()
         self.streamingChat = chatID
@@ -762,7 +773,7 @@ struct CompletionSegment {
           fitted = try await runner.fitConversation(
             prefixes: prefixes.map(Optional.some), history: oldHistory,
             instructions: instructions, context: context, request: request,
-            maxOutputTokens: 512, flag: flag)
+            maxOutputTokens: outputLimit, flag: flag)
           if let fitted, fitted.context != context {
             guard let current = self.state.chats[index].messages.indices.last else {
               throw BoomError.invalid("The current chat message disappeared.")
@@ -773,7 +784,7 @@ struct CompletionSegment {
         } else if let runner = self.selectedMLXRunner {
           fitted = try await runner.fitConversation(
             history: oldHistory, instructions: instructions, context: context,
-            request: request, maxOutputTokens: 512, flag: flag)
+            request: request, maxOutputTokens: outputLimit, flag: flag)
           if let fitted, fitted.context != context {
             guard let current = self.state.chats[index].messages.indices.last else {
               throw BoomError.invalid("The current chat message disappeared.")
@@ -806,11 +817,11 @@ struct CompletionSegment {
                 request: [instructions, fitted?.context ?? context, request].filter { !$0.isEmpty }
                   .joined(separator: "\n\n"))
               let result = try await runner.run(
-                prompt: prompt, restore: cache, maxTokens: 512, flag: flag
+                prompt: prompt, restore: cache, maxTokens: outputLimit, flag: flag
               ) { [weak self] text in
                 Task { @MainActor in
                   guard let self, self.activeFlag === flag, !flag.isCancelled else { return }
-                  self.streamingText = text
+                  if interaction == .ask { self.streamingText = text }
                 }
               }
               generated = result.text
@@ -819,18 +830,22 @@ struct CompletionSegment {
                   || (fitted?.omittedHistoryCount ?? 0) > 0 ? " · earlier context shortened" : "")
                 + (result.endedByEOS ? "" : " · output limit")
             } else if let runner = self.selectedMLXRunner {
-              let prompt = MLXGemmaRunner.chatPrompt(
-                history: fitted?.history ?? oldHistory,
-                request: [instructions, fitted?.context ?? context, request]
-                  .filter { !$0.isEmpty }.joined(separator: "\n\n"))
-              let result = try await runner.run(
-                rawPrompt: prompt, maxTokens: 512, flag: flag
-              ) { [weak self] text in
+              let body = [instructions, fitted?.context ?? context, request]
+                .filter { !$0.isEmpty }.joined(separator: "\n\n")
+              let onText: @Sendable (String) -> Void = { [weak self] text in
                 Task { @MainActor in
                   guard let self, self.activeFlag === flag, !flag.isCancelled else { return }
-                  self.streamingText = text
+                  if interaction == .ask { self.streamingText = text }
                 }
               }
+              let result = images.isEmpty
+                ? try await runner.run(
+                    rawPrompt: MLXGemmaRunner.chatPrompt(
+                      history: fitted?.history ?? oldHistory, request: body),
+                    maxTokens: outputLimit, flag: flag, onText: onText)
+                : try await runner.runChat(
+                    history: fitted?.history ?? oldHistory, request: body,
+                    images: images, maxTokens: outputLimit, flag: flag, onText: onText)
               generated = result.text
               resultStatus = "Local Gemma · \(result.promptTokens) prompt tokens"
                 + (result.endedByEOS ? "" : " · output limit")
@@ -892,6 +907,9 @@ struct CompletionSegment {
                 retained =
                   "The response and proposal were retained. Completing the local operation failed: "
                   + error.localizedDescription
+              } else if interaction != .ask {
+                retained = "I couldn't make that edit. The document was not changed. "
+                  + error.localizedDescription
               } else if !self.streamingText.isEmpty {
                 retained = self.streamingText
               } else {
@@ -906,6 +924,11 @@ struct CompletionSegment {
                   role: .assistant, text: retained, sources: sources,
                   state: flag.isCancelled ? .cancelled : .failed, personaID: persona?.id,
                   provider: self.inferenceName))
+            }
+            if interaction != .ask {
+              self.streamingText = ""
+              self.status = "Edit not applied"
+              return
             }
             throw error
           }
@@ -1310,7 +1333,10 @@ struct CompletionSegment {
         try self.store.vault.put(imported.original, kind: .attachment, id: imported.record.id)
         try self.store.vault.put(imported.receipt, kind: .receipt, id: imported.record.id)
         var record = imported.record
-        if record.text.isEmpty {
+        record.isImage = LocalImage.canDecode(imported.original)
+        if record.isImage == true {
+          record.coverage = "Original image available locally"
+        } else if record.text.isEmpty {
           do {
             record = try await self.preparedRecord(
               record, data: imported.original, sourceURL: sourceURL, flag: flag)
@@ -1328,13 +1354,26 @@ struct CompletionSegment {
       case .document:
         try self.insertAttachmentLinks(importedRecords, into: destination)
       }
-      self.status = importedRecords.allSatisfy { !$0.text.isEmpty }
+      self.status = importedRecords.allSatisfy { !$0.text.isEmpty || $0.isImage == true }
         ? "Attachments ready" : "Some attachments need a readable local conversion"
     }
   }
   func removePending(_ id: UUID) {
     guard !isBusy else { return }
     pendingAttachments.removeAll { $0 == id }
+    composerIssue = nil
+  }
+  private func imagePayload(for attachment: AttachmentRecord) throws -> Data? {
+    guard attachment.isImage == true || attachment.text.isEmpty else { return nil }
+    let data = try store.vault.get(.attachment, id: attachment.id, limit: 67_108_864)
+    guard Digest.sha256(data) == attachment.rootDigest else {
+      throw BoomError.invalid("Stored image bytes changed.")
+    }
+    if LocalImage.canDecode(data) { return data }
+    if attachment.isImage == true {
+      throw BoomError.invalid("The stored image cannot be decoded locally.")
+    }
+    return nil
   }
   private func preparedRecord(
     _ attachment: AttachmentRecord, data: Data, sourceURL: URL?, flag: CancellationFlag

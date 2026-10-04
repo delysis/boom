@@ -349,6 +349,30 @@ import SwiftUI
 
 @MainActor enum MarkdownStyle {
   static let body = NSFont.systemFont(ofSize: 15)
+  struct WikiDisplay {
+    let title: NSRange
+    let hidden: [NSRange]
+  }
+  static func wikiDisplays(in source: String) -> [WikiDisplay] {
+    guard let pattern = try? NSRegularExpression(pattern: #"\[\[([^\[\]\n]{1,256})\]\]"#)
+    else { return [] }
+    let text = source as NSString
+    return pattern.matches(in: source, range: NSRange(location: 0, length: text.length))
+      .compactMap { match in
+        let body = text.substring(with: match.range(at: 1))
+        let parts = body.split(separator: "|", omittingEmptySubsequences: false)
+        guard parts.count <= 2, !parts[0].trimmingCharacters(in: .whitespaces).isEmpty else {
+          return nil
+        }
+        if parts.count == 2, UUID(uuidString: String(parts[1])) == nil { return nil }
+        let title = NSRange(location: match.range.location + 2,
+          length: (String(parts[0]) as NSString).length)
+        return WikiDisplay(title: title, hidden: [
+          NSRange(location: match.range.location, length: 2),
+          NSRange(location: NSMaxRange(title), length: NSMaxRange(match.range) - NSMaxRange(title)),
+        ])
+      }
+  }
   static func apply(to view: NSTextView) {
     guard let storage = view.textStorage else { return }
     let manager = view.undoManager
@@ -402,9 +426,18 @@ import SwiftUI
           .backgroundColor: NSColor.quaternaryLabelColor.withAlphaComponent(0.08),
         ], range: $0.range)
     }
-    matches(#"\[\[[^\[\]\n]+\]\]"#) {
-      storage.addAttribute(
-        .underlineStyle, value: NSUnderlineStyle.single.rawValue, range: $0.range)
+    for display in wikiDisplays(in: storage.string) {
+      for range in display.hidden {
+        storage.addAttributes([
+          .font: NSFont.systemFont(ofSize: 0.1),
+          .foregroundColor: NSColor.clear,
+        ], range: range)
+      }
+      storage.addAttributes([
+        .font: NSFont.systemFont(ofSize: 15, weight: .medium),
+        .foregroundColor: NSColor.controlAccentColor,
+        .backgroundColor: NSColor.controlAccentColor.withAlphaComponent(0.09),
+      ], range: display.title)
     }
     matches(#"(?m)^\s*(?:[-*+] |\d+\. |>[ \t]?).*$"#) { match in
       let length = min(2, match.range.length)

@@ -24,9 +24,9 @@ swift "$HERE/scripts/prepare-runtime.swift" "$HERE/.deps/CoreML-LLM" "$HERE"
 swift "$HERE/scripts/record-native-libs.swift" "$OUT/rust-native-link.log" "$HERE/.build-support/RustNativeLink.json"
 (cd "$HERE/App" && swift build -c release --disable-automatic-resolution)
 BIN="$(cd "$HERE/App" && swift build -c release --show-bin-path)"
-APP="$OUT/Boom.app"
+APP="$OUT/Bloom.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$BIN/Boom" "$APP/Contents/MacOS/Boom"
+cp "$BIN/Boom" "$APP/Contents/MacOS/Bloom"
 # Keep package resources in the standard sealed location. Boom's supported
 # Gemma bundles include their tokenizer configuration; the Hub package's
 # GPT/T5 fallback resources are not part of Boom's model path.
@@ -62,8 +62,8 @@ codesign --verify --strict --verbose=2 "$APP"
 codesign -dv --verbose=4 "$APP" > "$OUT/code-signing-scope.txt" 2>&1
 rg -q 'Info.plist entries=[1-9]' "$OUT/code-signing-scope.txt"
 rg -q 'Sealed Resources version=2' "$OUT/code-signing-scope.txt"
-otool -L "$APP/Contents/MacOS/Boom" > "$OUT/dynamic-dependencies.txt"
-shasum -a 256 "$APP/Contents/MacOS/Boom" > "$OUT/executable.sha256"
+otool -L "$APP/Contents/MacOS/Bloom" > "$OUT/dynamic-dependencies.txt"
+shasum -a 256 "$APP/Contents/MacOS/Bloom" > "$OUT/executable.sha256"
 du -sk "$APP" > "$OUT/bundle-size-kib.txt"
 echo "Built $APP"
 echo 'Build success is not UI, Keychain, download, media, or real-weight acceptance. Run the documented native gates.'

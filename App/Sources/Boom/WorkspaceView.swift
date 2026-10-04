@@ -63,7 +63,7 @@ struct WorkspaceView: View {
     .environment(\.openURL, OpenURLAction { _ in .discarded })
     .sheet(isPresented: $model.showingModels) { ModelSetupView(model: model) }
     .alert(
-      "Boom",
+      "Bloom",
       isPresented: Binding(
         get: { model.errorMessage != nil }, set: { if !$0 { model.dismissError() } })
     ) {
@@ -506,6 +506,15 @@ struct ChatPane: View {
       model.state.personas.first { $0.id == id }.map { "@" + $0.slug }
     } ?? (message.provider ?? "Local assistant")
   }
+  private func visibleMessageText(_ message: ChatMessage) -> String {
+    // Older failed edit turns persisted the model's unfinished tool envelope.
+    // Keep the stored receipt intact, but never present that machinery as chat.
+    if message.role == .assistant, message.state == .failed,
+      message.text.hasPrefix("{\"reply\""), message.text.contains("\"edits\"") {
+      return "That edit did not complete. The document was not changed."
+    }
+    return message.text
+  }
   @ViewBuilder private func messageMenu(_ message: ChatMessage) -> some View {
     if let chatID = model.state.selectedChat {
       if message.role == .user {
@@ -526,7 +535,7 @@ struct ChatPane: View {
       Divider()
       Button("Copy message") {
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(message.text, forType: .string)
+        NSPasteboard.general.setString(visibleMessageText(message), forType: .string)
       }
     }
   }
@@ -534,7 +543,7 @@ struct ChatPane: View {
     if message.role == .user {
       HStack(alignment: .bottom, spacing: 4) {
         Spacer(minLength: 36)
-        ChatMarkdown(text: message.text)
+        ChatMarkdown(text: visibleMessageText(message))
           .padding(.horizontal, 12).padding(.vertical, 9)
           .background(Color.primary.opacity(0.065), in: RoundedRectangle(cornerRadius: 12))
       }.frame(maxWidth: .infinity, alignment: .trailing)
@@ -552,7 +561,7 @@ struct ChatPane: View {
               .font(.system(size: 10)).foregroundStyle(.tertiary)
           }
         }
-        ChatMarkdown(text: message.text)
+        ChatMarkdown(text: visibleMessageText(message))
         ForEach(model.state.proposals.filter { $0.messageID == message.id }) { proposal in
           ProposalCard(model: model, proposal: proposal)
         }
@@ -665,8 +674,8 @@ struct ChatPane: View {
                   HStack(spacing: 5) {
                     Label(
                       attachment.name,
-                      systemImage: attachment.text.isEmpty
-                        ? "exclamationmark.circle" : "paperclip"
+                      systemImage: attachment.isImage == true ? "photo"
+                        : attachment.text.isEmpty ? "exclamationmark.circle" : "paperclip"
                     ).lineLimit(1)
                     Button {
                       model.removePending(id)
@@ -680,6 +689,9 @@ struct ChatPane: View {
               }
             }
           }
+        }
+        if let issue = model.composerIssue {
+          Text(issue).font(.caption).foregroundStyle(.orange)
         }
         if !model.personaMatches.isEmpty {
           HStack(spacing: 10) {

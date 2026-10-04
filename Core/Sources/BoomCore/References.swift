@@ -165,14 +165,18 @@ public enum ContextGraph {
       self.bytes = bytes
     }
   }
-  /// A chat reads its explicitly attached document and references written in
-  /// the current request. Selecting a document elsewhere does not change this.
+  /// A chat reads its attached document, references in the request, and the
+  /// selected document only when the request grants edit or proposal authority.
   public static func resolveChat(
-    request: String, attachedDocumentID: UUID?, all: [DocumentSnapshot],
+    request: String, attachedDocumentID: UUID?, editingDocumentID: UUID? = nil,
+    all: [DocumentSnapshot],
     limits: Limits = Limits()
   ) throws -> ContextPlan {
-    let attachment = attachedDocumentID.map { "[[document|\($0.uuidString)]]\n" } ?? ""
-    let root = DocumentSnapshot(title: "Chat references", text: attachment + request)
+    let references = [attachedDocumentID, editingDocumentID].compactMap { $0 }
+      .reduce(into: [UUID]()) { ids, id in if !ids.contains(id) { ids.append(id) } }
+      .map { "[[document|\($0.uuidString)]]" }.joined(separator: "\n")
+    let root = DocumentSnapshot(title: "Chat references",
+      text: references.isEmpty ? request : references + "\n" + request)
     return try resolve(root: root, all: all, limits: limits)
   }
   public static func resolve(

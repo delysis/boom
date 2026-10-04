@@ -142,7 +142,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
       #else
       window.contentMinSize = NSSize(width: 750, height: 440)
       #endif
-      window.title = "Boom"
+      window.title = "Bloom"
       window.backgroundColor = BoomChrome.sidebarBackground
       window.titlebarAppearsTransparent = true
       window.toolbarStyle = .unifiedCompact
@@ -169,7 +169,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
       refreshToolbar()
     } catch {
       let alert = NSAlert()
-      alert.messageText = "Boom could not open its local workspace"
+      alert.messageText = "Bloom could not open its local workspace"
       alert.informativeText = error.localizedDescription
       alert.alertStyle = .critical
       alert.runModal()
@@ -237,7 +237,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
     buttons["library"]?.state = model.showsLibrary ? .on : .off
     buttons["document"]?.state = model.showsDocument ? .on : .off
     buttons["chat"]?.state = model.showsChat ? .on : .off
-    window?.title = model.selectedDocument?.title ?? model.selectedChat?.title ?? "Boom"
+    window?.title = model.selectedDocument?.title ?? model.selectedChat?.title ?? "Bloom"
   }
   private func makeMenu() -> NSMenu {
     let bar = NSMenu()
@@ -257,12 +257,12 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
       item.target = target
       return item
     }
-    let app = submenu("Boom")
+    let app = submenu("Bloom")
     app.addItem(item("Local model…", #selector(models), ",", target: self))
     app.addItem(.separator())
-    app.addItem(item("Hide Boom", #selector(NSApplication.hide(_:)), "h", target: NSApp))
+    app.addItem(item("Hide Bloom", #selector(NSApplication.hide(_:)), "h", target: NSApp))
     app.addItem(
-      item("Quit Boom", #selector(NSApplication.terminate(_:)), "q", target: NSApp))
+      item("Quit Bloom", #selector(NSApplication.terminate(_:)), "q", target: NSApp))
     let file = submenu("File")
     file.addItem(item("New Document", #selector(newDocument), "n", target: self))
     file.addItem(item("New Chat", #selector(newChat), "n", [.command, .shift], target: self))

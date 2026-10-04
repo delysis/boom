@@ -1,4 +1,4 @@
-# Boom text and layout review
+# Bloom text and layout review
 
 ## Why this check exists
 
@@ -23,7 +23,7 @@ evidence.
 ## Before handing off a text UI change
 
 1. Build and launch the exact candidate bundle. Record its source revision,
-   executable path and process identity so an older Boom window cannot supply
+   executable path and process identity so an older Bloom window cannot supply
    the screenshot.
 2. At normal and narrow window widths, inspect the empty unfocused control,
    then focus it without typing. Confirm the placeholder and insertion point
@@ -62,8 +62,8 @@ action, inspect both the editor and saved `.md` bytes, apply it again to remove
 the syntax, then undo. The native font palette and Writing Tools must not offer
 formatting that cannot be represented in the saved document.
 
-For a deleted document, test both deletion inside Boom and moving the `.md`
-file away while Boom is closed. Reopen with the existing workspace index and
+For a deleted document, test both deletion inside Bloom and moving the `.md`
+file away while Bloom is closed. Reopen with the existing workspace index and
 confirm the window opens, the missing document is absent from the library, and
 saved chat messages remain. Do not treat a corrupt or unreadable existing file
 as missing; that should still stop with a clear error and leave its bytes intact.
