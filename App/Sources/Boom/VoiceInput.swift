@@ -155,8 +155,7 @@ import Speech
     }
     guard let target = AVAudioFormat(
       commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1,
-      interleaved: false),
-      let converter = AVAudioConverter(from: format, to: target) else {
+      interleaved: false) else {
       throw BoomError.invalid("Cannot create the local audio converter.")
     }
     if #available(macOS 26.0, *) {
@@ -172,22 +171,7 @@ import Speech
       progress(chunk + 1, count)
       let start = AVAudioFramePosition(chunk) * chunkFrames
       let frames = AVAudioFrameCount(min(chunkFrames, file.length - start))
-      file.framePosition = start
-      guard let input = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames),
-        let output = AVAudioPCMBuffer(
-          pcmFormat: target,
-          frameCapacity: AVAudioFrameCount(ceil(Double(frames) * 16_000 / format.sampleRate) + 1024))
-      else { throw BoomError.invalid("Cannot allocate a bounded audio chunk.") }
-      try file.read(into: input, frameCount: frames)
-      let source = OneShotAudioInput(input)
-      var conversionError: NSError?
-      let result = converter.convert(to: output, error: &conversionError) { _, status in
-        source.take(status)
-      }
-      if let conversionError { throw conversionError }
-      guard result != .error, output.frameLength > 0 else {
-        throw BoomError.invalid("Local audio chunk conversion failed.")
-      }
+      let output = try LocalAudioChunk.convert(file, start: start, frames: frames, to: target)
       let chunkURL = FileManager.default.temporaryDirectory.appendingPathComponent(
         "boom-speech-\(UUID().uuidString).wav")
       defer { try? FileManager.default.removeItem(at: chunkURL) }
@@ -342,6 +326,40 @@ import Speech
         completion.finish(.failure(BoomError.unavailable("On-device transcription timed out.")))
       }
     }
+  }
+}
+
+/// An AVAudioConverter is exhausted after the input callback returns
+/// endOfStream. A fresh converter for each independent segment is required;
+/// reusing one silently produces zero frames after the first segment.
+enum LocalAudioChunk {
+  static func convert(
+    _ file: AVAudioFile, start: AVAudioFramePosition, frames: AVAudioFrameCount,
+    to target: AVAudioFormat
+  ) throws -> AVAudioPCMBuffer {
+    let format = file.processingFormat
+    file.framePosition = start
+    guard let input = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames),
+      let output = AVAudioPCMBuffer(
+        pcmFormat: target,
+        frameCapacity: AVAudioFrameCount(
+          ceil(Double(frames) * target.sampleRate / format.sampleRate) + 1024)),
+      let converter = AVAudioConverter(from: format, to: target)
+    else { throw BoomError.invalid("Cannot allocate a bounded audio chunk.") }
+    try file.read(into: input, frameCount: frames)
+    guard input.frameLength > 0 else {
+      throw BoomError.invalid("The audio file ended before this segment could be read.")
+    }
+    let source = OneShotAudioInput(input)
+    var conversionError: NSError?
+    let result = converter.convert(to: output, error: &conversionError) { _, status in
+      source.take(status)
+    }
+    if let conversionError { throw conversionError }
+    guard result != .error, output.frameLength > 0 else {
+      throw BoomError.invalid("Local audio chunk conversion failed.")
+    }
+    return output
   }
 }
 

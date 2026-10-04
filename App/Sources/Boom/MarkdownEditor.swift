@@ -347,20 +347,6 @@ import SwiftUI
   }
 }
 
-@MainActor final class MarkdownScrollView: NSScrollView {
-  override func layout() {
-    super.layout()
-    guard let text = documentView as? MarkdownTextView else { return }
-    let viewport = contentView.bounds.size
-    if text.minSize.height != viewport.height {
-      text.minSize = NSSize(width: 0, height: viewport.height)
-    }
-    if text.frame.height < viewport.height {
-      text.setFrameSize(NSSize(width: viewport.width, height: viewport.height))
-    }
-  }
-}
-
 @MainActor enum MarkdownStyle {
   static let body = NSFont.systemFont(ofSize: 15)
   static func apply(to view: NSTextView) {
@@ -377,8 +363,12 @@ import SwiftUI
     }
     let text = storage.string as NSString
     let full = NSRange(location: 0, length: text.length)
+    var attachmentRanges: [NSRange] = []
     storage.beginEditing()
-    defer { storage.endEditing() }
+    defer {
+      storage.endEditing()
+      for range in attachmentRanges { view.setSpellingState(0, range: range) }
+    }
     let paragraph = NSMutableParagraphStyle()
     paragraph.lineSpacing = 4
     storage.setAttributes(
@@ -429,6 +419,21 @@ import SwiftUI
           .backgroundColor: NSColor.quaternaryLabelColor.withAlphaComponent(0.06),
         ], range: $0.range)
     }
+    // Keep Markdown as the editable, portable source of truth while rendering
+    // local attachment references as file names. The UUID and punctuation
+    // retain their character positions for selection, undo and autosave.
+    matches(#"\[Attachment: ((?:\\.|[^\\\]\n])+)\]\(boom-attachment:[0-9A-Fa-f-]{36}\)"#) { match in
+      attachmentRanges.append(match.range)
+      storage.addAttributes([
+        .font: NSFont.systemFont(ofSize: 1),
+        .foregroundColor: NSColor.clear,
+      ], range: match.range)
+      storage.addAttributes([
+        .font: NSFont.systemFont(ofSize: 13, weight: .medium),
+        .foregroundColor: NSColor.secondaryLabelColor,
+        .underlineStyle: NSUnderlineStyle.single.rawValue,
+      ], range: match.range(at: 1))
+    }
     view.typingAttributes = [
       .font: body, .foregroundColor: NSColor.labelColor, .paragraphStyle: paragraph,
     ]
@@ -438,8 +443,9 @@ import SwiftUI
 struct MarkdownEditor: NSViewRepresentable {
   @ObservedObject var model: WorkspaceModel
   let document: DocumentSnapshot
+  let minimumHeight: CGFloat
   func makeCoordinator() -> Coordinator { Coordinator(model: model) }
-  func makeNSView(context: Context) -> NSScrollView {
+  func makeNSView(context: Context) -> MarkdownTextView {
     let storage = NSTextStorage()
     let layout = NSLayoutManager()
     let container = NSTextContainer(size: NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude))
@@ -475,23 +481,27 @@ struct MarkdownEditor: NSViewRepresentable {
     text.usesFindBar = true
     text.registerForDraggedTypes([.fileURL, .png, .tiff, .string])
     text.setAccessibilityLabel("Markdown document")
-    let scroll = MarkdownScrollView()
-    scroll.hasVerticalScroller = true
-    scroll.autohidesScrollers = true
-    scroll.borderType = .noBorder
-    scroll.drawsBackground = true
-    scroll.backgroundColor = .textBackgroundColor
-    scroll.documentView = text
-    scroll.findBarPosition = .aboveContent
     context.coordinator.view = text
     model.editor = text
     update(text, document: document)
-    return scroll
+    return text
   }
-  func updateNSView(_ scroll: NSScrollView, context: Context) {
-    guard let text = scroll.documentView as? MarkdownTextView else { return }
+  func updateNSView(_ text: MarkdownTextView, context: Context) {
     model.editor = text
     update(text, document: document)
+  }
+  func sizeThatFits(
+    _ proposal: ProposedViewSize, nsView text: MarkdownTextView, context: Context
+  ) -> CGSize? {
+    guard let width = proposal.width, width > 0, let container = text.textContainer,
+      let layout = text.layoutManager else { return nil }
+    container.size = NSSize(
+      width: max(1, width - text.textContainerInset.width * 2),
+      height: CGFloat.greatestFiniteMagnitude)
+    layout.ensureLayout(for: container)
+    let used = layout.usedRect(for: container)
+    return CGSize(width: width,
+      height: max(used.height + text.textContainerInset.height * 2, minimumHeight))
   }
   private func update(_ text: MarkdownTextView, document: DocumentSnapshot) {
     // SwiftUI status/streaming updates must never overwrite in-flight marked text.
@@ -517,6 +527,15 @@ struct MarkdownEditor: NSViewRepresentable {
     func undoManager(for view: NSTextView) -> UndoManager? {
       (view as? MarkdownTextView)?.documentUndo
     }
+    func textView(
+      _ textView: NSTextView, shouldSetSpellingState value: Int,
+      range affectedCharRange: NSRange
+    ) -> Int {
+      let text = textView.string as NSString
+      guard affectedCharRange.location < text.length else { return value }
+      let line = text.substring(with: text.lineRange(for: affectedCharRange))
+      return line.contains("](boom-attachment:") ? 0 : value
+    }
     func textDidChange(_ notification: Notification) {
       guard let view, !view.applyingExternal else { return }
       guard !view.hasMarkedText() else {
@@ -525,6 +544,7 @@ struct MarkdownEditor: NSViewRepresentable {
       }
       MarkdownStyle.apply(to: view)
       model.updateDocument(view.string, id: view.documentID, caret: view.selectedRange().location)
+      view.invalidateIntrinsicContentSize()
     }
     func textViewDidChangeSelection(_ notification: Notification) {
       guard let view, !view.applyingExternal else { return }

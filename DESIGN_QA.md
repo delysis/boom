@@ -81,10 +81,10 @@ surface. When changing input code, inspect every cell in this routing matrix:
 
 | Input | Document editor | Chat composer |
 | --- | --- | --- |
-| File paste | Markdown link and document chip | Chat attachment chip |
-| Image paste | Markdown link and document chip | Chat attachment chip |
-| File drop | Markdown link and document chip | Chat attachment chip |
-| Image drop | Markdown link and document chip | Chat attachment chip |
+| File paste | Markdown link and inline document card | Chat attachment chip |
+| Image paste | Markdown link and inline document card | Chat attachment chip |
+| File drop | Markdown link and inline document card | Chat attachment chip |
+| Image drop | Markdown link and inline document card | Chat attachment chip |
 | File menu | Explicit document target | Explicit chat target |
 
 Verify the saved document bytes and chat's pending attachments, then switch
@@ -99,15 +99,38 @@ not select a layout from a fixed window-width cutoff. Inspect the narrowest
 chat-only pane and a wide three-pane layout. Confirm all actions remain
 reachable and no control is clipped or moved to a second row.
 
+Rename a selected document and chat through both a second click and their
+context menus. The title must become an editable field in the same sidebar row;
+Return commits, Escape cancels, and neither path opens a modal rename alert.
+
 Drop or choose a file while the document editor has focus and inspect the saved
-Markdown link and the document chip. Reopen the document and its attachment
-preview, then check the retained original, extracted text and coverage. Repeat
+Markdown link and the inline card. Reopen the document and check the retained
+original, extracted text and coverage in the same document scroll. Repeat
 through chat and confirm the two destinations are distinct. For audio, use a
 short known-word local fixture and verify actual transcript content, not merely
 that a file chip appears. Missing speech assets and failed segments must
 produce a specific local error. A long recording must retain its original and
 expose explicit full transcription rather than silently claiming complete
 coverage.
+
+Inspect the attachment as a reader would: the document editor should show its
+file name without exposing the internal UUID or URL in ordinary reading, and
+the card should open the same original after reopening the document. Test an
+image, audio clip, video clip, PDF and text document. Confirm image zoom/fit,
+audio play/pause and elapsed time, video controls, PDF paging, and collapsed
+extracted text. Expand a long document, scroll its extracted text, collapse it,
+and confirm the document remains one continuous scroll surface with an editable
+caret. No attachment may create a second vertical scroll region or push the
+editor into a separate apparent pane. Reopen the same document and repeat.
+Switch documents and verify playback stops and temporary video files are
+removed. Copy or export the Markdown and confirm the original
+attachment reference remains intact despite its styled display. Click around
+the displayed reference and type nearby to catch selection or caret drift.
+
+For chunked transcription, test two consecutive segments of a real compressed
+recording, then one final short segment. Each segment must contain converted
+audio before recognition. Verify a recorded transcript's words and explicit
+coverage separately from the conversion check.
 
 Launch the sealed `.app` through LaunchServices and verify its signature binds
 `Info.plist` and seals resources. A direct executable launch is not a privacy

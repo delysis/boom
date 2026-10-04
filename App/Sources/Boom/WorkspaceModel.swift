@@ -44,15 +44,19 @@ struct CompletionSegment {
   @Published var streamingText = ""
   @Published var streamingChat: UUID?
   @Published var showingModels = false
-  @Published var previewAttachment: UUID?
-  @Published var previewReceipt = false
   @Published var ghostText = ""
   @Published var ghostStamp: GhostStamp?
   @Published var modelReady = false
   @Published var modelChoice: ModelChoice = .automatic
   let store: WorkspaceStore
   private(set) var runner: GemmaRunner?
-  var selectedRunner: GemmaRunner? { modelChoice == .apple ? nil : runner }
+  private(set) var mlxRunner: MLXGemmaRunner?
+  private(set) var baseRunner: MLXGemmaRunner?
+  var selectedMLXRunner: MLXGemmaRunner? { modelChoice == .apple ? nil : mlxRunner }
+  var completionRunner: MLXGemmaRunner? { baseRunner }
+  var selectedRunner: GemmaRunner? {
+    modelChoice == .apple || mlxRunner != nil ? nil : runner
+  }
   func documentAttachments(_ document: DocumentSnapshot) -> [AttachmentRecord] {
     AttachmentLink.ids(in: document.text).compactMap { id in
       state.attachments.first { $0.id == id }
@@ -105,15 +109,36 @@ struct CompletionSegment {
     guard let destination = documentAttachmentDestination(id: document.id, range: range) else { return }
     chooseAttachmentFiles(to: destination)
   }
-  var canInfer: Bool { selectedRunner != nil || (modelChoice != .gemma && AppleModel.isAvailable) }
+  var canInfer: Bool {
+    selectedMLXRunner != nil || selectedRunner != nil
+      || (modelChoice != .gemma && AppleModel.isAvailable)
+  }
   var inferenceName: String {
+    if let selectedMLXRunner { return "Gemma 4 \(selectedMLXRunner.size.rawValue)" }
     if selectedRunner != nil { return "Gemma 4 E2B" }
     return modelChoice != .gemma && AppleModel.isAvailable ? "Apple Foundation Model" : "No model"
+  }
+  var cachedQATSize: GemmaSize? {
+    MLXModelStore.bestCachedSource(
+      physicalBytes: ProcessInfo.processInfo.physicalMemory)?.size
+  }
+  var recommendedQATSize: GemmaSize? {
+    ModelMemoryPolicy.recommendedSize(physicalBytes: ProcessInfo.processInfo.physicalMemory)
+  }
+  var recommendedBaseSize: GemmaSize? {
+    guard let chat = recommendedQATSize else { return nil }
+    let bytes = ProcessInfo.processInfo.physicalMemory
+    let combined = UInt64(chat.nominalBillions + GemmaSize.b12.nominalBillions) * 500_000_000
+    return combined < bytes / 2 ? .b12 : nil
+  }
+  var baseReady: Bool { baseRunner != nil }
+  var baseCached: Bool {
+    recommendedBaseSize.flatMap(MLXModelStore.cachedBaseSource(for:)) != nil
   }
   func chooseModel(_ choice: ModelChoice) {
     modelChoice = choice
     invalidateGhost()
-    status = selectedRunner == nil && AppleModel.isAvailable
+    status = selectedRunner == nil && selectedMLXRunner == nil && AppleModel.isAvailable
       ? "Apple Foundation Model · chat only; raw document completion needs Gemma"
       : inferenceName == "No model" ? appleAvailability : inferenceName + " · on device"
     scheduleCompletion()
@@ -172,13 +197,29 @@ struct CompletionSegment {
       try flush()
     }
     #endif
-    if let name = state.installedModel {
+    if let source = MLXModelStore.bestCachedSource(
+      physicalBytes: ProcessInfo.processInfo.physicalMemory),
+      FileManager.default.fileExists(atPath: MLXModelStore.convertedURL(for: source).path),
+      let assistant = MLXModelStore.cachedAssistant(for: source.size)
+    {
+      loadConvertedMLX(source, assistant: assistant)
+    } else if let name = state.installedModel {
       guard name.range(of: "^gemma4-e2b-[0-9a-f]{20}$", options: .regularExpression) != nil else {
         throw BoomError.invalid("Invalid installed-model identifier.")
       }
       let appOwned = store.modelsURL.appendingPathComponent(name)
       let cached = HuggingFaceCache.boomModels.appendingPathComponent(name)
       loadModel(FileManager.default.fileExists(atPath: appOwned.path) ? appOwned : cached)
+    }
+    if recommendedBaseSize == .b12,
+      let source = MLXModelStore.cachedBaseSource(for: .b12),
+      FileManager.default.fileExists(atPath: MLXModelStore.convertedURL(for: source).path)
+    {
+      Task { [weak self] in
+        guard let self else { return }
+        if let foreground = self.foreground { await foreground.value }
+        self.loadConvertedBase(source)
+      }
     }
   }
   var selectedDocument: DocumentSnapshot? { documents.first { $0.id == state.selectedDocument } }
@@ -206,9 +247,12 @@ struct CompletionSegment {
   func refreshAppleAvailability() {
     let latest = AppleModel.availabilityMessage
     guard latest != appleAvailability else { return }
-    if selectedRunner == nil, !isBusy, status == appleAvailability { status = latest }
+    if selectedRunner == nil, selectedMLXRunner == nil, !isBusy,
+      status == appleAvailability { status = latest }
     appleAvailability = latest
-    if AppleModel.isAvailable, selectedRunner == nil { scheduleCompletion() }
+    if AppleModel.isAvailable, selectedRunner == nil, selectedMLXRunner == nil {
+      scheduleCompletion()
+    }
   }
   func dismissError() { errorMessage = nil }
   func finishComposition() { editor?.finishComposition() }
@@ -454,22 +498,20 @@ struct CompletionSegment {
       }
     } catch { report(error) }
   }
-  func renameDocument(_ id: UUID) {
-    guard let index = documents.firstIndex(where: { $0.id == id }),
-      let title = askForText(title: "Rename document", initial: documents[index].title)
-    else { return }
+  func renameDocument(_ id: UUID, to proposedTitle: String) {
+    guard let index = documents.firstIndex(where: { $0.id == id }) else { return }
+    let title = proposedTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !title.isEmpty else { return }
     cancel()
     documents[index].title = title
     scheduleSave()
-    if state.selectedDocument == id { focusEditor(id) }
   }
-  func renameChat(_ id: UUID) {
-    guard let index = state.chats.firstIndex(where: { $0.id == id }),
-      let title = askForText(title: "Rename chat", initial: state.chats[index].title)
-    else { return }
+  func renameChat(_ id: UUID, to proposedTitle: String) {
+    guard let index = state.chats.firstIndex(where: { $0.id == id }) else { return }
+    let title = proposedTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !title.isEmpty else { return }
     state.chats[index].title = title
     scheduleSave()
-    if state.selectedChat == id { composerFocusEpoch &+= 1 }
   }
   func updateDocument(_ text: String, id: UUID, caret: Int) {
     guard let index = documents.firstIndex(where: { $0.id == id }) else { return }
@@ -567,6 +609,7 @@ struct CompletionSegment {
           self.activeID = nil
           self.streamingText = ""
           self.streamingChat = nil
+          self.scheduleCompletion()
         }
       }
       do {
@@ -598,6 +641,8 @@ struct CompletionSegment {
     if let foreground { await foreground.value }
     if let ghostTask { await ghostTask.value }
     if let runner { await runner.join() }
+    if let mlxRunner { await mlxRunner.join() }
+    if let baseRunner { await baseRunner.join() }
     try flush()
   }
   private func revalidate(_ sources: [SourceReference], attachments: [SourceReference]) throws {
@@ -679,7 +724,9 @@ struct CompletionSegment {
         return p
       }
       if selectedRunner == nil && !personas.isEmpty {
-        throw BoomError.unavailable("Cached personas require a loaded Gemma model.")
+        throw BoomError.unavailable(
+          "This persona has a Core ML cache. Select its original model until a matching MLX cache is built."
+        )
       }
       if interaction != .ask && document == nil {
         throw BoomError.denied("Choose a document before requesting edits.")
@@ -723,6 +770,17 @@ struct CompletionSegment {
             self.state.chats[index].messages[current].context = fitted.context
             try self.flush()
           }
+        } else if let runner = self.selectedMLXRunner {
+          fitted = try await runner.fitConversation(
+            history: oldHistory, instructions: instructions, context: context,
+            request: request, maxOutputTokens: 512, flag: flag)
+          if let fitted, fitted.context != context {
+            guard let current = self.state.chats[index].messages.indices.last else {
+              throw BoomError.invalid("The current chat message disappeared.")
+            }
+            self.state.chats[index].messages[current].context = fitted.context
+            try self.flush()
+          }
         } else { fitted = nil }
         let consultations: [Persona?] = personas.isEmpty ? [nil] : personas.map { Optional($0) }
         for persona in consultations {
@@ -759,6 +817,22 @@ struct CompletionSegment {
               resultStatus = "Local Gemma · \(result.promptTokens) prompt tokens · \(result.cachedTokens) restored"
                 + ((fitted?.omittedContextCharacters ?? 0) > 0
                   || (fitted?.omittedHistoryCount ?? 0) > 0 ? " · earlier context shortened" : "")
+                + (result.endedByEOS ? "" : " · output limit")
+            } else if let runner = self.selectedMLXRunner {
+              let prompt = MLXGemmaRunner.chatPrompt(
+                history: fitted?.history ?? oldHistory,
+                request: [instructions, fitted?.context ?? context, request]
+                  .filter { !$0.isEmpty }.joined(separator: "\n\n"))
+              let result = try await runner.run(
+                rawPrompt: prompt, maxTokens: 512, flag: flag
+              ) { [weak self] text in
+                Task { @MainActor in
+                  guard let self, self.activeFlag === flag, !flag.isCancelled else { return }
+                  self.streamingText = text
+                }
+              }
+              generated = result.text
+              resultStatus = "Local Gemma · \(result.promptTokens) prompt tokens"
                 + (result.endedByEOS ? "" : " · output limit")
             } else {
               let prompt = try AppleModel.conversation(
@@ -1004,7 +1078,7 @@ struct CompletionSegment {
   }
   func scheduleCompletion() {
     guard state.autocomplete, state.showDocument, !isBusy,
-      let runner = selectedRunner, caret > 0,
+      (selectedRunner != nil || completionRunner != nil), caret > 0,
       let document = selectedDocument, let editor, editor.selectedRange().length == 0,
       !editor.hasMarkedText()
     else { return }
@@ -1021,27 +1095,37 @@ struct CompletionSegment {
         try self.flush()
         try self.revalidate(graph.sources, attachments: [])
         self.status = "Local autocomplete · bounded caret context"
-        let result = try await runner.complete(
-            document: document, caret: offset, context: graph, vault: self.store.vault, flag: flag
-          ) { [weak self] text in
-            Task { @MainActor in
-              guard let self, !flag.isCancelled, let current = self.selectedDocument,
-                stamp.accepts(
-                  document: current, caretUTF16: self.caret, epoch: self.epoch,
-                  hasMarkedText: self.editor?.hasMarkedText() ?? true),
-                (try? graph.revalidate(against: self.documents)) != nil,
-                let visible = GemmaPrompt.visibleCompletion(text)
-              else { return }
-              self.ghostSources = graph.sources
-              self.ghostStamp = stamp
-              self.ghostText = visible
-              self.editor?.showGhost(self.ghostText, stamp: stamp)
-            }
+        let onText: @Sendable (String) -> Void = { [weak self] text in
+          Task { @MainActor in
+            guard let self, !flag.isCancelled, let current = self.selectedDocument,
+              stamp.accepts(
+                document: current, caretUTF16: self.caret, epoch: self.epoch,
+                hasMarkedText: self.editor?.hasMarkedText() ?? true),
+              (try? graph.revalidate(against: self.documents)) != nil,
+              let visible = GemmaPrompt.visibleCompletion(text)
+            else { return }
+            self.ghostSources = graph.sources
+            self.ghostStamp = stamp
+            self.ghostText = visible
+            self.editor?.showGhost(self.ghostText, stamp: stamp)
           }
-        if self.epoch == capturedEpoch, !flag.isCancelled {
-          self.status =
-            "Local autocomplete · \(result.cachedTokens) reference tokens restored"
-            + (result.window.isExcerpt ? " · " + result.window.scopeDescription : "")
+        }
+        if let runner = self.completionRunner {
+          let result = try await runner.complete(
+            document: document, caret: offset, context: graph, flag: flag,
+            useDraft: false, onText: onText)
+          if self.epoch == capturedEpoch, !flag.isCancelled {
+            self.status = "Local autocomplete"
+              + (result.window.isExcerpt ? " · " + result.window.scopeDescription : "")
+          }
+        } else if let runner = self.selectedRunner {
+          let result = try await runner.complete(
+            document: document, caret: offset, context: graph, vault: self.store.vault,
+            flag: flag, onText: onText)
+          if self.epoch == capturedEpoch, !flag.isCancelled {
+            self.status = "Local autocomplete · \(result.cachedTokens) reference tokens restored"
+              + (result.window.isExcerpt ? " · " + result.window.scopeDescription : "")
+          }
         }
       } catch is CancellationError {} catch {
         // An unsupported/oversized autocomplete never inserts text or stops
@@ -1349,8 +1433,115 @@ struct CompletionSegment {
   }
   private func releaseRunner() async {
     if let old = runner { await old.join() }
+    if let old = mlxRunner { await old.join() }
     runner = nil
+    mlxRunner = nil
     modelReady = false
+  }
+  func loadConvertedMLX(_ source: MLXModelStore.Source, assistant: URL) {
+    work("Verifying local Gemma files…") { [weak self] flag in
+      guard let self else { return }
+      let directory = MLXModelStore.convertedURL(for: source)
+      try await detachedWork(priority: .utility) {
+        try MLXModelStore.verify(directory, expected: source)
+      }
+      try flag.check()
+      let loaded = try await MLXGemmaRunner.load(
+        directory: directory, assistantDirectory: assistant, size: source.size)
+      try flag.check()
+      await self.releaseRunner()
+      self.mlxRunner = loaded
+      self.modelReady = true
+      self.showingModels = false
+      self.status = "Gemma 4 \(source.size.rawValue) ready · local Metal"
+      self.scheduleCompletion()
+    }
+  }
+  func loadConvertedBase(_ source: MLXModelStore.Source) {
+    work("Opening local writing model…") { [weak self] flag in
+      guard let self else { return }
+      let directory = MLXModelStore.convertedURL(for: source)
+      try await detachedWork(priority: .utility) {
+        try MLXModelStore.verify(directory, expected: source)
+      }
+      try flag.check()
+      let loaded = try await MLXGemmaRunner.load(directory: directory, size: source.size)
+      try flag.check()
+      if let old = self.baseRunner { await old.join() }
+      self.baseRunner = loaded
+      self.status = "Writing suggestions ready"
+    }
+  }
+  func prepareBase() {
+    guard !isBusy, let size = recommendedBaseSize else { return }
+    work("Preparing writing suggestions…") { [weak self] flag in
+      guard let self else { return }
+      let source = try await MLXModelStore.ensureBaseSource(for: size)
+      try flag.check()
+      let directory = try await detachedWork(priority: .userInitiated) {
+        try await MLXModelStore.prepare(source)
+      }
+      try flag.check()
+      let loaded = try await MLXGemmaRunner.load(directory: directory, size: size)
+      try flag.check()
+      if let old = self.baseRunner { await old.join() }
+      self.baseRunner = loaded
+      self.status = "Writing suggestions ready"
+    }
+  }
+  func prepareCachedMLX() {
+    guard !isBusy else { return }
+    guard let source = MLXModelStore.bestCachedSource(
+      physicalBytes: ProcessInfo.processInfo.physicalMemory)
+    else {
+      report(BoomError.unavailable("No first-party Gemma 4 QAT safetensors are cached."))
+      return
+    }
+    prepareMLX(size: source.size, downloadIfMissing: false)
+  }
+  func downloadRecommendedMLX() {
+    guard let size = recommendedQATSize else {
+      report(BoomError.unavailable("This Mac has too little memory for Gemma 4."))
+      return
+    }
+    prepareMLX(size: size, downloadIfMissing: true)
+  }
+  private func prepareMLX(size: GemmaSize, downloadIfMissing: Bool) {
+    guard !isBusy else { return }
+    work("Preparing Gemma 4 \(size.rawValue)…") { [weak self] flag in
+      guard let self else { return }
+      let source: MLXModelStore.Source
+      if let cached = MLXModelStore.cachedSource(for: size) { source = cached }
+      else if downloadIfMissing {
+        self.status = "Downloading Gemma 4 \(size.rawValue) into the Hugging Face cache…"
+        source = try await MLXModelStore.ensureSource(for: size) { [weak self] progress in
+          Task { @MainActor in
+            guard let self, !flag.isCancelled else { return }
+            self.status = "Gemma 4 \(size.rawValue) · \(Int(progress.fractionCompleted * 100))%"
+          }
+        }
+      } else {
+        throw BoomError.unavailable("No cached QAT source weights for \(size.rawValue).")
+      }
+      try flag.check()
+      self.status = "Converting first-party QAT weights locally…"
+      let directory = try await detachedWork(priority: .userInitiated) {
+        try await MLXModelStore.prepare(source)
+      }
+      try flag.check()
+      self.status = "Loading matching Gemma assistant…"
+      let assistant = try await MLXModelStore.ensureAssistant(for: source.size)
+      try flag.check()
+      let loaded = try await MLXGemmaRunner.load(
+        directory: directory, assistantDirectory: assistant, size: source.size)
+      try flag.check()
+      await self.releaseRunner()
+      self.mlxRunner = loaded
+      self.modelReady = true
+      self.showingModels = false
+      self.status = "Gemma 4 \(source.size.rawValue) ready · local Metal"
+      self.scheduleCompletion()
+    }
   }
   func loadModel(_ url: URL) {
     work("Verifying local model files…") { [weak self] flag in

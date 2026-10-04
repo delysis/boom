@@ -26,6 +26,11 @@ public enum GemmaSize: String, CaseIterable, Sendable {
     }
   }
   public var qatRepository: String { "google/gemma-4-\(rawValue)-it-qat-q4_0-gguf" }
+  /// First-party QAT tensors before format-specific packing. MLX Swift
+  /// converts these to Q4_0-calibrated safetensors without a GGUF runtime.
+  public var qatSafetensorsRepository: String {
+    "google/gemma-4-\(rawValue)-it-qat-q4_0-unquantized"
+  }
   public var mobileRepository: String? {
     switch self {
     case .e2b, .e4b: "google/gemma-4-\(rawValue)-it-qat-mobile-transformers"

@@ -36,6 +36,27 @@ import SwiftUI
       }
       dispatchMain()
     }
+    if CommandLine.arguments.contains("--speech-smoke") {
+      Task {
+        do {
+          guard let index = CommandLine.arguments.firstIndex(of: "--audio-file"),
+            index + 1 < CommandLine.arguments.count else {
+            throw BoomError.invalid("Use --speech-smoke --audio-file ABSOLUTE_PATH.")
+          }
+          let url = URL(fileURLWithPath: CommandLine.arguments[index + 1])
+          let result = try await VoiceInput().transcribeAttachment(
+            url, flag: CancellationFlag()) { current, total in
+              fputs("Local speech segment \(current)/\(total)\n", stderr)
+            }
+          print("Recognized \(result.text.count) characters; \(result.coverage)")
+          exit(0)
+        } catch {
+          fputs("Local speech smoke failed: \(error.localizedDescription)\n", stderr)
+          exit(1)
+        }
+      }
+      dispatchMain()
+    }
     if CommandLine.arguments.contains("--install-default") {
       Task {
         do {
@@ -68,6 +89,18 @@ import SwiftUI
           exit(0)
         } catch {
           fputs("Native smoke failed: \(error.localizedDescription)\n", stderr)
+          exit(1)
+        }
+      }
+      dispatchMain()
+    }
+    if CommandLine.arguments.contains("--mlx-smoke") {
+      Task {
+        do {
+          try await MLXNativeSmoke.run(arguments: CommandLine.arguments)
+          exit(0)
+        } catch {
+          fputs("MLX smoke failed: \(error.localizedDescription)\n", stderr)
           exit(1)
         }
       }

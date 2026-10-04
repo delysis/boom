@@ -37,6 +37,10 @@ sources.append(
   Source(
     name: "swift:CoreML-LLM", directory: root.appendingPathComponent(".deps/CoreML-LLM"),
     license: "inspect source notice", explicit: nil))
+sources.append(
+  Source(
+    name: "swift:MLXSwiftLM", directory: root.appendingPathComponent(".deps/MLXSwiftLM"),
+    license: "inspect source notice", explicit: nil))
 let checkouts = root.appendingPathComponent("App/.build/checkouts")
 if fm.fileExists(atPath: checkouts.path) {
   for folder in try fm.contentsOfDirectory(

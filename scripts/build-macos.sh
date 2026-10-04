@@ -3,6 +3,9 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 if [[ "$(uname -s)" != Darwin ]]; then echo 'macOS required.' >&2; exit 1; fi
 [[ -f "$HERE/RustBridge/Cargo.lock" && -f "$HERE/App/Package.resolved" ]] || { echo 'Run scripts/bootstrap.sh once and review the dependency locks.' >&2; exit 1; }
+MLX_RUNTIME=9afc3b55f75a0d41a3d0c11330b9df6a036d24e4
+[[ "$(git -C "$HERE/.deps/MLXSwiftLM" rev-parse HEAD)" == "$MLX_RUNTIME" ]] || { echo 'Unexpected MLX Swift LM revision.' >&2; exit 1; }
+git -C "$HERE/.deps/MLXSwiftLM" diff --quiet HEAD || { echo 'MLX Swift LM source has local changes.' >&2; exit 1; }
 OUT="${1:-$HERE/out/$(date -u +%Y%m%dT%H%M%SZ)}"
 [[ ! -e "$OUT" ]] || { echo "Refusing to overwrite $OUT" >&2; exit 1; }
 mkdir -p "$OUT"
@@ -15,6 +18,7 @@ rustc --version
 xcrun --sdk macosx --show-sdk-version
 swift "$HERE/scripts/prepare-runtime.swift" "$HERE/.deps/CoreML-LLM" "$HERE"
 (cd "$HERE/Core" && swift test)
+(cd "$HERE/App" && swift test)
 (cd "$HERE/RustBridge" && cargo fmt -- --check && cargo test --locked && cargo clippy --locked --all-targets -- -D warnings)
 (cd "$HERE/RustBridge" && cargo rustc --release --locked --lib -- --print native-static-libs) 2>&1 | tee "$OUT/rust-native-link.log"
 swift "$HERE/scripts/record-native-libs.swift" "$OUT/rust-native-link.log" "$HERE/.build-support/RustNativeLink.json"
@@ -32,7 +36,7 @@ cp "$HERE/Info.plist" "$APP/Contents/Info.plist"
 [[ -n "$(/usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' "$APP/Contents/Info.plist")" ]]
 (
   cd "$HERE"
-  { find App/Sources Core/Sources RuntimeAdditions RustBridge/src crates scripts -type f; printf '%s\n' App/Package.swift Core/Package.swift RustBridge/Cargo.toml Cargo.toml Info.plist; } | LC_ALL=C sort | while IFS= read -r path; do shasum -a 256 "$path"; done
+  { find App/Sources Core/Sources RuntimeAdditions RustBridge/src crates scripts -type f; printf '%s\n' App/Package.swift Core/Package.swift RustBridge/Cargo.toml Cargo.toml Info.plist NOTICE.md; } | LC_ALL=C sort | while IFS= read -r path; do shasum -a 256 "$path"; done
 ) > "$OUT/source-files.sha256"
 (
   cd "$HERE"

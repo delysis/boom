@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.2
 import Foundation
 import PackageDescription
 
@@ -22,6 +22,10 @@ let package = Package(
   dependencies: [
     .package(path: "../Core"),
     .package(path: "../.deps/CoreML-LLM"),
+    .package(path: "../.deps/MLXSwiftLM", traits: []),
+    .package(url: "https://github.com/ml-explore/mlx-swift", exact: "0.32.3"),
+    .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.4"),
+    .package(url: "https://github.com/huggingface/swift-huggingface.git", exact: "0.11.0"),
   ],
   targets: [
     .target(name: "CAttachment", publicHeadersPath: "include"),
@@ -30,6 +34,12 @@ let package = Package(
       dependencies: [
         .product(name: "BoomCore", package: "core"),
         .product(name: "CoreMLLLM", package: "coreml-llm"), "CAttachment",
+        .product(name: "MLXLMCommon", package: "MLXSwiftLM"),
+        .product(name: "MLXVLM", package: "MLXSwiftLM"),
+        .product(name: "MLXHuggingFace", package: "MLXSwiftLM"),
+        .product(name: "MLX", package: "mlx-swift"),
+        .product(name: "HuggingFace", package: "swift-huggingface"),
+        .product(name: "Tokenizers", package: "swift-transformers"),
       ],
       linkerSettings: [
         .unsafeFlags(
@@ -41,5 +51,6 @@ let package = Package(
         .linkedFramework("SystemConfiguration"), .linkedFramework("CoreML"),
         .linkedFramework("AVFoundation"), .linkedFramework("Speech"),
       ]),
+    .testTarget(name: "BoomTests", dependencies: ["Boom"]),
   ], swiftLanguageModes: [.v5]
 )

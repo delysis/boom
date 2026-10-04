@@ -23,29 +23,25 @@ struct WorkspaceView: View {
         }
         if model.showsDocument {
           if let document = model.selectedDocument {
-            VStack(spacing: 0) {
-              let attachments = model.documentAttachments(document)
-              if !attachments.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                  HStack(spacing: 8) {
-                    ForEach(attachments) { attachment in
-                      Button {
-                        model.previewReceipt = false
-                        model.previewAttachment = attachment.id
-                      } label: {
-                        Label(attachment.name, systemImage: attachment.text.isEmpty
-                          ? "exclamationmark.circle" : "paperclip")
-                          .lineLimit(1)
-                      }.buttonStyle(.plain).font(.system(size: 11))
-                        .foregroundStyle(attachment.text.isEmpty ? .secondary : .primary)
-                        .help(attachment.coverage)
-                    }
-                  }.padding(.horizontal, 20).padding(.vertical, 8)
+            GeometryReader { pane in
+              ScrollView(.vertical) {
+                VStack(spacing: 0) {
+                  let attachments = model.documentAttachments(document)
+                  MarkdownEditor(model: model, document: document,
+                    minimumHeight: attachments.isEmpty ? pane.size.height : 0)
+                    .frame(width: pane.size.width)
+                  if !attachments.isEmpty {
+                    VStack(spacing: 8) {
+                      ForEach(attachments) { attachment in
+                        AttachmentInlineCard(model: model, record: attachment)
+                      }
+                    }.padding(.horizontal, 20).padding(.vertical, 12)
+                  }
                 }
-                Divider()
+                .frame(width: pane.size.width, alignment: .leading)
               }
-              MarkdownEditor(model: model, document: document)
-            }.frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
           } else {
             Text("Choose a document").foregroundStyle(.secondary).frame(
               minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
@@ -66,12 +62,6 @@ struct WorkspaceView: View {
     }
     .environment(\.openURL, OpenURLAction { _ in .discarded })
     .sheet(isPresented: $model.showingModels) { ModelSetupView(model: model) }
-    .sheet(
-      isPresented: Binding(
-        get: { model.previewAttachment != nil }, set: { if !$0 { model.previewAttachment = nil } })
-    ) {
-      if let id = model.previewAttachment { AttachmentPreview(model: model, id: id) }
-    }
     .alert(
       "Boom",
       isPresented: Binding(
@@ -85,10 +75,16 @@ struct WorkspaceView: View {
 }
 
 struct LibraryView: View {
+  private enum RenameTarget: Equatable {
+    case document(UUID), chat(UUID)
+  }
   @ObservedObject var model: WorkspaceModel
   @State private var filter = ""
   @State private var documentAnchor: UUID?
   @State private var chatAnchor: UUID?
+  @State private var renameTarget: RenameTarget?
+  @State private var renameDraft = ""
+  @FocusState private var renameFocused: Bool
   private func includes(_ title: String) -> Bool {
     filter.isEmpty || title.localizedCaseInsensitiveContains(filter)
   }
@@ -119,7 +115,50 @@ struct LibraryView: View {
       in: RoundedRectangle(cornerRadius: 7))
     .contentShape(Rectangle())
   }
+  private func editableRow(symbol: String, selected: Bool) -> some View {
+    HStack(spacing: 10) {
+      Image(systemName: symbol).font(.system(size: 13))
+        .foregroundStyle(selected ? .primary : .secondary).frame(width: 17)
+      TextField("Name", text: $renameDraft)
+        .textFieldStyle(.plain)
+        .focused($renameFocused)
+        .onSubmit(commitRename)
+        .onExitCommand(perform: cancelRename)
+        .onChange(of: renameFocused) { _, focused in
+          if !focused && renameTarget != nil { commitRename() }
+        }
+      Spacer(minLength: 0)
+    }
+    .font(.system(size: 13))
+    .padding(.horizontal, 11).padding(.vertical, 8)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(Color.primary.opacity(0.075), in: RoundedRectangle(cornerRadius: 7))
+    .padding(.horizontal, 7)
+  }
+  private func beginRename(_ target: RenameTarget, title: String) {
+    if renameTarget != nil { commitRename() }
+    renameTarget = target
+    renameDraft = title
+    renameFocused = true
+  }
+  private func commitRename() {
+    guard let target = renameTarget else { return }
+    let title = renameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !title.isEmpty {
+      switch target {
+      case .document(let id): model.renameDocument(id, to: title)
+      case .chat(let id): model.renameChat(id, to: title)
+      }
+    }
+    renameTarget = nil
+    renameFocused = false
+  }
+  private func cancelRename() {
+    renameTarget = nil
+    renameFocused = false
+  }
   private func chooseDocument(_ id: UUID) {
+    if renameTarget != nil { commitRename() }
     let visible = model.documents.filter { includes($0.title) }.map(\.id)
     let modifiers = NSApp.currentEvent?.modifierFlags ?? []
     var selection = LibrarySelection(ids: model.selectedDocumentIDs, anchor: documentAnchor)
@@ -127,10 +166,13 @@ struct LibraryView: View {
       id, visible: visible, primary: model.state.selectedDocument, gesture: clickGesture(modifiers))
     documentAnchor = selection.anchor
     model.selectedDocumentIDs = selection.ids
-    if result.rename { model.renameDocument(id) }
+    if result.rename, let document = model.documents.first(where: { $0.id == id }) {
+      beginRename(.document(id), title: document.title)
+    }
     if result.open { model.selectDocument(id, preservingSelection: true) }
   }
   private func chooseChat(_ id: UUID) {
+    if renameTarget != nil { commitRename() }
     let visible = model.state.chats.filter { includes($0.title) }.map(\.id)
     let modifiers = NSApp.currentEvent?.modifierFlags ?? []
     var selection = LibrarySelection(ids: model.selectedChatIDs, anchor: chatAnchor)
@@ -138,7 +180,9 @@ struct LibraryView: View {
       id, visible: visible, primary: model.state.selectedChat, gesture: clickGesture(modifiers))
     chatAnchor = selection.anchor
     model.selectedChatIDs = selection.ids
-    if result.rename { model.renameChat(id) }
+    if result.rename, let chat = model.state.chats.first(where: { $0.id == id }) {
+      beginRename(.chat(id), title: chat.title)
+    }
     if result.open { model.selectChat(id, preservingSelection: true) }
   }
   private func clickGesture(_ modifiers: NSEvent.ModifierFlags) -> LibrarySelection.Click {
@@ -167,12 +211,18 @@ struct LibraryView: View {
             do { try model.newDocument() } catch { model.report(error) }
           }
           ForEach(model.documents.filter { includes($0.title) }) { document in
-            Button { chooseDocument(document.id) } label: {
-              row(document.title, symbol: "doc.text",
-                selected: model.selectedDocumentIDs.contains(document.id))
-            }.buttonStyle(.plain).padding(.horizontal, 7)
+            Group {
+              if renameTarget == .document(document.id) {
+                editableRow(symbol: "doc.text", selected: true)
+              } else {
+                Button { chooseDocument(document.id) } label: {
+                  row(document.title, symbol: "doc.text",
+                    selected: model.selectedDocumentIDs.contains(document.id))
+                }.buttonStyle(.plain).padding(.horizontal, 7)
+              }
+            }
               .contextMenu {
-                Button("Rename…") { model.renameDocument(document.id) }
+                Button("Rename") { beginRename(.document(document.id), title: document.title) }
                 Button("New chat about this document") {
                   do { try model.newChat(about: document.id) } catch { model.report(error) }
                 }
@@ -198,12 +248,18 @@ struct LibraryView: View {
             do { try model.newChat() } catch { model.report(error) }
           }
           ForEach(model.state.chats.filter { includes($0.title) }) { chat in
-            Button { chooseChat(chat.id) } label: {
-              row(chat.title, symbol: "bubble.left",
-                selected: model.selectedChatIDs.contains(chat.id))
-            }.buttonStyle(.plain).padding(.horizontal, 7)
+            Group {
+              if renameTarget == .chat(chat.id) {
+                editableRow(symbol: "bubble.left", selected: true)
+              } else {
+                Button { chooseChat(chat.id) } label: {
+                  row(chat.title, symbol: "bubble.left",
+                    selected: model.selectedChatIDs.contains(chat.id))
+                }.buttonStyle(.plain).padding(.horizontal, 7)
+              }
+            }
               .contextMenu {
-                Button("Rename…") { model.renameChat(chat.id) }
+                Button("Rename") { beginRename(.chat(chat.id), title: chat.title) }
                 Button("Save as persona…") { model.savePersona(from: chat.id) }.disabled(
                   model.isBusy || !model.modelReady || chat.messages.last?.role != .assistant)
                 Divider()
@@ -296,8 +352,8 @@ struct ChatPane: View {
       Button("Automatic") { model.chooseModel(.automatic) }
       Button("Apple Foundation Model") { model.chooseModel(.apple) }
         .disabled(!AppleModel.isAvailable)
-      Button("Gemma 4 E2B") { model.chooseModel(.gemma) }
-        .disabled(model.runner == nil)
+      Button("Gemma 4") { model.chooseModel(.gemma) }
+        .disabled(model.runner == nil && model.mlxRunner == nil)
       Divider()
       Button("Manage models…") { model.showingModels = true }
     } label: {
@@ -305,7 +361,7 @@ struct ChatPane: View {
         Image(systemName: "cpu")
         if !compact {
           Text(model.inferenceName == "Apple Foundation Model" ? "Apple" :
-            model.inferenceName == "Gemma 4 E2B" ? "Gemma" : "No model")
+            model.inferenceName.hasPrefix("Gemma 4") ? "Gemma" : "No model")
         }
       }.font(.system(size: 11, weight: .medium)).lineLimit(1)
     }.menuStyle(.borderlessButton).fixedSize().disabled(model.isBusy)
@@ -391,8 +447,8 @@ struct ChatPane: View {
           Button("Automatic") { model.chooseModel(.automatic) }
           Button("Apple Foundation Model") { model.chooseModel(.apple) }
             .disabled(!AppleModel.isAvailable)
-          Button("Gemma 4 E2B") { model.chooseModel(.gemma) }
-            .disabled(model.runner == nil)
+          Button("Gemma 4") { model.chooseModel(.gemma) }
+            .disabled(model.runner == nil && model.mlxRunner == nil)
           Divider()
           Button("Manage models…") { model.showingModels = true }
         }
@@ -607,16 +663,11 @@ struct ChatPane: View {
               ForEach(model.pendingAttachments, id: \.self) { id in
                 if let attachment = model.state.attachments.first(where: { $0.id == id }) {
                   HStack(spacing: 5) {
-                    Button {
-                      model.previewReceipt = false
-                      model.previewAttachment = id
-                    } label: {
-                      Label(
-                        attachment.name,
-                        systemImage: attachment.text.isEmpty
-                          ? "exclamationmark.circle" : "paperclip"
-                      ).lineLimit(1)
-                    }.buttonStyle(.plain)
+                    Label(
+                      attachment.name,
+                      systemImage: attachment.text.isEmpty
+                        ? "exclamationmark.circle" : "paperclip"
+                    ).lineLimit(1)
                     Button {
                       model.removePending(id)
                     } label: {
@@ -741,6 +792,43 @@ struct ModelSetupView: View {
         }.font(.caption)
       }
       Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 1)
+      Text("Gemma 4 · MLX / Metal")
+        .font(.system(size: 13, weight: .medium))
+      if let size = model.cachedQATSize {
+        Button("Prepare cached first-party \(size.rawValue) QAT weights") {
+          model.prepareCachedMLX()
+        }.disabled(model.isBusy)
+        Text("Converts Google's cached safetensors to native 4-bit MLX weights in the Hugging Face cache.")
+          .font(.caption).foregroundStyle(.tertiary)
+      } else {
+        Text("No first-party QAT safetensors found in the Hugging Face cache.")
+          .font(.caption).foregroundStyle(.tertiary)
+      }
+      if let size = model.recommendedQATSize,
+        model.cachedQATSize != size {
+        Button("Download recommended \(size.rawValue) QAT weights") {
+          model.downloadRecommendedMLX()
+        }.disabled(model.isBusy)
+        Text("Downloads Google's weights and matching assistant into the Hugging Face cache.")
+          .font(.caption).foregroundStyle(.tertiary)
+      }
+      Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 1)
+      Text("Writing suggestions")
+        .font(.system(size: 13, weight: .medium))
+      if model.baseReady {
+        Label("Ready", systemImage: "checkmark.circle.fill")
+          .font(.caption).foregroundStyle(.secondary)
+      } else if model.recommendedBaseSize != nil {
+        Button(model.baseCached ? "Prepare cached writing model" : "Get writing model") {
+          model.prepareBase()
+        }.disabled(model.isBusy)
+        Text("Uses Google's base model to continue document text directly.")
+          .font(.caption).foregroundStyle(.tertiary)
+      } else {
+        Text("This Mac's current model choice leaves too little memory for a second writing model.")
+          .font(.caption).foregroundStyle(.tertiary)
+      }
+      Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 1)
       Text("Gemma 4 E2B · CoreML")
         .font(.system(size: 13, weight: .medium))
       HStack {
@@ -759,87 +847,5 @@ struct ModelSetupView: View {
         Button("Done") { model.showingModels = false }.keyboardShortcut(.cancelAction)
       }
     }.padding(24).frame(width: 490)
-  }
-}
-
-struct AttachmentPreview: View {
-  @ObservedObject var model: WorkspaceModel
-  let id: UUID
-  @State private var bytes: Data?
-  @State private var receipt = ""
-  @State private var failure: String?
-  private var record: AttachmentRecord? { model.state.attachments.first { $0.id == id } }
-  var body: some View {
-    VStack(alignment: .leading, spacing: 12) {
-      Text(record?.name ?? "Attachment").font(.headline)
-      if let record {
-        Text(record.coverage).font(.caption).foregroundStyle(.secondary)
-        if let transform = record.transform {
-          Text(transform).font(.caption).foregroundStyle(.secondary)
-        }
-        Picker("Preview", selection: $model.previewReceipt) {
-          Text("Content").tag(false)
-          Text("Processing receipt").tag(true)
-        }.pickerStyle(.segmented).frame(width: 270)
-        if model.previewReceipt {
-          ScrollView {
-            Text(receipt).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
-              .frame(maxWidth: .infinity, alignment: .leading)
-          }
-        } else {
-          ScrollView {
-            VStack(alignment: .leading, spacing: 10) {
-              if let bytes, let image = NativeMedia.thumbnail(bytes) {
-                Image(nsImage: NSImage(cgImage: image, size: .zero)).resizable().scaledToFit()
-                  .frame(maxHeight: 280)
-              }
-              Text(
-                record.text.isEmpty
-                  ? "No text has been admitted for this attachment. Its original bytes are preserved; unsupported content has not been silently included in the prompt."
-                  : record.text
-              ).font(.system(size: 12, design: .monospaced)).textSelection(.enabled).frame(
-                maxWidth: .infinity, alignment: .leading)
-            }
-          }
-        }
-        if let failure { Text(failure).font(.caption).foregroundStyle(.secondary) }
-        HStack {
-          if record.text.isEmpty {
-            Button(record.coverage.contains("Long recording")
-              ? "Transcribe full recording" : "Retry local conversion") {
-                model.prepareAttachment(id)
-              }.disabled(model.isBusy)
-          }
-          Button("Export original…") { exportOriginal() }.disabled(bytes == nil)
-          if model.isBusy {
-            ProgressView().controlSize(.small)
-            Text(model.status).font(.caption).foregroundStyle(.secondary)
-            Button("Stop") { model.cancel() }
-          }
-          Spacer()
-          Button("Done") { model.previewAttachment = nil }.keyboardShortcut(.cancelAction)
-        }
-      }
-    }.padding(20).frame(width: 680, height: 600)
-      .task {
-        do {
-          bytes = try model.store.vault.get(.attachment, id: id, limit: 67_108_864)
-          let data = try model.store.vault.get(.receipt, id: id, limit: 8_388_608)
-          let object = try JSONSerialization.jsonObject(with: data)
-          let pretty = try JSONSerialization.data(
-            withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
-          receipt = String(decoding: pretty.prefix(131_072), as: UTF8.self)
-          if pretty.count > 131_072 {
-            receipt += "\n[Display limited to 128 KiB; full receipt remains encrypted on disk.]"
-          }
-        } catch { failure = error.localizedDescription }
-      }
-  }
-  private func exportOriginal() {
-    guard let bytes else { return }
-    let panel = NSSavePanel()
-    panel.nameFieldStringValue = record?.name ?? "attachment"
-    guard panel.runModal() == .OK, let url = panel.url else { return }
-    do { try bytes.write(to: url, options: .atomic) } catch { failure = error.localizedDescription }
   }
 }
