@@ -18,6 +18,8 @@ A process-owned vault session reads one Keychain master-key item. The session re
 
 Readable Markdown and portable voice JSON are explicit exports. Complete backup uses a separate passphrase-derived key and includes every private record, while excluding model weights and disposable caches. Restore requires a fresh workspace. App-owned media decoding and playback use memory rather than plaintext temporary files. Native speech input and output remain available; speech asset installation is an explicit setup operation.
 
+Backup restore publishes the encrypted replacement with one native directory exchange; the canonical vault always retains a directory. Unsupported exchanges fail without falling back to separate moves. Failed workspace validation restores the previous encrypted bytes and document revision guards. If rollback cannot finish, both encrypted directories are retained.
+
 ## Models
 
 Bloom checks the Hugging Face cache, including `HF_HUB_CACHE`, `HF_HOME`, `XDG_CACHE_HOME` and the usual home cache. Verified local 4-bit conversions are preferred. It also recognizes the pinned official `google/gemma-4-12B-it-qat-q4_0-unquantized` and `google/gemma-4-12B` snapshots and can download those public checkpoints anonymously when explicitly requested. Every admitted file is checked against the signed catalog. Startup and inference use local files.

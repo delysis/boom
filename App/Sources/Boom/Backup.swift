@@ -1,7 +1,35 @@
 import BoomCore
 import CryptoKit
+import Darwin
 import Foundation
 import Security
+
+/// Native filesystem operation only. Rust owns restore admission. Both vault
+/// directories keep a name throughout publication and rollback; no move fallback.
+enum AtomicDirectoryReplacement {
+  static func exchange(_ first: URL, _ second: URL) throws {
+    let parent = first.deletingLastPathComponent()
+    guard first != second, parent == second.deletingLastPathComponent() else {
+      throw BoomError.invalid("Private replacement requires distinct sibling directories.")
+    }
+    let fd = open(parent.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+    guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+    defer { close(fd) }
+    for name in [first.lastPathComponent, second.lastPathComponent] {
+      var info = stat()
+      guard fstatat(fd, name, &info, AT_SYMLINK_NOFOLLOW) == 0 else {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+      }
+      guard info.st_mode & S_IFMT == S_IFDIR else {
+        throw BoomError.invalid("Private replacement requires real directories.")
+      }
+    }
+    guard renameatx_np(fd, first.lastPathComponent, fd, second.lastPathComponent,
+      UInt32(RENAME_SWAP | RENAME_NOFOLLOW_ANY | RENAME_RESOLVE_BENEATH)) == 0 else {
+      throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+  }
+}
 
 struct BackupRecord: Codable, Sendable {
   let kind: String
@@ -84,42 +112,6 @@ enum WorkspaceBackup {
     for voice in state.voices + state.voiceVersions {
       guard try ProductCore.voice(voice.draft).revision == voice.revision else { throw BoomError.invalid("Invalid voice revision in backup.") }
     }
-    try FileManager.default.removeItem(at: vault.root)
-    try FileManager.default.moveItem(at: stageURL, to: vault.root)
-  }
-}
-
-extension WorkspaceStore {
-  func exportBackup(passphrase: String, to url: URL) throws {
-    try WorkspaceBackup.export(vault: vault, passphrase: passphrase, to: url)
-  }
-  func restoreBackup(passphrase: String, from url: URL) throws -> (WorkspaceState, [DocumentSnapshot]) {
-    // Inspect without load(): recovery may write journals or finish interrupted
-    // responses, which is inappropriate before rejecting an occupied target.
-    let hasIndex = vault.exists(.workspace, Vault.workspaceID)
-    let current = try hasIndex ? vault.decode(WorkspaceState.self, kind: .workspace,
-      id: Vault.workspaceID, limit: Vault.workspaceLimit) : WorkspaceState()
-    let documents = try current.documents.map {
-      DocumentSnapshot(id: $0.id, title: $0.title, text: try readDocument($0.id))
-    }
-    let entries = try FileManager.default.contentsOfDirectory(atPath: vault.root.path)
-    try ProductCore.admitRestore(current, documents: documents, entries: entries, hasIndex: hasIndex)
-    let stageURL = root.appendingPathComponent(".backup-admission-" + UUID().uuidString)
-    let stage = try vault.sibling(at: stageURL)
-    defer { try? FileManager.default.removeItem(at: stageURL) }
-    try WorkspaceBackup.restore(from: url, passphrase: passphrase, into: stage)
-    let retained = root.appendingPathComponent(".empty-workspace-" + UUID().uuidString)
-    try FileManager.default.moveItem(at: vault.root, to: retained)
-    do { try FileManager.default.moveItem(at: stageURL, to: vault.root) }
-    catch { try FileManager.default.moveItem(at: retained, to: vault.root); throw error }
-    do {
-      let restored = try load().get()
-      try FileManager.default.removeItem(at: retained)
-      return restored
-    } catch {
-      try FileManager.default.moveItem(at: vault.root, to: stageURL)
-      try FileManager.default.moveItem(at: retained, to: vault.root)
-      throw error
-    }
+    try AtomicDirectoryReplacement.exchange(stageURL, vault.root)
   }
 }

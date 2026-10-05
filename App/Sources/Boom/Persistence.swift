@@ -473,3 +473,44 @@ actor WorkspaceStore {
     try vault.remove(.saveJournal, id: Vault.workspaceID)
   }
 }
+
+extension WorkspaceStore {
+  func exportBackup(passphrase: String, to url: URL) throws {
+    try WorkspaceBackup.export(vault: vault, passphrase: passphrase, to: url)
+  }
+  func restoreBackup(passphrase: String, from url: URL) throws -> (WorkspaceState, [DocumentSnapshot]) {
+    // Inspect without load(): recovery may write journals or finish interrupted
+    // responses, which is inappropriate before rejecting an occupied target.
+    let hasIndex = vault.exists(.workspace, Vault.workspaceID)
+    let current = try hasIndex ? vault.decode(WorkspaceState.self, kind: .workspace,
+      id: Vault.workspaceID, limit: Vault.workspaceLimit) : WorkspaceState()
+    let documents = try current.documents.map {
+      DocumentSnapshot(id: $0.id, title: $0.title, text: try readDocument($0.id))
+    }
+    let entries = try FileManager.default.contentsOfDirectory(atPath: vault.root.path)
+    try ProductCore.admitRestore(current, documents: documents, entries: entries, hasIndex: hasIndex)
+    let stageURL = root.appendingPathComponent(".backup-admission-" + UUID().uuidString)
+    let stage = try vault.sibling(at: stageURL)
+    var discardStage = true
+    defer { if discardStage { try? FileManager.default.removeItem(at: stageURL) } }
+    try WorkspaceBackup.restore(from: url, passphrase: passphrase, into: stage)
+    try AtomicDirectoryReplacement.exchange(stageURL, vault.root)
+    // The stage now holds the previous workspace. Retain it if rollback fails.
+    discardStage = false
+    let beforeRevisions = diskRevisions
+    diskRevisions.removeAll()
+    do {
+      let restored = try load().get()
+      discardStage = true
+      return restored
+    } catch {
+      do { try AtomicDirectoryReplacement.exchange(stageURL, vault.root) }
+      catch {
+        throw BoomError.unavailable("Restore rollback failed. Both encrypted directories were retained: \(error.localizedDescription)")
+      }
+      diskRevisions = beforeRevisions
+      discardStage = true
+      throw error
+    }
+  }
+}
