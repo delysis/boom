@@ -9,6 +9,7 @@ use uuid::Uuid;
 const TEXT_LIMIT: usize = 2 * 1024 * 1024;
 
 mod document;
+mod generation;
 mod import;
 mod layout;
 mod markdown;
@@ -642,6 +643,11 @@ fn sampling(profile: &str) -> Result<Sampling, Error> {
     deny_unknown_fields
 )]
 pub enum Request {
+    GenerationCheckpoint {
+        expected: generation::Identity,
+        previous: Option<Box<generation::Checkpoint>>,
+        next: Box<generation::Checkpoint>,
+    },
     DecodeEditResponse {
         text: String,
     },
@@ -729,6 +735,11 @@ pub enum Request {
 
 pub fn execute(request: Request) -> Result<Value, Error> {
     match request {
+        Request::GenerationCheckpoint {
+            expected,
+            previous,
+            next,
+        } => serde_json::to_value(generation::validate(&expected, previous.as_deref(), *next)?),
         Request::DecodeEditResponse { text } => serde_json::to_value(document::decode(&text)?),
         Request::ValidateDocumentPatch {
             patch,

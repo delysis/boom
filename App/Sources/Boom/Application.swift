@@ -15,6 +15,21 @@ import SwiftUI
 
 @main @MainActor enum BoomMain {
   static func main() {
+    if CommandLine.arguments.contains("--generation-recovery-smoke") {
+      let app = NSApplication.shared
+      app.setActivationPolicy(.prohibited)
+      Task {
+        do {
+          try await GenerationRecoverySmoke.run(arguments: CommandLine.arguments)
+          exit(0)
+        } catch {
+          fputs("Generation recovery diagnostic failed: \(error.localizedDescription)\n", stderr)
+          exit(1)
+        }
+      }
+      app.run()
+      return
+    }
     #if BOOM_UI_TEST
     if CommandLine.arguments.contains("--attachment-route-smoke") {
       Task {

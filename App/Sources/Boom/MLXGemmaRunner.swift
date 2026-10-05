@@ -184,18 +184,25 @@ actor MLXGemmaRunner {
       model: identity, profile: profile, settings: try ProductCore.sampling(profile), maxTokens: maxTokens)
   }
   func run(plan: ConsultationPlan, images: [Data], maxTokens: Int, seed: UInt64? = nil,
-    flag: CancellationFlag, onText: @escaping @Sendable (String) -> Void) async throws -> Output {
+    flag: CancellationFlag,
+    onCheckpoint: (@Sendable (GenerationProgress, String?) async throws -> Void)? = nil,
+    onText: @escaping @Sendable (String) -> Void) async throws -> Output {
     try await generate(plan: plan, raw: nil, images: images, maxTokens: maxTokens,
-      settings: ProductCore.sampling(.standard), seed: seed, flag: flag, onText: onText)
+      settings: ProductCore.sampling(.standard), seed: seed, flag: flag, onCheckpoint: onCheckpoint, onText: onText)
   }
   func run(rawPrompt: String, maxTokens: Int, settings: SamplingSettings? = nil, seed: UInt64? = nil,
-    flag: CancellationFlag, background: Bool = false, onText: @escaping @Sendable (String) -> Void) async throws -> Output {
+    flag: CancellationFlag, background: Bool = false,
+    onCheckpoint: (@Sendable (GenerationProgress, String?) async throws -> Void)? = nil,
+    onText: @escaping @Sendable (String) -> Void) async throws -> Output {
     try await generate(plan: nil, raw: rawPrompt, images: [], maxTokens: maxTokens,
-      settings: settings ?? ProductCore.sampling(.standard), seed: seed, flag: flag, background: background, onText: onText)
+      settings: settings ?? ProductCore.sampling(.standard), seed: seed, flag: flag, background: background,
+      onCheckpoint: onCheckpoint, onText: onText)
   }
   private func generate(plan: ConsultationPlan?, raw: String?, images: [Data], maxTokens: Int,
     settings: SamplingSettings, seed: UInt64?, flag: CancellationFlag,
-    background: Bool = false, onText: @escaping @Sendable (String) -> Void) async throws -> Output {
+    background: Bool = false,
+    onCheckpoint: (@Sendable (GenerationProgress, String?) async throws -> Void)? = nil,
+    onText: @escaping @Sendable (String) -> Void) async throws -> Output {
     await GenerationCoordinator.shared.enter(flag: flag, background: background)
     do {
       try flag.check()
@@ -209,41 +216,67 @@ actor MLXGemmaRunner {
         guard promptIDs.count + maxTokens <= capacity else { throw BoomError.budget("The request exceeds available context.") }
         let parameters = GenerateParameters(maxTokens: maxTokens, temperature: settings.temperature,
           topP: settings.topP, topK: settings.topK, minP: settings.minP, repetitionPenalty: nil, seed: seed)
+        let preparedDigest = Digest.sha256(try JSONEncoder().encode(promptIDs))
         let (stream, task) = try generateTokensTask(input: input, parameters: parameters, context: context)
         await GenerationCoordinator.shared.own(task)
         var tokens: [Int] = [], text = "", ended = false, reason = "output_limit"
-        let started = Date(); var first: Double?; var stopToken: Int?
-        for await event in stream {
-          if flag.isCancelled || Task.isCancelled { task.cancel(); break }
-          switch event {
-          case .token(let token):
-            if controls.contains(token) { stopToken = token; reason = "model_control"; ended = true; task.cancel(); break }
-            if first == nil { first = Date().timeIntervalSince(started) }
-            tokens.append(token)
-            let decoded = context.tokenizer.decode(tokenIds: tokens)
-            if !decoded.hasSuffix("\u{FFFD}"), decoded != text { text = decoded; onText(text) }
-          case .info(let info):
-            switch info.stopReason {
-            case .stop: ended = true; reason = "eos"
-            case .length: reason = "output_limit"
-            case .cancelled: reason = "cancelled"
+        let clock = ContinuousClock(), started = clock.now
+        var first: Double?; var stopToken: Int?
+        do {
+          for await event in stream {
+            if flag.isCancelled || Task.isCancelled { task.cancel(); break }
+            switch event {
+            case .token(let token):
+              if controls.contains(token) { stopToken = token; reason = "model_control"; ended = true; task.cancel(); break }
+              if first == nil { first = started.duration(to: clock.now).timeInterval }
+              tokens.append(token)
+              let decoded = context.tokenizer.decode(tokenIds: tokens)
+              if !decoded.hasSuffix("\u{FFFD}"), decoded != text {
+                // Every displayed update is durable before it reaches a view.
+                // Awaiting the store also bounds the checkpoint producer.
+                try await onCheckpoint?(GenerationProgress(text: decoded,
+                  tokenIDs: tokens, promptDigest: preparedDigest, promptTokens: promptIDs.count,
+                  firstTokenSeconds: first, elapsedSeconds: started.duration(to: clock.now).timeInterval), nil)
+                text = decoded; onText(text)
+              }
+            case .info(let info):
+              switch info.stopReason {
+              case .stop: ended = true; reason = "eos"
+              case .length: reason = "output_limit"
+              case .cancelled: reason = "cancelled"
+              }
             }
+            if ended { break }
           }
-          if ended { break }
+        } catch {
+          task.cancel()
+          await task.value
+          throw error
         }
         await task.value
         // Joining must retain the producer's emitted tokens even on cancellation.
         // Callers persist this receipt before propagating their cancelled operation.
         if flag.isCancelled || Task.isCancelled { reason = "cancelled" }
         let final = context.tokenizer.decode(tokenIds: tokens)
+        let elapsed = started.duration(to: clock.now).timeInterval
+        try await onCheckpoint?(GenerationProgress(text: final, tokenIDs: tokens,
+          promptDigest: preparedDigest, promptTokens: promptIDs.count, firstTokenSeconds: first,
+          elapsedSeconds: elapsed), reason)
         if final != text, reason != "cancelled" { onText(final) }
-        return Output(text: final, tokenIDs: tokens, promptDigest: Digest.sha256(try JSONEncoder().encode(promptIDs)),
+        return Output(text: final, tokenIDs: tokens, promptDigest: preparedDigest,
           promptTokens: promptIDs.count, outputTokens: tokens.count, endedByEOS: ended, stopReason: reason, stopTokenID: stopToken,
-          firstTokenSeconds: first, elapsedSeconds: Date().timeIntervalSince(started))
+          firstTokenSeconds: first, elapsedSeconds: elapsed)
       }
       await GenerationCoordinator.shared.leave()
       return result
     } catch { await GenerationCoordinator.shared.leave(); throw error }
   }
   func join() async { await GenerationCoordinator.shared.enter(); await GenerationCoordinator.shared.leave() }
+}
+
+private extension Duration {
+  var timeInterval: Double {
+    let value = components
+    return Double(value.seconds) + Double(value.attoseconds) / 1e18
+  }
 }

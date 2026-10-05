@@ -61,7 +61,7 @@ struct WorkspaceState: Codable, Sendable {
 
 /// One current format. Decryption/schema failure NEVER becomes an empty workspace.
 final class Vault: @unchecked Sendable {
-  enum Kind: String, Sendable { case workspace, document, attachment, receipt, candidate, editJournal, saveJournal }
+  enum Kind: String, Sendable { case workspace, document, attachment, receipt, candidate, editJournal, saveJournal, generationJournal }
   static let workspaceLimit = 134_217_728
   static let workspaceID = UUID(uuidString: "726B3A82-2EB1-493B-9D8E-F17C7A6E4B8A")!
   let root: URL
@@ -261,14 +261,6 @@ actor WorkspaceStore {
           throw BoomError.invalid("Voice revision changed; encrypted record retained.")
         }
       }
-      for chat in state.chats.indices {
-        for message in state.chats[chat].messages.indices where state.chats[chat].messages[message].state == .pending {
-          state.chats[chat].messages[message].state = .cancelled
-          if state.chats[chat].messages[message].text.isEmpty {
-            state.chats[chat].messages[message].failure = "Interrupted before an answer completed."
-          }
-        }
-      }
       var documents: [DocumentSnapshot] = []
       for item in state.documents {
         guard FileManager.default.fileExists(atPath: documentURL(item.id).path) else {
@@ -324,6 +316,7 @@ actor WorkspaceStore {
   nonisolated func documentURL(_ id: UUID) -> URL { vault.recordURL(.document, id) }
   private func recoverGenerations(_ state: inout WorkspaceState) throws {
     var bundles: [CandidateBundle] = [], receipts: [(UUID, ConsultationReceipt)] = []
+    var changed = false
     guard Set(state.candidateIDs).count == state.candidateIDs.count else {
       throw BoomError.invalid("Duplicate continuation identities; records retained.")
     }
@@ -335,17 +328,37 @@ actor WorkspaceStore {
         bundle.candidates.isEmpty ? bundle.selected == 0 : bundle.candidates.indices.contains(bundle.selected)
       else { throw BoomError.invalid("Inconsistent continuation record; existing bytes retained.") }
       var interrupted = false
-      for index in bundle.candidates.indices where bundle.candidates[index].state == .pending {
+      for index in bundle.candidates.indices {
+        let journal = try writingCheckpoint(bundle: bundle, candidate: bundle.candidates[index])
+        guard bundle.candidates[index].state == .pending else { continue }
+        if let journal { bundle.candidates[index].retain(journal.progress) }
         bundle.candidates[index].state = .cancelled
         bundle.candidates[index].stopReason = "interrupted"
         interrupted = true
       }
       if interrupted { bundles.append(bundle) }
     }
-    for chat in state.chats {
-      for message in chat.messages where message.role == .assistant && vault.exists(.receipt, message.id) {
+    for c in state.chats.indices {
+      for m in state.chats[c].messages.indices where state.chats[c].messages[m].role == .assistant {
+        let message = state.chats[c].messages[m]
+        if message.state == .pending {
+          state.chats[c].messages[m].state = .cancelled
+          state.chats[c].messages[m].failure = "The app closed before this answer was stored as complete."
+          changed = true
+        }
+        guard vault.exists(.receipt, message.id) else {
+          guard !vault.exists(.generationJournal, message.id) else {
+            throw BoomError.invalid("A captured response receipt is missing; checkpoint retained.")
+          }
+          continue
+        }
         var receipt = try vault.decode(ConsultationReceipt.self, kind: .receipt, id: message.id)
+        let journal = try consultationCheckpoint(id: message.id, receipt: receipt)
+        if message.state == .pending, let journal, journal.identity.kind == .consultation {
+          state.chats[c].messages[m].text = journal.progress.text
+        }
         if receipt.state == .pending {
+          if let journal { receipt.retain(journal.progress) }
           receipt.state = .cancelled; receipt.failure = "The app closed before this attempt completed."
           receipt.stopReason = "interrupted"
           receipts.append((message.id, receipt))
@@ -354,6 +367,7 @@ actor WorkspaceStore {
     }
     for bundle in bundles { try vault.encode(bundle, kind: .candidate, id: bundle.id) }
     for (id, receipt) in receipts { try vault.encode(receipt, kind: .receipt, id: id) }
+    if changed || !bundles.isEmpty || !receipts.isEmpty { try persist(state) }
   }
   func latestCandidate(for documentID: UUID, ids: [UUID]) throws -> CandidateBundle? {
     for id in ids.reversed() {

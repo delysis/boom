@@ -815,8 +815,14 @@ struct CompletionSegment {
               firstTokenSeconds: nil, elapsedSeconds: 0)
             let pendingReceipt = receipt, replyID = replyIDs[offset]
             try await detachedWork { try vault.encode(pendingReceipt, kind: .receipt, id: replyID) }
+            let checkpointStore = self.store
+            let generation = GenerationIdentity(kind: interaction == .ask ? .consultation : .documentResponse,
+              operationID: flag.operationID, recordID: replyID, attemptID: replyID,
+              model: provider, seed: seed, requestDigest: Digest.sha256(plan.rawPrompt), maxTokens: outputLimit)
             let result = try await runner.run(plan: plan, images: images, maxTokens: outputLimit,
-              seed: seed, flag: flag) { [weak self] text in
+              seed: seed, flag: flag, onCheckpoint: { progress, stop in
+                try await checkpointStore.checkpoint(progress, identity: generation, stopReason: stop)
+              }) { [weak self] text in
                 Task { @MainActor in
                   guard let self, self.activeFlag === flag, !flag.isCancelled else { return }
                   if interaction == .ask {
@@ -866,15 +872,28 @@ struct CompletionSegment {
             }
           }
           let vault = self.store.vault, failedIDs = replyIDs, reason = error.localizedDescription
+          let checkpointStore = self.store
           let ending: MessageState = flag.isCancelled ? .cancelled : .failed
           do {
-            try await detachedWork {
+            let restored: [(UUID, GenerationCheckpoint)] = try await detachedWork {
+              var restored: [(UUID, GenerationCheckpoint)] = []
               for id in failedIDs where vault.exists(.receipt, id) {
                 var receipt = try vault.decode(ConsultationReceipt.self, kind: .receipt, id: id)
                 if receipt.state == .pending {
+                  if let journal = try await checkpointStore.consultationCheckpoint(id: id, receipt: receipt) {
+                    receipt.retain(journal.progress); restored.append((id, journal))
+                  }
                   receipt.state = ending; receipt.failure = reason; receipt.stopReason = ending.rawValue
                   try vault.encode(receipt, kind: .receipt, id: id)
                 }
+              }
+              return restored
+            }
+            for (id, journal) in restored where journal.identity.kind == .consultation {
+              if let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
+                let m = self.state.chats[c].messages.firstIndex(where: { $0.id == id }),
+                self.state.chats[c].messages[m].state == ending {
+                self.state.chats[c].messages[m].text = journal.progress.text
               }
             }
           } catch { self.report(error) }
@@ -1264,8 +1283,15 @@ struct CompletionSegment {
         if !state.candidateIDs.contains(bundle.id) { state.candidateIDs.append(bundle.id) }
         try await flush()
         let bundleID = bundle.id
+        let checkpointStore = store
+        let generation = GenerationIdentity(kind: .writing, operationID: flag.operationID,
+          recordID: bundleID, attemptID: bundle.candidates[index].id, model: recipe.model,
+          seed: seed, requestDigest: recipe.promptDigest, maxTokens: recipe.maxTokens)
         let result = try await runner.run(rawPrompt: recipe.prompt, maxTokens: recipe.maxTokens,
-          settings: recipe.settings, seed: seed, flag: flag, background: maxTokens == 64 && !showingCandidates) { [weak self] text in
+          settings: recipe.settings, seed: seed, flag: flag, background: maxTokens == 64 && !showingCandidates,
+          onCheckpoint: { progress, stop in
+            try await checkpointStore.checkpoint(progress, identity: generation, stopReason: stop)
+          }) { [weak self] text in
             Task { @MainActor in
               guard let self, self.writingFlag === flag, !flag.isCancelled,
                 self.candidates?.id == bundleID,
@@ -1296,7 +1322,11 @@ struct CompletionSegment {
     } catch {
       if let current = candidates, current.id == bundle.id { bundle = current }
       for index in bundle.candidates.indices where bundle.candidates[index].state == .pending {
+        if let journal = try await store.writingCheckpoint(bundle: bundle, candidate: bundle.candidates[index]) {
+          bundle.candidates[index].retain(journal.progress)
+        }
         bundle.candidates[index].state = flag.isCancelled ? .cancelled : .failed
+        bundle.candidates[index].stopReason = flag.isCancelled ? "cancelled" : "failed"
       }
       candidates = bundle
       let vault = store.vault, saved = bundle
