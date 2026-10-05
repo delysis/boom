@@ -230,6 +230,7 @@ struct ModelGenerationPolicy: Codable, Equatable, Sendable {
   let eosTokenIDs: [Int]
   let suppressedTokenIDs: [Int]
   let controlTokenIDs: [Int]
+  let textDecoding: String?
 }
 struct CompletionRecipe: Codable, Sendable {
   let document: DocumentSnapshot

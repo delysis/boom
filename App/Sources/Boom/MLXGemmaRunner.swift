@@ -82,9 +82,12 @@ actor MLXGemmaRunner {
       let tokenizer = try JSONDecoder().decode(TokenizerFile.self, from: tokenizerDescription)
       let generationURL = directory.appendingPathComponent("generation_config.json")
       let generationDescription = try Data(contentsOf: generationURL)
+      let tokenizerConfigurationURL = directory.appendingPathComponent("tokenizer_config.json")
+      let tokenizerConfiguration = try Data(contentsOf: tokenizerConfigurationURL)
       let model = try await VLMModelFactory.shared.loadContainer(
-        from: directory, using: #huggingFaceTokenizerLoader())
+        from: directory, using: CheckpointTokenizerLoader())
       guard tokenizerDescription == (try Data(contentsOf: directory.appendingPathComponent("tokenizer.json"))),
+        tokenizerConfiguration == (try Data(contentsOf: tokenizerConfigurationURL)),
         generationDescription == (try Data(contentsOf: generationURL)) else {
         throw BoomError.stale("The tokenizer or generation configuration changed while the model was loading.")
       }

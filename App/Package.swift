@@ -50,6 +50,7 @@ let package = Package(
         .product(name: "MLX", package: "mlx-swift"),
         .product(name: "HuggingFace", package: "swift-huggingface"),
         .product(name: "Tokenizers", package: "swift-transformers"),
+        .product(name: "Hub", package: "swift-transformers"),
       ],
       resources: [.process("Resources")],
       linkerSettings: [

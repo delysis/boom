@@ -53,10 +53,30 @@ enum WritingEvaluation {
     }
     try persist()
     do {
-      _ = try ModelPacks.verify(directory, purpose: .writing)
-      try Data(contentsOf: directory.appendingPathComponent(ModelPacks.manifestName))
-        .write(to: evidence.appendingPathComponent("model-manifest.json"), options: .atomic)
-      let runner = try await MLXGemmaRunner.load(directory: directory)
+      // Use the same pinned, hash-checked cache admission as the product. A
+      // reference run loads official weights directly; it never converts them.
+      let admission = try ModelPacks.admission(directory, purpose: .writing)
+      try ModelResidency.admit(weightBytes: admission.weightBytes)
+      let manifest: Data
+      if admission.converted {
+        manifest = try Data(contentsOf: directory.appendingPathComponent(ModelPacks.manifestName))
+      } else {
+        let source = try ModelPacks.entry(.writing).manifest
+        // The catalog also describes the converted pack. Export only the
+        // admitted official files here, never its 4-bit output metadata.
+        manifest = try JSONSerialization.data(withJSONObject: ["schema": 1,
+          "purpose": "writing", "identity": admission.identity,
+          "upstreamRepository": source.upstreamRepository, "upstreamRevision": source.upstreamRevision,
+          "runtimeRevision": source.runtimeRevision, "weightKind": "official_checkpoint",
+          "quantization": NSNull(), "files": ProductCore.object(source.upstreamFiles)],
+          options: [.prettyPrinted, .sortedKeys])
+      }
+      try manifest.write(to: evidence.appendingPathComponent("model-manifest.json"), options: .atomic)
+      receipt["weight_kind"] = admission.converted ? "converted_pack" : "official_checkpoint"
+      receipt["weight_bytes"] = admission.weightBytes
+      receipt["admitted_identity"] = admission.identity
+      try persist()
+      let runner = try await MLXGemmaRunner.load(directory: directory, identity: admission.identity)
       receipt["model"] = runner.identity
       var attempts: [String] = [], failures = 0, empty = 0, replayMatches: [Bool] = []
       for (index, fixture) in suite.fixtures.enumerated() {

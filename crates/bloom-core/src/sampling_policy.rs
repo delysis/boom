@@ -2,6 +2,12 @@
 use crate::{Error, require};
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum TextDecoding {
+    #[serde(rename = "checkpoint_raw_v1")]
+    CheckpointRawV1,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Policy {
@@ -13,6 +19,10 @@ pub struct Policy {
     pub suppressed_token_ids: Vec<u32>,
     #[serde(rename = "controlTokenIDs")]
     pub control_token_ids: Vec<u32>,
+    // Earlier records remain readable, but replay cannot silently adopt the
+    // decoder that preserves punctuation and spacing exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_decoding: Option<TextDecoding>,
 }
 
 impl Policy {
@@ -89,6 +99,7 @@ pub fn compile(
         eos_token_ids,
         suppressed_token_ids,
         control_token_ids,
+        text_decoding: Some(TextDecoding::CheckpointRawV1),
     };
     policy.validate()?;
     Ok(policy)
@@ -101,7 +112,7 @@ pub fn admit(captured: Option<&Policy>, loaded: &Policy) -> Result<bool, Error> 
     captured.validate()?;
     require(
         captured == loaded,
-        "Replay requires the original model generation policy; captured outputs were retained.",
+        "Replay requires the original token and decoding policy. Captured outputs were retained; Explore again to create new alternatives.",
     )?;
     Ok(true)
 }
@@ -143,6 +154,21 @@ mod tests {
         let mut changed = policy.clone();
         changed.suppressed_token_ids.clear();
         assert!(admit(Some(&changed), &policy).is_err());
+        let mut legacy = policy.clone();
+        legacy.text_decoding = None;
+        legacy.validate()?;
+        assert!(admit(Some(&legacy), &policy).is_err());
+        let mut encoded = serde_json::to_value(&policy).expect("policy is serializable");
+        encoded
+            .as_object_mut()
+            .expect("policy is an object")
+            .remove("textDecoding");
+        assert_eq!(
+            serde_json::from_value::<Policy>(encoded.clone()).expect("legacy policy"),
+            legacy
+        );
+        encoded["textDecoding"] = json!("unknown_decoder");
+        assert!(serde_json::from_value::<Policy>(encoded).is_err());
         changed.schema = 2;
         assert!(admit(Some(&changed), &changed).is_err());
         Ok(())
