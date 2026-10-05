@@ -34,11 +34,28 @@ public final class CancellationFlag: @unchecked Sendable {
   public let operationID = UUID()
   private let lock = NSLock()
   private var value = false
+  private var handlers: [UUID: @Sendable () -> Void] = [:]
   public init() {}
   public func cancel() {
     lock.lock()
     value = true
+    let callbacks = Array(handlers.values)
+    handlers.removeAll()
     lock.unlock()
+    for callback in callbacks { callback() }
+  }
+  /// Registration races safely with cancellation. Callbacks run outside the
+  /// lock and may already be executing when their registration is removed.
+  public func onCancel(_ handler: @escaping @Sendable () -> Void) -> UUID? {
+    lock.lock()
+    if value { lock.unlock(); handler(); return nil }
+    let id = UUID(); handlers[id] = handler
+    lock.unlock()
+    return id
+  }
+  public func removeCancellationHandler(_ id: UUID?) {
+    guard let id else { return }
+    lock.lock(); handlers.removeValue(forKey: id); lock.unlock()
   }
   public var isCancelled: Bool {
     lock.lock()

@@ -8,7 +8,7 @@ enum MLXNativeSmoke {
     func argument(_ name: String) throws -> String {
       guard arguments.filter({ $0 == name }).count == 1,
         let index = arguments.firstIndex(of: name), index + 1 < arguments.count
-      else { throw BoomError.invalid("Use --mlx-smoke --pack ABSOLUTE_DIRECTORY --evidence NEW_DIRECTORY [--base] [--seed INTEGER] [--writing-fixtures ABSOLUTE_JSON].") }
+      else { throw BoomError.invalid("Use --mlx-smoke --pack ABSOLUTE_DIRECTORY --evidence NEW_DIRECTORY [--base] [--seed INTEGER] [--writing-fixtures ABSOLUTE_JSON] [--preempt].") }
       return arguments[index + 1]
     }
     let directory = URL(fileURLWithPath: try argument("--pack"))
@@ -23,6 +23,10 @@ enum MLXNativeSmoke {
     else { throw BoomError.invalid("Use absolute paths and a fresh evidence directory.") }
     try FileManager.default.createDirectory(at: evidence, withIntermediateDirectories: false,
       attributes: [.posixPermissions: 0o700])
+    if arguments.contains("--preempt") {
+      try await GenerationPreemptionSmoke.run(writingPack: directory, evidence: evidence)
+      return
+    }
     if arguments.contains("--writing-fixtures") {
       let path = try argument("--writing-fixtures")
       guard path.hasPrefix("/") else { throw BoomError.invalid("Use an absolute evaluation fixture path.") }

@@ -56,4 +56,34 @@ final class GenerationCoordinatorTests: XCTestCase {
     let completed = await trace.entries
     XCTAssertEqual(completed, ["producer joined", "foreground preparation", "queued autocomplete"])
   }
+  func testPreemptionBeforeRegistrationCancelsAndJoinsThrowingOwner() async throws {
+    let coordinator = GenerationCoordinator(), gate = Gate(), trace = Trace()
+    let flag = CancellationFlag()
+    await coordinator.enter(flag: flag, background: true)
+    let foreground = Task {
+      await coordinator.enter(flag: CancellationFlag())
+      await trace.append("foreground preparation")
+      await coordinator.leave()
+    }
+    try await waitForQueue(1, coordinator: coordinator)
+    let owner = Task<Int, Error> {
+      await gate.wait()
+      await trace.append("prefill joined")
+      try Task.checkCancellation()
+      return 1
+    }
+    await coordinator.own(owner)
+    XCTAssertTrue(flag.isCancelled)
+    XCTAssertTrue(owner.isCancelled)
+    let leaving = Task { await coordinator.leave() }
+    await Task.yield()
+    let beforeRelease = await trace.entries
+    XCTAssertTrue(beforeRelease.isEmpty)
+    await gate.release()
+    await leaving.value; await foreground.value
+    do { _ = try await owner.value; XCTFail("Preempted owner completed normally") }
+    catch is CancellationError {}
+    let entries = await trace.entries
+    XCTAssertEqual(entries, ["prefill joined", "foreground preparation"])
+  }
 }

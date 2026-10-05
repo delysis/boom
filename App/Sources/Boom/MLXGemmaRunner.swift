@@ -13,17 +13,24 @@ actor GenerationCoordinator {
   private var activeFlag: CancellationFlag?
   private var background = false
   private var producer: Task<Void, Never>?
+  private var cancelProducer: (@Sendable () -> Void)?
   private var waiting: [(CancellationFlag?, Bool, CheckedContinuation<Void, Never>)] = []
   var queuedOperations: Int { waiting.count }
   func enter(flag: CancellationFlag? = nil, background: Bool = false) async {
     if !occupied { occupied = true; activeFlag = flag; self.background = background; return }
-    if !background, self.background { activeFlag?.cancel(); producer?.cancel() }
+    if !background, self.background { activeFlag?.cancel(); cancelProducer?() }
     await withCheckedContinuation { waiting.append((flag, background, $0)) }
   }
-  func own(_ task: Task<Void, Never>) { producer = task }
+  func own<R: Sendable, E: Error>(_ task: Task<R, E>) {
+    cancelProducer = { task.cancel() }
+    producer = Task { _ = try? await task.value }
+    // A foreground request can arrive between lease acquisition and task
+    // registration. The new owner must observe that earlier cancellation.
+    if activeFlag?.isCancelled == true { task.cancel() }
+  }
   func leave() async {
     if let producer { await producer.value }
-    producer = nil; activeFlag = nil
+    producer = nil; cancelProducer = nil; activeFlag = nil
     if waiting.isEmpty { occupied = false; background = false }
     else {
       let index = waiting.firstIndex { !$0.1 } ?? 0
@@ -34,6 +41,11 @@ actor GenerationCoordinator {
 
 /// Mutable model state is confined to this actor and ModelContainer.
 actor MLXGemmaRunner {
+  struct PrefillProgress: Sendable {
+    let operationID: UUID
+    let processedPositions: Int
+    let totalPositions: Int
+  }
   struct Output: Sendable {
     let text: String
     let tokenIDs: [Int]
@@ -241,95 +253,121 @@ actor MLXGemmaRunner {
   }
   func run(rawPrompt: String, maxTokens: Int, settings: SamplingSettings? = nil, seed: UInt64? = nil,
     flag: CancellationFlag, background: Bool = false,
+    onPrefill: (@Sendable (PrefillProgress) -> Void)? = nil,
     onCheckpoint: (@Sendable (GenerationProgress, String?, Int?) async throws -> Void)? = nil,
     onText: @escaping @Sendable (String) -> Void) async throws -> Output {
     try await generate(plan: nil, raw: rawPrompt, images: [], maxTokens: maxTokens,
-      settings: settings ?? ProductCore.sampling(.standard), seed: seed, flag: flag, background: background,
+      settings: settings ?? ProductCore.sampling(.standard), seed: seed, flag: flag, background: background, onPrefill: onPrefill,
       onCheckpoint: onCheckpoint, onText: onText)
   }
   private func generate(plan: ConsultationPlan?, raw: String?, images: [Data], maxTokens: Int,
     settings: SamplingSettings, seed: UInt64?, flag: CancellationFlag,
     background: Bool = false,
+    onPrefill: (@Sendable (PrefillProgress) -> Void)? = nil,
     onCheckpoint: (@Sendable (GenerationProgress, String?, Int?) async throws -> Void)? = nil,
     onText: @escaping @Sendable (String) -> Void) async throws -> Output {
     await GenerationCoordinator.shared.enter(flag: flag, background: background)
+    // Own the whole task before preparing input or constructing the iterator.
+    // MLX checks Task cancellation between prefill chunks, before a stream
+    // producer exists. Every exit fences submitted GPU work before handoff.
+    let work = Task {
+      try await self.generateOwned(plan: plan, raw: raw, images: images, maxTokens: maxTokens,
+        settings: settings, seed: seed, flag: flag, onPrefill: onPrefill,
+        onCheckpoint: onCheckpoint, onText: onText)
+    }
+    let registration = flag.onCancel { work.cancel() }
+    defer { flag.removeCancellationHandler(registration) }
+    await GenerationCoordinator.shared.own(work)
     do {
-      try flag.check()
-      let capacity = try availableContext(), policy = generationPolicy
-      let controls = Set(policy.controlTokenIDs), ends = Set(policy.eosTokenIDs)
-      let result = try await container.perform { (context: ModelContext) async throws -> Output in
-        let input: LMInput
-        if let plan { input = try await Self.chatInput(plan, images: images, context: context) }
-        else if let raw { input = LMInput(tokens: MLXArray(context.tokenizer.encode(text: raw, addSpecialTokens: false))) }
-        else { throw BoomError.invalid("No compiled model input.") }
-        let promptIDs = input.text.tokens.asArray(Int.self)
-        guard promptIDs.count + maxTokens <= capacity else { throw BoomError.budget("The request exceeds available context.") }
-        let parameters = GenerateParameters(maxTokens: maxTokens, temperature: settings.temperature,
-          topP: settings.topP, topK: settings.topK, minP: settings.minP, repetitionPenalty: nil, seed: seed)
-        let preparedDigest = Digest.sha256(try JSONEncoder().encode(promptIDs))
-        // TokenIterator performs prompt prefill during task construction.
-        // Start before it so first-token and elapsed time include that work.
-        let clock = ContinuousClock(), started = clock.now
-        let components = GenerationComponents(logitProcessorFactory: { CheckpointTokenMask(policy.suppressedTokenIDs) })
-        let (stream, task) = try generateTokensTask(input: input, parameters: parameters, context: context,
-          includeStopToken: true, components: components)
-        await GenerationCoordinator.shared.own(task)
-        var tokens: [Int] = [], text = "", ended = false, reason = "output_limit"
-        var first: Double?; var stopToken: Int?
-        do {
-          for await event in stream {
-            if flag.isCancelled || Task.isCancelled { task.cancel(); break }
-            switch event {
-            case .token(let token):
-              guard !policy.suppressedTokenIDs.contains(token) else {
-                throw BoomError.invalid("The model emitted a token excluded by its checkpoint policy.")
-              }
-              if controls.contains(token) {
-                stopToken = token; reason = ends.contains(token) ? "eos" : "model_control"
-                ended = true; task.cancel(); break
-              }
-              if first == nil { first = started.duration(to: clock.now).timeInterval }
-              tokens.append(token)
-              let decoded = context.tokenizer.decode(tokenIds: tokens)
-              if !decoded.hasSuffix("\u{FFFD}"), decoded != text {
-                // Every displayed update is durable before it reaches a view.
-                // Awaiting the store also bounds the checkpoint producer.
-                try await onCheckpoint?(GenerationProgress(text: decoded,
-                  tokenIDs: tokens, promptDigest: preparedDigest, promptTokens: promptIDs.count,
-                  firstTokenSeconds: first, elapsedSeconds: started.duration(to: clock.now).timeInterval), nil, nil)
-                text = decoded; onText(text)
-              }
-            case .info(let info):
-              switch info.stopReason {
-              case .stop: ended = true; reason = "eos"
-              case .length: reason = "output_limit"
-              case .cancelled: reason = "cancelled"
-              }
-            }
-            if ended { break }
-          }
-        } catch {
-          task.cancel()
-          await task.value
-          throw error
-        }
-        await task.value
-        // Joining must retain the producer's emitted tokens even on cancellation.
-        // Callers persist this receipt before propagating their cancelled operation.
-        if flag.isCancelled || Task.isCancelled { reason = "cancelled" }
-        let final = context.tokenizer.decode(tokenIds: tokens)
-        let elapsed = started.duration(to: clock.now).timeInterval
-        try await onCheckpoint?(GenerationProgress(text: final, tokenIDs: tokens,
-          promptDigest: preparedDigest, promptTokens: promptIDs.count, firstTokenSeconds: first,
-          elapsedSeconds: elapsed), reason, stopToken)
-        if final != text, reason != "cancelled" { onText(final) }
-        return Output(text: final, tokenIDs: tokens, promptDigest: preparedDigest,
-          promptTokens: promptIDs.count, outputTokens: tokens.count, endedByEOS: ended, stopReason: reason, stopTokenID: stopToken,
-          firstTokenSeconds: first, elapsedSeconds: elapsed)
-      }
+      let result = try await withTaskCancellationHandler {
+        try await work.value
+      } onCancel: { flag.cancel(); work.cancel() }
       await GenerationCoordinator.shared.leave()
       return result
     } catch { await GenerationCoordinator.shared.leave(); throw error }
+  }
+  private func generateOwned(plan: ConsultationPlan?, raw: String?, images: [Data], maxTokens: Int,
+    settings: SamplingSettings, seed: UInt64?, flag: CancellationFlag,
+    onPrefill: (@Sendable (PrefillProgress) -> Void)?,
+    onCheckpoint: (@Sendable (GenerationProgress, String?, Int?) async throws -> Void)?,
+    onText: @escaping @Sendable (String) -> Void) async throws -> Output {
+    try flag.check()
+    let capacity = try availableContext(), policy = generationPolicy
+    let controls = Set(policy.controlTokenIDs), ends = Set(policy.eosTokenIDs)
+    return try await container.perform { (context: ModelContext) async throws -> Output in
+      defer { Stream.defaultStream.synchronize() }
+      let input: LMInput
+      if let plan { input = try await Self.chatInput(plan, images: images, context: context) }
+      else if let raw { input = LMInput(tokens: MLXArray(context.tokenizer.encode(text: raw, addSpecialTokens: false))) }
+      else { throw BoomError.invalid("No compiled model input.") }
+      let promptIDs = input.text.tokens.asArray(Int.self)
+      guard promptIDs.count + maxTokens <= capacity else { throw BoomError.budget("The request exceeds available context.") }
+      let parameters = GenerateParameters(maxTokens: maxTokens, temperature: settings.temperature,
+        topP: settings.topP, topK: settings.topK, minP: settings.minP, repetitionPenalty: nil,
+        prefill: PrefillParameters(progress: { processed, total in
+          onPrefill?(PrefillProgress(operationID: flag.operationID, processedPositions: processed, totalPositions: total))
+        }), seed: seed)
+      let preparedDigest = Digest.sha256(try JSONEncoder().encode(promptIDs))
+      // TokenIterator performs prompt prefill during task construction.
+      // Start before it so first-token and elapsed time include that work.
+      let clock = ContinuousClock(), started = clock.now
+      let components = GenerationComponents(logitProcessorFactory: { CheckpointTokenMask(policy.suppressedTokenIDs) })
+      let (stream, task) = try generateTokensTask(input: input, parameters: parameters, context: context,
+        includeStopToken: true, components: components)
+      var tokens: [Int] = [], text = "", ended = false, reason = "output_limit"
+      var first: Double?; var stopToken: Int?
+      do {
+        for await event in stream {
+          if flag.isCancelled || Task.isCancelled { task.cancel(); break }
+          switch event {
+          case .token(let token):
+            guard !policy.suppressedTokenIDs.contains(token) else {
+              throw BoomError.invalid("The model emitted a token excluded by its checkpoint policy.")
+            }
+            if controls.contains(token) {
+              stopToken = token; reason = ends.contains(token) ? "eos" : "model_control"
+              ended = true; task.cancel(); break
+            }
+            if first == nil { first = started.duration(to: clock.now).timeInterval }
+            tokens.append(token)
+            let decoded = context.tokenizer.decode(tokenIds: tokens)
+            if !decoded.hasSuffix("\u{FFFD}"), decoded != text {
+              // Every displayed update is durable before it reaches a view.
+              // Awaiting the store also bounds the checkpoint producer.
+              try await onCheckpoint?(GenerationProgress(text: decoded,
+                tokenIDs: tokens, promptDigest: preparedDigest, promptTokens: promptIDs.count,
+                firstTokenSeconds: first, elapsedSeconds: started.duration(to: clock.now).timeInterval), nil, nil)
+              text = decoded; onText(text)
+            }
+          case .info(let info):
+            switch info.stopReason {
+            case .stop: ended = true; reason = "eos"
+            case .length: reason = "output_limit"
+            case .cancelled: reason = "cancelled"
+            }
+          }
+          if ended { break }
+        }
+      } catch {
+        task.cancel()
+        await task.value
+        throw error
+      }
+      if flag.isCancelled || Task.isCancelled { task.cancel() }
+      await task.value
+      // Joining must retain the producer's emitted tokens even on cancellation.
+      // Callers persist this receipt before propagating their cancelled operation.
+      if flag.isCancelled || Task.isCancelled { reason = "cancelled" }
+      let final = context.tokenizer.decode(tokenIds: tokens)
+      let elapsed = started.duration(to: clock.now).timeInterval
+      try await onCheckpoint?(GenerationProgress(text: final, tokenIDs: tokens,
+        promptDigest: preparedDigest, promptTokens: promptIDs.count, firstTokenSeconds: first,
+        elapsedSeconds: elapsed), reason, stopToken)
+      if final != text, reason != "cancelled" { onText(final) }
+      return Output(text: final, tokenIDs: tokens, promptDigest: preparedDigest,
+        promptTokens: promptIDs.count, outputTokens: tokens.count, endedByEOS: ended, stopReason: reason, stopTokenID: stopToken,
+        firstTokenSeconds: first, elapsedSeconds: elapsed)
+    }
   }
   func join() async { await GenerationCoordinator.shared.enter(); await GenerationCoordinator.shared.leave() }
 }
