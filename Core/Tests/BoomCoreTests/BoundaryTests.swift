@@ -11,61 +11,6 @@ final class BoundaryTests: XCTestCase {
   func testBackslashInInlineCodeDoesNotHideTheClosingDelimiter() throws {
     XCTAssertEqual(try ReferenceParser.wiki("`code\\` [[Visible]]").map(\.title), ["Visible"])
   }
-  private func be32(_ n: UInt32) -> Data {
-    Data([
-      UInt8(truncatingIfNeeded: n >> 24), UInt8(truncatingIfNeeded: n >> 16),
-      UInt8(truncatingIfNeeded: n >> 8), UInt8(truncatingIfNeeded: n),
-    ])
-  }
-  private func atom(_ type: String, _ payload: Data) -> Data {
-    be32(UInt32(payload.count + 8)) + Data(type.utf8) + payload
-  }
-  private func reference(_ flags: UInt32 = 1, _ type: String = "url ") -> Data {
-    atom(type, be32(flags))
-  }
-  private func movie(_ entry: Data? = nil, count: UInt32 = 1) -> Data {
-    let dref = atom("dref", be32(0) + be32(count) + (entry ?? reference()))
-    return atom("ftyp", Data("isom".utf8))
-      + atom("moov", atom("trak", atom("mdia", atom("minf", atom("dinf", dref)))))
-  }
-  func testSelfContainedMP4ReferenceAllowed() throws {
-    XCTAssertTrue(try MediaContainerPolicy.selfContainedMP4(movie()))
-  }
-  func testExternalMP4ReferenceRejected() {
-    XCTAssertThrowsError(try MediaContainerPolicy.selfContainedMP4(movie(reference(0))))
-  }
-  func testMP4URNReferenceRejected() {
-    XCTAssertThrowsError(try MediaContainerPolicy.selfContainedMP4(movie(reference(1, "urn "))))
-  }
-  func testMP4ReferenceCountMismatchRejected() {
-    XCTAssertThrowsError(try MediaContainerPolicy.selfContainedMP4(movie(count: 2)))
-  }
-  func testMP4ReferenceTrailingPayloadRejected() {
-    XCTAssertThrowsError(try MediaContainerPolicy.selfContainedMP4(movie(reference() + Data([0]))))
-  }
-  func testMP4WithoutDataReferencesNotAdmitted() throws {
-    XCTAssertFalse(try MediaContainerPolicy.selfContainedMP4(atom("ftyp", Data("isom".utf8))))
-  }
-  func testExtendedMP4SizeCannotOverflow() {
-    let malformed =
-      atom("ftyp", Data("isom".utf8)) + be32(1) + Data("moov".utf8) + Data(repeating: 255, count: 8)
-    XCTAssertThrowsError(try MediaContainerPolicy.selfContainedMP4(malformed))
-  }
-  func testMP4NestedAtomBudget() {
-    var child = atom("dref", be32(0) + be32(1) + reference())
-    for _ in 0..<15 { child = atom("moov", child) }
-    XCTAssertThrowsError(
-      try MediaContainerPolicy.selfContainedMP4(atom("ftyp", Data("isom".utf8)) + child))
-  }
-  func testDataSliceOffsetsAreNormalized() throws {
-    let bytes = Data([255]) + movie()
-    XCTAssertTrue(try MediaContainerPolicy.selfContainedMP4(bytes.dropFirst()))
-  }
-  func testPlaylistsAndReferenceMoviesAreNotMP4() throws {
-    for s in ["#EXTM3U\nhttps://example.com/a.m3u8", "https://example.com/video.mp4", ""] {
-      XCTAssertFalse(try MediaContainerPolicy.selfContainedMP4(Data(s.utf8)))
-    }
-  }
   func testCompletionStopsBeforeSecondParagraph() {
     XCTAssertEqual(
       GemmaPrompt.visibleCompletion("100 feet tall.\n\n[[Voice]]"), "100 feet tall.")

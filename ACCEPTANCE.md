@@ -38,6 +38,8 @@ Verify authenticated identity swapping, corrupt records, missing/unknown indices
 
 Check every standard Hugging Face cache root and the pinned public snapshots. Verify local pack import, hashes, missing/modified files, interrupted download/resume and atomic admission. Startup and inference must run with outbound networking denied at the OS level. Inspect app-owned files and logs for private plaintext. Exercise image/audio/video/PDF/text originals and explicit attachment routing through paste, drop and menus; include switch-destination and cancellation cases. Missing on-device speech assets must offer explicit setup and cannot trigger an inference-time download.
 
+Audio/video preview and extraction must use the same Rust admission before native decoder creation. Reject playlists, external URL/alias/URN data references, reference-movie metadata beside a local track, compressed movie metadata, malformed/truncated tables and excessive nesting. Rejected media must retain its encrypted original and honest failure coverage. Audio processing must use captured bytes rather than rereading an ordinary source file. Validation and duration admission precede speech authorization/asset setup. Verify real in-memory MP4 frame seeking and M4A/WAV PCM decoding; codec checks do not qualify microphone or on-device recognition behavior.
+
 Inspect the exact bundle at wide and narrow sizes in light and dark appearances, including focused empty controls, typing, selection, Unicode, input methods, Undo and accessibility. A quiet empty page must have no active operation that merely opens an avoidable error alert. Every visible control must lead to a working action or state its availability.
 
 ## Actual 32 GB MacBook

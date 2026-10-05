@@ -13,7 +13,7 @@ enum AttachmentKind: Equatable {
   init(name: String) {
     switch (name as NSString).pathExtension.lowercased() {
     case "png", "jpg", "jpeg", "heic", "tif", "tiff", "gif", "webp": self = .image
-    case "mp3", "m4a", "aac", "wav", "aiff", "flac", "ogg": self = .audio
+    case "mp3", "m4a", "aac", "wav", "aiff", "aif", "flac", "ogg": self = .audio
     case "mov", "mp4", "m4v": self = .video
     case "pdf": self = .pdf
     default: self = .document
@@ -205,7 +205,7 @@ private struct AudioAttachmentPlayer: View {
     .padding(16)
     .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 12))
     .onAppear {
-      do { player = try AVAudioPlayer(data: bytes); player?.prepareToPlay() }
+      do { player = try MemoryMedia.audioPlayer(bytes: bytes); player?.prepareToPlay() }
       catch { failure = error.localizedDescription }
     }
     .onDisappear { player?.stop(); player = nil }
@@ -297,9 +297,12 @@ private struct VideoAttachmentPlayer: View {
 
   private func prepare() {
     guard player == nil else { return }
-    let source = MemoryMedia(bytes: bytes, extension: (name as NSString).pathExtension.lowercased())
-    media = source
-    player = AVPlayer(playerItem: AVPlayerItem(asset: source.asset))
+    do {
+      let source = try MemoryMedia(bytes: bytes)
+      guard source.container == .mp4 else { throw BoomError.invalid("This attachment is not self-contained MP4 video.") }
+      media = source
+      player = AVPlayer(playerItem: AVPlayerItem(asset: source.asset))
+    } catch { failure = error.localizedDescription }
   }
 }
 

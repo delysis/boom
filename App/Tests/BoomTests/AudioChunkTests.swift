@@ -21,7 +21,7 @@ final class AudioChunkTests: XCTestCase {
     append(UInt32(16)); append(UInt16(3)); append(UInt16(1))
     append(rate); append(rate * 4); append(UInt16(4)); append(UInt16(32))
     wav.append(Data("data".utf8)); append(UInt32(pcm.count)); wav.append(pcm)
-    let owner = MemoryMedia(bytes: wav, extension: "wav")
+    let owner = try MemoryMedia(bytes: wav)
     let reader = try await owner.audioReader()
     for part in 0..<3 {
       let output = try XCTUnwrap(reader.next(flag: CancellationFlag(), seconds: 1))

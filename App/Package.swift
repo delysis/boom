@@ -63,6 +63,6 @@ let package = Package(
         .linkedFramework("SystemConfiguration"),
         .linkedFramework("AVFoundation"), .linkedFramework("Speech"),
       ]),
-    .testTarget(name: "BoomTests", dependencies: ["Boom"]),
+    .testTarget(name: "BoomTests", dependencies: ["Boom"], resources: [.copy("Fixtures")]),
   ], swiftLanguageModes: [.v5]
 )

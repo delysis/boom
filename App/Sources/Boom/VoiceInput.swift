@@ -114,18 +114,17 @@ import Speech
     let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
     guard values.isRegularFile == true, (values.fileSize ?? Int.max) <= 67_108_864 else { throw BoomError.budget("Audio attachment exceeds 64 MiB.") }
     let data = try await detachedWork { try Data(contentsOf: url) }
-    return try await transcribeAttachment(data: data, extension: url.pathExtension, flag: flag, progress: progress)
+    return try await transcribeAttachment(data: data, flag: flag, progress: progress)
   }
-  func transcribeAttachment(data: Data, extension ext: String, flag: CancellationFlag,
+  func transcribeAttachment(data: Data, automaticAudio: Bool = false, flag: CancellationFlag,
     progress: (Int, Int) -> Void) async throws -> (text: String, coverage: String) {
-    if ["m4a", "mp4", "mov"].contains(ext.lowercased()),
-      try !MediaContainerPolicy.selfContainedMP4(data) {
-      throw BoomError.invalid("Audio must be self-contained. External media references are not opened.")
-    }
+    try flag.check()
+    let media = try MemoryMedia(bytes: data)
+    let reader = try await media.audioReader(automaticAudio: automaticAudio)
+    try flag.check()
     if #available(macOS 26.0, *) { _ = try await readyDictationModule() }
     else { try await authorizeLegacySpeech() }
-    let media = MemoryMedia(bytes: data, extension: ext)
-    let reader = try await media.audioReader()
+    try flag.check()
     let count = max(1, Int(ceil(reader.duration / 50)))
     var parts: [String] = [], failures: [Int] = [], index = 0
     while let buffer = try await detachedWork(operation: { try reader.next(flag: flag) }) {

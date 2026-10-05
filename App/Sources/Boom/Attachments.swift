@@ -254,19 +254,17 @@ enum NativeMedia {
       )
     }
     if let image = thumbnail(data) { return .image(image) }
-    guard try MediaContainerPolicy.selfContainedMP4(data) else {
+    let media = try MemoryMedia(bytes: data)
+    guard media.container == .mp4 else {
       throw BoomError.unavailable(
         "No supported native transform. Use canonical text or a supported image, WAV/AIFF/FLAC/MP3 audio, or self-contained MP4 video. The original and processing receipt remain available."
       )
     }
-    let media = MemoryMedia(bytes: data, extension: "mp4")
     let asset = media.asset
     do {
       defer { withExtendedLifetime(media) {} }
       let duration = try await asset.load(.duration).seconds
-      guard duration.isFinite, duration > 0, duration <= 7200 else {
-        throw BoomError.budget("Video duration is invalid or exceeds two hours.")
-      }
+      try ProductCore.mediaDuration(duration)
       let generator = AVAssetImageGenerator(asset: asset)
       generator.appliesPreferredTrackTransform = true
       generator.maximumSize = CGSize(width: 1600, height: 1600)

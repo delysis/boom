@@ -1632,7 +1632,7 @@ struct CompletionSegment {
         } else if record.text.isEmpty {
           do {
             record = try await self.preparedRecord(
-              record, data: imported.original, sourceURL: sourceURL, flag: flag)
+              record, data: imported.original, automaticAudio: sourceURL != nil, flag: flag)
           } catch is CancellationError { throw CancellationError() }
           catch { record.coverage = "Unreadable locally: " + error.localizedDescription }
         }
@@ -1677,31 +1677,14 @@ struct CompletionSegment {
     return try await runner.run(plan: plan, images: [bytes], maxTokens: 512, flag: flag, onText: { _ in }).text
   }
   private func preparedRecord(
-    _ attachment: AttachmentRecord, data: Data, sourceURL: URL?, flag: CancellationFlag
+    _ attachment: AttachmentRecord, data: Data, automaticAudio: Bool, flag: CancellationFlag
   ) async throws -> AttachmentRecord {
     var updated = attachment
-    let audioExtensions = ["mp3", "wav", "aiff", "aif", "flac"]
-    if audioExtensions.contains((attachment.name as NSString).pathExtension.lowercased()) {
-      if let sourceURL {
-        let audio = try AVAudioFile(forReading: sourceURL)
-        let seconds = Double(audio.length) / audio.processingFormat.sampleRate
-        if seconds > 120 {
-          throw BoomError.unavailable(
-            "Long recording (\(Int(seconds / 60)) min). Open this attachment to transcribe the full recording on device.")
-        }
-      }
-      let result: (text: String, coverage: String)
-      if let sourceURL {
-        result = try await VoiceInput().transcribeAttachment(sourceURL, flag: flag) {
-          [weak self] current, total in
-          self?.status = "Transcribing \(attachment.name) · \(current) of \(total)"
-        }
-      } else {
-        result = try await VoiceInput().transcribeAttachment(
-          data: data, extension: (attachment.name as NSString).pathExtension.lowercased(), flag: flag
-        ) { [weak self] current, total in
-          self?.status = "Transcribing \(attachment.name) · \(current) of \(total)"
-        }
+    if AttachmentKind(name: attachment.name) == .audio {
+      let result = try await VoiceInput().transcribeAttachment(
+        data: data, automaticAudio: automaticAudio, flag: flag
+      ) { [weak self] current, total in
+        self?.status = "Transcribing \(attachment.name) · \(current) of \(total)"
       }
       updated.text = result.text
       updated.transform = result.coverage
@@ -1758,7 +1741,7 @@ struct CompletionSegment {
         throw BoomError.invalid("Stored attachment digest changed.")
       }
       let updated = try await self.preparedRecord(
-        attachment, data: data, sourceURL: nil, flag: flag)
+        attachment, data: data, automaticAudio: false, flag: flag)
       guard let index = self.state.attachments.firstIndex(where: { $0.id == id }),
         self.state.attachments[index].digest == attachment.digest
       else { throw BoomError.stale(attachment.name) }

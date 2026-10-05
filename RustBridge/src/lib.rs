@@ -116,6 +116,29 @@ pub unsafe extern "C" fn bloom_core_request(
 /// supplied lengths for this call. The embedding Swift Data.withUnsafeBytes owns them.
 /// The returned buffer must be released exactly once with boom_attachment_free.
 #[no_mangle]
+pub unsafe extern "C" fn bloom_media_admit(data: *const u8, length: usize) -> BoomAttachmentBuffer {
+    if data.is_null() || length == 0 || length > MAX_INPUT {
+        return owned(error(
+            "input_limit",
+            "Native media must be nonempty and at most 64 MiB.",
+        ));
+    }
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: caller provides a live immutable byte buffer only for this call.
+        let bytes = unsafe { slice::from_raw_parts(data, length) };
+        match bloom_core::admit_media(bytes) {
+            Ok(kind) => json!({"schema":1,"ok":true,"value":kind}),
+            Err(e) => error("media_denied", &e.to_string()),
+        }
+    }));
+    owned(outcome.unwrap_or_else(|_| error("media_panic", "Media admission failed.")))
+}
+
+/// # Safety
+/// For nonzero lengths, pointers must address readable immutable buffers of the
+/// supplied lengths for this call. The embedding Swift Data.withUnsafeBytes owns them.
+/// The returned buffer must be released exactly once with boom_attachment_free.
+#[no_mangle]
 pub unsafe extern "C" fn boom_attachment_inspect(
     name: *const u8,
     name_length: usize,
@@ -197,6 +220,27 @@ mod tests {
             let v: Value = serde_json::from_slice(slice::from_raw_parts(b.data, b.length)).unwrap();
             assert_eq!(v["ok"], false);
             boom_attachment_free(b);
+        }
+    }
+    #[test]
+    fn media_bytes_cross_the_bounded_boundary_without_json_encoding() {
+        let bytes = b"RIFF\0\0\0\0WAVE";
+        // SAFETY: bytes outlive the call; every returned owned buffer is freed once.
+        unsafe {
+            let buffer = bloom_media_admit(bytes.as_ptr(), bytes.len());
+            let value: Value =
+                serde_json::from_slice(slice::from_raw_parts(buffer.data, buffer.length)).unwrap();
+            assert_eq!(value["value"], "wav");
+            boom_attachment_free(buffer);
+            for (data, length) in [(ptr::null(), 1), (bytes.as_ptr(), MAX_INPUT + 1)] {
+                let buffer = bloom_media_admit(data, length);
+                let value: Value =
+                    serde_json::from_slice(slice::from_raw_parts(buffer.data, buffer.length))
+                        .unwrap();
+                assert_eq!(value["ok"], false);
+                assert_eq!(value["error"]["code"], "input_limit");
+                boom_attachment_free(buffer);
+            }
         }
     }
 }

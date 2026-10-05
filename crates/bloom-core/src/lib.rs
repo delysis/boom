@@ -14,10 +14,13 @@ mod generation;
 mod import;
 mod layout;
 mod markdown;
+mod media;
 mod restore;
 mod sampling_policy;
 mod search;
 mod writing;
+
+pub use media::{MediaContainer, admit_media};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -647,6 +650,10 @@ fn sampling(profile: &str) -> Result<Sampling, Error> {
     deny_unknown_fields
 )]
 pub enum Request {
+    ValidateMediaDuration {
+        seconds: f64,
+        automatic_audio: bool,
+    },
     ModelGenerationPolicy {
         vocabulary_size: u32,
         configuration: serde_json::Value,
@@ -795,6 +802,13 @@ pub enum Request {
 
 pub fn execute(request: Request) -> Result<Value, Error> {
     match request {
+        Request::ValidateMediaDuration {
+            seconds,
+            automatic_audio,
+        } => {
+            media::admit_duration(seconds, automatic_audio)?;
+            Ok(Value::Bool(true))
+        }
         Request::ContextVocabulary { descriptor } => {
             serde_json::to_value(context::vocabulary(descriptor)?)
         }

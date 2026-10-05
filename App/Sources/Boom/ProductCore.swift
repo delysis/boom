@@ -4,6 +4,14 @@ import Foundation
 
 /// Swift projections of Rust-owned policy. No duplicate validation rules.
 enum ProductCore {
+  static func mediaDuration(_ seconds: Double, automaticAudio: Bool = false) throws {
+    let _: Bool = try call(["op": "validate_media_duration", "seconds": seconds, "automaticAudio": automaticAudio])
+  }
+  static func admitMedia(_ data: Data) throws -> MediaContainer {
+    try response(data.withUnsafeBytes {
+      bloom_media_admit($0.bindMemory(to: UInt8.self).baseAddress, data.count)
+    })
+  }
   static func search(_ text: String, query: String) throws -> SearchMatches {
     try call(["op": "search", "text": text, "query": query])
   }
@@ -43,6 +51,9 @@ enum ProductCore {
     let buffer = data.withUnsafeBytes {
       bloom_core_request($0.bindMemory(to: UInt8.self).baseAddress, data.count)
     }
+    return try response(buffer)
+  }
+  private static func response<T: Decodable>(_ buffer: BoomAttachmentBuffer) throws -> T {
     defer { boom_attachment_free(buffer) }
     guard let pointer = buffer.data, buffer.length > 0, buffer.length <= 16_777_216 else {
       throw BoomError.invalid("Invalid product-core response.")
@@ -138,6 +149,9 @@ enum ProductCore {
   static func residencyBudget(physical: UInt64, metal: UInt64) throws -> UInt64 {
     try call(["op": "residency_budget", "physicalBytes": physical, "metalBytes": metal])
   }
+}
+enum MediaContainer: String, Decodable {
+  case mp4, wav, aiff, flac, mp3, aac, ogg
 }
 final class ContextVocabulary: Sendable {
   let id: UUID

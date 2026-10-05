@@ -42,6 +42,8 @@ Cargo has one workspace and lock. Swift dependencies are resolved once, with MLX
 
 The safe Rust `bloom-delivery` developer tool owns signing admission and command receipts. The third build argument selects `development` (default) or `distribution`; distribution requires an explicitly configured Developer ID Application identity and secure timestamp. Inspection and archive preparation do not submit to Apple or launch the app. See [DISTRIBUTION.md](DISTRIBUTION.md) for the exact preparation, notarization, stapling and installation sequence.
 
+Audio/video preview, extraction and transcription share safe Rust admission before constructing native decoders. Playlists, external data references, reference movies and compressed movie metadata are rejected; their imported originals remain encrypted and can still be explicitly exported. Audio conversion uses the captured import bytes, and validation precedes speech asset setup or authorization. Native codec tests use authored public MP4/M4A fixtures and memory-backed decoding without playing sound.
+
 The developer-only `BloomPackBuilder` converts pinned source checkpoints outside normal installation. Its manifests retain source revisions and hashes, quantization settings, runtime revision, output hashes and licenses. The app executable does not perform conversion.
 
 An explicit real-weight diagnostic preserves every attempt in a fresh evidence directory:

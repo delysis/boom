@@ -7,15 +7,21 @@ import UniformTypeIdentifiers
 /// The delegate is retained by its owner; it never writes bytes to a file.
 final class MemoryMedia: NSObject, AVAssetResourceLoaderDelegate, @unchecked Sendable {
   let asset: AVURLAsset
+  let container: MediaContainer
   private let bytes: Data
   private let contentType: String
   private let queue = DispatchQueue(label: "com.delysis.Bloom.media")
-  init(bytes: Data, extension ext: String) {
+  init(bytes: Data) throws {
+    container = try ProductCore.admitMedia(bytes)
     self.bytes = bytes
-    contentType = UTType(filenameExtension: ext)?.identifier ?? UTType.data.identifier
+    contentType = UTType(filenameExtension: container.rawValue)?.identifier ?? UTType.data.identifier
     asset = AVURLAsset(url: URL(string: "bloom-media://local/\(UUID().uuidString)")!)
     super.init()
     asset.resourceLoader.setDelegate(self, queue: queue)
+  }
+  static func audioPlayer(bytes: Data) throws -> AVAudioPlayer {
+    _ = try ProductCore.admitMedia(bytes)
+    return try AVAudioPlayer(data: bytes)
   }
   func resourceLoader(_ resourceLoader: AVAssetResourceLoader,
     shouldWaitForLoadingOfRequestedResource request: AVAssetResourceLoadingRequest) -> Bool {
@@ -41,11 +47,11 @@ final class MemoryMedia: NSObject, AVAssetResourceLoaderDelegate, @unchecked Sen
     return true
   }
 
-  func audioReader() async throws -> MemoryAudioReader {
+  func audioReader(automaticAudio: Bool = false) async throws -> MemoryAudioReader {
     let duration = try await asset.load(.duration).seconds
-    guard duration.isFinite, duration > 0, duration <= 7200,
-      let track = try await asset.loadTracks(withMediaType: .audio).first else {
-      throw BoomError.budget("Audio must contain a local track of at most two hours.")
+    try ProductCore.mediaDuration(duration, automaticAudio: automaticAudio)
+    guard let track = try await asset.loadTracks(withMediaType: .audio).first else {
+      throw BoomError.invalid("Audio has no local audio track.")
     }
     let reader = try AVAssetReader(asset: asset)
     let output = AVAssetReaderTrackOutput(track: track, outputSettings: [

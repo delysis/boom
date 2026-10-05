@@ -57,7 +57,8 @@ cp "$BIN/Boom" "$APP/Contents/MacOS/Bloom"
 # Keep package resources in the standard sealed location. Boom's supported
 # Gemma bundles include their tokenizer configuration; the Hub package's
 # GPT/T5 fallback resources are not part of Boom's model path.
-find "$BIN" -maxdepth 1 -name '*.bundle' -type d -exec cp -R {} "$APP/Contents/Resources/" \;
+# SwiftPM leaves test resource bundles beside products. They are not app assets.
+find "$BIN" -maxdepth 1 -name '*.bundle' ! -name '*Tests.bundle' -type d -exec cp -R {} "$APP/Contents/Resources/" \;
 cp "$HERE/Info.plist" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :BloomEdition string $EDITION" "$APP/Contents/Info.plist"
 cp "$HERE/.build-support/RustProductBuild.json" "$OUT/product-build.json"
