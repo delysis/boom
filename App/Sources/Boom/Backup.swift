@@ -50,9 +50,24 @@ enum WorkspaceBackup {
       "salt": Array(salt)])
     return SymmetricKey(data: Data(bytes))
   }
+  private static func validateInventory(_ records: [BackupRecord]) throws -> WorkspaceState {
+    guard let index = records.first(where: { $0.kind == "workspace" && $0.id == Vault.workspaceID }) else {
+      throw BoomError.invalid("The workspace index is missing.")
+    }
+    let state = try PropertyListDecoder().decode(WorkspaceState.self, from: index.bytes)
+    guard state.schema == 1 else { throw BoomError.invalid("Unsupported workspace in backup.") }
+    let entries = records.map { record in
+      VaultInventoryEntry(name: record.kind + "-" + record.id.uuidString + ".sealed", regular: true,
+        digest: record.kind == "attachment" ? Digest.sha256(record.bytes) : nil,
+        bytes: record.kind == "attachment" ? record.bytes.count : nil)
+    }
+    try ProductCore.validateOriginals(state)
+    try ProductCore.validateInventory(state, entries: entries, hasIndex: true)
+    return state
+  }
   static func export(vault: Vault, passphrase: String, to target: URL) throws {
     let records = try FileManager.default.contentsOfDirectory(at: vault.root,
-      includingPropertiesForKeys: nil).filter { $0.pathExtension == "sealed" }.map { file -> BackupRecord in
+      includingPropertiesForKeys: nil).map { file -> BackupRecord in
       let stem = file.deletingPathExtension().lastPathComponent
       guard let dash = stem.firstIndex(of: "-"),
         let kind = Vault.Kind(rawValue: String(stem[..<dash])),
@@ -62,9 +77,7 @@ enum WorkspaceBackup {
       return BackupRecord(kind: kind.rawValue, id: id,
         bytes: try vault.get(kind, id: id, limit: 1_100_000_000))
     }
-    guard records.contains(where: { $0.kind == "workspace" && $0.id == Vault.workspaceID }) else {
-      throw BoomError.invalid("The workspace index is missing.")
-    }
+    _ = try validateInventory(records)
     let encoder = PropertyListEncoder(); encoder.outputFormat = .binary
     let data = try encoder.encode(BackupArchive(schema: 1, records: records))
     guard data.count <= limit else { throw BoomError.budget("Backup exceeds 2 GiB.") }
@@ -97,14 +110,13 @@ enum WorkspaceBackup {
       archive.records.allSatisfy({ Vault.Kind(rawValue: $0.kind) != nil }) else {
       throw BoomError.invalid("Backup identities are invalid.")
     }
+    let state = try validateInventory(archive.records)
     // Admission happens in an owned sibling directory. A failure never replaces
     // an existing workspace or leaves a partially admitted one.
     let stageURL = vault.root.deletingLastPathComponent().appendingPathComponent(".restore-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: stageURL) }
     let stage = try vault.sibling(at: stageURL)
     for record in archive.records { try stage.put(record.bytes, kind: Vault.Kind(rawValue: record.kind)!, id: record.id) }
-    let state = try stage.decode(WorkspaceState.self, kind: .workspace, id: Vault.workspaceID, limit: Vault.workspaceLimit)
-    guard state.schema == 1 else { throw BoomError.invalid("Unsupported workspace in backup.") }
     for document in state.documents {
       let data = try stage.get(.document, id: document.id, limit: 2_097_152)
       guard String(data: data, encoding: .utf8) != nil else { throw BoomError.invalid("Invalid document in backup.") }

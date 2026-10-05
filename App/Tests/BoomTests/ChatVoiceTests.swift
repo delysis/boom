@@ -49,7 +49,7 @@ final class ChatVoiceTests: XCTestCase {
     let voice = try ProductCore.voice(VoiceDraft(slug: "reader", name: "Reader", instructions: "Read attentively."))
     let source = SourceReference(id: UUID(), title: "Notes", digest: "captured", kind: "document")
     let original = ChatMessage(role: .assistant, text: "Original answer", context: "Captured context",
-      sources: [source], provider: "Captured model", speaker: voice.speaker)
+      sources: [source], provider: "Captured model", speaker: voice.speaker, authoredByUser: true)
     let chat = ChatRecord(title: "Consultation", messages: [original])
     state.chats = [chat]; state.selectedChat = chat.id
     try await store.save(state, documents: [])

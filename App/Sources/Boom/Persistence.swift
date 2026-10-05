@@ -38,6 +38,12 @@ struct DocumentEditJournal: Codable, Sendable {
   let afterRevision: String
   let phase: String
 }
+struct VaultInventoryEntry: Encodable, Sendable {
+  let name: String
+  let regular: Bool
+  let digest: String?
+  let bytes: Int?
+}
 struct WorkspaceState: Codable, Sendable {
   var schema = 1
   var documents: [DocumentIndex] = []
@@ -76,8 +82,8 @@ final class Vault: @unchecked Sendable {
       key = testKey
       return
     }
-    key = try VaultSession.shared.unlock(existingRecords: FileManager.default.contentsOfDirectory(
-      at: root, includingPropertiesForKeys: nil).contains { $0.pathExtension == "sealed" })
+    key = try VaultSession.shared.unlock(existingRecords: !FileManager.default.contentsOfDirectory(
+      at: root, includingPropertiesForKeys: nil).isEmpty)
   }
   private static func requireDirectory(_ url: URL) throws {
     let v = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
@@ -137,6 +143,22 @@ final class Vault: @unchecked Sendable {
     lock.lock(); defer { lock.unlock() }
     let target = url(kind, id)
     if FileManager.default.fileExists(atPath: target.path) { try FileManager.default.removeItem(at: target) }
+  }
+  func validateInventory(_ state: WorkspaceState, hasIndex: Bool) throws {
+    let ids = Set(state.attachments.map(\.id) + Array((state.importedFiles ?? [:]).keys))
+    var originals: [String: (String, Int)] = [:]
+    for id in ids where exists(.attachment, id) {
+      let bytes = try get(.attachment, id: id, limit: 67_108_864)
+      originals[recordURL(.attachment, id).lastPathComponent] = (Digest.sha256(bytes), bytes.count)
+    }
+    let entries = try FileManager.default.contentsOfDirectory(at: root,
+      includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]).map { file in
+      let values = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+      let original = originals[file.lastPathComponent]
+      return VaultInventoryEntry(name: file.lastPathComponent, regular: values.isRegularFile == true && values.isSymbolicLink != true,
+        digest: original?.0, bytes: original?.1)
+    }
+    try ProductCore.validateInventory(state, entries: entries, hasIndex: hasIndex)
   }
 }
 
@@ -234,28 +256,21 @@ actor WorkspaceStore {
     Result {
       try recoverSave()
       var state: WorkspaceState
-      if vault.exists(.workspace, Vault.workspaceID) {
+      let hasIndex = vault.exists(.workspace, Vault.workspaceID)
+      if hasIndex {
         state = try vault.decode(
           WorkspaceState.self, kind: .workspace, id: Vault.workspaceID, limit: Vault.workspaceLimit)
       } else {
-        let existingPrivate = try FileManager.default.contentsOfDirectory(
-          at: vault.root, includingPropertiesForKeys: nil
-        ).contains { $0.pathExtension == "sealed" }
-        guard !existingPrivate else {
-          throw BoomError.invalid(
-            "The workspace index is missing while local data exists. Existing files were retained; no empty replacement workspace was created."
-          )
-        }
         state = WorkspaceState()
       }
       guard state.schema == 1 else {
         throw BoomError.invalid("Unknown workspace schema. Existing data was retained.")
       }
-      guard Set(state.documents.map(\.id)).count == state.documents.count,
-        Set(state.chats.map(\.id)).count == state.chats.count,
+      guard Set(state.chats.map(\.id)).count == state.chats.count,
         Set(state.voices.map(\.slug)).count == state.voices.count,
         Set(state.voices.map(\.id)).count == state.voices.count
       else { throw BoomError.invalid("Duplicate identities in workspace index.") }
+      try vault.validateInventory(state, hasIndex: hasIndex)
       for voice in state.voices + state.voiceVersions {
         guard try ProductCore.voice(voice.draft).revision == voice.revision else {
           throw BoomError.invalid("Voice revision changed; encrypted record retained.")
@@ -318,9 +333,6 @@ actor WorkspaceStore {
   private func recoverGenerations(_ state: inout WorkspaceState) throws {
     var bundles: [CandidateBundle] = [], receipts: [(UUID, ConsultationReceipt)] = []
     var changed = false
-    guard Set(state.candidateIDs).count == state.candidateIDs.count else {
-      throw BoomError.invalid("Duplicate continuation identities; records retained.")
-    }
     // Validate all captured records before finishing any interrupted attempt.
     for id in state.candidateIDs {
       var bundle = try vault.decode(CandidateBundle.self, kind: .candidate, id: id)

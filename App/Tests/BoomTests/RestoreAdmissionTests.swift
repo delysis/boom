@@ -74,10 +74,11 @@ final class RestoreAdmissionTests: XCTestCase {
     let invalid = DocumentSnapshot(id: stub.id, title: "Restored", text: "A different captured revision.")
     var state = WorkspaceState(); state.documents = [DocumentIndex(id: invalid.id, title: invalid.title)]
     // Authenticated backup bytes alone do not establish complete workspace validity.
-    state.importedFiles = [invalid.id: ImportedFile(folderID: nil, path: "Missing.txt",
-      originalDigest: Digest.sha256("Missing original"))]
+    let invalidCandidate = UUID()
+    state.candidateIDs = [invalidCandidate]
+    try source.vault.put(Data("Authenticated but incompatible candidate payload.".utf8), kind: .candidate, id: invalidCandidate)
     try await source.save(state, documents: [invalid])
-    let backup = root.appendingPathComponent("invalid-original.bloombackup")
+    let backup = root.appendingPathComponent("invalid-candidate.bloombackup")
     try await source.exportBackup(passphrase: "public rollback test passphrase", to: backup)
     do { _ = try await target.restoreBackup(passphrase: "public rollback test passphrase", from: backup); XCTFail("Incomplete workspace admitted") } catch {}
     XCTAssertEqual(try bytes(target.vault), before)

@@ -20,6 +20,8 @@ Readable Markdown and portable voice JSON are explicit exports. Complete backup 
 
 Backup restore publishes the encrypted replacement with one native directory exchange; the canonical vault always retains a directory. Unsupported exchanges fail without falling back to separate moves. Failed workspace validation restores the previous encrypted bytes and document revision guards. If rollback cannot finish, both encrypted directories are retained.
 
+Startup and backup admission share a Rust inventory check. Required originals, inspection receipts, generated-answer receipts, documents and candidates must be present. Original hashes and limits are verified; unknown private files cannot become empty state or be silently omitted from a complete backup. Unindexed encrypted records remain part of the backup.
+
 ## Models
 
 Bloom checks the Hugging Face cache, including `HF_HUB_CACHE`, `HF_HOME`, `XDG_CACHE_HOME` and the usual home cache. Verified local 4-bit conversions are preferred. It also recognizes the pinned official `google/gemma-4-12B-it-qat-q4_0-unquantized` and `google/gemma-4-12B` snapshots and can download those public checkpoints anonymously when explicitly requested. Every admitted file is checked against the signed catalog. Startup and inference use local files.

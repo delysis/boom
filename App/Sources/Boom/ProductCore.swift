@@ -37,6 +37,18 @@ enum ProductCore {
     let _: Bool = try call(["op": "admit_restore", "state": object(state), "documents": object(documents),
       "entries": entries, "hasIndex": hasIndex])
   }
+  static func validateInventory(_ state: WorkspaceState, entries: [VaultInventoryEntry], hasIndex: Bool) throws {
+    let originals = state.attachments.map { ["id": $0.id.uuidString, "digest": $0.rootDigest] }
+    let imported = (state.importedFiles ?? [:]).map { ["id": $0.key.uuidString, "digest": $0.value.originalDigest] }
+    let replies = state.chats.flatMap { $0.messages + ($0.messageVersions ?? []) }.map { message in
+      ["id": message.id.uuidString, "role": message.role.rawValue, "state": message.state.rawValue,
+        "hasModel": message.provider != nil, "authored": message.authoredByUser == true,
+        "hasText": !message.text.isEmpty] as [String: Any]
+    }
+    let _: Bool = try call(["op": "validate_vault_inventory", "manifest": ["hasIndex": hasIndex,
+      "documents": state.documents.map { $0.id.uuidString }, "attachments": originals, "importedOriginals": imported,
+      "candidates": state.candidateIDs.map(\.uuidString), "replies": replies], "entries": object(entries)])
+  }
   static func chatTitle(_ request: String, routing: [String]) throws -> String {
     try call(["op": "chat_title", "request": request, "routing": routing])
   }

@@ -12,6 +12,7 @@ mod context;
 mod document;
 mod generation;
 mod import;
+mod inventory;
 mod layout;
 mod markdown;
 mod media;
@@ -733,6 +734,10 @@ pub enum Request {
         folders: Vec<Uuid>,
         files: Vec<import::Original>,
     },
+    ValidateVaultInventory {
+        manifest: inventory::Manifest,
+        entries: Vec<inventory::Entry>,
+    },
     AdmitRestore {
         state: Value,
         documents: Vec<document::Document>,
@@ -886,6 +891,9 @@ pub fn execute(request: Request) -> Result<Value, Error> {
             folders,
             files,
         } => serde_json::to_value(import::validate_manifest(&documents, &folders, &files)?),
+        Request::ValidateVaultInventory { manifest, entries } => {
+            serde_json::to_value(inventory::validate(&manifest, &entries)?)
+        }
         Request::AdmitRestore {
             state,
             documents,

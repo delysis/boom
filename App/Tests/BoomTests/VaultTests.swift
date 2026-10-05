@@ -107,6 +107,7 @@ final class VaultTests: XCTestCase {
       text: "Confidential attachment original.", coverage: "complete")]
     try await store.save(state, documents: [doc, branch])
     try store.vault.put(original, kind: .attachment, id: originalID)
+    try store.vault.put(Data("Public inspection receipt.".utf8), kind: .receipt, id: originalID)
     try store.vault.encode(bundle, kind: .candidate, id: bundle.id)
     try store.vault.encode(receipt, kind: .receipt, id: answer.id)
     try store.vault.encode(DocumentEditJournal(schema: 1, proposalID: proposalID, documentID: doc.id,
@@ -114,7 +115,7 @@ final class VaultTests: XCTestCase {
     try store.vault.encode(WorkspaceStore.SaveJournal(schema: 1, state: state, documents: [], before: [:]),
       kind: .saveJournal, id: Vault.workspaceID)
     let identities: [(Vault.Kind, UUID)] = [(.workspace, Vault.workspaceID), (.document, doc.id), (.document, branch.id),
-      (.attachment, originalID), (.candidate, bundle.id), (.receipt, answer.id), (.editJournal, proposalID), (.saveJournal, Vault.workspaceID)]
+      (.attachment, originalID), (.receipt, originalID), (.candidate, bundle.id), (.receipt, answer.id), (.editJournal, proposalID), (.saveJournal, Vault.workspaceID)]
     let backup = root.appendingPathComponent("complete.bloombackup")
     try WorkspaceBackup.export(vault: store.vault, passphrase: "six violets by the sea", to: backup)
     XCTAssertNil(try Data(contentsOf: backup).range(of: Data("Confidential".utf8)))

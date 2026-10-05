@@ -7,7 +7,7 @@ import SwiftUI
 /// Explicit public fixtures only. No window is shown and no real Keychain item is used.
 @MainActor enum WorkspaceImportSmoke {
   private struct Original: Codable { let id: UUID; let bytes: Data }
-  private struct Fixture: Codable { let documents: [DocumentSnapshot]; let originals: [Original] }
+  private struct Fixture: Codable { let documents: [DocumentSnapshot]; let originals: [Original]; let attachments: [Original] }
   private static let key = SymmetricKey(data: Data(repeating: 0x5a, count: 32))
   private static let passphrase = "public import restore fixture passphrase"
   static func run(arguments: [String]) async throws {
@@ -41,8 +41,17 @@ import SwiftUI
     let imported = model.documents.filter { model.state.importedFiles?[$0.id] != nil }
     guard imported.count == 2, let first = imported.first else { throw BoomError.invalid("Native import did not retain both selected files.") }
     model.updateDocument("# After import\n\nThe manuscript can change while its exact original stays private. Café 👩‍💻\n", id: first.id, caret: 0)
+    if model.selectedChat == nil { try model.newChat() }
+    let attachedBytes = Data("Public standalone attachment canary. Café 👩‍💻".utf8)
+    model.attachToCurrentChat([.bytes(name: "Public notes.txt", data: attachedBytes)])
+    for _ in 0..<500 where model.isBusy { try await Task.sleep(for: .milliseconds(10)) }
+    guard !model.isBusy, let attachment = model.state.attachments.first,
+      attachment.rootDigest == Digest.sha256(attachedBytes), !attachment.text.isEmpty,
+      try store.vault.get(.attachment, id: attachment.id) == attachedBytes,
+      store.vault.exists(.receipt, attachment.id) else { throw BoomError.invalid("Standalone attachment capture failed.") }
     try await model.flush()
-    let fixture = Fixture(documents: model.documents, originals: zip(imported, bytes).map { Original(id: $0.0.id, bytes: $0.1) })
+    let fixture = Fixture(documents: model.documents, originals: zip(imported, bytes).map { Original(id: $0.0.id, bytes: $0.1) },
+      attachments: [Original(id: attachment.id, bytes: attachedBytes)])
     try write(fixture, to: evidence.appendingPathComponent("fixture.json"))
     if model.layout.isAuthor {
       for dark in [true, false] {
@@ -71,6 +80,11 @@ import SwiftUI
         throw BoomError.invalid("Imported originals or their captured identities changed.")
       }
     }
+    for original in fixture.attachments {
+      guard state.attachments.first(where: { $0.id == original.id })?.rootDigest == Digest.sha256(original.bytes),
+        try store.vault.get(.attachment, id: original.id) == original.bytes,
+        store.vault.exists(.receipt, original.id) else { throw BoomError.invalid("Standalone original or inspection receipt changed.") }
+    }
     let restored = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("restored-workspace"),
       testKey: SymmetricKey(data: Data(repeating: 0x5b, count: 32)))
     let (_, restoredDocuments) = try await restored.restoreBackup(passphrase: passphrase,
@@ -80,6 +94,10 @@ import SwiftUI
       guard try restored.vault.get(.attachment, id: original.id) == original.bytes else {
         throw BoomError.invalid("Complete backup lost an imported original.")
       }
+    }
+    for original in fixture.attachments {
+      guard try restored.vault.get(.attachment, id: original.id) == original.bytes,
+        restored.vault.exists(.receipt, original.id) else { throw BoomError.invalid("Backup lost a standalone original or its receipt.") }
     }
     let occupied = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("occupied-workspace"), testKey: key)
     try await occupied.save(WorkspaceState(), documents: [])
