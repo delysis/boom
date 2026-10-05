@@ -15,6 +15,7 @@ mod layout;
 mod markdown;
 mod restore;
 mod search;
+mod writing;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -603,7 +604,7 @@ pub fn writing_prompt(
     })
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Sampling {
     pub temperature: f32,
@@ -644,6 +645,13 @@ fn sampling(profile: &str) -> Result<Sampling, Error> {
     deny_unknown_fields
 )]
 pub enum Request {
+    ValidateWritingRecipe {
+        recipe: Box<writing::Recipe>,
+    },
+    BranchWriting {
+        recipe: Box<writing::Recipe>,
+        continuation: String,
+    },
     GenerationCheckpoint {
         expected: generation::Identity,
         previous: Option<Box<generation::Checkpoint>>,
@@ -754,6 +762,13 @@ pub enum Request {
 
 pub fn execute(request: Request) -> Result<Value, Error> {
     match request {
+        Request::ValidateWritingRecipe { recipe } => {
+            serde_json::to_value(writing::validate(&recipe)?)
+        }
+        Request::BranchWriting {
+            recipe,
+            continuation,
+        } => serde_json::to_value(writing::branch(&recipe, &continuation)?),
         Request::GenerationCheckpoint {
             expected,
             previous,

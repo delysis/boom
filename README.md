@@ -4,6 +4,8 @@ Bloom is a native, private macOS workspace for consulting editable voices and wr
 
 Bloom has two compile-time layouts. The author build keeps a bounded manuscript beside its document library and optional chat; two native icons control the side panes. The chat build has a conversation library and chat, with no manuscript pane. Live title-bar search finds document bodies and chat text. Imported folders are snapshots inside the encrypted library; ordinary source files are never edited. The native Writing menu offers continuations, writing examples, inline suggestions and variation. Requested alternatives appear in a temporary tray; accepting text uses the editor's normal Undo path. Every chat supports instructions and editable exchanges. Pin a chat as a voice, then mention it elsewhere with `@`. Several mentions give separate answers by default; discussion lets later voices read earlier answers from that round.
 
+Continuation replay uses its saved manuscript, prompt, model, sampling and seed even after live edits. Branching creates a new manuscript from that captured snapshot and retains its lineage. Acceptance requires the current manuscript, caret and example revisions to match the request. Safe Rust validates captured recipes and branch size before either action.
+
 ## Privacy and ownership
 
 The fresh workspace is `~/Library/Application Support/Bloom/Private`. Documents, conversations, voice revisions, attachment originals, continuations, receipts and recovery journals are authenticated encrypted records. There is no migration, old-store reader, or plaintext workspace mode. Existing Boom stores are left alone.

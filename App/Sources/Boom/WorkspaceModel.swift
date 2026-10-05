@@ -1255,18 +1255,21 @@ struct CompletionSegment {
     replaySeed: UInt64? = nil) async throws {
     guard let runner = baseRunner else { throw BoomError.unavailable("Install the writing model first.") }
     let capturedEpoch = epoch
-    let examples = try writingExampleIDs.map { id in
-      guard let value = documents.first(where: { $0.id == id }) else { throw BoomError.stale("An example was removed.") }
-      return value
-    }
-    let sources = ([document] + examples).map { SourceReference(id: $0.id, title: $0.title, digest: $0.revision, kind: "document") }
     try await flush()
-    try await revalidateOnDisk(sources, attachments: [])
     let recipe: CompletionRecipe
     if let previous { recipe = previous.recipe }
-    else { recipe = try await runner.completionRecipe(document: document, caret: offset,
-      sources: sources, examples: examples.map(\.text), profile: profile,
-      maxTokens: maxTokens, flag: flag) }
+    else {
+      let examples = try writingExampleIDs.map { id in
+        guard let value = documents.first(where: { $0.id == id }) else { throw BoomError.stale("An example was removed.") }
+        return value
+      }
+      let sources = ([document] + examples).map { SourceReference(id: $0.id, title: $0.title, digest: $0.revision, kind: "document") }
+      try await revalidateOnDisk(sources, attachments: [])
+      recipe = try await runner.completionRecipe(document: document, caret: offset,
+        sources: sources, examples: examples.map(\.text), profile: profile,
+        maxTokens: maxTokens, flag: flag)
+    }
+    try ProductCore.validateWritingRecipe(recipe)
     guard recipe.model == runner.identity else { throw BoomError.stale("Replay requires the original writing model.") }
     var bundle = CandidateBundle(id: replaySeed == nil ? previous?.id ?? UUID() : UUID(), recipe: recipe, origin: previous?.origin ?? state.manuscriptOrigins[document.id],
       candidates: replaySeed == nil ? previous?.candidates ?? [] : [], selected: replaySeed == nil ? previous?.selected ?? 0 : 0)
@@ -1291,20 +1294,21 @@ struct CompletionSegment {
           seed: seed, requestDigest: recipe.promptDigest, maxTokens: recipe.maxTokens)
         let result = try await runner.run(rawPrompt: recipe.prompt, maxTokens: recipe.maxTokens,
           settings: recipe.settings, seed: seed, flag: flag, background: maxTokens == 64 && !showingCandidates,
-          onCheckpoint: { progress, stop in
+          onCheckpoint: { [weak self] progress, stop in
             try await checkpointStore.checkpoint(progress, identity: generation, stopReason: stop)
-          }) { [weak self] text in
-            Task { @MainActor in
-              guard let self, self.writingFlag === flag, !flag.isCancelled,
-                self.candidates?.id == bundleID,
-                self.candidates?.candidates.indices.contains(index) == true,
-                self.candidates?.candidates[index].state == .pending else { return }
-              self.candidates?.candidates[index].text = text
-              if index == self.candidates?.selected, self.epoch == capturedEpoch {
-                self.showCandidateGhost(text, recipe: recipe, epoch: capturedEpoch)
+            guard let owner = self else { return }
+            await MainActor.run {
+              guard owner.writingFlag === flag, !flag.isCancelled,
+                owner.candidates?.id == bundleID,
+                owner.candidates?.candidates.indices.contains(index) == true,
+                owner.candidates?.candidates[index].id == generation.attemptID,
+                owner.candidates?.candidates[index].state == .pending else { return }
+              owner.candidates?.candidates[index].retain(progress)
+              if index == owner.candidates?.selected, owner.epoch == capturedEpoch {
+                owner.showCandidateGhost(progress.text, recipe: recipe, epoch: capturedEpoch)
               }
             }
-          }
+          }, onText: { _ in })
         bundle.candidates[index].text = result.text
         bundle.candidates[index].state = result.stopReason == "cancelled" ? .cancelled : (result.text.isEmpty ? .failed : .complete)
         bundle.candidates[index].promptTokens = result.promptTokens
@@ -1394,8 +1398,7 @@ struct CompletionSegment {
       bundle.candidates[index].state == .complete, editor?.hasMarkedText() != true else { return }
     do {
       let snapshot = bundle.recipe.document
-      guard let range = Range(NSRange(location: bundle.recipe.caretUTF16, length: 0), in: snapshot.text) else { throw BoomError.invalid("Invalid captured caret.") }
-      var text = snapshot.text; text.replaceSubrange(range, with: bundle.candidates[index].text)
+      let text = try ProductCore.branchWriting(bundle.recipe, continuation: bundle.candidates[index].text)
       let document = DocumentSnapshot(title: snapshot.title + " · branch", text: text)
       state.manuscriptOrigins[document.id] = ManuscriptOrigin(documentID: snapshot.id, revision: snapshot.revision,
         bundleID: bundle.id, candidateID: bundle.candidates[index].id)

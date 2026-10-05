@@ -104,6 +104,12 @@ enum ProductCore {
   static func sampling(_ profile: SamplingProfile) throws -> SamplingSettings {
     try call(["op": "sampling", "profile": profile.rawValue])
   }
+  static func validateWritingRecipe(_ recipe: CompletionRecipe) throws {
+    let _: Bool = try call(["op": "validate_writing_recipe", "recipe": object(recipe)])
+  }
+  static func branchWriting(_ recipe: CompletionRecipe, continuation: String) throws -> String {
+    try call(["op": "branch_writing", "recipe": object(recipe), "continuation": continuation])
+  }
   static func residencyBudget(physical: UInt64, metal: UInt64) throws -> UInt64 {
     try call(["op": "residency_budget", "physicalBytes": physical, "metalBytes": metal])
   }

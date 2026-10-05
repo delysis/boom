@@ -15,12 +15,14 @@ import SwiftUI
 
 @main @MainActor enum BoomMain {
   static func main() {
-    if CommandLine.arguments.contains("--generation-recovery-smoke") || CommandLine.arguments.contains("--workspace-import-smoke") {
+    if CommandLine.arguments.contains("--generation-recovery-smoke") || CommandLine.arguments.contains("--workspace-import-smoke") || CommandLine.arguments.contains("--writing-control-smoke") {
       let app = NSApplication.shared
       app.setActivationPolicy(.prohibited)
       Task {
         do {
-          if CommandLine.arguments.contains("--workspace-import-smoke") {
+          if CommandLine.arguments.contains("--writing-control-smoke") {
+            try await WritingControlSmoke.run(arguments: CommandLine.arguments)
+          } else if CommandLine.arguments.contains("--workspace-import-smoke") {
             try await WorkspaceImportSmoke.run(arguments: CommandLine.arguments)
           } else { try await GenerationRecoverySmoke.run(arguments: CommandLine.arguments) }
           exit(0)

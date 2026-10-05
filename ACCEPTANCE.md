@@ -14,6 +14,8 @@ Use substantial authored prose and chosen literary examples. Verify exact bytes 
 
 Evaluate Steady, Standard and experimental Open against a fixed literary prompt/seed set. Retain every output and failure. Review continuity, style, repetition, diversity and author control; nonempty output is not a quality gate.
 
+The explicit `--writing-control-smoke capture --fixture /absolute/public-fixture.json --evidence /absolute/new-directory` diagnostic drives Explore, partial acceptance, the native editor's Undo action, branching and replay after live edits. A separate process runs `--writing-control-smoke verify --evidence /absolute/existing-directory` to check encrypted persistence and complete backup restore. Run both with outbound networking denied. These background controller/editor checks and offscreen body renders do not qualify visible interaction, Keychain dialogs or writing quality. Long-context selection remains unqualified: suffix token counts can decrease as characters are added, so the current binary search does not establish the largest fitting suffix.
+
 ## Privacy, recovery and installation
 
 Through the signed production bundle, measure actual Keychain authorization dialogs on first, repeated and rebuilt launches, concurrent consumers, denial and missing/wrong-key conditions. Require at most one authorization dialog per launch, no retries after failure and no silent replacement key. Calls alone do not qualify this gate.
