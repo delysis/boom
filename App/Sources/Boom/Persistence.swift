@@ -332,7 +332,7 @@ actor WorkspaceStore {
       for index in bundle.candidates.indices {
         let journal = try writingCheckpoint(bundle: bundle, candidate: bundle.candidates[index])
         guard bundle.candidates[index].state == .pending else { continue }
-        if let journal { bundle.candidates[index].retain(journal.progress) }
+        if let journal { bundle.candidates[index].retain(journal) }
         bundle.candidates[index].state = .cancelled
         bundle.candidates[index].stopReason = "interrupted"
         interrupted = true
@@ -359,7 +359,7 @@ actor WorkspaceStore {
           state.chats[c].messages[m].text = journal.progress.text
         }
         if receipt.state == .pending {
-          if let journal { receipt.retain(journal.progress) }
+          if let journal { receipt.retain(journal) }
           receipt.state = .cancelled; receipt.failure = "The app closed before this attempt completed."
           receipt.stopReason = "interrupted"
           receipts.append((message.id, receipt))

@@ -15,14 +15,14 @@ final class GenerationJournalTests: XCTestCase {
     let writing: GenerationIdentity
     let document: DocumentSnapshot
   }
-  private func fixture() async throws -> Fixture {
+  private func fixture(_ policy: ModelGenerationPolicy? = nil) async throws -> Fixture {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-journal-" + UUID().uuidString)
     let key = SymmetricKey(size: .bits256), store = try WorkspaceStore(rootOverride: root, testKey: key)
     let document = DocumentSnapshot(title: "Manuscript", text: "At the shore, ")
     let prompt = try ProductCore.writingPrompt(document, caret: document.text.utf16.count, examples: [], retaining: Int.max)
     let recipe = CompletionRecipe(document: document, caretUTF16: document.text.utf16.count, sources: [],
       prompt: prompt.prompt, promptDigest: prompt.digest, omittedPrefixCharacters: 0, model: "captured-model",
-      profile: .standard, settings: try ProductCore.sampling(.standard), maxTokens: 256)
+      profile: .standard, settings: try ProductCore.sampling(.standard), maxTokens: 256, generationPolicy: policy)
     let bundle = CandidateBundle(id: UUID(), recipe: recipe, origin: nil,
       candidates: [WritingCandidate(id: UUID(), seed: UInt64.max, text: "", state: .pending,
         promptTokens: 0, outputTokens: 0, tokenIDs: [], stopReason: nil)], selected: 0)
@@ -32,7 +32,7 @@ final class GenerationJournalTests: XCTestCase {
     let operationID = UUID(), replyID = chat.messages[0].id
     let receipt = ConsultationReceipt(operationID: operationID, seed: 17, state: .pending, failure: nil,
       model: "captured-model", voice: nil, plan: plan, sources: [], promptDigest: Digest.sha256(plan.rawPrompt),
-      tokenIDs: [], stopReason: "pending", firstTokenSeconds: nil, elapsedSeconds: 0)
+      tokenIDs: [], stopReason: "pending", firstTokenSeconds: nil, elapsedSeconds: 0, generationPolicy: policy)
     try store.vault.encode(bundle, kind: .candidate, id: bundle.id)
     try store.vault.encode(receipt, kind: .receipt, id: replyID)
     var state = WorkspaceState(); state.documents = [DocumentIndex(id: document.id, title: document.title)]
@@ -41,10 +41,10 @@ final class GenerationJournalTests: XCTestCase {
     return Fixture(root: root, key: key, store: store, chat: chat, receipt: receipt, bundle: bundle,
       consultation: GenerationIdentity(kind: .consultation, operationID: operationID, recordID: replyID,
         attemptID: replyID, model: receipt.model, seed: receipt.seed,
-        requestDigest: Digest.sha256(plan.rawPrompt), maxTokens: 512),
+        requestDigest: Digest.sha256(plan.rawPrompt), maxTokens: 512, generationPolicy: policy),
       writing: GenerationIdentity(kind: .writing, operationID: UUID(), recordID: bundle.id,
         attemptID: bundle.candidates[0].id, model: recipe.model, seed: UInt64.max,
-        requestDigest: recipe.promptDigest, maxTokens: 256), document: document)
+        requestDigest: recipe.promptDigest, maxTokens: 256, generationPolicy: policy), document: document)
   }
   private func progress(_ text: String = "A partial answer 👩🏽‍💻é", tokens: [Int] = [1, 2], elapsed: Double = 1) -> GenerationProgress {
     GenerationProgress(text: text, tokenIDs: tokens, promptDigest: Digest.sha256("prepared tokens"),
@@ -76,6 +76,34 @@ final class GenerationJournalTests: XCTestCase {
       XCTAssertNil(try Data(contentsOf: file).range(of: Data(checkpoint.text.utf8)))
     }
   }
+  func testStoppingIdentitySurvivesEncryptedInterruptionAndWrongTokenRetainsBytes() async throws {
+    let policy = try ProductCore.generationPolicy(vocabularySize: 16,
+      configuration: Data(#"{"eos_token_id":1,"suppress_tokens":[15,14]}"#.utf8),
+      controls: [0, 1, 3, 14, 15], tokenizerEOS: 1)
+    let f = try await fixture(policy); defer { try? FileManager.default.removeItem(at: f.root) }
+    let value = progress(tokens: [4, 5])
+    try await f.store.checkpoint(value, identity: f.writing, stopReason: nil)
+    let url = f.store.vault.recordURL(.generationJournal, f.writing.attemptID)
+    let before = try Data(contentsOf: url)
+    do {
+      try await f.store.checkpoint(value, identity: f.writing, stopReason: "model_control", stopTokenID: 14)
+      XCTFail("Suppressed stopping token was admitted")
+    } catch {}
+    XCTAssertEqual(try Data(contentsOf: url), before)
+    try await f.store.checkpoint(value, identity: f.writing, stopReason: "eos", stopTokenID: 1)
+    try await f.store.checkpoint(value, identity: f.consultation, stopReason: "eos", stopTokenID: 1)
+    let fresh = try WorkspaceStore(rootOverride: f.root, testKey: f.key)
+    _ = try await fresh.load().get()
+    let bundle = try fresh.vault.decode(CandidateBundle.self, kind: .candidate, id: f.bundle.id)
+    XCTAssertEqual(bundle.recipe.generationPolicy, policy)
+    XCTAssertEqual(bundle.candidates[0].stopTokenID, 1)
+    XCTAssertEqual(bundle.candidates[0].stopReason, "interrupted")
+    let receipt = try fresh.vault.decode(ConsultationReceipt.self, kind: .receipt, id: f.consultation.attemptID)
+    XCTAssertEqual(receipt.generationPolicy, policy); XCTAssertEqual(receipt.stopTokenID, 1)
+    let journal = try await fresh.writingCheckpoint(bundle: bundle, candidate: bundle.candidates[0])
+    XCTAssertEqual(journal?.stopTokenID, 1); XCTAssertEqual(journal?.stopReason, "eos")
+    XCTAssertThrowsError(try ProductCore.admitGenerationPolicy(nil, loaded: policy))
+  }
   func testStaleCheckpointAndCorruptionRetainExactSealedBytesAndIndex() async throws {
     let f = try await fixture(); defer { try? FileManager.default.removeItem(at: f.root) }
     try await f.store.checkpoint(progress(), identity: f.consultation, stopReason: "cancelled")
@@ -102,7 +130,7 @@ final class GenerationJournalTests: XCTestCase {
     let generation = GenerationIdentity(kind: .documentResponse, operationID: f.consultation.operationID,
       recordID: f.consultation.recordID, attemptID: f.consultation.attemptID,
       model: f.consultation.model, seed: f.consultation.seed,
-      requestDigest: f.consultation.requestDigest, maxTokens: 4096)
+      requestDigest: f.consultation.requestDigest, maxTokens: 4096, generationPolicy: nil)
     let partial = progress("{\"reply\":\"Changed\",\"edits\":[")
     try await f.store.checkpoint(partial, identity: generation, stopReason: nil)
     let (state, documents) = try await f.store.load().get()

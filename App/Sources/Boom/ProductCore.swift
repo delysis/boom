@@ -119,6 +119,16 @@ enum ProductCore {
   static func sampling(_ profile: SamplingProfile) throws -> SamplingSettings {
     try call(["op": "sampling", "profile": profile.rawValue])
   }
+  static func generationPolicy(vocabularySize: Int, configuration: Data,
+    controls: [Int], tokenizerEOS: Int?) throws -> ModelGenerationPolicy {
+    try call(["op": "model_generation_policy", "vocabularySize": vocabularySize,
+      "configuration": JSONSerialization.jsonObject(with: configuration),
+      "controlTokenIds": controls, "tokenizerEos": tokenizerEOS.map { $0 as Any } ?? NSNull()])
+  }
+  static func admitGenerationPolicy(_ captured: ModelGenerationPolicy?, loaded: ModelGenerationPolicy) throws {
+    let _: Bool = try call(["op": "admit_generation_policy",
+      "captured": try captured.map { try object($0) } ?? NSNull(), "loaded": object(loaded)])
+  }
   static func validateWritingRecipe(_ recipe: CompletionRecipe) throws {
     let _: Bool = try call(["op": "validate_writing_recipe", "recipe": object(recipe)])
   }
@@ -214,6 +224,13 @@ struct SamplingSettings: Codable, Equatable, Sendable {
   let topK: Int
   let minP: Float
 }
+struct ModelGenerationPolicy: Codable, Equatable, Sendable {
+  let schema: Int
+  let vocabularySize: Int
+  let eosTokenIDs: [Int]
+  let suppressedTokenIDs: [Int]
+  let controlTokenIDs: [Int]
+}
 struct CompletionRecipe: Codable, Sendable {
   let document: DocumentSnapshot
   let caretUTF16: Int
@@ -225,6 +242,7 @@ struct CompletionRecipe: Codable, Sendable {
   let profile: SamplingProfile
   let settings: SamplingSettings
   let maxTokens: Int
+  let generationPolicy: ModelGenerationPolicy?
 }
 struct WritingCandidate: Codable, Identifiable, Sendable {
   let id: UUID
@@ -235,6 +253,7 @@ struct WritingCandidate: Codable, Identifiable, Sendable {
   var outputTokens: Int
   var tokenIDs: [Int]
   var stopReason: String?
+  var stopTokenID: Int? = nil
 }
 struct CandidateBundle: Codable, Identifiable, Sendable {
   let id: UUID
@@ -270,6 +289,8 @@ struct ConsultationReceipt: Codable, Sendable {
   var stopReason: String
   var firstTokenSeconds: Double?
   var elapsedSeconds: Double
+  let generationPolicy: ModelGenerationPolicy?
+  var stopTokenID: Int? = nil
 }
 
 struct WritingPrompt: Codable { let prompt: String; let digest: String; let totalCharacters: Int; let omittedCharacters: Int }

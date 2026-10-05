@@ -41,7 +41,7 @@ final class GeneratedTextTests: XCTestCase {
     let recipe = CompletionRecipe(document: snapshot, caretUTF16: caret,
       sources: [SourceReference(id: example.id, title: example.title, digest: example.revision, kind: "document")],
       prompt: compiled.prompt, promptDigest: compiled.digest, omittedPrefixCharacters: 0,
-      model: "unit-test-model", profile: .standard, settings: try ProductCore.sampling(.standard), maxTokens: 256)
+      model: "unit-test-model", profile: .standard, settings: try ProductCore.sampling(.standard), maxTokens: 256, generationPolicy: nil)
     // Authored unit fixture, never represented as an actual model output.
     let candidate = WritingCandidate(id: UUID(), seed: 42, text: " quietly.", state: .complete,
       promptTokens: 0, outputTokens: 0, tokenIDs: [], stopReason: "unit-fixture")
@@ -91,7 +91,7 @@ final class GeneratedTextTests: XCTestCase {
     let compiled = try ProductCore.writingPrompt(document, caret: caret, examples: [], retaining: Int.max)
     let recipe = CompletionRecipe(document: document, caretUTF16: caret, sources: [], prompt: compiled.prompt,
       promptDigest: compiled.digest, omittedPrefixCharacters: 0, model: "unit-test-model", profile: .standard,
-      settings: try ProductCore.sampling(.standard), maxTokens: 64)
+      settings: try ProductCore.sampling(.standard), maxTokens: 64, generationPolicy: nil)
     // Authored fixture; no inference or writing-quality claim.
     let candidate = WritingCandidate(id: UUID(), seed: 42, text: " quietly by the window.", state: .complete,
       promptTokens: 0, outputTokens: 0, tokenIDs: [], stopReason: "unit-fixture")

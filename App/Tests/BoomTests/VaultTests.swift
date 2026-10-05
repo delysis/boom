@@ -90,14 +90,14 @@ final class VaultTests: XCTestCase {
     let prompt = try ProductCore.writingPrompt(doc, caret: doc.text.utf16.count, examples: [], retaining: Int.max)
     let recipe = CompletionRecipe(document: doc, caretUTF16: doc.text.utf16.count, sources: [],
       prompt: prompt.prompt, promptDigest: prompt.digest, omittedPrefixCharacters: 0, model: "unit-test-model",
-      profile: .standard, settings: try ProductCore.sampling(.standard), maxTokens: 256)
+      profile: .standard, settings: try ProductCore.sampling(.standard), maxTokens: 256, generationPolicy: nil)
     let candidate = WritingCandidate(id: UUID(), seed: 7, text: " An authored test continuation.", state: .complete,
       promptTokens: 4, outputTokens: 1, tokenIDs: [900], stopReason: "output_limit")
     let bundle = CandidateBundle(id: UUID(), recipe: recipe, origin: nil, candidates: [candidate], selected: 0)
     let plan = try ProductCore.prompt(voice: first, history: [], instructions: "", context: "", request: "A question.", routing: [])
     let receipt = ConsultationReceipt(operationID: UUID(), seed: 11, state: .complete, failure: nil,
       model: "unit-test-model", voice: first, plan: plan, sources: [], promptDigest: Digest.sha256(plan.rawPrompt),
-      tokenIDs: [901], stopReason: "output_limit", firstTokenSeconds: nil, elapsedSeconds: 0)
+      tokenIDs: [901], stopReason: "output_limit", firstTokenSeconds: nil, elapsedSeconds: 0, generationPolicy: nil)
     let original = Data("Confidential attachment original.\0".utf8), originalID = UUID(), proposalID = UUID()
     var state = WorkspaceState(); state.documents = [doc, branch].map { DocumentIndex(id: $0.id, title: $0.title) }
     state.chats = [chat]; state.voices = [voice]; state.voiceVersions = [first, voice]; state.candidateIDs = [bundle.id]

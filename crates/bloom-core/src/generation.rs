@@ -25,6 +25,7 @@ pub struct Identity {
     pub seed: u64,
     pub request_digest: String,
     pub max_tokens: usize,
+    pub generation_policy: Option<crate::sampling_policy::Policy>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -46,6 +47,8 @@ pub struct Checkpoint {
     pub identity: Identity,
     pub progress: Progress,
     pub stop_reason: Option<String>,
+    #[serde(rename = "stopTokenID")]
+    pub stop_token_id: Option<u32>,
 }
 
 fn hash(value: &str) -> bool {
@@ -71,6 +74,41 @@ fn valid(checkpoint: &Checkpoint, expected: &Identity) -> Result<(), Error> {
         "Invalid captured generation identity.",
     )?;
     let progress = &checkpoint.progress;
+    if let Some(policy) = &expected.generation_policy {
+        policy.validate()?;
+        require(
+            progress
+                .token_ids
+                .iter()
+                .all(|id| *id < policy.vocabulary_size && !policy.control_token_ids.contains(id)),
+            "A generation checkpoint contains a control token in its prose ledger.",
+        )?;
+        let reason = checkpoint.stop_reason.as_deref();
+        let stop = checkpoint.stop_token_id;
+        require(
+            match (reason, stop) {
+                (Some("eos"), Some(id)) => policy.eos_token_ids.contains(&id),
+                (Some("model_control"), Some(id)) => {
+                    policy.control_token_ids.contains(&id)
+                        && !policy.eos_token_ids.contains(&id)
+                        && !policy.suppressed_token_ids.contains(&id)
+                }
+                (Some("cancelled"), Some(id)) => {
+                    policy.control_token_ids.contains(&id)
+                        && !policy.suppressed_token_ids.contains(&id)
+                }
+                (Some("eos" | "model_control"), None) => false,
+                (_, None) => true,
+                _ => false,
+            },
+            "The stopping token does not match the captured model policy.",
+        )?;
+    } else {
+        require(
+            checkpoint.stop_token_id.is_none(),
+            "A stopping token requires a captured model policy.",
+        )?;
+    }
     require(
         hash(&progress.prompt_digest)
             && progress.prompt_tokens > 0
@@ -144,6 +182,7 @@ mod tests {
                 seed: u64::MAX,
                 request_digest: "a".repeat(64),
                 max_tokens: 64,
+                generation_policy: None,
             },
             progress: Progress {
                 text: "At the shore, 👩🏽‍💻é".into(),
@@ -154,6 +193,7 @@ mod tests {
                 elapsed_seconds: 0.2,
             },
             stop_reason: None,
+            stop_token_id: None,
         }
     }
     #[test]
@@ -208,6 +248,47 @@ mod tests {
         let mut terminal = before.clone();
         terminal.stop_reason = Some("cancelled".into());
         assert!(validate(&before.identity, Some(&terminal), after).is_err());
+        Ok(())
+    }
+    #[test]
+    fn terminal_tokens_are_excluded_from_prose_and_bound_to_the_policy() -> Result<(), Error> {
+        let mut base = checkpoint();
+        base.identity.generation_policy = Some(crate::sampling_policy::compile(
+            16,
+            serde_json::json!({"eos_token_id": 1, "suppress_tokens": [14, 15]}),
+            vec![0, 1, 3, 14, 15],
+            Some(1),
+        )?);
+        base.progress.token_ids = vec![4, 5];
+        for (reason, token) in [("eos", 1), ("model_control", 3), ("cancelled", 1)] {
+            let mut terminal = base.clone();
+            terminal.stop_reason = Some(reason.into());
+            terminal.stop_token_id = Some(token);
+            assert!(validate(&base.identity, Some(&base), terminal).is_ok());
+        }
+        for (reason, token) in [
+            ("eos", Some(3)),
+            ("eos", None),
+            ("model_control", Some(1)),
+            ("model_control", Some(14)),
+            ("model_control", Some(16)),
+            ("output_limit", Some(1)),
+        ] {
+            let mut terminal = base.clone();
+            terminal.stop_reason = Some(reason.into());
+            terminal.stop_token_id = token;
+            assert!(validate(&base.identity, Some(&base), terminal).is_err());
+        }
+        for token in [0, 1, 3, 14, 15, 16] {
+            let mut bad = base.clone();
+            bad.progress.token_ids.push(token);
+            assert!(validate(&base.identity, Some(&base), bad).is_err());
+        }
+        let mut altered = base.clone();
+        if let Some(policy) = altered.identity.generation_policy.as_mut() {
+            policy.suppressed_token_ids.clear();
+        }
+        assert!(validate(&base.identity, Some(&base), altered).is_err());
         Ok(())
     }
     #[test]

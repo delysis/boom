@@ -15,6 +15,7 @@ mod import;
 mod layout;
 mod markdown;
 mod restore;
+mod sampling_policy;
 mod search;
 mod writing;
 
@@ -646,6 +647,16 @@ fn sampling(profile: &str) -> Result<Sampling, Error> {
     deny_unknown_fields
 )]
 pub enum Request {
+    ModelGenerationPolicy {
+        vocabulary_size: u32,
+        configuration: serde_json::Value,
+        control_token_ids: Vec<u32>,
+        tokenizer_eos: Option<u32>,
+    },
+    AdmitGenerationPolicy {
+        captured: Option<sampling_policy::Policy>,
+        loaded: sampling_policy::Policy,
+    },
     ContextVocabulary {
         descriptor: context::Vocabulary,
     },
@@ -821,6 +832,20 @@ pub fn execute(request: Request) -> Result<Value, Error> {
             previous,
             next,
         } => serde_json::to_value(generation::validate(&expected, previous.as_deref(), *next)?),
+        Request::ModelGenerationPolicy {
+            vocabulary_size,
+            configuration,
+            control_token_ids,
+            tokenizer_eos,
+        } => serde_json::to_value(sampling_policy::compile(
+            vocabulary_size,
+            configuration,
+            control_token_ids,
+            tokenizer_eos,
+        )?),
+        Request::AdmitGenerationPolicy { captured, loaded } => {
+            serde_json::to_value(sampling_policy::admit(captured.as_ref(), &loaded)?)
+        }
         Request::DecodeEditResponse { text } => serde_json::to_value(document::decode(&text)?),
         Request::ValidateDocumentPatch {
             patch,

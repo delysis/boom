@@ -29,9 +29,13 @@ pub struct Recipe {
     profile: String,
     settings: Sampling,
     max_tokens: usize,
+    generation_policy: Option<crate::sampling_policy::Policy>,
 }
 
 pub fn validate(recipe: &Recipe) -> Result<bool, Error> {
+    if let Some(policy) = &recipe.generation_policy {
+        policy.validate()?;
+    }
     let prefix = authored_prefix(&recipe.document.text, recipe.caret)?;
     let boundaries: Vec<_> = prefix
         .grapheme_indices(true)

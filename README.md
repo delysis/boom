@@ -6,6 +6,8 @@ Bloom has two compile-time layouts. The author build keeps a bounded manuscript 
 
 Continuation replay uses its saved manuscript, prompt, model, sampling and seed even after live edits. Branching creates a new manuscript from that captured snapshot and retains its lineage. Acceptance requires the current manuscript, caret and example revisions to match the request. Safe Rust validates captured recipes and branch size before either action.
 
+Generation applies the pinned checkpoint's control-token suppression before sampling. New recipes, receipts and recovery journals retain the effective token policy and exact stopping token, excluding control tokens from prose. Replay requires the captured policy to match the loaded model; earlier records without that policy remain readable and branchable, but require a fresh Explore request for replayable alternatives.
+
 Writing supplies the chosen examples as prose, followed by the manuscript before the caret. When the full prefix exceeds the budget, Rust excludes impossible suffixes using validated vocabulary bounds and asks the loaded tokenizer to check the remaining suffixes in order. The first fit retains the most recent contiguous text possible, without splitting a grapheme. Token counts can decrease when text is added; a binary search cannot establish this result. Text after the caret is excluded.
 
 ## Privacy and ownership

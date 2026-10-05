@@ -72,7 +72,7 @@ final class RecoveryTests: XCTestCase {
     let prompt = try ProductCore.writingPrompt(document, caret: document.text.utf16.count, examples: [], retaining: Int.max)
     let recipe = CompletionRecipe(document: document, caretUTF16: document.text.utf16.count, sources: [],
       prompt: prompt.prompt, promptDigest: prompt.digest, omittedPrefixCharacters: 0, model: "captured-model",
-      profile: .standard, settings: try ProductCore.sampling(.standard), maxTokens: 256)
+      profile: .standard, settings: try ProductCore.sampling(.standard), maxTokens: 256, generationPolicy: nil)
     let bundle = CandidateBundle(id: UUID(), recipe: recipe, origin: nil,
       candidates: [WritingCandidate(id: UUID(), seed: 7, text: "a partial continuation", state: .pending,
         promptTokens: 9, outputTokens: 2, tokenIDs: [1, 2], stopReason: nil)], selected: 0)
@@ -81,7 +81,7 @@ final class RecoveryTests: XCTestCase {
     let plan = try ProductCore.prompt(voice: nil, history: [], instructions: "", context: "", request: "Question", routing: [])
     let receipt = ConsultationReceipt(operationID: UUID(), seed: 9, state: .pending, failure: nil,
       model: "captured-model", voice: nil, plan: plan, sources: [], promptDigest: Digest.sha256(plan.rawPrompt),
-      tokenIDs: [3], stopReason: "pending", firstTokenSeconds: 1, elapsedSeconds: 2)
+      tokenIDs: [3], stopReason: "pending", firstTokenSeconds: 1, elapsedSeconds: 2, generationPolicy: nil)
     try store.vault.encode(bundle, kind: .candidate, id: bundle.id)
     try store.vault.encode(receipt, kind: .receipt, id: message.id)
     var state = WorkspaceState(); state.documents = [DocumentIndex(id: document.id, title: document.title)]

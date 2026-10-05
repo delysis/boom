@@ -207,7 +207,9 @@ import SwiftUI
       for candidate in saved.candidates {
         guard let journal = try await store.writingCheckpoint(bundle: saved, candidate: candidate),
           journal.identity.seed == candidate.seed, journal.progress.tokenIDs == candidate.tokenIDs,
-          journal.progress.text == candidate.text, journal.stopReason == candidate.stopReason else {
+          journal.progress.text == candidate.text, journal.stopReason == candidate.stopReason,
+          journal.stopTokenID == candidate.stopTokenID,
+          journal.identity.generationPolicy == bundle.recipe.generationPolicy else {
           throw BoomError.invalid("Generation journal disagreed with the retained candidate.")
         }
       }

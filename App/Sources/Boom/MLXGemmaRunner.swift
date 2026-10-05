@@ -48,16 +48,17 @@ actor MLXGemmaRunner {
   }
   nonisolated let source: URL
   nonisolated let identity: String
+  nonisolated let generationPolicy: ModelGenerationPolicy
   private let container: ModelContainer
   private let architectureContext: Int
   private let kvBytesPerToken: UInt64
-  private let controlTokens: Set<Int>
   private let tokenizerDescription: Data
   private var contextVocabulary: ContextVocabulary?
   private struct Configuration: Decodable {
     let model_type: String
     let text_config: Text
     struct Text: Decodable {
+      let vocab_size: Int
       let max_position_embeddings: Int
       let num_hidden_layers: Int
       let num_key_value_heads: Int
@@ -79,17 +80,24 @@ actor MLXGemmaRunner {
       else { throw BoomError.invalid("This is not the supported Gemma 4 12B model.") }
       let tokenizerDescription = try Data(contentsOf: directory.appendingPathComponent("tokenizer.json"))
       let tokenizer = try JSONDecoder().decode(TokenizerFile.self, from: tokenizerDescription)
+      let generationURL = directory.appendingPathComponent("generation_config.json")
+      let generationDescription = try Data(contentsOf: generationURL)
       let model = try await VLMModelFactory.shared.loadContainer(
         from: directory, using: #huggingFaceTokenizerLoader())
-      guard tokenizerDescription == (try Data(contentsOf: directory.appendingPathComponent("tokenizer.json"))) else {
-        throw BoomError.stale("The tokenizer changed while the model was loading.")
+      guard tokenizerDescription == (try Data(contentsOf: directory.appendingPathComponent("tokenizer.json"))),
+        generationDescription == (try Data(contentsOf: generationURL)) else {
+        throw BoomError.stale("The tokenizer or generation configuration changed while the model was loading.")
       }
+      let tokenizerEnds = await model.perform { ($0.tokenizer.eosTokenId, $0.tokenizer.unknownTokenId) }
+      let controls = tokenizer.added_tokens.filter(\.special).map(\.id) + (tokenizerEnds.1.map { [$0] } ?? [])
+      let policy = try ProductCore.generationPolicy(vocabularySize: text.vocab_size,
+        configuration: generationDescription, controls: controls, tokenizerEOS: tokenizerEnds.0)
       let runner = MLXGemmaRunner(source: directory, container: model,
         identity: try identity ?? ModelInstaller.hashFile(directory.appendingPathComponent(ModelPacks.manifestName), maxBytes: 4_194_304).sha256,
         architectureContext: text.max_position_embeddings,
         kvBytesPerToken: UInt64(text.num_hidden_layers) * UInt64(text.num_key_value_heads)
           * UInt64(text.head_dim) * 4,
-        controlTokens: Set(tokenizer.added_tokens.filter(\.special).map(\.id)), tokenizerDescription: tokenizerDescription)
+        generationPolicy: policy, tokenizerDescription: tokenizerDescription)
       guard try runner.availableContext() >= 1024 else {
         throw BoomError.budget("The model leaves too little memory for a useful context.")
       }
@@ -98,10 +106,10 @@ actor MLXGemmaRunner {
     } catch { await GenerationCoordinator.shared.leave(); throw error }
   }
   private init(source: URL, container: ModelContainer, identity: String,
-    architectureContext: Int, kvBytesPerToken: UInt64, controlTokens: Set<Int>, tokenizerDescription: Data) {
+    architectureContext: Int, kvBytesPerToken: UInt64, generationPolicy: ModelGenerationPolicy, tokenizerDescription: Data) {
     self.source = source; self.identity = identity
     self.container = container; self.architectureContext = architectureContext
-    self.kvBytesPerToken = kvBytesPerToken; self.controlTokens = controlTokens
+    self.kvBytesPerToken = kvBytesPerToken; self.generationPolicy = generationPolicy
     self.tokenizerDescription = tokenizerDescription
   }
   private nonisolated func availableContext() throws -> Int {
@@ -218,18 +226,19 @@ actor MLXGemmaRunner {
       capacity: capacity, flag: flag)
     return CompletionRecipe(document: document, caretUTF16: caret, sources: sources,
       prompt: selected.prompt, promptDigest: selected.digest, omittedPrefixCharacters: selected.omittedCharacters,
-      model: identity, profile: profile, settings: try ProductCore.sampling(profile), maxTokens: maxTokens)
+      model: identity, profile: profile, settings: try ProductCore.sampling(profile), maxTokens: maxTokens,
+      generationPolicy: generationPolicy)
   }
   func run(plan: ConsultationPlan, images: [Data], maxTokens: Int, seed: UInt64? = nil,
     flag: CancellationFlag,
-    onCheckpoint: (@Sendable (GenerationProgress, String?) async throws -> Void)? = nil,
+    onCheckpoint: (@Sendable (GenerationProgress, String?, Int?) async throws -> Void)? = nil,
     onText: @escaping @Sendable (String) -> Void) async throws -> Output {
     try await generate(plan: plan, raw: nil, images: images, maxTokens: maxTokens,
       settings: ProductCore.sampling(.standard), seed: seed, flag: flag, onCheckpoint: onCheckpoint, onText: onText)
   }
   func run(rawPrompt: String, maxTokens: Int, settings: SamplingSettings? = nil, seed: UInt64? = nil,
     flag: CancellationFlag, background: Bool = false,
-    onCheckpoint: (@Sendable (GenerationProgress, String?) async throws -> Void)? = nil,
+    onCheckpoint: (@Sendable (GenerationProgress, String?, Int?) async throws -> Void)? = nil,
     onText: @escaping @Sendable (String) -> Void) async throws -> Output {
     try await generate(plan: nil, raw: rawPrompt, images: [], maxTokens: maxTokens,
       settings: settings ?? ProductCore.sampling(.standard), seed: seed, flag: flag, background: background,
@@ -238,12 +247,13 @@ actor MLXGemmaRunner {
   private func generate(plan: ConsultationPlan?, raw: String?, images: [Data], maxTokens: Int,
     settings: SamplingSettings, seed: UInt64?, flag: CancellationFlag,
     background: Bool = false,
-    onCheckpoint: (@Sendable (GenerationProgress, String?) async throws -> Void)? = nil,
+    onCheckpoint: (@Sendable (GenerationProgress, String?, Int?) async throws -> Void)? = nil,
     onText: @escaping @Sendable (String) -> Void) async throws -> Output {
     await GenerationCoordinator.shared.enter(flag: flag, background: background)
     do {
       try flag.check()
-      let capacity = try availableContext(), controls = controlTokens
+      let capacity = try availableContext(), policy = generationPolicy
+      let controls = Set(policy.controlTokenIDs), ends = Set(policy.eosTokenIDs)
       let result = try await container.perform { (context: ModelContext) async throws -> Output in
         let input: LMInput
         if let plan { input = try await Self.chatInput(plan, images: images, context: context) }
@@ -254,17 +264,27 @@ actor MLXGemmaRunner {
         let parameters = GenerateParameters(maxTokens: maxTokens, temperature: settings.temperature,
           topP: settings.topP, topK: settings.topK, minP: settings.minP, repetitionPenalty: nil, seed: seed)
         let preparedDigest = Digest.sha256(try JSONEncoder().encode(promptIDs))
-        let (stream, task) = try generateTokensTask(input: input, parameters: parameters, context: context)
+        // TokenIterator performs prompt prefill during task construction.
+        // Start before it so first-token and elapsed time include that work.
+        let clock = ContinuousClock(), started = clock.now
+        let components = GenerationComponents(logitProcessorFactory: { CheckpointTokenMask(policy.suppressedTokenIDs) })
+        let (stream, task) = try generateTokensTask(input: input, parameters: parameters, context: context,
+          includeStopToken: true, components: components)
         await GenerationCoordinator.shared.own(task)
         var tokens: [Int] = [], text = "", ended = false, reason = "output_limit"
-        let clock = ContinuousClock(), started = clock.now
         var first: Double?; var stopToken: Int?
         do {
           for await event in stream {
             if flag.isCancelled || Task.isCancelled { task.cancel(); break }
             switch event {
             case .token(let token):
-              if controls.contains(token) { stopToken = token; reason = "model_control"; ended = true; task.cancel(); break }
+              guard !policy.suppressedTokenIDs.contains(token) else {
+                throw BoomError.invalid("The model emitted a token excluded by its checkpoint policy.")
+              }
+              if controls.contains(token) {
+                stopToken = token; reason = ends.contains(token) ? "eos" : "model_control"
+                ended = true; task.cancel(); break
+              }
               if first == nil { first = started.duration(to: clock.now).timeInterval }
               tokens.append(token)
               let decoded = context.tokenizer.decode(tokenIds: tokens)
@@ -273,7 +293,7 @@ actor MLXGemmaRunner {
                 // Awaiting the store also bounds the checkpoint producer.
                 try await onCheckpoint?(GenerationProgress(text: decoded,
                   tokenIDs: tokens, promptDigest: preparedDigest, promptTokens: promptIDs.count,
-                  firstTokenSeconds: first, elapsedSeconds: started.duration(to: clock.now).timeInterval), nil)
+                  firstTokenSeconds: first, elapsedSeconds: started.duration(to: clock.now).timeInterval), nil, nil)
                 text = decoded; onText(text)
               }
             case .info(let info):
@@ -298,7 +318,7 @@ actor MLXGemmaRunner {
         let elapsed = started.duration(to: clock.now).timeInterval
         try await onCheckpoint?(GenerationProgress(text: final, tokenIDs: tokens,
           promptDigest: preparedDigest, promptTokens: promptIDs.count, firstTokenSeconds: first,
-          elapsedSeconds: elapsed), reason)
+          elapsedSeconds: elapsed), reason, stopToken)
         if final != text, reason != "cancelled" { onText(final) }
         return Output(text: final, tokenIDs: tokens, promptDigest: preparedDigest,
           promptTokens: promptIDs.count, outputTokens: tokens.count, endedByEOS: ended, stopReason: reason, stopTokenID: stopToken,
