@@ -7,6 +7,12 @@ MLX_RUNTIME=9afc3b55f75a0d41a3d0c11330b9df6a036d24e4
 [[ "$(git -C "$HERE/.deps/MLXSwiftLM" rev-parse HEAD)" == "$MLX_RUNTIME" ]] || { echo 'Unexpected MLX Swift LM revision.' >&2; exit 1; }
 git -C "$HERE/.deps/MLXSwiftLM" diff --quiet HEAD || { echo 'MLX Swift LM source has local changes.' >&2; exit 1; }
 EDITION="${2:-author}"
+SIGN_PROFILE="${3:-development}"
+case "$SIGN_PROFILE" in
+  development) SIGN_IDENTITY="${BLOOM_SIGN_IDENTITY:-Apple Development: georgewalkeriv@gmail.com (FZ4WD25KGG)}" ;;
+  distribution) SIGN_IDENTITY="${BLOOM_SIGN_IDENTITY:?Set BLOOM_SIGN_IDENTITY to your Developer ID Application identity.}" ;;
+  *) echo 'Choose development or distribution for the third build argument.' >&2; exit 1 ;;
+esac
 case "$EDITION" in
   author) RUST_FEATURES=(--no-default-features) ;;
   chat) RUST_FEATURES=(--features boom-attachment-ffi/chat-layout) ;;
@@ -16,6 +22,7 @@ if [[ "$EDITION" == author ]]; then export CARGO_TARGET_DIR="$HERE/target"; else
 OUT="${1:-$HERE/out/$(date -u +%Y%m%dT%H%M%SZ)}"
 [[ ! -e "$OUT" ]] || { echo "Refusing to overwrite $OUT" >&2; exit 1; }
 mkdir -p "$OUT"
+OUT="$(cd "$OUT" && pwd -P)"
 exec > >(tee "$OUT/build.log") 2>&1
 source_inventory() {
   (
@@ -33,6 +40,7 @@ xcrun --sdk macosx --show-sdk-version
 (cd "$HERE/Core" && swift test)
 (cd "$HERE" && cargo fmt --all -- --check && cargo test --workspace --locked "${RUST_FEATURES[@]}" && cargo clippy --workspace --locked "${RUST_FEATURES[@]}" --all-targets -- -D warnings)
 (cd "$HERE" && cargo rustc -p boom-attachment-ffi --release --locked "${RUST_FEATURES[@]}" --lib -- --print native-static-libs) 2>&1 | tee "$OUT/rust-native-link.log"
+(cd "$HERE" && cargo build -p bloom-core --bin bloom-delivery --release --locked)
 mkdir -p "$HERE/.build-support"
 python3 - "$CARGO_TARGET_DIR/release" "$EDITION" "$HERE/.build-support/RustProductBuild.json" <<'PYBUILD'
 import json,sys
@@ -76,24 +84,10 @@ cp "$HERE/App/Package.resolved" "$OUT/Package.resolved"
 # TCC reads the app's privacy descriptions from its signed bundle identity.
 # Signing only the SwiftPM executable leaves Info.plist unbound and can abort
 # Speech or microphone access when launched outside LaunchServices.
-SIGN_IDENTITY="${BLOOM_SIGN_IDENTITY:-Apple Development: georgewalkeriv@gmail.com (FZ4WD25KGG)}"
-codesign --force --deep --options runtime --timestamp=none --entitlements "$HERE/Entitlements.plist" --sign "$SIGN_IDENTITY" "$APP"
-codesign --verify --strict --verbose=2 "$APP"
-codesign -d --entitlements - --xml "$APP" > "$OUT/signed-entitlements.plist" 2> "$OUT/entitlements-inspection.log"
-python3 - "$HERE/Entitlements.plist" "$OUT/signed-entitlements.plist" <<'PYENTITLEMENTS'
-import plistlib,sys
-expected = {'com.apple.security.device.audio-input': True}
-for path in sys.argv[1:]:
-    with open(path, 'rb') as stream:
-        actual = plistlib.load(stream)
-    if actual != expected or type(actual.get('com.apple.security.device.audio-input')) is not bool:
-        raise SystemExit(f'Unexpected microphone signing entitlements: {path}')
-PYENTITLEMENTS
-codesign -d -r- "$APP" > "$OUT/designated-requirement.txt" 2>&1
-codesign -dv --verbose=4 "$APP" > "$OUT/code-signing-scope.txt" 2>&1
-rg -q 'Info.plist entries=[1-9]' "$OUT/code-signing-scope.txt"
-rg -q 'Sealed Resources version=2' "$OUT/code-signing-scope.txt"
-rg -q 'flags=.*\(runtime\)' "$OUT/code-signing-scope.txt"
+"$CARGO_TARGET_DIR/release/bloom-delivery" sign "$APP" "$OUT" "$SIGN_PROFILE" "$SIGN_IDENTITY" "$HERE/Entitlements.plist"
+cp "$OUT/delivery/signed-entitlements.plist" "$OUT/signed-entitlements.plist"
+cat "$OUT/delivery/designated-requirement.stdout" "$OUT/delivery/designated-requirement.stderr" > "$OUT/designated-requirement.txt"
+cat "$OUT/delivery/signing-scope.stdout" "$OUT/delivery/signing-scope.stderr" > "$OUT/code-signing-scope.txt"
 otool -L "$APP/Contents/MacOS/Bloom" > "$OUT/dynamic-dependencies.txt"
 shasum -a 256 "$APP/Contents/MacOS/Bloom" > "$OUT/executable.sha256"
 du -sk "$APP" > "$OUT/bundle-size-kib.txt"

@@ -40,6 +40,8 @@ open "$PWD/out/fresh-build/Bloom.app"
 
 Cargo has one workspace and lock. Swift dependencies are resolved once, with MLX Swift LM pinned to `9afc3b55f75a0d41a3d0c11330b9df6a036d24e4`. Builds use locked dependencies, run Rust and native tests, record actual static linker requirements, and reject source changes during the build. The signed bundle contains source/lock inventories, notices and the model catalog. Development signing uses a stable Apple Development identity; Developer ID distribution is a separate gate.
 
+The safe Rust `bloom-delivery` developer tool owns signing admission and command receipts. The third build argument selects `development` (default) or `distribution`; distribution requires an explicitly configured Developer ID Application identity and secure timestamp. Inspection and archive preparation do not submit to Apple or launch the app. See [DISTRIBUTION.md](DISTRIBUTION.md) for the exact preparation, notarization, stapling and installation sequence.
+
 The developer-only `BloomPackBuilder` converts pinned source checkpoints outside normal installation. Its manifests retain source revisions and hashes, quantization settings, runtime revision, output hashes and licenses. The app executable does not perform conversion.
 
 An explicit real-weight diagnostic preserves every attempt in a fresh evidence directory:
