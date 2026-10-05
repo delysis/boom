@@ -11,6 +11,24 @@ enum ProductCore {
   static func importedTexts(_ files: [ImportedText]) throws -> [ImportedText] {
     try call(["op": "validate_import", "files": object(files)])
   }
+  static func importedDocuments(_ files: [ImportedText]) throws -> [ImportedText] {
+    try call(["op": "validate_document_import", "files": object(files)])
+  }
+  static func importBudget(files: Int, bytes: Int) throws {
+    let _: Bool = try call(["op": "validate_import_budget", "files": files, "bytes": bytes])
+  }
+  static func validateOriginals(_ state: WorkspaceState) throws {
+    let files = (state.importedFiles ?? [:]).map { id, file in
+      ["id": id.uuidString, "folderID": file.folderID.map { $0.uuidString as Any } ?? NSNull(),
+        "path": file.path, "originalDigest": file.originalDigest] as [String: Any]
+    }
+    let _: Bool = try call(["op": "validate_imported_originals", "documents": state.documents.map { $0.id.uuidString },
+      "folders": (state.importedFolders ?? []).map { $0.id.uuidString }, "files": files])
+  }
+  static func admitRestore(_ state: WorkspaceState, documents: [DocumentSnapshot], entries: [String], hasIndex: Bool) throws {
+    let _: Bool = try call(["op": "admit_restore", "state": object(state), "documents": object(documents),
+      "entries": entries, "hasIndex": hasIndex])
+  }
   static func chatTitle(_ request: String, routing: [String]) throws -> String {
     try call(["op": "chat_title", "request": request, "routing": routing])
   }

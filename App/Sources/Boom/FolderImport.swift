@@ -55,3 +55,25 @@ enum FolderImport {
     return files
   }
 }
+
+enum DocumentImport {
+  static func read(_ urls: [URL], flag: CancellationFlag) throws -> [FolderImport.File] {
+    try flag.check()
+    _ = try ProductCore.importedDocuments(urls.map { ImportedText(path: $0.lastPathComponent, text: "") })
+    var files: [FolderImport.File] = [], totalBytes = 0
+    for url in urls {
+      try flag.check()
+      let scope = url.startAccessingSecurityScopedResource()
+      defer { if scope { url.stopAccessingSecurityScopedResource() } }
+      let original = try AttachmentProcessor.readGranted(url, limit: 2_097_152, allowEmpty: true)
+      totalBytes += original.count
+      try ProductCore.importBudget(files: urls.count, bytes: totalBytes)
+      guard let text = String(data: original, encoding: .utf8) else {
+        throw BoomError.invalid("Document import requires UTF-8 text.")
+      }
+      files.append(FolderImport.File(id: UUID(), path: url.lastPathComponent, original: original, text: text))
+    }
+    _ = try ProductCore.importedDocuments(files.map { ImportedText(path: $0.path, text: $0.text) })
+    return files
+  }
+}

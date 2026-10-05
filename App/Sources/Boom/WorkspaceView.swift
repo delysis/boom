@@ -222,7 +222,7 @@ struct LibraryView: View {
           heading("Documents") {
             do { try model.newDocument() } catch { model.report(error) }
           }
-          ForEach(model.documents.filter { model.state.importedFiles?[$0.id] == nil && model.documentMatchesSearch($0) }) { document in
+          ForEach(model.documents.filter { model.state.importedFiles?[$0.id]?.folderID == nil && model.documentMatchesSearch($0) }) { document in
             Group {
               if renameTarget == .document(document.id) {
                 editableRow(symbol: "doc.text", selected: true)

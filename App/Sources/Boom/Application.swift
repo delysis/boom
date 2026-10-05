@@ -15,15 +15,17 @@ import SwiftUI
 
 @main @MainActor enum BoomMain {
   static func main() {
-    if CommandLine.arguments.contains("--generation-recovery-smoke") {
+    if CommandLine.arguments.contains("--generation-recovery-smoke") || CommandLine.arguments.contains("--workspace-import-smoke") {
       let app = NSApplication.shared
       app.setActivationPolicy(.prohibited)
       Task {
         do {
-          try await GenerationRecoverySmoke.run(arguments: CommandLine.arguments)
+          if CommandLine.arguments.contains("--workspace-import-smoke") {
+            try await WorkspaceImportSmoke.run(arguments: CommandLine.arguments)
+          } else { try await GenerationRecoverySmoke.run(arguments: CommandLine.arguments) }
           exit(0)
         } catch {
-          fputs("Generation recovery diagnostic failed: \(error.localizedDescription)\n", stderr)
+          fputs("Native diagnostic failed: \(error.localizedDescription)\n", stderr)
           exit(1)
         }
       }

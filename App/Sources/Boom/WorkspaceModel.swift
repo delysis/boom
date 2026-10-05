@@ -246,7 +246,9 @@ struct CompletionSegment {
           for document in capturedDocuments {
             try Task.checkCancellation()
             let matches = try ProductCore.search(document.text, query: query)
-            let importedPath = imported[document.id].map { (folderNames[$0.folderID] ?? "") + "/" + $0.path } ?? ""
+            let importedPath = imported[document.id].map { file in
+              file.folderID.flatMap { folderNames[$0] }.map { $0 + "/" + file.path } ?? file.path
+            } ?? ""
             let title = try ProductCore.search(document.title + "\n" + importedPath, query: query)
             if matches.hasMatches || title.hasMatches {
               documents[document.id] = DocumentSearchMatches(query: query, revision: document.revision, matches: matches)
@@ -1474,10 +1476,7 @@ struct CompletionSegment {
       defer { if scope { root.stopAccessingSecurityScopedResource() } }
       let files = try await detachedWork { try FolderImport.read(root, flag: flag) }
       try flag.check()
-      let vault = self.store.vault
-      try await detachedWork {
-        for file in files { try flag.check(); try vault.put(file.original, kind: .attachment, id: file.id) }
-      }
+      try await self.store.retainImportedOriginals(files, flag: flag)
       try flag.check()
       let folder = ImportedFolder(id: UUID(), name: root.lastPathComponent)
       self.state.importedFolders = (self.state.importedFolders ?? []) + [folder]
@@ -1504,23 +1503,23 @@ struct CompletionSegment {
     let urls = panel.urls
     work("Importing documents…") { [weak self] flag in
       guard let self else { return }
-      let imported = try await detachedWork {
-        try urls.map { url -> DocumentSnapshot in
-          try flag.check()
-          let scope = url.startAccessingSecurityScopedResource()
-          defer { if scope { url.stopAccessingSecurityScopedResource() } }
-          let data = try AttachmentProcessor.readGranted(url, limit: 2_097_152, allowEmpty: true)
-          guard data.count <= 2_097_152, let text = String(data: data, encoding: .utf8) else {
-            throw BoomError.invalid("Markdown import requires UTF-8 text up to 2 MiB.")
-          }
-          return DocumentSnapshot(title: url.deletingPathExtension().lastPathComponent, text: text)
-        }
-      }
-      try flag.check()
-      for document in imported { self.dirty.insert(document.id); self.documents.append(document) }
-      if let document = imported.first { self.selectImportedDocument(document.id) }
-      try await self.flush()
+      try await self.importDocuments(urls, flag: flag)
     }
+  }
+  func importDocuments(_ urls: [URL], flag: CancellationFlag) async throws {
+    let imported = try await detachedWork { try DocumentImport.read(urls, flag: flag) }
+    try flag.check()
+    try await store.retainImportedOriginals(imported, flag: flag)
+    try flag.check()
+    state.importedFiles = state.importedFiles ?? [:]
+    for file in imported {
+      let document = DocumentSnapshot(id: file.id,
+        title: URL(fileURLWithPath: file.path).deletingPathExtension().lastPathComponent, text: file.text)
+      dirty.insert(document.id); documents.append(document)
+      state.importedFiles?[file.id] = ImportedFile(folderID: nil, path: file.path, originalDigest: Digest.sha256(file.original))
+    }
+    if let first = imported.first { selectImportedDocument(first.id) }
+    try await flush()
   }
   func exportDocument(_ id: UUID? = nil) {
     finishComposition()

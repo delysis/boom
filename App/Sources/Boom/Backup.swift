@@ -94,14 +94,16 @@ extension WorkspaceStore {
     try WorkspaceBackup.export(vault: vault, passphrase: passphrase, to: url)
   }
   func restoreBackup(passphrase: String, from url: URL) throws -> (WorkspaceState, [DocumentSnapshot]) {
-    let current = try load().get()
-    guard current.1.allSatisfy({ $0.text.isEmpty && $0.title == "Untitled" }),
-      current.0.chats.allSatisfy({ $0.messages.isEmpty && ($0.instructions ?? "").isEmpty }), current.0.voices.isEmpty,
-      current.0.voiceVersions.isEmpty, current.0.attachments.isEmpty,
-      current.0.candidateIDs.isEmpty, current.0.proposals.isEmpty,
-      (current.0.importedFolders ?? []).isEmpty, (current.0.importedFiles ?? [:]).isEmpty else {
-      throw BoomError.denied("Restore into a fresh workspace. This workspace already contains authored data and was retained.")
+    // Inspect without load(): recovery may write journals or finish interrupted
+    // responses, which is inappropriate before rejecting an occupied target.
+    let hasIndex = vault.exists(.workspace, Vault.workspaceID)
+    let current = try hasIndex ? vault.decode(WorkspaceState.self, kind: .workspace,
+      id: Vault.workspaceID, limit: Vault.workspaceLimit) : WorkspaceState()
+    let documents = try current.documents.map {
+      DocumentSnapshot(id: $0.id, title: $0.title, text: try readDocument($0.id))
     }
+    let entries = try FileManager.default.contentsOfDirectory(atPath: vault.root.path)
+    try ProductCore.admitRestore(current, documents: documents, entries: entries, hasIndex: hasIndex)
     let stageURL = root.appendingPathComponent(".backup-admission-" + UUID().uuidString)
     let stage = try vault.sibling(at: stageURL)
     defer { try? FileManager.default.removeItem(at: stageURL) }

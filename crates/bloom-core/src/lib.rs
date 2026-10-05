@@ -13,6 +13,7 @@ mod generation;
 mod import;
 mod layout;
 mod markdown;
+mod restore;
 mod search;
 
 #[derive(Debug, thiserror::Error)]
@@ -672,6 +673,24 @@ pub enum Request {
     ValidateImport {
         files: Vec<import::ImportedText>,
     },
+    ValidateDocumentImport {
+        files: Vec<import::ImportedText>,
+    },
+    ValidateImportBudget {
+        files: usize,
+        bytes: usize,
+    },
+    ValidateImportedOriginals {
+        documents: Vec<Uuid>,
+        folders: Vec<Uuid>,
+        files: Vec<import::Original>,
+    },
+    AdmitRestore {
+        state: Value,
+        documents: Vec<document::Document>,
+        entries: Vec<String>,
+        has_index: bool,
+    },
     ChatTitle {
         request: String,
         routing: Vec<String>,
@@ -755,6 +774,23 @@ pub fn execute(request: Request) -> Result<Value, Error> {
         Request::MarkdownSpans { text } => serde_json::to_value(markdown::spans(&text)?),
         Request::Layout => serde_json::to_value(layout::compiled_layout()),
         Request::ValidateImport { files } => serde_json::to_value(import::validate_import(files)?),
+        Request::ValidateDocumentImport { files } => {
+            serde_json::to_value(import::validate_documents(files)?)
+        }
+        Request::ValidateImportBudget { files, bytes } => {
+            serde_json::to_value(import::validate_budget(files, bytes)?)
+        }
+        Request::ValidateImportedOriginals {
+            documents,
+            folders,
+            files,
+        } => serde_json::to_value(import::validate_manifest(&documents, &folders, &files)?),
+        Request::AdmitRestore {
+            state,
+            documents,
+            entries,
+            has_index,
+        } => serde_json::to_value(restore::admit(&state, &documents, &entries, has_index)?),
         Request::ChatTitle { request, routing } => {
             serde_json::to_value(chat_title(&request, &routing)?)
         }

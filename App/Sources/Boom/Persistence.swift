@@ -13,7 +13,7 @@ struct ImportedFolder: Codable, Identifiable, Sendable {
   let name: String
 }
 struct ImportedFile: Codable, Sendable {
-  let folderID: UUID
+  let folderID: UUID?
   let path: String
   let originalDigest: String
 }
@@ -270,18 +270,8 @@ actor WorkspaceStore {
         diskRevisions[item.id] = Digest.sha256(text)
         documents.append(DocumentSnapshot(id: item.id, title: item.title, text: text))
       }
-      let folders = state.importedFolders ?? [], files = state.importedFiles ?? [:]
-      let folderIDs = Set(folders.map(\.id)), documentIDs = Set(documents.map(\.id))
-      guard folderIDs.count == folders.count,
-        files.allSatisfy({ documentIDs.contains($0.key) && folderIDs.contains($0.value.folderID) }) else {
-        throw BoomError.invalid("Inconsistent imported-folder identities; encrypted records retained.")
-      }
-      for folder in folders {
-        let entries = files.filter { $0.value.folderID == folder.id }
-        if !entries.isEmpty {
-          _ = try ProductCore.importedTexts(entries.map { ImportedText(path: $0.value.path, text: "") })
-        }
-      }
+      try ProductCore.validateOriginals(state)
+      let files = state.importedFiles ?? [:]
       for (id, file) in files {
         guard vault.exists(.attachment, id),
           try Digest.sha256(vault.get(.attachment, id: id, limit: 2_097_152)) == file.originalDigest else {
@@ -314,6 +304,17 @@ actor WorkspaceStore {
     }
   }
   nonisolated func documentURL(_ id: UUID) -> URL { vault.recordURL(.document, id) }
+  func retainImportedOriginals(_ files: [FolderImport.File], flag: CancellationFlag) throws {
+    // Check the complete capture before admitting any originals. Fresh document
+    // identities may never replace an existing original or manuscript.
+    for file in files {
+      try flag.check()
+      guard !vault.exists(.attachment, file.id), !vault.exists(.document, file.id) else {
+        throw BoomError.stale("An imported document identity already exists; its records were retained.")
+      }
+    }
+    for file in files { try flag.check(); try vault.put(file.original, kind: .attachment, id: file.id) }
+  }
   private func recoverGenerations(_ state: inout WorkspaceState) throws {
     var bundles: [CandidateBundle] = [], receipts: [(UUID, ConsultationReceipt)] = []
     var changed = false
