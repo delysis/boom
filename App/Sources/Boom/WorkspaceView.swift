@@ -4,73 +4,91 @@ import Combine
 import SwiftUI
 
 enum BoomChrome {
-  static var sidebarBackground: NSColor {
+  private static func color(dark: (Double, Double, Double), light: (Double, Double, Double)) -> NSColor {
     NSColor(name: nil) { appearance in
-      appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        ? NSColor(srgbRed: 0.16, green: 0.16, blue: 0.16, alpha: 1)
-        : NSColor(srgbRed: 0.95, green: 0.95, blue: 0.95, alpha: 1)
+      let c = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
+      return NSColor(srgbRed: c.0, green: c.1, blue: c.2, alpha: 1)
     }
   }
+  static let sidebarBackground = color(dark: (0.16, 0.16, 0.16), light: (0.96, 0.945, 0.92))
+  static let canvasBackground = color(dark: (0.14, 0.14, 0.14), light: (0.955, 0.945, 0.928))
+  static let paperBackground = color(dark: (0.15, 0.15, 0.15), light: (1, 1, 1))
+  static let inputBackground = color(dark: (0.125, 0.125, 0.125), light: (1, 1, 1))
 }
 
 struct WorkspaceView: View {
   @ObservedObject var model: WorkspaceModel
+  private var panes: [PaneLayout.Pane] {
+    var result: [PaneLayout.Pane] = []
+    if model.showsLibrary {
+      result.append(.init(id: "library", content: AnyView(LibraryView(model: model)),
+        minimum: 170, preferred: 210, maximum: 300))
+    }
+    if model.showsDocument {
+      result.append(.init(id: "document", content: AnyView(ManuscriptPane(model: model)),
+        minimum: 280, preferred: 580, maximum: .infinity))
+    }
+    if model.showsChat {
+      result.append(.init(id: "chat", content: AnyView(ChatPane(model: model)),
+        minimum: 300, preferred: model.layout.isAuthor ? 370 : 800,
+        maximum: model.layout.isAuthor ? 620 : .infinity))
+    }
+    return result
+  }
   var body: some View {
     GeometryReader { geometry in
-      HSplitView {
-        if model.showsLibrary {
-          LibraryView(model: model).frame(minWidth: 170, idealWidth: 210, maxWidth: 320)
-        }
-        if model.showsDocument {
-          if let document = model.selectedDocument {
-            GeometryReader { pane in
-              ScrollView(.vertical) {
-                VStack(spacing: 0) {
-                  let attachments = model.documentAttachments(document)
-                  MarkdownEditor(model: model, document: document,
-                    minimumHeight: attachments.isEmpty ? pane.size.height : 0)
-                    .frame(width: pane.size.width)
-                  if !attachments.isEmpty {
-                    VStack(spacing: 8) {
-                      ForEach(attachments) { attachment in
-                        AttachmentInlineCard(model: model, record: attachment)
-                      }
-                    }.padding(.horizontal, 20).padding(.vertical, 12)
-                  }
-                }
-                .frame(width: pane.size.width, alignment: .leading)
-              }
-            }
-            .frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
-          } else {
-            Text("Choose a document").foregroundStyle(.secondary).frame(
-              minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
-          }
-        }
-        if model.showsChat {
-          ChatPane(model: model).frame(
-            minWidth: 280, idealWidth: 370, maxWidth: model.showsDocument ? 620 : .infinity)
-        }
-      }
-      .onChange(of: geometry.size.width, initial: true) { _, width in
-        model.fitPanes(to: width)
-      }
+      PaneLayout(panes: panes)
+        .onChange(of: geometry.size.width, initial: true) { _, width in model.fitPanes(to: width) }
     }
-    .background(Color(nsColor: .textBackgroundColor))
-    .onReceive(Timer.publish(every: 15, on: .main, in: .common).autoconnect()) { _ in
-      model.refreshAppleAvailability()
-    }
+    .background(Color(nsColor: BoomChrome.sidebarBackground))
     .environment(\.openURL, OpenURLAction { _ in .discarded })
     .sheet(isPresented: $model.showingModels) { ModelSetupView(model: model) }
-    .alert(
-      "Bloom",
-      isPresented: Binding(
-        get: { model.errorMessage != nil }, set: { if !$0 { model.dismissError() } })
-    ) {
-      Button("OK", role: .cancel) { model.dismissError() }
-    } message: {
-      Text(model.errorMessage ?? "")
-    }
+    .sheet(item: $model.backupRequest) { BackupPassphraseView(model: model, request: $0) }
+    .sheet(item: $model.editingWritingExamples) { WritingExamplesView(model: model, request: $0) }
+    .alert("Bloom", isPresented: Binding(
+      get: { model.errorMessage != nil }, set: { if !$0 { model.dismissError() } })
+    ) { Button("OK", role: .cancel) { model.dismissError() } }
+    message: { Text(model.errorMessage ?? "") }
+  }
+}
+
+struct ManuscriptPane: View {
+  @ObservedObject var model: WorkspaceModel
+  var body: some View {
+    GeometryReader { pane in
+      VStack(spacing: 0) {
+        if let document = model.selectedDocument {
+          ScrollView(.vertical) {
+            let width = min(760, max(1, pane.size.width - 40))
+            let attachments = model.documentAttachments(document)
+            VStack(spacing: 0) {
+              MarkdownEditor(model: model, document: document,
+                minimumHeight: attachments.isEmpty ? max(180, pane.size.height - 48 -
+                  (model.showingCandidates && model.candidates != nil ? 300 : 0)) : 180)
+              if !attachments.isEmpty {
+                VStack(spacing: 8) {
+                  ForEach(attachments) { attachment in AttachmentInlineCard(model: model, record: attachment) }
+                }.padding(.horizontal, 28).padding(.vertical, 12)
+              }
+            }
+            .frame(width: width)
+            .background(Color(nsColor: BoomChrome.paperBackground))
+            .padding(.vertical, 24)
+            .frame(maxWidth: .infinity)
+          }
+        } else {
+          Text("Import a document or create a new one").foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        if let issue = model.writingIssue {
+          Text(issue).font(.callout).foregroundStyle(.secondary).textSelection(.enabled).padding(14)
+        }
+        if model.showingCandidates, model.candidates != nil {
+          WritingAlternatives(model: model).frame(height: min(300, max(220, pane.size.height * 0.4)))
+            .background(Color(nsColor: BoomChrome.sidebarBackground))
+        }
+      }
+    }.background(Color(nsColor: BoomChrome.canvasBackground))
   }
 }
 
@@ -79,14 +97,13 @@ struct LibraryView: View {
     case document(UUID), chat(UUID)
   }
   @ObservedObject var model: WorkspaceModel
-  @State private var filter = ""
   @State private var documentAnchor: UUID?
   @State private var chatAnchor: UUID?
   @State private var renameTarget: RenameTarget?
   @State private var renameDraft = ""
   @FocusState private var renameFocused: Bool
   private func includes(_ title: String) -> Bool {
-    filter.isEmpty || title.localizedCaseInsensitiveContains(filter)
+    model.librarySearch.isEmpty || title.localizedCaseInsensitiveContains(model.librarySearch)
   }
   private func heading(_ title: String, add: (() -> Void)? = nil) -> some View {
     HStack {
@@ -159,7 +176,7 @@ struct LibraryView: View {
   }
   private func chooseDocument(_ id: UUID) {
     if renameTarget != nil { commitRename() }
-    let visible = model.documents.filter { includes($0.title) }.map(\.id)
+    let visible = model.documents.filter { model.documentMatchesSearch($0) }.map(\.id)
     let modifiers = NSApp.currentEvent?.modifierFlags ?? []
     var selection = LibrarySelection(ids: model.selectedDocumentIDs, anchor: documentAnchor)
     let result = selection.click(
@@ -173,7 +190,7 @@ struct LibraryView: View {
   }
   private func chooseChat(_ id: UUID) {
     if renameTarget != nil { commitRename() }
-    let visible = model.state.chats.filter { includes($0.title) }.map(\.id)
+    let visible = model.state.chats.filter { model.chatMatchesSearch($0) }.map(\.id)
     let modifiers = NSApp.currentEvent?.modifierFlags ?? []
     var selection = LibrarySelection(ids: model.selectedChatIDs, anchor: chatAnchor)
     let result = selection.click(
@@ -199,25 +216,20 @@ struct LibraryView: View {
   }
   var body: some View {
     VStack(spacing: 0) {
-      HStack(spacing: 8) {
-        Image(systemName: "magnifyingglass").foregroundStyle(.tertiary)
-        TextField("Search", text: $filter).textFieldStyle(.plain)
-          .accessibilityLabel("Filter documents, chats and personas")
-      }.font(.system(size: 12)).padding(.horizontal, 14).padding(.vertical, 12)
-      Rectangle().fill(Color.primary.opacity(0.07)).frame(height: 1)
       ScrollView {
         LazyVStack(alignment: .leading, spacing: 1) {
+          if model.layout.isAuthor {
           heading("Documents") {
             do { try model.newDocument() } catch { model.report(error) }
           }
-          ForEach(model.documents.filter { includes($0.title) }) { document in
+          ForEach(model.documents.filter { model.state.importedFiles?[$0.id] == nil && model.documentMatchesSearch($0) }) { document in
             Group {
               if renameTarget == .document(document.id) {
                 editableRow(symbol: "doc.text", selected: true)
               } else {
                 Button { chooseDocument(document.id) } label: {
                   row(document.title, symbol: "doc.text",
-                    selected: model.selectedDocumentIDs.contains(document.id))
+                    selected: model.showsDocument && model.selectedDocumentIDs.contains(document.id))
                 }.buttonStyle(.plain).padding(.horizontal, 7)
               }
             }
@@ -235,7 +247,6 @@ struct LibraryView: View {
                 }
                 Divider()
                 Button("Export Markdown…") { model.exportDocument(document.id) }
-                Button("Reveal UTF-8 file") { model.revealDocument(document.id) }
                 Divider()
                 Button(
                   documentDeletion(document.id).count == 1 ? "Delete Document…"
@@ -244,24 +255,32 @@ struct LibraryView: View {
                 ) { model.deleteDocuments(documentDeletion(document.id)) }.disabled(model.isBusy)
               }
           }
+          ForEach(model.state.importedFolders ?? []) { folder in
+            ImportedFolderRows(model: model, folder: folder)
+          }
+          Button { model.importFolder() } label: {
+            row("Import folder…", symbol: "folder.badge.plus", selected: false)
+          }.buttonStyle(.plain).padding(.horizontal, 7).disabled(model.isBusy)
+          } else {
           heading("Chats") {
             do { try model.newChat() } catch { model.report(error) }
           }
-          ForEach(model.state.chats.filter { includes($0.title) }) { chat in
+          ForEach(model.state.chats.filter { model.chatMatchesSearch($0) && model.chatVoice($0.id) == nil }) { chat in
             Group {
               if renameTarget == .chat(chat.id) {
                 editableRow(symbol: "bubble.left", selected: true)
               } else {
                 Button { chooseChat(chat.id) } label: {
                   row(chat.title, symbol: "bubble.left",
-                    selected: model.selectedChatIDs.contains(chat.id))
+                    selected: model.showsChat && model.selectedChatIDs.contains(chat.id))
                 }.buttonStyle(.plain).padding(.horizontal, 7)
               }
             }
               .contextMenu {
                 Button("Rename") { beginRename(.chat(chat.id), title: chat.title) }
-                Button("Save as persona…") { model.savePersona(from: chat.id) }.disabled(
-                  model.isBusy || !model.modelReady || chat.messages.last?.role != .assistant)
+                Button("Export conversation…") { model.exportChat(chat.id) }
+                Button("Instructions…") { model.openChatInstructions(chat.id) }.disabled(model.isBusy)
+                Button("Pin as voice") { model.pinChat(chat.id) }.disabled(model.isBusy)
                 Divider()
                 Button(
                   chatDeletion(chat.id).count == 1 ? "Delete Chat…"
@@ -270,29 +289,27 @@ struct LibraryView: View {
                 ) { model.deleteChats(chatDeletion(chat.id)) }.disabled(model.isBusy)
               }
           }
-          if !model.state.personas.isEmpty {
-            heading("Personas")
-            ForEach(model.state.personas.filter { includes($0.title) || includes($0.slug) }) {
-              persona in
-              Button {
-                model.insertPersona(persona)
-                model.state.showChat = true
-              } label: {
-                row("@" + persona.slug, symbol: "person.crop.circle", selected: false)
-              }.buttonStyle(.plain).padding(.horizontal, 7).help(
-                persona.model == model.runner?.identity
-                  ? "Native KV snapshot saved; authenticated again on use"
-                  : "Rebuild this persona for the selected model"
-              )
-              .contextMenu {
-                Button("Consult @\(persona.slug)") { model.insertPersona(persona) }
-                Button("Rebuild native cache") { model.rebuildPersona(persona.id) }.disabled(
-                  model.isBusy || !model.modelReady)
-                Button("Delete persona…", role: .destructive) { model.deletePersona(persona.id) }
-                  .disabled(model.isBusy)
-              }
-            }
           }
+          if !model.state.voices.isEmpty { heading("Voices") }
+          ForEach(model.state.voices.filter { model.voiceMatchesSearch($0) }) { voice in
+            Group {
+              if renameTarget == .chat(voice.id) { editableRow(symbol: "pin", selected: true) }
+              else {
+                Button { model.editVoice(voice) } label: {
+                  row(voice.name + " · @" + voice.slug, symbol: "pin",
+                    selected: model.showsChat && model.state.selectedChat == voice.id)
+                }.buttonStyle(.plain).padding(.horizontal, 7)
+              }
+            }.contextMenu {
+              Button("Consult @" + voice.slug) { model.consultVoice(voice) }
+              Button("Rename") { model.editVoice(voice); beginRename(.chat(voice.id), title: voice.name) }
+              Button("Instructions…") { model.editVoice(voice); model.openChatInstructions(voice.id) }
+              Button("Duplicate") { model.duplicateVoice(voice) }
+              Button("Export voice…") { model.exportVoice(voice) }
+              Button("Unpin") { model.unpinChat(voice.id) }
+            }.disabled(model.isBusy)
+          }
+          if let issue = model.searchIssue { Text(issue).font(.caption).foregroundStyle(.secondary).padding(12) }
           Spacer(minLength: 12)
         }
       }
@@ -315,16 +332,21 @@ struct ChatPane: View {
       Button("Ask · read only") { model.mode = .ask }
       Button("Propose · review edits") { model.mode = .propose }
       Button("Edit · apply edits") { model.mode = .edit }
+      Divider()
+      Picker("Multiple voices", selection: $model.consultationStyle) {
+        ForEach(ConsultationStyle.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+      }
     } label: {
       HStack(spacing: 5) {
         Image(systemName: model.mode == .ask ? "bubble.left" :
           model.mode == .propose ? "text.badge.plus" : "pencil.line")
-        if !compact { Text(model.mode.rawValue) }
+        Text(model.mode.rawValue)
         Image(systemName: "chevron.down").font(.system(size: 9, weight: .medium))
       }.font(.system(size: 11, weight: .medium))
         .foregroundStyle(model.mode == .ask ? .secondary : .primary)
-    }.menuStyle(.borderlessButton).fixedSize().disabled(model.isBusy)
-      .help("Choose this message's document authority")
+    }.menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().disabled(model.isBusy)
+      .accessibilityLabel("Document authority: " + model.mode.rawValue)
+      .help("Ask reads; Propose offers edits for review; Edit applies validated edits to the attached document")
   }
   private var attachmentMenu: some View {
     Menu {
@@ -349,19 +371,12 @@ struct ChatPane: View {
   }
   private func modelMenu(compact: Bool) -> some View {
     Menu {
-      Button("Automatic") { model.chooseModel(.automatic) }
-      Button("Apple Foundation Model") { model.chooseModel(.apple) }
-        .disabled(!AppleModel.isAvailable)
-      Button("Gemma 4") { model.chooseModel(.gemma) }
-        .disabled(model.runner == nil && model.mlxRunner == nil)
-      Divider()
       Button("Manage models…") { model.showingModels = true }
     } label: {
       HStack(spacing: 4) {
         Image(systemName: "cpu")
         if !compact {
-          Text(model.inferenceName == "Apple Foundation Model" ? "Apple" :
-            model.inferenceName.hasPrefix("Gemma 4") ? "Gemma" : "No model")
+          Text(model.canInfer ? "Gemma" : "No model")
         }
       }.font(.system(size: 11, weight: .medium)).lineLimit(1)
     }.menuStyle(.borderlessButton).fixedSize().disabled(model.isBusy)
@@ -397,7 +412,7 @@ struct ChatPane: View {
           Image(systemName: "arrow.up.circle.fill").font(.system(size: 24))
         }.buttonStyle(.plain).disabled(
           model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        ).keyboardShortcut(.return, modifiers: .command).accessibilityLabel("Send message")
+        ).keyboardShortcut(.return, modifiers: .command).accessibilityLabel(model.authoredChatRole == nil ? "Send message" : "Add message")
       }
     }
   }
@@ -413,6 +428,16 @@ struct ChatPane: View {
         Button("New chat about \(document.title)") {
           do { try model.newChat(about: document.id) } catch { model.report(error) }
         }
+      }
+      if let chat = model.selectedChat {
+        Divider()
+        Button("Instructions…") { model.openChatInstructions(chat.id) }
+        Button(model.chatVoice(chat.id) == nil ? "Pin as voice" : "Unpin voice") {
+          if model.chatVoice(chat.id) == nil { model.pinChat(chat.id) } else { model.unpinChat(chat.id) }
+        }
+        Divider()
+        Button("Write a question") { model.authorChatMessage(.user) }
+        Button("Write an answer") { model.authorChatMessage(.assistant) }
       }
     } label: {
       Image(systemName: "square.and.pencil").frame(width: 22, height: 22)
@@ -436,6 +461,10 @@ struct ChatPane: View {
           Button("Ask") { model.mode = .ask }
           Button("Propose · review edits") { model.mode = .propose }
           Button("Edit · apply edits") { model.mode = .edit }
+      Divider()
+      Picker("Multiple voices", selection: $model.consultationStyle) {
+        ForEach(ConsultationStyle.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+      }
         }
       }
       if hidden.contains(.attachment) {
@@ -444,14 +473,8 @@ struct ChatPane: View {
       }
       if hidden.contains(.model) {
         Menu("Model · \(model.inferenceName)") {
-          Button("Automatic") { model.chooseModel(.automatic) }
-          Button("Apple Foundation Model") { model.chooseModel(.apple) }
-            .disabled(!AppleModel.isAvailable)
-          Button("Gemma 4") { model.chooseModel(.gemma) }
-            .disabled(model.runner == nil && model.mlxRunner == nil)
-          Divider()
           Button("Manage models…") { model.showingModels = true }
-        }
+        }.disabled(model.isBusy)
       }
       if hidden.contains(.dictation) {
         Button(voice.purpose == .dictation ? "Stop dictation" : "Dictate into message") {
@@ -475,7 +498,7 @@ struct ChatPane: View {
   ) -> some View {
     HStack(spacing: 6) {
       HStack(spacing: 6) {
-        if !hidden.contains(.newChat) { newChatMenu }
+        if !model.layout.isAuthor && !hidden.contains(.newChat) { newChatMenu }
         if !hidden.contains(.authority) { authorityMenu(compact: compactLabels) }
         if !hidden.contains(.attachment) { attachmentMenu }
       }.fixedSize()
@@ -497,22 +520,19 @@ struct ChatPane: View {
       controlRow(hidden: [.newChat, .attachment], compactLabels: true)
       controlRow(hidden: [.newChat, .attachment, .dictation], compactLabels: true)
       controlRow(hidden: [.newChat, .attachment, .dictation, .conversation], compactLabels: true)
-      controlRow(hidden: [.newChat, .attachment, .dictation, .conversation, .authority], compactLabels: true)
-      controlRow(hidden: [.newChat, .attachment, .dictation, .conversation, .authority, .model], compactLabels: true)
+      controlRow(hidden: [.newChat, .attachment, .dictation, .conversation], compactLabels: true)
+      controlRow(hidden: [.newChat, .attachment, .dictation, .conversation, .model], compactLabels: true)
     }.frame(height: 28)
   }
   private func assistantName(_ message: ChatMessage) -> String {
-    message.personaID.flatMap { id in
-      model.state.personas.first { $0.id == id }.map { "@" + $0.slug }
-    } ?? (message.provider ?? "Local assistant")
+    message.speaker?.name ?? "Bloom"
+  }
+  private func needsSpeakerName(_ message: ChatMessage) -> Bool {
+    message.speaker?.voiceID != nil || (model.selectedChat?.messages.contains { $0.speaker?.voiceID != nil } ?? false)
   }
   private func visibleMessageText(_ message: ChatMessage) -> String {
-    // Older failed edit turns persisted the model's unfinished tool envelope.
-    // Keep the stored receipt intact, but never present that machinery as chat.
-    if message.role == .assistant, message.state == .failed,
-      message.text.hasPrefix("{\"reply\""), message.text.contains("\"edits\"") {
-      return "That edit did not complete. The document was not changed."
-    }
+    if message.state == .pending { return message.text.isEmpty ? "…" : message.text }
+    if message.text.isEmpty, let failure = message.failure { return failure }
     return message.text
   }
   @ViewBuilder private func messageMenu(_ message: ChatMessage) -> some View {
@@ -532,6 +552,12 @@ struct ChatPane: View {
           model.rate(message.id, in: chatID, as: .unhelpful)
         }
       }
+      Button("Edit text") { model.editingChatMessage = message.id }.disabled(model.isBusy || message.state != .complete)
+      if message.editedFrom != nil {
+        Text("Edited by you · original retained")
+      } else if message.authoredByUser == true && message.role == .assistant {
+        Text("Written by you")
+      }
       Divider()
       Button("Copy message") {
         NSPasteboard.general.clearContents()
@@ -540,7 +566,16 @@ struct ChatPane: View {
     }
   }
   @ViewBuilder private func messageView(_ message: ChatMessage) -> some View {
-    if message.role == .user {
+    if model.editingChatMessage == message.id, let chat = model.selectedChat {
+      VStack(alignment: .leading, spacing: 6) {
+        if message.role == .assistant, needsSpeakerName(message) {
+          Text(assistantName(message)).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+        }
+        ChatTextEditor(label: "Edit message", text: message.text,
+          save: { try model.replaceChatMessage($0, id: message.id, chatID: chat.id) },
+          cancel: { model.editingChatMessage = nil })
+      }
+    } else if message.role == .user {
       HStack(alignment: .bottom, spacing: 4) {
         Spacer(minLength: 36)
         ChatMarkdown(text: visibleMessageText(message))
@@ -550,15 +585,19 @@ struct ChatPane: View {
         .contentShape(Rectangle()).contextMenu { messageMenu(message) }
     } else {
       VStack(alignment: .leading, spacing: 6) {
-        HStack(spacing: 5) {
-          Text(assistantName(message))
-            .font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
-          if message.state != .complete {
-            Text(message.state.rawValue).font(.system(size: 10)).foregroundStyle(.tertiary)
-          }
-          if let feedback = message.feedback {
-            Image(systemName: feedback == .helpful ? "hand.thumbsup.fill" : "hand.thumbsdown.fill")
-              .font(.system(size: 10)).foregroundStyle(.tertiary)
+        if needsSpeakerName(message) || message.state != .complete || message.feedback != nil {
+          HStack(spacing: 5) {
+            if needsSpeakerName(message) {
+              Text(assistantName(message))
+                .font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+            }
+            if message.state != .complete {
+              Text(message.state.rawValue).font(.system(size: 10)).foregroundStyle(.tertiary)
+            }
+            if let feedback = message.feedback {
+              Image(systemName: feedback == .helpful ? "hand.thumbsup.fill" : "hand.thumbsdown.fill")
+                .font(.system(size: 10)).foregroundStyle(.tertiary)
+            }
           }
         }
         ChatMarkdown(text: visibleMessageText(message))
@@ -614,35 +653,46 @@ struct ChatPane: View {
   }
   var body: some View {
     VStack(spacing: 0) {
+      if model.layout.isAuthor { DocumentChatHistory(model: model) }
       ScrollViewReader { proxy in
         ScrollView {
           LazyVStack(alignment: .leading, spacing: 16) {
             if let chat = model.selectedChat {
+              VStack(alignment: .leading, spacing: 0) {
+                if model.showingChatInstructions == chat.id {
+                  ChatInstructions(model: model, chat: chat)
+                } else if !(chat.instructions ?? "").isEmpty {
+                  Button("Instructions") { model.openChatInstructions(chat.id) }
+                    .buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
+                    .disabled(model.isBusy)
+                }
+              }.id("chat-instructions")
               ForEach(chat.messages) { message in
-                messageView(message).id(message.id)
+                VStack(alignment: .leading, spacing: 0) { messageView(message) }
               }
-              if model.isBusy && model.streamingChat == chat.id {
-                VStack(alignment: .leading, spacing: 6) {
-                  Text(model.inferenceName)
-                    .font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
-                  ChatMarkdown(text: model.streamingText.isEmpty ? "…" : model.streamingText)
-                }.frame(maxWidth: .infinity, alignment: .leading).id("stream")
-              }
+
             }
             Color.clear.frame(height: 1).id("bottom")
           }.padding(.horizontal, 16).padding(.vertical, 18)
         }
-          .onAppear { DispatchQueue.main.async { proxy.scrollTo("bottom", anchor: .bottom) } }
+          .onAppear {
+            DispatchQueue.main.async {
+              let instructions = model.showingChatInstructions == model.state.selectedChat
+              proxy.scrollTo(instructions ? "chat-instructions" : "bottom", anchor: instructions ? .top : .bottom)
+            }
+          }
           .onChange(of: model.selectedChat?.messages.count) { _, _ in
             proxy.scrollTo("bottom", anchor: .bottom)
           }
-          .onChange(of: model.state.selectedChat) { _, _ in
-            proxy.scrollTo("bottom", anchor: .bottom)
+          .onChange(of: model.showingChatInstructions) { _, id in
+            if id != nil {
+              DispatchQueue.main.async { proxy.scrollTo("chat-instructions", anchor: .top) }
+            }
           }
           .onChange(of: model.streamingText) { _, _ in
             if model.isBusy { proxy.scrollTo("bottom", anchor: .bottom) }
           }
-      }
+      }.id(model.state.selectedChat)
       VStack(alignment: .leading, spacing: 8) {
         if let chat = model.selectedChat, let documentID = chat.attachedDocumentID {
           HStack(spacing: 5) {
@@ -690,17 +740,25 @@ struct ChatPane: View {
             }
           }
         }
+        if let role = model.authoredChatRole {
+          HStack {
+            Text(role == .user ? "Writing a question" : "Writing an answer").font(.caption).foregroundStyle(.secondary)
+            Spacer()
+            Button("Return to chat") { model.authoredChatRole = nil }.buttonStyle(.plain).font(.caption)
+          }
+        }
         if let issue = model.composerIssue {
           Text(issue).font(.caption).foregroundStyle(.orange)
         }
-        if !model.personaMatches.isEmpty {
+        if !model.voiceMatches.isEmpty {
           HStack(spacing: 10) {
-            ForEach(model.personaMatches) { persona in
-              Button("@" + persona.slug) { model.insertPersona(persona) }.buttonStyle(.plain).font(
+            ForEach(model.voiceMatches) { persona in
+              Button("@" + persona.slug) { model.insertVoice(persona) }.buttonStyle(.plain).font(
                 .caption)
             }
           }
         }
+        if model.selectedChat != nil || !model.layout.isAuthor {
         ChatComposer(
           text: $model.draft, focusRequest: composerFocusRequest,
           onSend: { model.send() }, onCancel: { model.cancel() },
@@ -708,11 +766,17 @@ struct ChatPane: View {
           onFocus: { model.noteInputFocus(.chat) }
         ).frame(height: CGFloat(50 + 18 * min(3, model.draft.filter { $0 == "\n" }.count)))
         composerControls
+        } else {
+          Button {
+            do { try model.newChat(about: model.state.selectedDocument) } catch { model.report(error) }
+          } label: { Label("New chat about this document", systemImage: "square.and.pencil") }
+            .buttonStyle(.plain).foregroundStyle(.secondary).padding(.vertical, 14)
+        }
       }.padding(10)
-        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.primary.opacity(0.07)))
+        .background(Color(nsColor: BoomChrome.inputBackground), in: RoundedRectangle(cornerRadius: 12))
         .padding(.horizontal, 12).padding(.bottom, 12).padding(.top, 8)
     }
+    .background(Color(nsColor: BoomChrome.sidebarBackground))
     .onChange(of: model.selectedChat?.messages.count) { _, _ in
       guard let chat = model.selectedChat, chat.id == awaitingVoiceReply,
         let message = chat.messages.last, message.role == .assistant else { return }
@@ -738,15 +802,31 @@ struct ChatPane: View {
     .onDisappear { voice.cancel() }
   }
 }
-struct ChatMarkdown: View {
+/// The same source-preserving styling as every editable native text surface.
+struct ChatMarkdown: NSViewRepresentable {
   let text: String
-  var body: some View {
-    Text(
-      (try? AttributedString(
-        markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
-        ?? AttributedString(text)
-    )
-    .font(.system(size: 14)).lineSpacing(3)
+  func makeNSView(context: Context) -> NSTextView {
+    let view = NSTextView()
+    view.isEditable = false; view.isSelectable = true; view.isRichText = false
+    view.drawsBackground = false; view.textContainerInset = .zero
+    view.textContainer?.lineFragmentPadding = 0
+    view.isHorizontallyResizable = false; view.isVerticallyResizable = true
+    view.textContainer?.widthTracksTextView = true
+    view.writingToolsBehavior = .none
+    return view
+  }
+  func updateNSView(_ view: NSTextView, context: Context) {
+    if view.string != text {
+      view.string = text
+      MarkdownStyle.apply(to: view, bodyFont: NSFont.systemFont(ofSize: 14), lineSpacing: 3, reading: true)
+    }
+  }
+  func sizeThatFits(_ proposal: ProposedViewSize, nsView view: NSTextView, context: Context) -> CGSize? {
+    guard let width = proposal.width, width > 0, let container = view.textContainer,
+      let layout = view.layoutManager else { return nil }
+    container.size = NSSize(width: width, height: .greatestFiniteMagnitude)
+    layout.ensureLayout(for: container)
+    return CGSize(width: width, height: max(18, layout.usedRect(for: container).height))
   }
 }
 struct ProposalCard: View {
@@ -787,78 +867,35 @@ struct ProposalCard: View {
 struct ModelSetupView: View {
   @ObservedObject var model: WorkspaceModel
   var body: some View {
-    VStack(alignment: .leading, spacing: 13) {
-      Text("Models").font(.title2.weight(.semibold))
-      HStack(spacing: 9) {
-        Image(systemName: "sparkles")
-          .foregroundStyle(AppleModel.isAvailable ? .primary : .secondary)
-        Text(model.appleAvailability).font(.system(size: 13))
-          .foregroundStyle(.secondary)
-      }
-      if !AppleModel.isAvailable {
-        Button("Open Siri Settings") {
-          guard let url = URL(string: "x-apple.systempreferences:com.apple.Siri-Settings.extension"),
-            NSWorkspace.shared.open(url) else {
-            model.report(BoomError.unavailable("Could not open Siri Settings. Open it from System Settings."))
-            return
+    VStack(alignment: .leading, spacing: 16) {
+      Text("Models on this Mac").font(.title2.weight(.semibold))
+      Text(model.layout.isAuthor ? "Consult privately with voices, or explore manuscript continuations with a base model." : "Consult privately with voices on this Mac.")
+        .foregroundStyle(.secondary)
+      ForEach(model.layout.isAuthor ? ModelPurpose.allCases : [.consultation], id: \.self) { purpose in
+        VStack(alignment: .leading, spacing: 6) {
+          Text(purpose == .consultation ? "Consultation · Gemma 4 12B" : "Writing · Gemma 4 12B base").font(.headline)
+          let ready = purpose == .consultation ? model.canInfer : model.baseReady
+          if ready { Label("Ready on this Mac", systemImage: "checkmark.circle").foregroundStyle(.secondary) }
+          else if let installed = ModelPacks.cached(purpose) {
+            Button("Open \(purpose.rawValue) model") { model.loadPack(installed, purpose: purpose) }.disabled(model.isBusy)
+          } else {
+            Button("Download public \(purpose.rawValue) checkpoint") { model.installModel(purpose) }
+              .disabled(model.isBusy)
+            if let entry = try? ModelPacks.entry(purpose) {
+              Text("Checks the Hugging Face cache first. The public checkpoint uses full precision; a local 4-bit pack uses less memory.").font(.caption).foregroundStyle(.secondary)
+              Text("Download \(ByteCountFormatter.string(fromByteCount: entry.manifest.upstreamFiles.reduce(0) { $0 + $1.bytes }, countStyle: .file)); verification precedes loading.")
+                .font(.caption).foregroundStyle(.secondary)
+            }
           }
-        }.font(.caption)
-      }
-      Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 1)
-      Text("Gemma 4 · MLX / Metal")
-        .font(.system(size: 13, weight: .medium))
-      if let size = model.cachedQATSize {
-        Button("Prepare cached first-party \(size.rawValue) QAT weights") {
-          model.prepareCachedMLX()
-        }.disabled(model.isBusy)
-        Text("Converts Google's cached safetensors to native 4-bit MLX weights in the Hugging Face cache.")
-          .font(.caption).foregroundStyle(.tertiary)
-      } else {
-        Text("No first-party QAT safetensors found in the Hugging Face cache.")
-          .font(.caption).foregroundStyle(.tertiary)
-      }
-      if let size = model.recommendedQATSize,
-        model.cachedQATSize != size {
-        Button("Download recommended \(size.rawValue) QAT weights") {
-          model.downloadRecommendedMLX()
-        }.disabled(model.isBusy)
-        Text("Downloads Google's weights and matching assistant into the Hugging Face cache.")
-          .font(.caption).foregroundStyle(.tertiary)
-      }
-      Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 1)
-      Text("Writing suggestions")
-        .font(.system(size: 13, weight: .medium))
-      if model.baseReady {
-        Label("Ready", systemImage: "checkmark.circle.fill")
-          .font(.caption).foregroundStyle(.secondary)
-      } else if model.recommendedBaseSize != nil {
-        Button(model.baseCached ? "Prepare cached writing model" : "Get writing model") {
-          model.prepareBase()
-        }.disabled(model.isBusy)
-        Text("Uses Google's base model to continue document text directly.")
-          .font(.caption).foregroundStyle(.tertiary)
-      } else {
-        Text("This Mac's current model choice leaves too little memory for a second writing model.")
-          .font(.caption).foregroundStyle(.tertiary)
-      }
-      Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 1)
-      Text("Gemma 4 E2B · CoreML")
-        .font(.system(size: 13, weight: .medium))
-      HStack {
-        Button("Download Gemma 4 E2B") { model.downloadModel() }
-        Button("Import model folder…") { model.importModel() }
-      }.disabled(model.isBusy)
-      Text(
-        "Verified files are reused from the Hugging Face cache; new downloads go there too. Native persona caches require Gemma."
-      ).font(.caption).foregroundStyle(.tertiary)
-      HStack {
-        if model.isBusy {
-          ProgressView().controlSize(.small)
-          Button("Stop") { model.cancel() }
         }
-        Spacer()
-        Button("Done") { model.showingModels = false }.keyboardShortcut(.cancelAction)
       }
-    }.padding(24).frame(width: 490)
+      Button("Import an offline model pack…") { model.importModel() }.disabled(model.isBusy)
+      Button("Set up on-device speech…") { model.installSpeechAsset() }.disabled(model.isBusy)
+      Text(model.status).font(.caption).foregroundStyle(.secondary)
+      HStack {
+        if model.isBusy { ProgressView().controlSize(.small); Button("Stop") { model.cancel() } }
+        Spacer(); Button("Done") { model.showingModels = false }.keyboardShortcut(.cancelAction)
+      }
+    }.padding(24).frame(width: 470)
   }
 }

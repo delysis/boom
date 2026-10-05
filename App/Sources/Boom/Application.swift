@@ -4,6 +4,15 @@ import Foundation
 import BoomCore
 import SwiftUI
 
+/// Accessibility input follows the same live action as typed search text.
+@MainActor final class LibrarySearchField: NSSearchField {
+  override func setAccessibilityValue(_ value: Any?) {
+    guard let value = value as? String, value != stringValue else { return }
+    stringValue = value
+    if let action { sendAction(action, to: target) }
+  }
+}
+
 @main @MainActor enum BoomMain {
   static func main() {
     #if BOOM_UI_TEST
@@ -20,22 +29,6 @@ import SwiftUI
       dispatchMain()
     }
     #endif
-    if CommandLine.arguments.contains("--runtime-preflight") {
-      print(AppleModel.availabilityMessage)
-      exit(0)
-    }
-    if CommandLine.arguments.contains("--apple-smoke") {
-      Task {
-        do {
-          try await AppleModel.smoke()
-          exit(0)
-        } catch {
-          fputs("Apple smoke unavailable or failed: \(error.localizedDescription)\n", stderr)
-          exit(1)
-        }
-      }
-      dispatchMain()
-    }
     if CommandLine.arguments.contains("--speech-smoke") {
       Task {
         do {
@@ -52,43 +45,6 @@ import SwiftUI
           exit(0)
         } catch {
           fputs("Local speech smoke failed: \(error.localizedDescription)\n", stderr)
-          exit(1)
-        }
-      }
-      dispatchMain()
-    }
-    if CommandLine.arguments.contains("--install-default") {
-      Task {
-        do {
-          guard let rootIndex = CommandLine.arguments.firstIndex(of: "--model-root"),
-            rootIndex + 1 < CommandLine.arguments.count
-          else { throw BoomError.invalid("Use --install-default --model-root ABSOLUTE_DIRECTORY.") }
-          let rootPath = CommandLine.arguments[rootIndex + 1]
-          guard rootPath.hasPrefix("/") else {
-            throw BoomError.invalid("Model root must be absolute.")
-          }
-          let root = URL(fileURLWithPath: rootPath).standardizedFileURL
-          try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-          let installer = ModelInstaller()
-          let installed = try await installer.download(to: root) { status in
-            fputs(status + "\n", stderr)
-          }
-          print(installed.path)
-          exit(0)
-        } catch {
-          fputs("Model install failed: \(error.localizedDescription)\n", stderr)
-          exit(1)
-        }
-      }
-      dispatchMain()
-    }
-    if CommandLine.arguments.contains("--smoke") {
-      Task {
-        do {
-          try await NativeSmoke.run(arguments: CommandLine.arguments)
-          exit(0)
-        } catch {
-          fputs("Native smoke failed: \(error.localizedDescription)\n", stderr)
           exit(1)
         }
       }
@@ -116,22 +72,44 @@ import SwiftUI
 
 @MainActor
 final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
-  NSMenuItemValidation, NSMenuDelegate
+  NSMenuItemValidation, NSMenuDelegate, NSSearchFieldDelegate
 {
   private var model: WorkspaceModel?
   private var window: NSWindow?
   private var observer: AnyCancellable?
   private var buttons: [String: NSButton] = [:]
+  private var searchItem: NSSearchToolbarItem?
+  private var searchField: NSSearchField?
   private var terminating = false
+  private var isNativeCheck = false
   func applicationDidFinishLaunching(_ notification: Notification) {
+    Task { await openWorkspace() }
+  }
+  private func openWorkspace() async {
     do {
-      let model = try WorkspaceModel()
+      let arguments = CommandLine.arguments
+      let override: WorkspaceStore?
+      if let index = arguments.firstIndex(of: "--native-check-workspace") {
+        guard arguments.filter({ $0 == "--native-check-workspace" }).count == 1,
+          index + 1 < arguments.count, arguments[index + 1].hasPrefix("/") else {
+          throw BoomError.invalid("Native checks require an explicit absolute encrypted workspace path.")
+        }
+        let root = URL(fileURLWithPath: arguments[index + 1]).standardizedFileURL
+        override = try await detachedWork { try WorkspaceStore(rootOverride: root) }
+        isNativeCheck = true
+      } else { override = nil }
+      let backgroundCheck = isNativeCheck && arguments.contains("--native-check-background")
+      let noModels = isNativeCheck && arguments.contains("--native-check-no-models")
+      let model = try await WorkspaceModel(storeOverride: override, loadModels: !noModels)
       self.model = model
-      model.setTheme(model.state.theme)
+      if isNativeCheck, let index = arguments.firstIndex(of: "--native-check-theme"), index + 1 < arguments.count {
+        guard ["light", "dark"].contains(arguments[index + 1]) else { throw BoomError.invalid("Native appearance check requires light or dark.") }
+        model.setTheme(arguments[index + 1])
+      } else { model.setTheme(model.state.theme) }
       #if BOOM_UI_TEST
       let initialWidth: CGFloat = 340
       #else
-      let initialWidth: CGFloat = 1190
+      let initialWidth: CGFloat = model.layout.isAuthor ? 1190 : 1000
       #endif
       let window = NSWindow(
         contentRect: NSRect(x: 0, y: 0, width: initialWidth, height: 780),
@@ -140,7 +118,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
       #if BOOM_UI_TEST
       window.contentMinSize = NSSize(width: 300, height: 440)
       #else
-      window.contentMinSize = NSSize(width: 750, height: 440)
+      window.contentMinSize = NSSize(width: model.layout.isAuthor ? 750 : 540, height: 440)
       #endif
       window.title = "Bloom"
       window.backgroundColor = BoomChrome.sidebarBackground
@@ -156,7 +134,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
       #if BOOM_UI_TEST
       window.minSize = NSSize(width: 310, height: 500)
       #else
-      window.minSize = NSSize(width: 760, height: 500)
+      window.minSize = NSSize(width: model.layout.isAuthor ? 760 : 550, height: 500)
       #endif
       self.window = window
       NSApp.mainMenu = makeMenu()
@@ -164,8 +142,8 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
         DispatchQueue.main.async { self?.refreshToolbar() }
       }
       window.center()
-      window.makeKeyAndOrderFront(nil)
-      NSApp.activate(ignoringOtherApps: true)
+      if backgroundCheck { window.orderBack(nil) }
+      else { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
       refreshToolbar()
     } catch {
       let alert = NSAlert()
@@ -198,15 +176,28 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
     toolbarDefaultItemIdentifiers(toolbar)
   }
   func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-    [
-      .flexibleSpace, NSToolbarItem.Identifier("library"), NSToolbarItem.Identifier("document"),
-      NSToolbarItem.Identifier("chat"),
-    ]
+    let controls = (model?.layout.paneControls ?? []).map { NSToolbarItem.Identifier($0) }
+    return [NSToolbarItem.Identifier.flexibleSpace] + controls + [NSToolbarItem.Identifier("search")]
   }
   func toolbar(
     _ toolbar: NSToolbar, itemForItemIdentifier identifier: NSToolbarItem.Identifier,
     willBeInsertedIntoToolbar flag: Bool
   ) -> NSToolbarItem? {
+    if identifier.rawValue == "search" {
+      let item = NSSearchToolbarItem(itemIdentifier: identifier)
+      let field = LibrarySearchField()
+      field.placeholderString = "Search"
+      field.setAccessibilityLabel("Search library")
+      field.target = self; field.action = #selector(searchLibrary(_:)); field.delegate = self
+      field.sendsSearchStringImmediately = true; field.sendsWholeSearchString = false
+      field.recentsAutosaveName = nil; field.maximumRecents = 0
+      item.searchField = field
+      item.preferredWidthForSearchField = 240
+      field.widthAnchor.constraint(lessThanOrEqualToConstant: 280).isActive = true
+      searchItem = item; searchField = field
+      return item
+    }
+    guard model?.layout.paneControls.contains(identifier.rawValue) == true else { return nil }
     let definitions: [String: (String, String, Selector)] = [
       "library": ("sidebar.left", "Show or hide library (⌘1)", #selector(toggleLibrary)),
       "document": (
@@ -237,7 +228,8 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
     buttons["library"]?.state = model.showsLibrary ? .on : .off
     buttons["document"]?.state = model.showsDocument ? .on : .off
     buttons["chat"]?.state = model.showsChat ? .on : .off
-    window?.title = model.selectedDocument?.title ?? model.selectedChat?.title ?? "Bloom"
+    let title = model.layout.isAuthor ? model.selectedDocument?.title ?? "Bloom" : model.selectedChat?.title ?? "Bloom"
+    window?.title = isNativeCheck ? "Native check · " + title : title
   }
   private func makeMenu() -> NSMenu {
     let bar = NSMenu()
@@ -264,6 +256,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
     app.addItem(
       item("Quit Bloom", #selector(NSApplication.terminate(_:)), "q", target: NSApp))
     let file = submenu("File")
+    if model?.layout.isAuthor == true {
     file.addItem(item("New Document", #selector(newDocument), "n", target: self))
     file.addItem(item("New Chat", #selector(newChat), "n", [.command, .shift], target: self))
     file.addItem(.separator())
@@ -273,7 +266,14 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
     file.addItem(item(
       "Attach Files to Document…", #selector(attachDocument), "a", [.command, .shift],
       target: self))
+    file.addItem(item("Import Folder…", #selector(importFolder), target: self))
+    } else {
+      file.addItem(item("New Chat", #selector(newChat), "n", target: self))
+    }
     file.addItem(item("Attach Files to Chat…", #selector(attachChat), target: self))
+    file.addItem(.separator())
+    file.addItem(item("Export Encrypted Backup…", #selector(exportBackup), target: self))
+    file.addItem(item("Restore Encrypted Backup…", #selector(restoreBackup), target: self))
     let edit = submenu("Edit")
     if #available(macOS 15.2, *) { edit.automaticallyInsertsWritingToolsItems = false }
     edit.delegate = self
@@ -299,13 +299,37 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
     format.addItem(item("Bulleted List", #selector(MarkdownTextView.markdownList(_:))))
     format.addItem(item("Quote", #selector(MarkdownTextView.markdownQuote(_:))))
     format.addItem(item("Inline Code", #selector(MarkdownTextView.markdownCode(_:))))
+    if model?.layout.isAuthor == true {
+    let writing = submenu("Writing")
+    writing.addItem(item("Explore continuations", #selector(exploreWriting), "\r", target: self))
+    writing.addItem(item("Writing examples…", #selector(writingExamples), target: self))
+    writing.addItem(item("Show continuations", #selector(showContinuations), target: self))
+    writing.addItem(.separator())
+    writing.addItem(item("Inline suggestions", #selector(toggleCompletion), target: self))
+    let variation = NSMenuItem(title: "Variation", action: nil, keyEquivalent: "")
+    let variations = NSMenu(title: "Variation")
+    for (label, profile) in [("Less", SamplingProfile.steady), ("Default", .standard), ("More (experimental)", .open)] {
+      let option = item(label, #selector(changeVariation), target: self)
+      option.representedObject = profile.rawValue
+      variations.addItem(option)
+    }
+    variation.submenu = variations; writing.addItem(variation)
+    }
+    let chat = submenu("Chat")
+    chat.addItem(item("Instructions…", #selector(chatInstructions), target: self))
+    chat.addItem(item("Pin as voice", #selector(pinChat), target: self))
+    chat.addItem(.separator())
+    chat.addItem(item("Write a question", #selector(writeQuestion), target: self))
+    chat.addItem(item("Write an answer", #selector(writeAnswer), target: self))
+    chat.addItem(item("Import voice…", #selector(importVoice), target: self))
     let view = submenu("View")
     view.addItem(item("Library", #selector(toggleLibrary), "1", target: self))
-    view.addItem(item("Document", #selector(toggleDocument), "2", target: self))
-    view.addItem(item("Chat", #selector(toggleChat), "3", target: self))
+    if model?.layout.paneControls.contains("chat") == true {
+      view.addItem(item("Chat", #selector(toggleChat), "3", target: self))
+    }
+    view.addItem(item("Search Library…", #selector(focusSearch), "f", [.command, .shift], target: self))
     view.addItem(.separator())
-    view.addItem(item("Inline Completion", #selector(toggleCompletion), target: self))
-    view.addItem(item("Clear Autocomplete Cache", #selector(clearFollowCache), target: self))
+
     let theme = NSMenu(title: "Appearance")
     let themeItem = NSMenuItem(title: "Appearance", action: nil, keyEquivalent: "")
     themeItem.submenu = theme
@@ -330,15 +354,25 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
   func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
     guard let model else { return false }
     switch menuItem.action {
+    case #selector(chatInstructions), #selector(writeQuestion), #selector(writeAnswer): return model.showsChat && model.selectedChat != nil && !model.isBusy
+    case #selector(pinChat):
+      menuItem.title = model.selectedChat.flatMap { model.chatVoice($0.id) } == nil ? "Pin as voice" : "Unpin voice"
+      return model.showsChat && model.selectedChat != nil && !model.isBusy
+    case #selector(importVoice): return !model.isBusy
+    case #selector(exportBackup), #selector(restoreBackup): return !model.isBusy
+    case #selector(exportDocument): return model.selectedDocument != nil
     case #selector(toggleLibrary): menuItem.state = model.showsLibrary ? .on : .off
     case #selector(toggleDocument): menuItem.state = model.showsDocument ? .on : .off
     case #selector(toggleChat): menuItem.state = model.showsChat ? .on : .off
+    case #selector(exploreWriting): return model.showsDocument && model.canExploreWriting
+    case #selector(showContinuations): menuItem.title = model.showingCandidates ? "Hide continuations" : "Show continuations"; return model.showsDocument && model.candidates != nil
+    case #selector(writingExamples): return model.showsDocument && model.selectedDocument != nil && !model.isBusy
+    case #selector(changeVariation): menuItem.state = (menuItem.representedObject as? String) == model.samplingProfile.rawValue ? .on : .off
     case #selector(toggleCompletion): menuItem.state = model.state.autocomplete ? .on : .off
     case #selector(changeTheme(_:)):
       menuItem.state = (menuItem.representedObject as? String) == model.state.theme ? .on : .off
     case #selector(attachDocument): return !model.isBusy && model.selectedDocument != nil
     case #selector(attachChat): return !model.isBusy
-    case #selector(clearFollowCache): return !model.isBusy && model.modelReady
     default: break
     }
     return true
@@ -349,19 +383,42 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
   @objc private func newDocument() {
     do { try model?.newDocument() } catch { model?.report(error) }
   }
-  @objc private func newChat() { do { try model?.newChat() } catch { model?.report(error) } }
+  @objc private func newChat() { do { try model?.newChat(about: model?.layout.isAuthor == true ? model?.state.selectedDocument : nil) } catch { model?.report(error) } }
+  @objc private func chatInstructions() { if let id = model?.state.selectedChat { model?.openChatInstructions(id) } }
+  @objc private func pinChat() {
+    guard let model, let id = model.state.selectedChat else { return }
+    if model.chatVoice(id) == nil { model.pinChat(id) } else { model.unpinChat(id) }
+  }
+  @objc private func writeQuestion() { model?.authorChatMessage(.user) }
+  @objc private func writeAnswer() { model?.authorChatMessage(.assistant) }
+  @objc private func importVoice() { model?.importVoice() }
+  @objc private func searchLibrary(_ field: NSSearchField) {
+    model?.librarySearch = field.stringValue
+    if !field.stringValue.isEmpty, model?.showsLibrary == false { model?.toggle("library") }
+  }
+  @objc private func focusSearch() { searchItem?.beginSearchInteraction() }
+  func controlTextDidChange(_ notification: Notification) {
+    guard let field = notification.object as? NSSearchField, field === searchField else { return }
+    searchLibrary(field)
+  }
+  @objc private func importFolder() { model?.importFolder() }
   @objc private func importDocument() { model?.importDocument() }
   @objc private func exportDocument() { model?.exportDocument() }
   @objc private func attachDocument() { model?.chooseDocumentAttachmentFiles() }
   @objc private func attachChat() { model?.chooseChatAttachmentFiles() }
+  @objc private func exportBackup() { model?.backupWorkspace(restoring: false) }
+  @objc private func restoreBackup() { model?.backupWorkspace(restoring: true) }
   @objc private func models() { model?.showingModels = true }
+  @objc private func showContinuations() { model?.showingCandidates.toggle() }
+  @objc private func writingExamples() { model?.openWritingExamples() }
+  @objc private func exploreWriting() { model?.exploreWriting() }
+  @objc private func changeVariation(_ sender: NSMenuItem) {
+    if let value = sender.representedObject as? String, let profile = SamplingProfile(rawValue: value) { model?.samplingProfile = profile }
+  }
   @objc private func toggleCompletion() {
     guard let model else { return }
-    model.state.autocomplete.toggle()
-    model.invalidateGhost()
-    model.scheduleSave()
+    model.setAutocomplete(!model.state.autocomplete)
   }
-  @objc private func clearFollowCache() { model?.clearFollowCache() }
   @objc private func changeTheme(_ sender: NSMenuItem) {
     if let value = sender.representedObject as? String { model?.setTheme(value) }
   }

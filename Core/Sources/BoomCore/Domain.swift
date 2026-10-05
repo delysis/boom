@@ -28,7 +28,16 @@ public struct DocumentSnapshot: Codable, Equatable, Identifiable, Sendable {
   }
 }
 public enum Role: String, Codable, Sendable { case user, assistant }
-public enum MessageState: String, Codable, Sendable { case complete, cancelled, failed }
+public enum MessageState: String, Codable, Sendable { case pending, complete, cancelled, failed }
+public struct Speaker: Codable, Equatable, Sendable {
+  private enum CodingKeys: String, CodingKey { case name, voiceID = "voiceId", voiceRevision }
+  public let name: String
+  public let voiceID: UUID?
+  public let voiceRevision: String?
+  public init(name: String, voiceID: UUID? = nil, voiceRevision: String? = nil) {
+    self.name = name; self.voiceID = voiceID; self.voiceRevision = voiceRevision
+  }
+}
 public enum MessageFeedback: String, Codable, Sendable { case helpful, unhelpful }
 public struct SourceReference: Codable, Equatable, Sendable, Identifiable {
   public let id: UUID
@@ -49,13 +58,17 @@ public struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
   public var context: String
   public var sources: [SourceReference]
   public var state: MessageState
-  public var personaID: UUID?
   public var provider: String?
   public var feedback: MessageFeedback?
+  public var speaker: Speaker?
+  public var failure: String?
+  public var authoredByUser: Bool?
+  public var editedFrom: UUID?
   public init(
     id: UUID = UUID(), role: Role, text: String, context: String = "",
-    sources: [SourceReference] = [], state: MessageState = .complete, personaID: UUID? = nil,
-    provider: String? = nil, feedback: MessageFeedback? = nil
+    sources: [SourceReference] = [], state: MessageState = .complete,
+    provider: String? = nil, feedback: MessageFeedback? = nil, speaker: Speaker? = nil, failure: String? = nil,
+    authoredByUser: Bool? = nil, editedFrom: UUID? = nil
   ) {
     self.id = id
     self.role = role
@@ -63,9 +76,12 @@ public struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
     self.context = context
     self.sources = sources
     self.state = state
-    self.personaID = personaID
     self.provider = provider
     self.feedback = feedback
+    self.speaker = speaker
+    self.failure = failure
+    self.authoredByUser = authoredByUser
+    self.editedFrom = editedFrom
   }
   public var promptText: String { context.isEmpty ? text : context + "\n\nUSER REQUEST\n" + text }
 }
@@ -74,14 +90,17 @@ public struct ChatRecord: Codable, Equatable, Sendable, Identifiable {
   public var title: String
   public var messages: [ChatMessage]
   public var attachedDocumentID: UUID?
+  public var instructions: String?
+  public var messageVersions: [ChatMessage]?
   public init(
     id: UUID = UUID(), title: String = "New chat", messages: [ChatMessage] = [],
-    attachedDocumentID: UUID? = nil
+    attachedDocumentID: UUID? = nil, instructions: String? = nil
   ) {
     self.id = id
     self.title = title
     self.messages = messages
     self.attachedDocumentID = attachedDocumentID
+    self.instructions = instructions
   }
   public func branch(at messageID: UUID, includeMessage: Bool) throws -> ChatRecord {
     guard let index = messages.firstIndex(where: { $0.id == messageID }) else {
@@ -90,54 +109,7 @@ public struct ChatRecord: Codable, Equatable, Sendable, Identifiable {
     let count = index + (includeMessage ? 1 : 0)
     return ChatRecord(
       title: title == "New chat" ? "New chat · branch" : title + " · branch",
-      messages: Array(messages.prefix(count)), attachedDocumentID: attachedDocumentID)
-  }
-}
-public struct ModelIdentity: Codable, Equatable, Sendable {
-  public let manifestDigest: String
-  public let runtimeRevision: String
-  public let promptVersion: Int
-  public let contextLength: Int
-  public init(
-    manifestDigest: String, runtimeRevision: String, promptVersion: Int = 2, contextLength: Int
-  ) {
-    self.manifestDigest = manifestDigest
-    self.runtimeRevision = runtimeRevision
-    self.promptVersion = promptVersion
-    self.contextLength = contextLength
-  }
-  public var key: String { (try? Digest.identity(self)) ?? "invalid" }
-}
-public struct Persona: Codable, Equatable, Sendable, Identifiable {
-  public let id: UUID
-  public let slug: String
-  public let title: String
-  public let messages: [ChatMessage]
-  public let prefixDigest: String
-  public let model: ModelIdentity
-  public let cacheID: UUID
-  public let createdAt: Date
-  public init(
-    id: UUID = UUID(), slug: String, title: String, messages: [ChatMessage], prefixDigest: String,
-    model: ModelIdentity, cacheID: UUID, createdAt: Date = Date()
-  ) throws {
-    guard Self.validSlug(slug), messages.first?.role == .user,
-      messages.allSatisfy({ $0.state == .complete }), messages.last?.role == .assistant
-    else {
-      throw BoomError.invalid(
-        "A persona needs a unique lowercase slug and a completed chat ending in an assistant turn.")
-    }
-    self.id = id
-    self.slug = slug
-    self.title = title
-    self.messages = messages
-    self.prefixDigest = prefixDigest
-    self.model = model
-    self.cacheID = cacheID
-    self.createdAt = createdAt
-  }
-  public static func validSlug(_ s: String) -> Bool {
-    s.range(of: "^[a-z][a-z0-9_-]{0,47}$", options: .regularExpression) != nil
+      messages: Array(messages.prefix(count)), attachedDocumentID: attachedDocumentID, instructions: instructions)
   }
 }
 public enum InteractionMode: String, Codable, CaseIterable, Sendable {

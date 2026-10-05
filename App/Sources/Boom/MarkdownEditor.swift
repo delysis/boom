@@ -7,11 +7,49 @@ import SwiftUI
   var documentID = UUID()
   var documentUndo: UndoManager?
   var applyingExternal = false
+  override func setAccessibilityValue(_ value: Any?) {
+    guard isEditable, !hasMarkedText(), let value = value as? String, value != string else { return }
+    insertText(value, replacementRange: NSRange(location: 0, length: string.utf16.count))
+  }
   private var displayStorage: NSTextStorage?
   private var displayLayout: NSLayoutManager?
   private var displayContainer: NSTextContainer?
+  private var searchRanges: [NSRange] = []
+  private var searchIdentity: String?
+  func highlightSearch(_ ranges: [NSRange], identity: String?) {
+    guard let layout = layoutManager, let storage = textStorage else { return }
+    for range in searchRanges where NSMaxRange(range) <= storage.length {
+      layout.removeTemporaryAttribute(.backgroundColor, forCharacterRange: range)
+    }
+    searchRanges = ranges.filter { NSMaxRange($0) <= storage.length }
+    for range in searchRanges {
+      layout.addTemporaryAttribute(.backgroundColor, value: NSColor.systemYellow.withAlphaComponent(0.22),
+        forCharacterRange: range)
+    }
+    if searchIdentity != identity, let first = searchRanges.first { scrollRangeToVisible(first) }
+    if identity == nil || !searchRanges.isEmpty { searchIdentity = identity }
+    needsDisplay = true
+  }
   private var visibleStamp: GhostStamp?
   private var displayGhostLength = 0
+  private let placeholderStorage = NSTextStorage()
+  private let placeholderLayout = NSLayoutManager()
+  private let placeholderContainer = NSTextContainer(size: .zero)
+  func preparePlaceholder() {
+    placeholderStorage.addLayoutManager(placeholderLayout)
+    placeholderLayout.addTextContainer(placeholderContainer)
+    setAccessibilityPlaceholderValue("Begin writing…")
+  }
+  private func drawPlaceholder() {
+    guard string.isEmpty, !hasMarkedText(), let textContainer else { return }
+    var attributes = typingAttributes
+    attributes[.font] = font ?? MarkdownStyle.body
+    attributes[.foregroundColor] = NSColor.placeholderTextColor
+    placeholderStorage.setAttributedString(NSAttributedString(string: "Begin writing…", attributes: attributes))
+    placeholderContainer.size = textContainer.size
+    placeholderContainer.lineFragmentPadding = textContainer.lineFragmentPadding
+    placeholderLayout.drawGlyphs(forGlyphRange: placeholderLayout.glyphRange(for: placeholderContainer), at: textContainerOrigin)
+  }
   private struct AcceptedStep {
     let documentID: UUID
     let revision: String
@@ -94,9 +132,10 @@ import SwiftUI
       stamp.caretUTF16 == selectedRange().location, !hasMarkedText()
     else {
       super.draw(dirtyRect)
+      drawPlaceholder()
       return
     }
-    NSColor.textBackgroundColor.setFill()
+    BoomChrome.paperBackground.setFill()
     dirtyRect.fill()
     container.size = textContainer?.size ?? container.size
     let origin = textContainerOrigin
@@ -119,25 +158,24 @@ import SwiftUI
     owner?.invalidateGhost()
     acceptedSteps.removeAll()
   }
+  @discardableResult func acceptNextGhostWord() -> Bool {
+    guard !hasMarkedText(), selectedRange().length == 0 else { return false }
+    let position = selectedRange().location
+    guard let segment = owner?.takeGhostChunk(documentID: documentID, caret: position), !segment.accepted.isEmpty else { return false }
+    insertText(segment.accepted, replacementRange: selectedRange())
+    if let document = owner?.selectedDocument {
+      acceptedSteps.append(AcceptedStep(documentID: documentID, revision: document.revision,
+        caret: selectedRange().location, accepted: segment.accepted, previous: segment.whole, sources: segment.sources))
+    }
+    owner?.resumeGhost(segment.remaining, documentID: documentID, caret: selectedRange().location, sources: segment.sources)
+    return true
+  }
   override func keyDown(with event: NSEvent) {
     let modifiers = event.modifierFlags.intersection([.shift, .control, .command, .option])
     if modifiers == [.option], !hasMarkedText(), selectedRange().length == 0 {
       switch event.keyCode {
       case 124: // Option-Right: accept the next word of the visible completion.
-        let position = selectedRange().location
-        if let segment = owner?.takeGhostChunk(documentID: documentID, caret: position),
-          !segment.accepted.isEmpty {
-          insertText(segment.accepted, replacementRange: selectedRange())
-          if let document = owner?.selectedDocument {
-            acceptedSteps.append(AcceptedStep(
-              documentID: documentID, revision: document.revision,
-              caret: selectedRange().location, accepted: segment.accepted,
-              previous: segment.whole, sources: segment.sources))
-          }
-          owner?.resumeGhost(segment.remaining, documentID: documentID,
-            caret: selectedRange().location, sources: segment.sources)
-          return
-        }
+        if acceptNextGhostWord() { return }
       case 123: // Option-Left: reverse only the last completion acceptance.
         if let step = acceptedSteps.last, step.documentID == documentID,
           owner?.selectedDocument?.revision == step.revision,
@@ -265,11 +303,23 @@ import SwiftUI
     guard let owner, let destination = attachmentDestination else { return }
     owner.attach(inputs, to: destination)
   }
+  @objc private func exploreContinuations(_ sender: Any?) { owner?.exploreWriting() }
+  @objc private func editWritingExamples(_ sender: Any?) { owner?.openWritingExamples() }
+  override func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
+    if item.action == #selector(exploreContinuations(_:)) { return owner?.canExploreWriting == true }
+    if item.action == #selector(editWritingExamples(_:)) { return owner?.isBusy == false }
+    return super.validateUserInterfaceItem(item)
+  }
   override func menu(for event: NSEvent) -> NSMenu? {
     let menu = NSMenu()
     if #available(macOS 15.2, *) { menu.automaticallyInsertsWritingToolsItems = false }
     menu.allowsContextMenuPlugIns = false
     menu.delegate = self
+    let explore = NSMenuItem(title: "Explore continuations", action: #selector(exploreContinuations(_:)), keyEquivalent: "")
+    explore.target = self; menu.addItem(explore)
+    let examples = NSMenuItem(title: "Writing examples…", action: #selector(editWritingExamples(_:)), keyEquivalent: "")
+    examples.target = self; menu.addItem(examples)
+    menu.addItem(.separator())
     menu.addItem(withTitle: "Cut", action: #selector(cut(_:)), keyEquivalent: "x")
     menu.addItem(withTitle: "Copy", action: #selector(copy(_:)), keyEquivalent: "c")
     menu.addItem(withTitle: "Paste", action: #selector(paste(_:)), keyEquivalent: "v")
@@ -352,6 +402,13 @@ import SwiftUI
   }
 }
 
+private struct MarkdownSpan: Decodable {
+  let kind: String
+  let location: Int
+  let length: Int
+  let level: Int
+}
+
 @MainActor enum MarkdownStyle {
   static let body = NSFont.systemFont(ofSize: 15)
   struct WikiDisplay {
@@ -378,8 +435,9 @@ import SwiftUI
         ])
       }
   }
-  static func apply(to view: NSTextView) {
+  static func apply(to view: NSTextView, bodyFont: NSFont? = nil, lineSpacing: CGFloat = 4, reading: Bool = false) {
     guard let storage = view.textStorage else { return }
+    let bodyFont = bodyFont ?? body
     let manager = view.undoManager
     let registered = view.undoManager?.isUndoRegistrationEnabled == true
     let native = view as? MarkdownTextView
@@ -399,37 +457,46 @@ import SwiftUI
       for range in attachmentRanges { view.setSpellingState(0, range: range) }
     }
     let paragraph = NSMutableParagraphStyle()
-    paragraph.lineSpacing = 4
+    paragraph.lineSpacing = lineSpacing
     storage.setAttributes(
-      [.font: body, .foregroundColor: NSColor.labelColor, .paragraphStyle: paragraph], range: full)
+      [.font: bodyFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: paragraph], range: full)
     func matches(_ pattern: String, _ action: (NSTextCheckingResult) -> Void) {
       guard let regex = try? NSRegularExpression(pattern: pattern) else { return }
       for result in regex.matches(in: storage.string, range: full) { action(result) }
     }
-    matches(#"(?m)^(#{1,6})[ \t]+.+$"#) { match in
-      let level = match.range(at: 1).length
-      storage.addAttribute(
-        .font,
-        value: NSFont.systemFont(ofSize: level == 1 ? 24 : level == 2 ? 20 : 17, weight: .semibold),
-        range: match.range)
-      storage.addAttribute(
-        .foregroundColor, value: NSColor.tertiaryLabelColor, range: match.range(at: 1))
+    let spans: [MarkdownSpan] = (try? ProductCore.call(["op": "markdown_spans", "text": storage.string])) ?? []
+    for span in spans where span.kind != "syntax" {
+      let range = NSRange(location: span.location, length: span.length)
+      guard NSMaxRange(range) <= text.length else { continue }
+      switch span.kind {
+      case "heading":
+        storage.addAttribute(.font, value: NSFont.systemFont(ofSize:
+          span.level == 1 ? bodyFont.pointSize * 1.6 : span.level == 2 ? bodyFont.pointSize * 1.35 : bodyFont.pointSize * 1.15,
+          weight: .semibold), range: range)
+      case "strong", "emphasis":
+        let trait: NSFontTraitMask = span.kind == "strong" ? .boldFontMask : .italicFontMask
+        storage.enumerateAttribute(.font, in: range) { value, run, _ in
+          storage.addAttribute(.font, value: NSFontManager.shared.convert(value as? NSFont ?? bodyFont,
+            toHaveTrait: trait), range: run)
+        }
+      case "strike": storage.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: range)
+      case "code", "table":
+        storage.addAttributes([.font: NSFont.monospacedSystemFont(ofSize: bodyFont.pointSize - 1, weight: .regular),
+          .backgroundColor: NSColor.quaternaryLabelColor.withAlphaComponent(0.06)], range: range)
+      case "quote":
+        let quote = paragraph.mutableCopy() as! NSMutableParagraphStyle
+        quote.headIndent = 12; quote.firstLineHeadIndent = 12
+        storage.addAttributes([.paragraphStyle: quote, .foregroundColor: NSColor.secondaryLabelColor], range: range)
+      case "link": storage.addAttribute(.foregroundColor, value: NSColor.controlAccentColor, range: range)
+      default: break
+      }
     }
-    matches(#"\*\*[^*\n]+\*\*|__[^_\n]+__"#) {
-      storage.addAttribute(
-        .font, value: NSFont.systemFont(ofSize: 15, weight: .semibold), range: $0.range)
-    }
-    matches(#"(?<!\*)\*(?!\*)[^*\n]+\*(?!\*)|(?<!_)_(?!_)[^_\n]+_(?!_)"#) {
-      storage.addAttribute(
-        .font,
-        value: NSFontManager.shared.convert(body, toHaveTrait: .italicFontMask), range: $0.range)
-    }
-    matches(#"`[^`\n]+`"#) {
-      storage.addAttributes(
-        [
-          .font: NSFont.monospacedSystemFont(ofSize: 14, weight: .regular),
-          .backgroundColor: NSColor.quaternaryLabelColor.withAlphaComponent(0.08),
-        ], range: $0.range)
+    for span in spans where span.kind == "syntax" {
+      let range = NSRange(location: span.location, length: span.length)
+      guard NSMaxRange(range) <= text.length else { continue }
+      if reading {
+        storage.addAttributes([.font: NSFont.systemFont(ofSize: 0.1), .foregroundColor: NSColor.clear], range: range)
+      } else { storage.addAttribute(.foregroundColor, value: NSColor.tertiaryLabelColor, range: range) }
     }
     for display in wikiDisplays(in: storage.string) {
       for range in display.hidden {
@@ -443,19 +510,6 @@ import SwiftUI
         .foregroundColor: NSColor.controlAccentColor,
         .backgroundColor: NSColor.controlAccentColor.withAlphaComponent(0.09),
       ], range: display.title)
-    }
-    matches(#"(?m)^\s*(?:[-*+] |\d+\. |>[ \t]?).*$"#) { match in
-      let length = min(2, match.range.length)
-      storage.addAttribute(
-        .foregroundColor, value: NSColor.secondaryLabelColor,
-        range: NSRange(location: match.range.location, length: length))
-    }
-    matches(#"(?ms)^```[^\n]*\n.*?(?:^```[ \t]*$|\z)"#) {
-      storage.addAttributes(
-        [
-          .font: NSFont.monospacedSystemFont(ofSize: 14, weight: .regular),
-          .backgroundColor: NSColor.quaternaryLabelColor.withAlphaComponent(0.06),
-        ], range: $0.range)
     }
     // Keep Markdown as the editable, portable source of truth while rendering
     // local attachment references as file names. The UUID and punctuation
@@ -473,7 +527,7 @@ import SwiftUI
       ], range: match.range(at: 1))
     }
     view.typingAttributes = [
-      .font: body, .foregroundColor: NSColor.labelColor, .paragraphStyle: paragraph,
+      .font: bodyFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: paragraph,
     ]
   }
 }
@@ -506,9 +560,9 @@ struct MarkdownEditor: NSViewRepresentable {
     text.autoresizingMask = [.width]
     text.minSize = NSSize(width: 0, height: 0)
     text.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-    text.textContainerInset = NSSize(width: 20, height: 18)
+    text.textContainerInset = NSSize(width: 28, height: 28)
     text.font = MarkdownStyle.body
-    text.backgroundColor = NSColor.textBackgroundColor
+    text.backgroundColor = BoomChrome.paperBackground
     text.isAutomaticQuoteSubstitutionEnabled = false
     text.isAutomaticDashSubstitutionEnabled = false
     text.isAutomaticTextReplacementEnabled = false
@@ -518,15 +572,28 @@ struct MarkdownEditor: NSViewRepresentable {
     text.isContinuousSpellCheckingEnabled = true
     text.usesFindBar = true
     text.registerForDraggedTypes([.fileURL, .png, .tiff, .string])
-    text.setAccessibilityLabel("Markdown document")
+    text.setAccessibilityLabel("Manuscript")
+    text.preparePlaceholder()
+    MarkdownStyle.apply(to: text)
     context.coordinator.view = text
     model.editor = text
+    text.isEditable = !model.editingLocked
     update(text, document: document)
+    updateSearch(text)
     return text
   }
   func updateNSView(_ text: MarkdownTextView, context: Context) {
     model.editor = text
+    text.isEditable = !model.editingLocked
     update(text, document: document)
+    updateSearch(text)
+  }
+  private func updateSearch(_ view: MarkdownTextView) {
+    let found = model.documentSearch[document.id]
+    let valid = !view.hasMarkedText() && view.string == document.text && found?.revision == document.revision
+      && found?.query == model.librarySearch
+    let ranges = valid ? found?.matches.ranges.map(\.native) ?? [] : []
+    view.highlightSearch(ranges, identity: model.librarySearch.isEmpty ? nil : document.id.uuidString + "\n" + model.librarySearch)
   }
   func sizeThatFits(
     _ proposal: ProposedViewSize, nsView text: MarkdownTextView, context: Context

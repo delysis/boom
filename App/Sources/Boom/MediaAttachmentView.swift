@@ -98,7 +98,12 @@ struct AttachmentInlineCard: View {
     .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
     .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.primary.opacity(0.08)))
     .task(id: record.rootDigest) {
-      do { bytes = try model.store.vault.get(.attachment, id: record.id, limit: 67_108_864) }
+      do {
+        let vault = model.store.vault, id = record.id, digest = record.rootDigest
+        let data = try await detachedWork { try vault.get(.attachment, id: id, limit: 67_108_864) }
+        guard Digest.sha256(data) == digest else { throw BoomError.invalid("Attachment original changed.") }
+        bytes = data
+      }
       catch { failure = error.localizedDescription }
     }
   }
@@ -223,7 +228,7 @@ private struct VideoAttachmentPlayer: View {
   let name: String
   let bytes: Data
   @State private var player: AVPlayer?
-  @State private var temporaryDirectory: URL?
+  @State private var media: MemoryMedia?
   @State private var failure: String?
   @State private var playing = false
   @State private var seconds = 0.0
@@ -273,8 +278,7 @@ private struct VideoAttachmentPlayer: View {
     .onDisappear {
       player?.pause()
       player = nil
-      if let temporaryDirectory { try? FileManager.default.removeItem(at: temporaryDirectory) }
-      temporaryDirectory = nil
+      media = nil
     }
     .onReceive(ticker) { _ in
       guard let player else { return }
@@ -292,19 +296,10 @@ private struct VideoAttachmentPlayer: View {
   }
 
   private func prepare() {
-    guard player == nil, temporaryDirectory == nil else { return }
-    do {
-      let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
-        "BoomVideoPreview-\(UUID().uuidString)", isDirectory: true)
-      try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
-        attributes: [.posixPermissions: 0o700])
-      temporaryDirectory = directory
-      let ext = (name as NSString).pathExtension.lowercased()
-      let file = directory.appendingPathComponent("preview.\(ext)")
-      try bytes.write(to: file, options: .atomic)
-      try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
-      player = AVPlayer(url: file)
-    } catch { failure = error.localizedDescription }
+    guard player == nil else { return }
+    let source = MemoryMedia(bytes: bytes, extension: (name as NSString).pathExtension.lowercased())
+    media = source
+    player = AVPlayer(playerItem: AVPlayerItem(asset: source.asset))
   }
 }
 

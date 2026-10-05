@@ -8,16 +8,17 @@ import Speech
   @Published private(set) var purpose: Purpose?
   @Published private(set) var starting = false
   @Published private(set) var transcribing = false
-  private var recorder: AVAudioRecorder?
-  private var recordingURL: URL?
+  private var engine: AVAudioEngine?
+  private var recording: RecordedAudio?
   private var deadline: Task<Void, Never>?
+  private var transcriptionFlag: CancellationFlag?
   private var generation = 0
   private let speaker = AVSpeechSynthesizer()
 
-  var isRecording: Bool { recorder != nil }
+  var isRecording: Bool { engine != nil }
 
   func start(_ purpose: Purpose) async throws {
-    guard recorder == nil, !starting, !transcribing else { return }
+    guard engine == nil, !starting, !transcribing else { return }
     starting = true
     let capturedGeneration = generation
     defer { starting = false }
@@ -31,60 +32,39 @@ import Speech
       throw BoomError.denied("Microphone access was not granted.")
     }
     guard generation == capturedGeneration else { throw CancellationError() }
-    let url = FileManager.default.temporaryDirectory
-      .appendingPathComponent("boom-voice-\(UUID().uuidString).wav")
-    let settings: [String: Any] = [
-      AVFormatIDKey: Int(kAudioFormatLinearPCM), AVSampleRateKey: 16_000,
-      AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 16,
-      AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false,
-    ]
-    let recorder = try AVAudioRecorder(url: url, settings: settings)
-    guard recorder.record(forDuration: 60) else {
-      try? FileManager.default.removeItem(at: url)
-      throw BoomError.unavailable("The microphone could not start recording.")
-    }
-    self.recorder = recorder
-    recordingURL = url
-    self.purpose = purpose
-    deadline = Task { [weak self, capturedRecorder = recorder] in
-      do { try await Task.sleep(nanoseconds: 60_000_000_000) }
-      catch { return }
-      guard self?.recorder === capturedRecorder else { return }
-      capturedRecorder.stop()
+    let engine = AVAudioEngine(), recording = RecordedAudio()
+    let input = engine.inputNode, format = input.outputFormat(forBus: 0)
+    input.installTap(onBus: 0, bufferSize: 4096, format: format) { buffer, _ in recording.append(buffer) }
+    do { try engine.start() }
+    catch { input.removeTap(onBus: 0); throw error }
+    self.engine = engine; self.recording = recording; self.purpose = purpose
+    deadline = Task { [weak self] in
+      do { try await Task.sleep(nanoseconds: 60_000_000_000) } catch { return }
+      guard self?.engine === engine else { return }
+      engine.stop()
     }
   }
 
   func stop() async throws -> String {
-    guard let recorder, let url = recordingURL else { return "" }
+    guard let engine, let recording else { return "" }
     let capturedGeneration = generation
-    recorder.stop()
-    deadline?.cancel()
-    deadline = nil
-    self.recorder = nil
-    recordingURL = nil
-    purpose = nil
+    engine.stop(); engine.inputNode.removeTap(onBus: 0)
+    deadline?.cancel(); deadline = nil
+    self.engine = nil; self.recording = nil; purpose = nil
+    let flag = CancellationFlag(); transcriptionFlag = flag
     transcribing = true
-    defer {
-      transcribing = false
-      try? FileManager.default.removeItem(at: url)
-    }
-    guard ((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) > 4_096 else {
-      throw BoomError.unavailable("No speech was recorded.")
-    }
-    let text = try await transcribe(url)
+    defer { transcribing = false; if transcriptionFlag === flag { transcriptionFlag = nil } }
+    let buffer = try recording.snapshot()
+    let text = try await recognize(buffer, flag: flag)
     guard generation == capturedGeneration else { throw CancellationError() }
     return text
   }
 
   func cancel() {
     generation += 1
-    recorder?.stop()
-    deadline?.cancel()
-    recorder = nil
-    deadline = nil
-    purpose = nil
-    if let recordingURL { try? FileManager.default.removeItem(at: recordingURL) }
-    recordingURL = nil
+    transcriptionFlag?.cancel()
+    if let engine { engine.stop(); engine.inputNode.removeTap(onBus: 0) }
+    deadline?.cancel(); engine = nil; recording = nil; deadline = nil; purpose = nil
     speaker.stopSpeaking(at: .immediate)
   }
 
@@ -113,16 +93,7 @@ import Speech
     case .installed:
       return module
     case .supported, .downloading:
-      // This fetches only Apple's speech model asset. Recorded audio is never
-      // supplied to a network recognizer.
-      if let request = try await AssetInventory.assetInstallationRequest(supporting: [module]) {
-        try await request.downloadAndInstall()
-      }
-      guard await AssetInventory.status(forModules: [module]) == .installed else {
-        throw BoomError.unavailable(
-          "The on-device speech model is still downloading. Try again when macOS finishes installing it.")
-      }
-      return module
+      throw BoomError.unavailable("Install the on-device speech asset from model setup before using speech.")
     case .unsupported:
       throw BoomError.unavailable("On-device dictation does not support this language on this Mac.")
     @unknown default:
@@ -130,114 +101,57 @@ import Speech
     }
   }
 
-  func transcribe(_ url: URL) async throws -> String {
+  func installSpeechAsset() async throws {
     if #available(macOS 26.0, *) {
-      return try await transcribeModern(url, with: readyDictationModule())
-    }
-    return try await transcribeLegacy(url)
-  }
-
-  /// File attachments are divided into short, independently recognized local
-  /// requests. A single hour-long Speech request is not a valid transcript.
-  func transcribeAttachment(
-    _ url: URL, flag: CancellationFlag, progress: (Int, Int) -> Void
-  ) async throws -> (text: String, coverage: String) {
-    let file = try AVAudioFile(forReading: url)
-    let format = file.processingFormat
-    guard format.sampleRate >= 8_000, format.sampleRate <= 192_000,
-      format.channelCount > 0, format.channelCount <= 8, file.length > 0 else {
-      throw BoomError.invalid("Unsupported local audio format.")
-    }
-    let chunkFrames = AVAudioFramePosition(format.sampleRate * 50)
-    let count = Int((file.length + chunkFrames - 1) / chunkFrames)
-    guard count > 0, count <= 144 else {
-      throw BoomError.budget("Audio transcription accepts at most two hours of local audio.")
-    }
-    guard let target = AVAudioFormat(
-      commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1,
-      interleaved: false) else {
-      throw BoomError.invalid("Cannot create the local audio converter.")
-    }
-    if #available(macOS 26.0, *) {
+      let module = try await dictationModule()
+      if let request = try await AssetInventory.assetInstallationRequest(supporting: [module]) {
+        try await request.downloadAndInstall()
+      }
       _ = try await readyDictationModule()
-    } else {
-      try await authorizeLegacySpeech()
+    } else { try await authorizeLegacySpeech() }
+  }
+  func transcribeAttachment(_ url: URL, flag: CancellationFlag, progress: (Int, Int) -> Void) async throws -> (text: String, coverage: String) {
+    let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+    guard values.isRegularFile == true, (values.fileSize ?? Int.max) <= 67_108_864 else { throw BoomError.budget("Audio attachment exceeds 64 MiB.") }
+    let data = try await detachedWork { try Data(contentsOf: url) }
+    return try await transcribeAttachment(data: data, extension: url.pathExtension, flag: flag, progress: progress)
+  }
+  func transcribeAttachment(data: Data, extension ext: String, flag: CancellationFlag,
+    progress: (Int, Int) -> Void) async throws -> (text: String, coverage: String) {
+    if ["m4a", "mp4", "mov"].contains(ext.lowercased()),
+      try !MediaContainerPolicy.selfContainedMP4(data) {
+      throw BoomError.invalid("Audio must be self-contained. External media references are not opened.")
     }
-    var parts: [String] = []
-    var failures: [Int] = []
-    var firstFailure: String?
-    for chunk in 0..<count {
-      try flag.check()
-      progress(chunk + 1, count)
-      let start = AVAudioFramePosition(chunk) * chunkFrames
-      let frames = AVAudioFrameCount(min(chunkFrames, file.length - start))
-      let output = try LocalAudioChunk.convert(file, start: start, frames: frames, to: target)
-      let chunkURL = FileManager.default.temporaryDirectory.appendingPathComponent(
-        "boom-speech-\(UUID().uuidString).wav")
-      defer { try? FileManager.default.removeItem(at: chunkURL) }
-      do {
-        let writer = try AVAudioFile(
-          forWriting: chunkURL, settings: target.settings,
-          commonFormat: .pcmFormatFloat32, interleaved: false)
-        try writer.write(from: output)
-      }
-      do {
-        let text: String
-        if #available(macOS 26.0, *) {
-          text = try await transcribeModern(
-            chunkURL, with: readyDictationModule(), flag: flag)
-        } else {
-          text = try await transcribeLegacy(chunkURL, flag: flag)
-        }
-        if !text.isEmpty { parts.append(text) }
-      } catch is CancellationError { throw CancellationError() }
+    if #available(macOS 26.0, *) { _ = try await readyDictationModule() }
+    else { try await authorizeLegacySpeech() }
+    let media = MemoryMedia(bytes: data, extension: ext)
+    let reader = try await media.audioReader()
+    let count = max(1, Int(ceil(reader.duration / 50)))
+    var parts: [String] = [], failures: [Int] = [], index = 0
+    while let buffer = try await detachedWork(operation: { try reader.next(flag: flag) }) {
+      try flag.check(); index += 1; progress(index, count)
+      do { parts.append(try await recognize(buffer, flag: flag)) }
+      catch is CancellationError { throw CancellationError() }
       catch let error as BoomError {
-        if case .denied = error { throw error }
-        firstFailure = firstFailure ?? error.localizedDescription
-        failures.append(chunk + 1)
-      } catch {
-        firstFailure = firstFailure ?? error.localizedDescription
-        failures.append(chunk + 1)
-      }
-      try flag.check()
+        if case .denied = error { throw error }; failures.append(index)
+      } catch { failures.append(index) }
     }
-    guard !parts.isEmpty else {
-      throw BoomError.unavailable(
-        "On-device speech could not transcribe this recording: "
-          + (firstFailure ?? "No words were recognized."))
-    }
+    guard !parts.isEmpty else { throw BoomError.unavailable("On-device speech recognized no words. The original is retained.") }
     let text = parts.joined(separator: "\n\n")
-    guard text.utf8.count <= 262_144 else {
-      throw BoomError.budget("The transcript exceeds the attachment text limit; the original is retained.")
-    }
-    let coverage = failures.isEmpty
-      ? "On-device transcription of all \(count) audio segments; wording should be checked against the original."
-      : "Partial on-device transcription: \(count - failures.count) of \(count) segments; failed segments \(failures.map(String.init).joined(separator: ", "))."
-    return (text, coverage)
+    guard text.utf8.count <= 262_144 else { throw BoomError.budget("Transcript exceeds 256 KiB; original retained.") }
+    return (text, failures.isEmpty ? "On-device transcription of all \(index) segments; check wording against the original."
+      : "Partial on-device transcription: \(index - failures.count) of \(index) segments; failed segments \(failures.map(String.init).joined(separator: ", ")).")
   }
-
-  func transcribeAttachment(
-    data: Data, extension ext: String, flag: CancellationFlag,
-    progress: (Int, Int) -> Void
-  ) async throws -> (text: String, coverage: String) {
-    let root = FileManager.default.temporaryDirectory.appendingPathComponent(
-      "boom-speech-input-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(
-      at: root, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
-    defer { try? FileManager.default.removeItem(at: root) }
-    let url = root.appendingPathComponent("source." + ext)
-    try data.write(to: url, options: .atomic)
-    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-    return try await transcribeAttachment(url, flag: flag, progress: progress)
+  private func recognize(_ buffer: AVAudioPCMBuffer, flag: CancellationFlag) async throws -> String {
+    if #available(macOS 26.0, *) { return try await transcribeModern(buffer, with: readyDictationModule(), flag: flag) }
+    return try await transcribeLegacy(buffer, flag: flag)
   }
-
   @available(macOS 26.0, *)
   private func transcribeModern(
-    _ url: URL, with transcriber: DictationTranscriber, flag: CancellationFlag? = nil
+    _ buffer: AVAudioPCMBuffer, with transcriber: DictationTranscriber, flag: CancellationFlag? = nil
   ) async throws -> String {
-    let file = try AVAudioFile(forReading: url)
     let analyzer = SpeechAnalyzer(modules: [transcriber])
-    try await analyzer.prepareToAnalyze(in: file.processingFormat)
+    try await analyzer.prepareToAnalyze(in: buffer.format)
     let watchdog = flag.map { flag in
       Task {
         while !Task.isCancelled {
@@ -259,7 +173,10 @@ import Speech
       return words
     }
     do {
-      _ = try await analyzer.analyzeSequence(from: file)
+      let inputs = AsyncStream<AnalyzerInput> { continuation in
+        continuation.yield(AnalyzerInput(buffer: buffer)); continuation.finish()
+      }
+      _ = try await analyzer.analyzeSequence(inputs)
       try await analyzer.finalizeAndFinishThroughEndOfInput()
       try flag?.check()
       let text = try await results.value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -289,13 +206,14 @@ import Speech
     }
   }
 
-  private func transcribeLegacy(_ url: URL, flag: CancellationFlag? = nil) async throws -> String {
+  private func transcribeLegacy(_ buffer: AVAudioPCMBuffer, flag: CancellationFlag? = nil) async throws -> String {
     try await authorizeLegacySpeech()
     guard let recognizer = SFSpeechRecognizer(locale: .current),
       recognizer.supportsOnDeviceRecognition, recognizer.isAvailable else {
       throw BoomError.unavailable("An on-device speech recognizer is not available for this language.")
     }
-    let request = SFSpeechURLRecognitionRequest(url: url)
+    let request = SFSpeechAudioBufferRecognitionRequest()
+    request.append(buffer); request.endAudio()
     request.requiresOnDeviceRecognition = true
     request.shouldReportPartialResults = false
     return try await withCheckedThrowingContinuation { continuation in
@@ -329,40 +247,6 @@ import Speech
   }
 }
 
-/// An AVAudioConverter is exhausted after the input callback returns
-/// endOfStream. A fresh converter for each independent segment is required;
-/// reusing one silently produces zero frames after the first segment.
-enum LocalAudioChunk {
-  static func convert(
-    _ file: AVAudioFile, start: AVAudioFramePosition, frames: AVAudioFrameCount,
-    to target: AVAudioFormat
-  ) throws -> AVAudioPCMBuffer {
-    let format = file.processingFormat
-    file.framePosition = start
-    guard let input = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames),
-      let output = AVAudioPCMBuffer(
-        pcmFormat: target,
-        frameCapacity: AVAudioFrameCount(
-          ceil(Double(frames) * target.sampleRate / format.sampleRate) + 1024)),
-      let converter = AVAudioConverter(from: format, to: target)
-    else { throw BoomError.invalid("Cannot allocate a bounded audio chunk.") }
-    try file.read(into: input, frameCount: frames)
-    guard input.frameLength > 0 else {
-      throw BoomError.invalid("The audio file ended before this segment could be read.")
-    }
-    let source = OneShotAudioInput(input)
-    var conversionError: NSError?
-    let result = converter.convert(to: output, error: &conversionError) { _, status in
-      source.take(status)
-    }
-    if let conversionError { throw conversionError }
-    guard result != .error, output.frameLength > 0 else {
-      throw BoomError.invalid("Local audio chunk conversion failed.")
-    }
-    return output
-  }
-}
-
 private final class SpeechOnce: @unchecked Sendable {
   private let lock = NSLock()
   private var continuation: CheckedContinuation<String, Error>?
@@ -378,5 +262,39 @@ private final class SpeechOnce: @unchecked Sendable {
     continuation = nil
     lock.unlock()
     saved?.resume(with: result)
+  }
+}
+
+/// The microphone callback owns no file and cannot exceed one minute of PCM.
+private final class RecordedAudio: @unchecked Sendable {
+  private let lock = NSLock()
+  private var samples: [Float] = []
+  private var failure: Error?
+  func append(_ input: AVAudioPCMBuffer) {
+    lock.lock(); defer { lock.unlock() }
+    guard samples.count < 960_000, failure == nil else { return }
+    do {
+      guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false),
+        let converter = AVAudioConverter(from: input.format, to: format),
+        let output = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(ceil(Double(input.frameLength) * 16_000 / input.format.sampleRate) + 32)) else {
+        throw BoomError.invalid("Microphone audio could not be converted.")
+      }
+      let source = OneShotAudioInput(input); var error: NSError?
+      let status = converter.convert(to: output, error: &error) { _, state in source.take(state) }
+      if let error { throw error }
+      guard status != .error, let channel = output.floatChannelData?[0] else { throw BoomError.invalid("Microphone conversion failed.") }
+      samples.append(contentsOf: UnsafeBufferPointer(start: channel, count: min(Int(output.frameLength), 960_000 - samples.count)))
+    } catch { failure = error }
+  }
+  func snapshot() throws -> AVAudioPCMBuffer {
+    lock.lock(); defer { lock.unlock() }
+    if let failure { throw failure }
+    guard samples.count > 1_024, samples.allSatisfy(\.isFinite),
+      let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false),
+      let output = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)),
+      let channel = output.floatChannelData?[0] else { throw BoomError.unavailable("No speech was recorded.") }
+    output.frameLength = AVAudioFrameCount(samples.count)
+    for index in samples.indices { channel[index] = samples[index] }
+    return output
   }
 }

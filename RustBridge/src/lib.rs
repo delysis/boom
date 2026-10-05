@@ -90,6 +90,32 @@ fn owned(value: Value) -> BoomAttachmentBuffer {
 /// supplied lengths for this call. The embedding Swift Data.withUnsafeBytes owns them.
 /// The returned buffer must be released exactly once with boom_attachment_free.
 #[no_mangle]
+pub unsafe extern "C" fn bloom_core_request(
+    data: *const u8,
+    length: usize,
+) -> BoomAttachmentBuffer {
+    if data.is_null() || length == 0 || length > 16 * 1024 * 1024 {
+        return owned(error("input_limit", "Product request exceeds 16 MiB."));
+    }
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: caller provides a live immutable buffer for this call only.
+        let bytes = unsafe { slice::from_raw_parts(data, length) };
+        match serde_json::from_slice::<bloom_core::Request>(bytes) {
+            Ok(request) => match bloom_core::execute(request) {
+                Ok(value) => json!({"schema":1,"ok":true,"value":value}),
+                Err(e) => error("invalid", &e.to_string()),
+            },
+            Err(_) => error("request_invalid", "Malformed product request."),
+        }
+    }));
+    owned(outcome.unwrap_or_else(|_| error("core_panic", "Product request failed.")))
+}
+
+/// # Safety
+/// For nonzero lengths, pointers must address readable immutable buffers of the
+/// supplied lengths for this call. The embedding Swift Data.withUnsafeBytes owns them.
+/// The returned buffer must be released exactly once with boom_attachment_free.
+#[no_mangle]
 pub unsafe extern "C" fn boom_attachment_inspect(
     name: *const u8,
     name_length: usize,

@@ -1,38 +1,36 @@
 import AVFoundation
+import BoomCore
 import XCTest
 @testable import Boom
 
 final class AudioChunkTests: XCTestCase {
-  func testConsecutiveChunksAndShortTailContainAudio() throws {
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
-      "boom-audio-chunk-test-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
-    defer { try? FileManager.default.removeItem(at: directory) }
-    let url = directory.appendingPathComponent("source.wav")
-    let source = AVAudioFormat(standardFormatWithSampleRate: 22_050, channels: 1)!
-    let frames: AVAudioFrameCount = 22_050
-    do {
-      let writer = try AVAudioFile(forWriting: url, settings: source.settings)
-      for part in 0..<3 {
-        let count: AVAudioFrameCount = part == 2 ? frames / 4 : frames
-        let buffer = AVAudioPCMBuffer(pcmFormat: source, frameCapacity: count)!
-        buffer.frameLength = count
-        for index in 0..<Int(count) {
-          buffer.floatChannelData![0][index] = sin(Float(index) * 0.02)
-        }
-        try writer.write(from: buffer)
-      }
+  func testMemoryDecoderConvertsConsecutiveSegmentsAndShortTail() async throws {
+    // Authored audio fixture lives entirely in memory, including its WAV header.
+    let rate: UInt32 = 22_050, frames = Int(22_050 * 9 / 4)
+    var pcm = Data(capacity: frames * 4)
+    for index in 0..<frames {
+      var bits = sin(Float(index) * 0.02).bitPattern.littleEndian
+      withUnsafeBytes(of: &bits) { pcm.append(contentsOf: $0) }
     }
-    let reader = try AVAudioFile(forReading: url)
-    let target = AVAudioFormat(
-      commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1,
-      interleaved: false)!
+    var wav = Data("RIFF".utf8)
+    func append<T: FixedWidthInteger>(_ value: T) {
+      var little = value.littleEndian
+      withUnsafeBytes(of: &little) { wav.append(contentsOf: $0) }
+    }
+    append(UInt32(pcm.count + 36)); wav.append(Data("WAVEfmt ".utf8))
+    append(UInt32(16)); append(UInt16(3)); append(UInt16(1))
+    append(rate); append(rate * 4); append(UInt16(4)); append(UInt16(32))
+    wav.append(Data("data".utf8)); append(UInt32(pcm.count)); wav.append(pcm)
+    let owner = MemoryMedia(bytes: wav, extension: "wav")
+    let reader = try await owner.audioReader()
     for part in 0..<3 {
-      let start = AVAudioFramePosition(part) * AVAudioFramePosition(frames)
-      let count: AVAudioFrameCount = part == 2 ? frames / 4 : frames
-      let output = try LocalAudioChunk.convert(reader, start: start, frames: count, to: target)
+      let output = try XCTUnwrap(reader.next(flag: CancellationFlag(), seconds: 1))
+      XCTAssertEqual(output.format.sampleRate, 16_000)
       XCTAssertGreaterThan(output.frameLength, 0, "segment \(part + 1) was empty")
-      XCTAssertNotEqual(output.floatChannelData![0][Int(output.frameLength / 2)], 0)
+      XCTAssertTrue((0..<Int(output.frameLength)).contains { abs(output.floatChannelData![0][$0]) > 0.01 })
+      if part < 2 { XCTAssertEqual(output.frameLength, 16_000) }
+      else { XCTAssertLessThan(output.frameLength, 16_000) }
     }
+    XCTAssertNil(try reader.next(flag: CancellationFlag(), seconds: 1))
   }
 }

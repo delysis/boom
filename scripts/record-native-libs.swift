@@ -20,6 +20,6 @@ else {
 let output = URL(fileURLWithPath: args[2])
 try FileManager.default.createDirectory(
   at: output.deletingLastPathComponent(), withIntermediateDirectories: true)
-try JSONSerialization.data(withJSONObject: flags, options: [.prettyPrinted]).write(
-  to: output, options: .atomic)
+let bytes = try JSONSerialization.data(withJSONObject: flags, options: [.prettyPrinted])
+if (try? Data(contentsOf: output)) != bytes { try bytes.write(to: output, options: .atomic) }
 print("Recorded \(flags.count) native linker arguments from rustc.")

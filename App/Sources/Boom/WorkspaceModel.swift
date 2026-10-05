@@ -1,11 +1,11 @@
 import AppKit
 import AVFoundation
 import Combine
-import CoreMLLLM
 import BoomCore
+import MLX
 import SwiftUI
 
-struct StoredProposal: Codable, Identifiable {
+struct StoredProposal: Codable, Identifiable, Sendable {
   let id: UUID
   let chatID: UUID
   let messageID: UUID
@@ -28,7 +28,6 @@ struct CompletionSegment {
 }
 
 @MainActor final class WorkspaceModel: ObservableObject {
-  enum ModelChoice: String { case automatic = "Auto", apple = "Apple", gemma = "Gemma" }
   enum InputPane: Equatable { case document, chat }
   @Published var state: WorkspaceState
   @Published var documents: [DocumentSnapshot]
@@ -39,8 +38,7 @@ struct CompletionSegment {
   @Published var mode: InteractionMode = .ask
   @Published var pendingAttachments: [UUID] = []
   @Published var isBusy = false
-  @Published var status = AppleModel.availabilityMessage
-  @Published var appleAvailability = AppleModel.availabilityMessage
+  @Published var status = "Install a consultation model to begin"
   @Published var errorMessage: String?
   @Published var composerIssue: String?
   @Published var streamingText = ""
@@ -49,16 +47,32 @@ struct CompletionSegment {
   @Published var ghostText = ""
   @Published var ghostStamp: GhostStamp?
   @Published var modelReady = false
-  @Published var modelChoice: ModelChoice = .automatic
+  @Published var consultationStyle: ConsultationStyle = .separate
+  @Published var showingChatInstructions: UUID?
+  @Published var editingChatMessage: UUID?
+  @Published var authoredChatRole: Role?
+  @Published var samplingProfile: SamplingProfile = .standard
+  @Published var candidates: CandidateBundle?
+  @Published var showingCandidates = false
+  @Published var writingIssue: String?
+  @Published var editingWritingExamples: WritingExamplesRequest?
+  @Published var editingLocked = false
+  @Published var backupRequest: BackupRequest?
+  @Published var writingExampleIDs: [UUID] = []
+  let layout: ProductLayout
+  @Published var librarySearch = "" { didSet { if oldValue != librarySearch { refreshSearch() } } }
+  @Published private(set) var documentSearch: [UUID: DocumentSearchMatches] = [:]
+  @Published private(set) var matchingChatIDs: Set<UUID> = []
+  @Published private(set) var matchingVoiceIDs: Set<UUID> = []
+  @Published private(set) var searchIssue: String?
+  private var searchedQuery = ""
+  private var searchEpoch: UInt64 = 0
+  private var searchTask: Task<Void, Never>?
   let store: WorkspaceStore
-  private(set) var runner: GemmaRunner?
   private(set) var mlxRunner: MLXGemmaRunner?
   private(set) var baseRunner: MLXGemmaRunner?
-  var selectedMLXRunner: MLXGemmaRunner? { modelChoice == .apple ? nil : mlxRunner }
+  var selectedMLXRunner: MLXGemmaRunner? { mlxRunner }
   var completionRunner: MLXGemmaRunner? { baseRunner }
-  var selectedRunner: GemmaRunner? {
-    modelChoice == .apple || mlxRunner != nil ? nil : runner
-  }
   func documentAttachments(_ document: DocumentSnapshot) -> [AttachmentRecord] {
     AttachmentLink.ids(in: document.text).compactMap { id in
       state.attachments.first { $0.id == id }
@@ -73,13 +87,13 @@ struct CompletionSegment {
     if let id = state.selectedChat, state.chats.contains(where: { $0.id == id }) {
       return .chat(id: id)
     }
-    try flush()
+    scheduleSave()
     var next = state
     let chat = ChatRecord()
     next.chats.append(chat)
     next.selectedChat = chat.id
     next.showChat = true
-    try store.persist(next)
+    scheduleSave()
     state = next
     selectedChatIDs = [chat.id]
     compactPane = "chat"
@@ -112,45 +126,16 @@ struct CompletionSegment {
     guard let destination = documentAttachmentDestination(id: document.id, range: range) else { return }
     chooseAttachmentFiles(to: destination)
   }
-  var canInfer: Bool {
-    selectedMLXRunner != nil || selectedRunner != nil
-      || (modelChoice != .gemma && AppleModel.isAvailable)
-  }
-  var inferenceName: String {
-    if let selectedMLXRunner { return "Gemma 4 \(selectedMLXRunner.size.rawValue)" }
-    if selectedRunner != nil { return "Gemma 4 E2B" }
-    return modelChoice != .gemma && AppleModel.isAvailable ? "Apple Foundation Model" : "No model"
-  }
-  var cachedQATSize: GemmaSize? {
-    MLXModelStore.bestCachedSource(
-      physicalBytes: ProcessInfo.processInfo.physicalMemory)?.size
-  }
-  var recommendedQATSize: GemmaSize? {
-    ModelMemoryPolicy.recommendedSize(physicalBytes: ProcessInfo.processInfo.physicalMemory)
-  }
-  var recommendedBaseSize: GemmaSize? {
-    guard let chat = recommendedQATSize else { return nil }
-    let bytes = ProcessInfo.processInfo.physicalMemory
-    let combined = UInt64(chat.nominalBillions + GemmaSize.b12.nominalBillions) * 500_000_000
-    return combined < bytes / 2 ? .b12 : nil
-  }
+  var canInfer: Bool { mlxRunner != nil }
+  var inferenceName: String { mlxRunner == nil ? "No model" : "Gemma 4 12B" }
   var baseReady: Bool { baseRunner != nil }
-  var baseCached: Bool {
-    recommendedBaseSize.flatMap(MLXModelStore.cachedBaseSource(for:)) != nil
-  }
-  func chooseModel(_ choice: ModelChoice) {
-    modelChoice = choice
-    invalidateGhost()
-    status = selectedRunner == nil && selectedMLXRunner == nil && AppleModel.isAvailable
-      ? "Apple Foundation Model · chat only; raw document completion needs Gemma"
-      : inferenceName == "No model" ? appleAvailability : inferenceName + " · on device"
-    scheduleCompletion()
-  }
   private var foreground: Task<Void, Never>?
   private var activeFlag: CancellationFlag?
   private var activeID: UUID?
   private var ghostTask: Task<Void, Never>?
+  private var writingFlag: CancellationFlag?
   private var ghostFlag: CancellationFlag?
+  private var pressureWatch: MemoryPressureWatch?
   private var saveTask: Task<Void, Never>?
   private var dirty = Set<UUID>()
   private var undoManagers: [UUID: UndoManager] = [:]
@@ -164,7 +149,7 @@ struct CompletionSegment {
     case compact, medium, wide
 
     init(width: CGFloat) {
-      self = width < 820 ? .compact : width < 1000 ? .medium : .wide
+      self = width < 600 ? .compact : width < 900 ? .medium : .wide
     }
   }
   @Published private var paneFit: PaneFit = .wide
@@ -172,33 +157,39 @@ struct CompletionSegment {
   @Published private var mediumHiddenPane = "library"
   var showsLibrary: Bool {
     if paneFit == .compact { return compactPane == "library" }
-    return state.showLibrary && !(paneFit == .medium && allPanesRequested
+    return state.showLibrary && !(layout.isAuthor && paneFit == .medium && allPanesRequested
       && mediumHiddenPane == "library")
   }
   var showsDocument: Bool {
+    guard layout.isAuthor else { return false }
     if paneFit == .compact { return compactPane == "document" }
-    return state.showDocument && !(paneFit == .medium && allPanesRequested
-      && mediumHiddenPane == "document")
+    return true
   }
   var showsChat: Bool {
+    if !layout.isAuthor { return paneFit != .compact || compactPane == "chat" }
     if paneFit == .compact { return compactPane == "chat" }
     return state.showChat && !(paneFit == .medium && allPanesRequested
       && mediumHiddenPane == "chat")
   }
   private var allPanesRequested: Bool {
-    state.showLibrary && state.showDocument && state.showChat
+    layout.isAuthor && state.showLibrary && state.showChat
   }
 
-  init() throws {
-    store = try WorkspaceStore()
-    let loaded = try store.load().get()
+  init(storeOverride: WorkspaceStore? = nil, loadModels: Bool = true) async throws {
+    layout = try ProductCore.layout()
+    if let storeOverride { store = storeOverride }
+    else { store = try await detachedWork { try WorkspaceStore() } }
+    let loaded = try await store.load().get()
     self.state = loaded.0
     self.documents = loaded.1
     selectedDocumentIDs = Set(state.selectedDocument.map { [$0] } ?? [])
     selectedChatIDs = Set(state.selectedChat.map { [$0] } ?? [])
-    if documents.isEmpty { try newDocument() }
-    if state.chats.isEmpty { try newChat() }
-    compactPane = state.showDocument ? "document" : state.showChat ? "chat" : "library"
+    if layout.isAuthor && documents.isEmpty { try newDocument() }
+    if state.chats.isEmpty && !layout.isAuthor { try newChat() }
+    if let id = state.selectedDocument {
+      candidates = try await store.latestCandidate(for: id, ids: state.candidateIDs)
+    }
+    compactPane = layout.primaryPane
     #if BOOM_UI_TEST
     if let index = state.chats.firstIndex(where: { $0.id == state.selectedChat }),
       state.chats[index].messages.isEmpty {
@@ -206,31 +197,84 @@ struct CompletionSegment {
         ChatMessage(role: .user, text: "A sample request"),
         ChatMessage(role: .assistant, text: "A sample reply."),
       ]
-      try flush()
+      scheduleSave()
     }
     #endif
-    if let source = MLXModelStore.bestCachedSource(
-      physicalBytes: ProcessInfo.processInfo.physicalMemory),
-      FileManager.default.fileExists(atPath: MLXModelStore.convertedURL(for: source).path),
-      let assistant = MLXModelStore.cachedAssistant(for: source.size)
-    {
-      loadConvertedMLX(source, assistant: assistant)
-    } else if let name = state.installedModel {
-      guard name.range(of: "^gemma4-e2b-[0-9a-f]{20}$", options: .regularExpression) != nil else {
-        throw BoomError.invalid("Invalid installed-model identifier.")
-      }
-      let appOwned = store.modelsURL.appendingPathComponent(name)
-      let cached = HuggingFaceCache.boomModels.appendingPathComponent(name)
-      loadModel(FileManager.default.fileExists(atPath: appOwned.path) ? appOwned : cached)
+    try await flush()
+    pressureWatch = MemoryPressureWatch { [weak self] critical in
+      Task { @MainActor in self?.handleMemoryPressure(critical: critical) }
     }
-    if recommendedBaseSize == .b12,
-      let source = MLXModelStore.cachedBaseSource(for: .b12),
-      FileManager.default.fileExists(atPath: MLXModelStore.convertedURL(for: source).path)
-    {
-      Task { [weak self] in
-        guard let self else { return }
-        if let foreground = self.foreground { await foreground.value }
-        self.loadConvertedBase(source)
+    if loadModels { loadInstalledModels() }
+  }
+  private func handleMemoryPressure(critical: Bool) {
+    if critical { cancel() }
+    if writingFlag != nil { mlxRunner = nil; modelReady = false }
+    else { baseRunner = nil }
+    Task {
+      await GenerationCoordinator.shared.enter()
+      MLX.Memory.clearCache()
+      await GenerationCoordinator.shared.leave()
+    }
+    status = "Memory pressure released the inactive model. It can be reopened from model setup."
+  }
+  func documentMatchesSearch(_ document: DocumentSnapshot) -> Bool {
+    librarySearch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || searchedQuery != librarySearch || documentSearch[document.id] != nil
+  }
+  func chatMatchesSearch(_ chat: ChatRecord) -> Bool {
+    librarySearch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || searchedQuery != librarySearch || matchingChatIDs.contains(chat.id)
+  }
+  func voiceMatchesSearch(_ voice: Voice) -> Bool {
+    librarySearch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || searchedQuery != librarySearch || matchingVoiceIDs.contains(voice.id)
+  }
+  private func refreshSearch() {
+    searchEpoch &+= 1; searchTask?.cancel()
+    let query = librarySearch, identity = searchEpoch
+    searchIssue = nil
+    if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      searchedQuery = query; documentSearch = [:]; matchingChatIDs = []; matchingVoiceIDs = []
+      return
+    }
+    editor?.clearGhost()
+    let capturedDocuments = documents, capturedChats = state.chats, capturedVoices = state.voices
+    let imported = state.importedFiles ?? [:]
+    let folderNames = Dictionary(uniqueKeysWithValues: (state.importedFolders ?? []).map { ($0.id, $0.name) })
+    searchTask = Task { [weak self] in
+      do {
+        try await Task.sleep(nanoseconds: 120_000_000)
+        let results = try await detachedWork(priority: .utility) {
+          var documents: [UUID: DocumentSearchMatches] = [:], chats = Set<UUID>(), voices = Set<UUID>()
+          for document in capturedDocuments {
+            try Task.checkCancellation()
+            let matches = try ProductCore.search(document.text, query: query)
+            let importedPath = imported[document.id].map { (folderNames[$0.folderID] ?? "") + "/" + $0.path } ?? ""
+            let title = try ProductCore.search(document.title + "\n" + importedPath, query: query)
+            if matches.hasMatches || title.hasMatches {
+              documents[document.id] = DocumentSearchMatches(query: query, revision: document.revision, matches: matches)
+            }
+          }
+          for chat in capturedChats {
+            try Task.checkCancellation()
+            var found = try ProductCore.search(chat.title + "\n" + (chat.instructions ?? ""), query: query).hasMatches
+            for message in chat.messages where !found {
+              try Task.checkCancellation()
+              found = try ProductCore.search(message.text, query: query).hasMatches
+            }
+            if found { chats.insert(chat.id) }
+          }
+          for voice in capturedVoices {
+            try Task.checkCancellation()
+            if try chats.contains(voice.id) || ProductCore.search(voice.name + "\n" + voice.slug + "\n" + voice.instructions, query: query).hasMatches {
+              voices.insert(voice.id)
+            }
+          }
+          return (documents, chats, voices)
+        }
+        guard let self, self.searchEpoch == identity else { return }
+        self.documentSearch = results.0; self.matchingChatIDs = results.1; self.matchingVoiceIDs = results.2
+        self.searchedQuery = query
+      } catch is CancellationError {} catch {
+        guard let self, self.searchEpoch == identity else { return }
+        self.searchIssue = error.localizedDescription
       }
     }
   }
@@ -239,11 +283,11 @@ struct CompletionSegment {
   var proposedForChat: [StoredProposal] {
     state.proposals.filter { $0.chatID == state.selectedChat }
   }
-  var personaMatches: [Persona] {
+  var voiceMatches: [Voice] {
     guard let range = draft.range(of: #"(?:^|\s)@([a-z0-9_-]*)$"#, options: .regularExpression)
     else { return [] }
     let query = draft[range].trimmingCharacters(in: .whitespacesAndNewlines).dropFirst()
-    return state.personas.filter { $0.slug.hasPrefix(query) }.prefix(6).map { $0 }
+    return state.voices.filter { $0.slug.hasPrefix(query) }.prefix(6).map { $0 }
   }
   func undoManager(_ id: UUID) -> UndoManager {
     if let manager = undoManagers[id] { return manager }
@@ -256,55 +300,55 @@ struct CompletionSegment {
     errorMessage = error.localizedDescription
     status = error.localizedDescription
   }
-  func refreshAppleAvailability() {
-    let latest = AppleModel.availabilityMessage
-    guard latest != appleAvailability else { return }
-    if selectedRunner == nil, selectedMLXRunner == nil, !isBusy,
-      status == appleAvailability { status = latest }
-    appleAvailability = latest
-    if AppleModel.isAvailable, selectedRunner == nil, selectedMLXRunner == nil {
-      scheduleCompletion()
-    }
-  }
   func dismissError() { errorMessage = nil }
   func finishComposition() { editor?.finishComposition() }
-  func flush() throws {
+  func flush() async throws {
     saveTask?.cancel()
     saveTask = nil
-    for id in dirty.sorted(by: { $0.uuidString < $1.uuidString }) {
-      if let document = documents.first(where: { $0.id == id }) { try store.saveDocument(document) }
-      dirty.remove(id)
+    let captured = documents.filter { dirty.contains($0.id) }
+    // The editable source is the chat; portable voice records are its immutable snapshots.
+    for voice in state.voices {
+      if let chat = state.chats.first(where: { $0.id == voice.id }) {
+        let revision = try ProductCore.pinnedVoice(chat, slug: voice.slug,
+          occupied: state.voices.filter { $0.id != chat.id }.map(\.slug))
+        retainVoice(revision)
+      }
     }
     state.documents = documents.map { DocumentIndex(id: $0.id, title: $0.title) }
-    try store.persist(state)
+    let snapshot = state
+    try await store.save(snapshot, documents: captured)
+    if !librarySearch.isEmpty { refreshSearch() }
+    for saved in captured where documents.first(where: { $0.id == saved.id })?.revision == saved.revision {
+      dirty.remove(saved.id)
+    }
   }
   func scheduleSave() {
     saveTask?.cancel()
     saveTask = Task { [weak self] in
       do {
         try await Task.sleep(nanoseconds: 350_000_000)
-        try self?.flush()
+        try await self?.flush()
       } catch is CancellationError {} catch { self?.report(error) }
     }
   }
   func newDocument() throws {
     finishComposition()
     cancel()
-    try flush()
+    scheduleSave()
     let document = DocumentSnapshot(title: "Untitled", text: "")
-    try store.saveDocument(document)
+    dirty.insert(document.id)
     documents.append(document)
     state.selectedDocument = document.id
     selectedDocumentIDs = [document.id]
     state.showDocument = true
     compactPane = "document"
     invalidateGhost()
-    try flush()
+    scheduleSave()
   }
   func newChat(about documentID: UUID? = nil) throws {
     finishComposition()
     cancel()
-    try flush()
+    scheduleSave()
     if let documentID, !documents.contains(where: { $0.id == documentID }) {
       throw BoomError.invalid("The document for this chat no longer exists.")
     }
@@ -318,20 +362,19 @@ struct CompletionSegment {
     pendingAttachments = []
     draft = ""
     mode = .ask
-    try flush()
+    authoredChatRole = nil; showingChatInstructions = nil; editingChatMessage = nil
+    scheduleSave()
   }
   func ensureChatForDraft() {
     guard !isBusy, !draft.isEmpty, selectedChat == nil else { return }
-    do {
-      try flush()
+      scheduleSave()
       var next = state
       let chat = ChatRecord()
       next.chats.append(chat)
       next.selectedChat = chat.id
-      try store.persist(next)
+      scheduleSave()
       state = next
       selectedChatIDs = [chat.id]
-    } catch { report(error) }
   }
   func attachDocument(_ documentID: UUID?, to chatID: UUID) {
     guard !isBusy else { return }
@@ -344,14 +387,14 @@ struct CompletionSegment {
       }
       var next = state
       next.chats[index].attachedDocumentID = documentID
-      try store.persist(next)
+      scheduleSave()
       state = next
     } catch { report(error) }
   }
   func branch(_ messageID: UUID, from chatID: UUID, editing: Bool = false) {
     guard !isBusy else { return }
     do {
-      try flush()
+      scheduleSave()
       guard let original = state.chats.first(where: { $0.id == chatID }),
         let message = original.messages.first(where: { $0.id == messageID }) else {
         throw BoomError.stale("The selected message is no longer in this chat.")
@@ -363,7 +406,7 @@ struct CompletionSegment {
       var next = state
       next.chats.append(nextChat)
       next.selectedChat = nextChat.id
-      try store.persist(next)
+      scheduleSave()
       state = next
       selectedChatIDs = [nextChat.id]
       pendingAttachments = editing
@@ -392,32 +435,33 @@ struct CompletionSegment {
   }
   func rate(_ messageID: UUID, in chatID: UUID, as feedback: MessageFeedback) {
     guard !isBusy else { return }
-    do {
       guard let chat = state.chats.firstIndex(where: { $0.id == chatID }),
         let message = state.chats[chat].messages.firstIndex(where: { $0.id == messageID }),
         state.chats[chat].messages[message].role == .assistant else { return }
       var next = state
       let current = next.chats[chat].messages[message].feedback
       next.chats[chat].messages[message].feedback = current == feedback ? nil : feedback
-      try store.persist(next)
+      scheduleSave()
       state = next
-    } catch { report(error) }
   }
+
   func selectDocument(_ id: UUID, preservingSelection: Bool = false) {
-    do {
       guard documents.contains(where: { $0.id == id }) else { return }
       finishComposition()
-      try flush()
+      scheduleSave()
       cancel()
       state.selectedDocument = id
+      if layout.isAuthor, selectedChat?.attachedDocumentID != id {
+        state.selectedChat = state.chats.last(where: { $0.attachedDocumentID == id })?.id
+        draft = ""; pendingAttachments = []; showingChatInstructions = nil; editingChatMessage = nil
+      }
       if !preservingSelection { selectedDocumentIDs = [id] }
       state.showDocument = true
-      compactPane = "document"
+        compactPane = "document"
       caret = 0
       invalidateGhost()
       scheduleSave()
       focusEditor(id)
-    } catch { report(error) }
   }
   func selectChat(_ id: UUID, preservingSelection: Bool = false) {
     guard state.chats.contains(where: { $0.id == id }) else { return }
@@ -430,6 +474,7 @@ struct CompletionSegment {
     pendingAttachments = []
     draft = ""
     mode = .ask
+    authoredChatRole = nil; showingChatInstructions = nil; editingChatMessage = nil
     scheduleSave()
   }
   func focusEditor(_ id: UUID) {
@@ -442,44 +487,24 @@ struct CompletionSegment {
   func deleteDocuments(_ ids: Set<UUID>) {
     guard !isBusy, !ids.isEmpty else { return }
     let targets = documents.filter { ids.contains($0.id) }
-    guard !targets.isEmpty,
-      confirm(
-        targets.count == 1 ? "Delete \(targets[0].title)?" : "Delete \(targets.count) documents?",
-        message: "The Markdown files will move to macOS Trash. Captured chat sources and edit receipts stay."
-      ) else { return }
-    do {
-      finishComposition()
-      try flush()
-      let before = documents
-      let remaining = before.filter { !ids.contains($0.id) }
-      var next = state
-      next.documents = remaining.map { DocumentIndex(id: $0.id, title: $0.title) }
-      if let selected = next.selectedDocument, ids.contains(selected) {
-        next.selectedDocument = remaining.first?.id
+    guard !targets.isEmpty, confirm(targets.count == 1 ? "Delete \(targets[0].title)?" : "Delete \(targets.count) documents?",
+      message: "Encrypted records move to macOS Trash after the library change is saved. Captured chat sources and receipts stay.") else { return }
+    finishComposition()
+    work("Deleting documents…") { [weak self] _ in
+      guard let self else { return }
+      try await self.flush()
+      self.documents.removeAll { ids.contains($0.id) }
+      self.state.importedFiles = self.state.importedFiles?.filter { !ids.contains($0.key) }
+      if self.state.selectedDocument.map(ids.contains) == true { self.state.selectedDocument = self.documents.first?.id }
+      self.selectedDocumentIDs.subtract(ids)
+      self.invalidateGhost()
+      try await self.flush()
+      for document in targets {
+        try await self.store.trashDocument(document.id)
+        self.undoManagers.removeValue(forKey: document.id)
       }
-      try store.persist(next)
-      documents = remaining
-      state = next
-      selectedDocumentIDs.subtract(ids)
-      if selectedDocumentIDs.isEmpty, let id = next.selectedDocument { selectedDocumentIDs = [id] }
-      invalidateGhost()
-      var failed = Set<UUID>()
-      for target in targets {
-        do {
-          try store.trashDocument(target.id)
-          undoManagers.removeValue(forKey: target.id)
-        } catch { failed.insert(target.id) }
-      }
-      if !failed.isEmpty {
-        documents = before.filter { !ids.contains($0.id) || failed.contains($0.id) }
-        state.documents = documents.map { DocumentIndex(id: $0.id, title: $0.title) }
-        if state.selectedDocument == nil { state.selectedDocument = documents.first?.id }
-        try flush()
-        throw BoomError.unavailable("Some documents could not move to Trash; they remain in the library.")
-      }
-      if documents.isEmpty { try newDocument() }
-      scheduleSave()
-    } catch { report(error) }
+      if self.documents.isEmpty { try self.newDocument() }
+    }
   }
   func deleteChats(_ ids: Set<UUID>) {
     guard !isBusy, !ids.isEmpty else { return }
@@ -488,17 +513,17 @@ struct CompletionSegment {
     guard !targets.isEmpty,
       confirm(
         targets.count == 1 ? "Delete \(targets[0].title)?" : "Delete \(targets.count) chats?",
-        message: "Their messages and captured source snapshots will be removed from the encrypted workspace. Saved personas and edit receipts stay."
+        message: "Their messages and pinned voices will be removed from the library. Captured voice revisions and edit receipts stay."
           + (removesCurrent && !draft.isEmpty ? " The unsent message will be discarded." : "")
       ) else { return }
-    do {
-      try flush()
+      scheduleSave()
       var next = state
       next.chats.removeAll { ids.contains($0.id) }
+      next.voices.removeAll { ids.contains($0.id) }
       if let selected = next.selectedChat, ids.contains(selected) {
         next.selectedChat = next.chats.first?.id
       }
-      try store.persist(next)
+      scheduleSave()
       state = next
       selectedChatIDs.subtract(ids)
       if selectedChatIDs.isEmpty, let id = next.selectedChat { selectedChatIDs = [id] }
@@ -508,7 +533,6 @@ struct CompletionSegment {
         mode = .ask
         composerFocusEpoch &+= 1
       }
-    } catch { report(error) }
   }
   func renameDocument(_ id: UUID, to proposedTitle: String) {
     guard let index = documents.firstIndex(where: { $0.id == id }) else { return }
@@ -516,19 +540,21 @@ struct CompletionSegment {
     guard !title.isEmpty else { return }
     cancel()
     documents[index].title = title
-    scheduleSave()
+    refreshSearch(); scheduleSave()
   }
   func renameChat(_ id: UUID, to proposedTitle: String) {
     guard let index = state.chats.firstIndex(where: { $0.id == id }) else { return }
     let title = proposedTitle.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !title.isEmpty else { return }
-    state.chats[index].title = title
-    scheduleSave()
+    var chat = state.chats[index]; chat.title = title
+    do { try applyChat(chat) } catch { composerIssue = error.localizedDescription }
   }
   func updateDocument(_ text: String, id: UUID, caret: Int) {
     guard let index = documents.firstIndex(where: { $0.id == id }) else { return }
     invalidateGhost()
     documents[index].text = text
+    writingIssue = nil
+    refreshSearch()
     dirty.insert(id)
     self.caret = caret
     scheduleSave()
@@ -542,6 +568,7 @@ struct CompletionSegment {
   }
   func invalidateGhost() {
     epoch &+= 1
+    writingFlag?.cancel()
     ghostFlag?.cancel()
     ghostTask?.cancel()
     ghostText = ""
@@ -550,8 +577,9 @@ struct CompletionSegment {
     editor?.clearGhost()
   }
   func toggle(_ pane: String) {
+    guard layout.paneControls.contains(pane) else { return }
     if paneFit == .compact {
-      compactPane = compactPane == pane ? (pane == "document" ? "chat" : "document") : pane
+      compactPane = compactPane == pane ? layout.primaryPane : pane
       if compactPane != "document" { finishComposition(); invalidateGhost() }
       return
     }
@@ -577,7 +605,7 @@ struct CompletionSegment {
     // The window relays out native views for each pixel on its own. Publish
     // only when pane visibility can change, not for every drag event.
     guard paneFit != fit else { return }
-    let previous = NSApp.keyWindow?.firstResponder
+    let previous = NSApp?.keyWindow?.firstResponder
     let focused: InputPane?
     switch previous {
     case is ChatTextView: focused = .chat
@@ -621,7 +649,7 @@ struct CompletionSegment {
     editor.insertText(link, replacementRange: editor.selectedRange())
     editor.window?.makeFirstResponder(editor)
   }
-  func insertPersona(_ persona: Persona) {
+  func insertVoice(_ persona: Voice) {
     if let range = draft.range(of: #"(?:^|\s)@[a-z0-9_-]*$"#, options: .regularExpression) {
       let prefix = draft[range].first?.isWhitespace == true ? " " : ""
       draft.replaceSubrange(range, with: prefix + "@" + persona.slug + " ")
@@ -655,17 +683,17 @@ struct CompletionSegment {
       do {
         try flag.check()
         try await body(flag)
-        try self.flush()
+        try await self.flush()
       } catch is CancellationError {
         self.status = "Stopped"
-        do { try self.flush() } catch { self.report(error) }
+        do { try await self.flush() } catch { self.report(error) }
       } catch {
         if flag.isCancelled || Task.isCancelled {
           self.status = "Stopped"
         } else {
           self.report(error)
         }
-        do { try self.flush() } catch { self.report(error) }
+        do { try await self.flush() } catch { self.report(error) }
       }
     }
   }
@@ -678,19 +706,18 @@ struct CompletionSegment {
     finishComposition()
     cancel()
     saveTask?.cancel()
+    searchEpoch &+= 1; searchTask?.cancel()
     if let foreground { await foreground.value }
     if let ghostTask { await ghostTask.value }
-    if let runner { await runner.join() }
     if let mlxRunner { await mlxRunner.join() }
     if let baseRunner { await baseRunner.join() }
-    try flush()
+    try await flush()
   }
   private func revalidate(_ sources: [SourceReference], attachments: [SourceReference]) throws {
     for source in sources {
       guard documents.first(where: { $0.id == source.id })?.revision == source.digest else {
         throw BoomError.stale(source.title)
       }
-      try store.checkDisk(source.id)
     }
     for source in attachments {
       guard state.attachments.first(where: { $0.id == source.id })?.digest == source.digest else {
@@ -700,300 +727,220 @@ struct CompletionSegment {
   }
   func send() {
     ensureChatForDraft()
-    guard !isBusy,
-      !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !pendingAttachments.isEmpty,
-      let chat = selectedChat, canInfer
-    else {
-      if !canInfer { showingModels = true }
-      return
-    }
+    if authoredChatRole != nil { appendAuthoredChatMessage(); return }
+    guard !isBusy, let chat = selectedChat, let runner = mlxRunner,
+      !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !pendingAttachments.isEmpty
+    else { if mlxRunner == nil { showingModels = true }; return }
+    let request = draft, interaction = mode, document = selectedDocument
+    let selectedIDs = pendingAttachments, style = consultationStyle, provider = runner.identity
     do {
       finishComposition()
-      try flush()
-      let request = draft
-      let interaction = mode
-      let document = selectedDocument
-      let graph = try ContextGraph.resolveChat(
-        request: request, attachedDocumentID: chat.attachedDocumentID,
+      let graph = try ContextGraph.resolveChat(request: request, attachedDocumentID: chat.attachedDocumentID,
         editingDocumentID: interaction == .ask ? nil : document?.id, all: documents)
-      let sourceDocuments = graph.sources
-      let selectedAttachments = try pendingAttachments.map { id -> AttachmentRecord in
-        guard let attachment = state.attachments.first(where: { $0.id == id }) else {
-          throw BoomError.stale("The selected attachment was removed.")
-        }
-        return attachment
-      }
-      let inheritedIDs = graph.documents.flatMap { AttachmentLink.ids(in: $0.text) }
-      let inheritedAttachments = inheritedIDs.compactMap { id in
-        state.attachments.first { $0.id == id }
-      }
-      let attachments = (selectedAttachments + inheritedAttachments).reduce(
-        into: [AttachmentRecord]()) { records, attachment in
-          if !records.contains(where: { $0.id == attachment.id }) { records.append(attachment) }
-        }
-      guard attachments.count <= 8 else {
-        throw BoomError.budget("At most eight attachments per turn.")
-      }
-      let imagePayloads = try attachments.compactMap { attachment -> (UUID, Data)? in
-        try imagePayload(for: attachment).map { (attachment.id, $0) }
-      }
-      let imageIDs = Set(imagePayloads.map { $0.0 })
-      let images = imagePayloads.map { $0.1 }
-      guard selectedAttachments.allSatisfy({ !$0.text.isEmpty || imageIDs.contains($0.id) }) else {
-        composerIssue = "This file has no readable local content. Remove it or prepare it locally."
-        return
-      }
-      guard images.isEmpty || selectedMLXRunner != nil else {
-        composerIssue = "Choose local Gemma to chat with images."
-        return
-      }
-      composerIssue = nil
-      let attachmentSources = attachments.map(\.reference)
-      let sources = sourceDocuments + attachmentSources
-      let attachmentText = attachments.filter { !$0.text.isEmpty }.map {
-        "ATTACHMENT \($0.name)\nID \($0.id)\nDIGEST \($0.digest)\nCOVERAGE \($0.coverage)\n\($0.transform ?? "")\n"
-          + $0.text
-      }.joined(separator: "\n\n")
-      let contextParts = [graph.text, attachmentText].filter { !$0.isEmpty }
-      let context = contextParts.isEmpty ? "" : "REFERENCE DATA:\n" + contextParts.joined(separator: "\n\n")
-      guard context.utf8.count <= 524_288 else {
-        throw BoomError.budget("Combined reference context exceeds 512 KiB.")
-      }
-      let slugs = try ReferenceParser.personas(request)
-      guard slugs.count <= 3 else {
-        throw BoomError.budget(
-          "Consult at most three personas in one turn; their caches are never merged.")
-      }
+      let slugs = try ReferenceParser.voices(request)
+      guard slugs.count <= 3 else { throw BoomError.budget("Consult at most three voices per turn.") }
       guard interaction != .edit || slugs.count <= 1 else {
-        throw BoomError.denied(
-          "Edit grants one consultation at a time. Use Propose to compare multiple personas before applying any changes."
-        )
+        throw BoomError.denied("Edit grants one voice at a time. Use Propose to compare voices.")
       }
-      let personas = try slugs.map { slug -> Persona in
-        guard let p = state.personas.first(where: { $0.slug == slug }) else {
-          throw BoomError.invalid("Unknown persona @\(slug).")
-        }
-        return p
+      let voices = try slugs.map { slug -> Voice in
+        guard let voice = state.voices.first(where: { $0.slug == slug }) else { throw BoomError.invalid("Unknown voice @\(slug).") }
+        return voice
       }
-      if selectedRunner == nil && !personas.isEmpty {
-        throw BoomError.unavailable(
-          "This persona has a Core ML cache. Select its original model until a matching MLX cache is built."
-        )
+      guard interaction == .ask || document != nil else { throw BoomError.denied("Choose a document before requesting edits.") }
+      let inherited = graph.documents.flatMap { AttachmentLink.ids(in: $0.text) }
+      let attachmentIDs = (selectedIDs + inherited).reduce(into: [UUID]()) { if !$0.contains($1) { $0.append($1) } }
+      guard attachmentIDs.count <= 8 else { throw BoomError.budget("At most eight attachments per turn.") }
+      let attachments = try attachmentIDs.map { id -> AttachmentRecord in
+        guard let record = state.attachments.first(where: { $0.id == id }) else { throw BoomError.stale("An attachment was removed.") }
+        return record
       }
-      if interaction != .ask && document == nil {
-        throw BoomError.denied("Choose a document before requesting edits.")
-      }
-      // Historic source snapshots are receipts. Only the current chat attachment,
-      // explicit links and selected files become source material for this turn.
-      let oldHistory = chat.messages.map { message -> ChatMessage in
-        var copy = message
-        copy.context = ""
-        return copy
-      }
-      let outputLimit = interaction == .ask ? 512 : 4_096
-      let chatID = chat.id
-      draft = ""
-      pendingAttachments = []
-      mode = .ask
-      work("Generating locally…") { [weak self] flag in
+      let attachmentSources = attachments.map(\.reference), sources = graph.sources + attachmentSources
+      let attachmentText = attachments.filter { !$0.text.isEmpty }.map {
+        "ATTACHMENT \($0.name)\nID \($0.id)\nDIGEST \($0.digest)\nCOVERAGE \($0.coverage)\n\($0.text)"
+      }.joined(separator: "\n\n")
+      let context = [graph.text, attachmentText].filter { !$0.isEmpty }.joined(separator: "\n\n")
+      guard context.utf8.count <= 524_288 else { throw BoomError.budget("Combined reference context exceeds 512 KiB.") }
+      let instructions = chat.instructions ?? ""
+      let authority = CapturedDocumentAuthority(mode: interaction, target: interaction == .ask ? nil : document)
+      let targets: [Voice?] = voices.isEmpty ? [nil] : voices.map(Optional.some)
+      let outputLimit = interaction == .ask ? 512 : 4096
+      work("Checking consultation context…") { [weak self] flag in
         guard let self else { return }
-        try self.revalidate(sourceDocuments, attachments: attachmentSources)
-        guard let index = self.state.chats.firstIndex(where: { $0.id == chatID }) else {
-          throw BoomError.stale("Chat was removed.")
+        try await self.flush()
+        try await self.revalidateOnDisk(graph.sources, attachments: attachmentSources)
+        var images: [Data] = []
+        for attachment in attachments {
+          if let image = try await self.imagePayload(for: attachment) { images.append(image) }
+          else if attachment.text.isEmpty { throw BoomError.unavailable("\(attachment.name) has no readable local content. Prepare it locally or remove it.") }
         }
-        self.state.chats[index].messages.append(
-          ChatMessage(role: .user, text: request, context: context, sources: sources))
-        if self.state.chats[index].title == "New chat" {
-          self.state.chats[index].title = request.isEmpty
-            ? (selectedAttachments.first?.name ?? "Image chat") : String(request.prefix(48))
+        let reserves = targets.indices.map { index in
+          style == .discuss ? outputLimit * (index + 1) + 256 * index : outputLimit
         }
-        try self.flush()
-        self.streamingChat = chatID
-        let instructions = interaction == .ask ? "" : DocumentTools.instructions
-        let fitted: FittedConversation?
-        if let runner = self.selectedRunner {
-          let prefixes = try personas.map { try GemmaPrompt.prefix($0.messages) }
-          fitted = try await runner.fitConversation(
-            prefixes: prefixes.map(Optional.some), history: oldHistory,
-            instructions: instructions, context: context, request: request,
-            maxOutputTokens: outputLimit, flag: flag)
-          if let fitted, fitted.context != context {
-            guard let current = self.state.chats[index].messages.indices.last else {
-              throw BoomError.invalid("The current chat message disappeared.")
-            }
-            self.state.chats[index].messages[current].context = fitted.context
-            try self.flush()
-          }
-        } else if let runner = self.selectedMLXRunner {
-          fitted = try await runner.fitConversation(
-            history: oldHistory, instructions: instructions, context: context,
-            request: request, maxOutputTokens: outputLimit, flag: flag)
-          if let fitted, fitted.context != context {
-            guard let current = self.state.chats[index].messages.indices.last else {
-              throw BoomError.invalid("The current chat message disappeared.")
-            }
-            self.state.chats[index].messages[current].context = fitted.context
-            try self.flush()
-          }
-        } else { fitted = nil }
-        let consultations: [Persona?] = personas.isEmpty ? [nil] : personas.map { Optional($0) }
-        for persona in consultations {
-          try flag.check()
-          var prefix: String?
-          var cache: BoomKVSnapshot?
-          if let persona {
-            guard let runner = self.selectedRunner else { throw BoomError.unavailable("Gemma is required for native persona caches.") }
-            self.status = "Consulting @\(persona.slug)…"
-            let vault = self.store.vault
-            (prefix, cache) = try await detachedWork {
-              try runner.restorePersona(persona, vault: vault)
-            }
-          }
-          self.streamingText = ""
-          var responseRecorded = false
-          do {
-            let generated: String
-            let resultStatus: String
-            if let runner = self.selectedRunner {
-              let prompt = GemmaPrompt.conversation(
-                prefix: prefix, history: fitted?.history ?? oldHistory,
-                request: [instructions, fitted?.context ?? context, request].filter { !$0.isEmpty }
-                  .joined(separator: "\n\n"))
-              let result = try await runner.run(
-                prompt: prompt, restore: cache, maxTokens: outputLimit, flag: flag
-              ) { [weak self] text in
+        let fitted = try await runner.fittedRound(voices: targets, history: chat.messages,
+          instructions: instructions, context: context, request: request, routing: slugs,
+          images: images, reserves: reserves, flag: flag, authority: authority)
+        let plans = fitted.plans
+        try flag.check()
+        try self.revalidate(graph.sources, attachments: attachmentSources)
+        guard let index = self.state.chats.firstIndex(where: { $0.id == chat.id }) else { throw BoomError.stale("Chat was removed.") }
+        let replyIDs = targets.map { _ in UUID() }
+        self.state.chats[index].messages.append(ChatMessage(role: .user, text: request,
+          context: context, sources: sources, speaker: Speaker(name: "Human")))
+        for (offset, voice) in targets.enumerated() {
+          self.state.chats[index].messages.append(ChatMessage(id: replyIDs[offset], role: .assistant,
+            text: "", sources: sources, state: .pending, provider: provider,
+            speaker: voice?.speaker ?? Speaker(name: "Bloom")))
+        }
+        if self.state.chats[index].title == "New chat" { self.state.chats[index].title = try ProductCore.chatTitle(request, routing: slugs) }
+        if self.draft == request { self.draft = "" }
+        if self.pendingAttachments == selectedIDs { self.pendingAttachments = [] }
+        self.mode = .ask
+        self.streamingChat = chat.id
+        var round: [ChatMessage] = []
+        do {
+          try await self.flush()
+          for (offset, voice) in targets.enumerated() {
+            try flag.check()
+            self.status = voice.map { "Consulting @\($0.slug)…" } ?? "Generating locally…"
+            self.streamingText = ""
+            let plan: ConsultationPlan
+            if style == .discuss, !round.isEmpty {
+              plan = try ProductCore.prompt(voice: voice, history: fitted.history + round,
+                instructions: instructions, context: context, request: request, routing: slugs, authority: authority)
+            } else { plan = plans[offset] }
+            let seed = UInt64.random(in: .min ... .max), vault = self.store.vault
+            var receipt = ConsultationReceipt(operationID: flag.operationID, seed: seed, state: .pending,
+              failure: nil, model: provider, voice: voice, plan: plan, sources: sources,
+              promptDigest: Digest.sha256(plan.rawPrompt), tokenIDs: [], stopReason: "pending",
+              firstTokenSeconds: nil, elapsedSeconds: 0)
+            let pendingReceipt = receipt, replyID = replyIDs[offset]
+            try await detachedWork { try vault.encode(pendingReceipt, kind: .receipt, id: replyID) }
+            let result = try await runner.run(plan: plan, images: images, maxTokens: outputLimit,
+              seed: seed, flag: flag) { [weak self] text in
                 Task { @MainActor in
                   guard let self, self.activeFlag === flag, !flag.isCancelled else { return }
-                  if interaction == .ask { self.streamingText = text }
+                  if interaction == .ask {
+                    self.streamingText = text
+                    if let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
+                      let m = self.state.chats[c].messages.firstIndex(where: { $0.id == replyIDs[offset] }),
+                      self.state.chats[c].messages[m].state == .pending {
+                      self.state.chats[c].messages[m].text = text
+                    }
+                  }
                 }
               }
-              generated = result.text
-              resultStatus = "Local Gemma · \(result.promptTokens) prompt tokens · \(result.cachedTokens) restored"
-                + ((fitted?.omittedContextCharacters ?? 0) > 0
-                  || (fitted?.omittedHistoryCount ?? 0) > 0 ? " · earlier context shortened" : "")
-                + (result.endedByEOS ? "" : " · output limit")
-            } else if let runner = self.selectedMLXRunner {
-              let body = [instructions, fitted?.context ?? context, request]
-                .filter { !$0.isEmpty }.joined(separator: "\n\n")
-              let onText: @Sendable (String) -> Void = { [weak self] text in
-                Task { @MainActor in
-                  guard let self, self.activeFlag === flag, !flag.isCancelled else { return }
-                  if interaction == .ask { self.streamingText = text }
-                }
-              }
-              let result = images.isEmpty
-                ? try await runner.run(
-                    rawPrompt: MLXGemmaRunner.chatPrompt(
-                      history: fitted?.history ?? oldHistory, request: body),
-                    maxTokens: outputLimit, flag: flag, onText: onText)
-                : try await runner.runChat(
-                    history: fitted?.history ?? oldHistory, request: body,
-                    images: images, maxTokens: outputLimit, flag: flag, onText: onText)
-              generated = result.text
-              resultStatus = "Local Gemma · \(result.promptTokens) prompt tokens"
-                + (result.endedByEOS ? "" : " · output limit")
-            } else {
-              let prompt = try AppleModel.conversation(
-                history: oldHistory, context: context, request: request)
-              generated = try await AppleModel.respond(to: prompt, instructions: instructions)
-              resultStatus = "Apple Foundation Model · on device · no native KV cache"
+            receipt.promptDigest = result.promptDigest; receipt.tokenIDs = result.tokenIDs
+            receipt.stopReason = result.stopReason; receipt.firstTokenSeconds = result.firstTokenSeconds
+            receipt.elapsedSeconds = result.elapsedSeconds
+            if result.stopReason == "cancelled" { receipt.state = .cancelled }
+            let emittedReceipt = receipt
+            try await detachedWork { try vault.encode(emittedReceipt, kind: .receipt, id: replyID) }
+            if interaction == .ask,
+              let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
+              let m = self.state.chats[c].messages.firstIndex(where: { $0.id == replyID }) {
+              self.state.chats[c].messages[m].text = result.text
             }
             try flag.check()
-            try self.revalidate(sourceDocuments, attachments: attachmentSources)
-            guard interaction == .ask || self.state.selectedDocument == document?.id else {
-              throw BoomError.stale("Active document selection changed.")
+            try await self.revalidateOnDisk(graph.sources, attachments: attachmentSources)
+            guard interaction == .ask || self.state.selectedDocument == document?.id else { throw BoomError.stale("Active document changed.") }
+            guard !result.text.isEmpty else { throw BoomError.unavailable("The model ended before producing an answer.") }
+            let pending = ChatMessage(id: replyID, role: .assistant, text: "", sources: sources,
+              state: .pending, provider: provider, speaker: voice?.speaker ?? Speaker(name: "Bloom"))
+            let message = try await self.finishConsultationResponse(result.text, pending: pending,
+              chatID: chat.id, authority: authority, documentSources: graph.sources, attachments: attachmentSources)
+            round.append(message)
+            receipt.state = .complete
+            let completedReceipt = receipt
+            try await detachedWork { try vault.encode(completedReceipt, kind: .receipt, id: replyID) }
+            self.streamingText = ""
+            self.status = interaction == .ask ? "Local answer · \(result.promptTokens) prompt tokens"
+              : interaction == .edit ? "Document edit checked" : "Proposal ready for review"
+            try await self.flush()
+          }
+        } catch {
+          if let chatIndex = self.state.chats.firstIndex(where: { $0.id == chat.id }) {
+            for message in self.state.chats[chatIndex].messages.indices where replyIDs.contains(self.state.chats[chatIndex].messages[message].id)
+              && self.state.chats[chatIndex].messages[message].state == .pending {
+              self.state.chats[chatIndex].messages[message].state = flag.isCancelled ? .cancelled : .failed
+              self.state.chats[chatIndex].messages[message].failure = error.localizedDescription
             }
-            var answer = generated
-            var patch: DocumentPatch?
-            if interaction != .ask {
-              let envelope = try AssistantEnvelope.decode(generated)
-              answer = envelope.reply
-              patch = envelope.edits.first
-            }
-            let message = ChatMessage(
-              role: .assistant, text: answer, sources: sources, personaID: persona?.id,
-              provider: self.inferenceName)
-            guard let chatIndex = self.state.chats.firstIndex(where: { $0.id == chatID }) else {
-              throw BoomError.stale("Chat was removed.")
-            }
-            if let patch, let document {
-              _ = try DocumentTools.validate(
-                patch, grant: DocumentGrant(mode: interaction, snapshot: document),
-                current: self.selectedDocument ?? document)
-              let proposal = StoredProposal(
-                id: UUID(), chatID: chatID, messageID: message.id, patch: patch, document: document,
-                documents: sourceDocuments, attachments: attachmentSources, status: "pending")
-              self.state.proposals.append(proposal)
-              self.state.chats[chatIndex].messages.append(message)
-              responseRecorded = true
-              self.streamingText = ""
-              // Even Edit records the exact proposal and answer before mutation.
-              try self.flush()
-              if interaction == .edit {
-                try self.commit(proposal)
-                if let index = self.state.proposals.firstIndex(where: { $0.id == proposal.id }) {
-                  self.state.proposals[index].status = "applied"
+          }
+          let vault = self.store.vault, failedIDs = replyIDs, reason = error.localizedDescription
+          let ending: MessageState = flag.isCancelled ? .cancelled : .failed
+          do {
+            try await detachedWork {
+              for id in failedIDs where vault.exists(.receipt, id) {
+                var receipt = try vault.decode(ConsultationReceipt.self, kind: .receipt, id: id)
+                if receipt.state == .pending {
+                  receipt.state = ending; receipt.failure = reason; receipt.stopReason = ending.rawValue
+                  try vault.encode(receipt, kind: .receipt, id: id)
                 }
               }
-            } else {
-              self.state.chats[chatIndex].messages.append(message)
-              responseRecorded = true
-              self.streamingText = ""
             }
-            self.status = resultStatus
-            self.streamingText = ""
-            try self.flush()
-          } catch {
-            if let chatIndex = self.state.chats.firstIndex(where: { $0.id == chatID }) {
-              let retained: String
-              if responseRecorded {
-                retained =
-                  "The response and proposal were retained. Completing the local operation failed: "
-                  + error.localizedDescription
-              } else if interaction != .ask {
-                retained = "I couldn't make that edit. The document was not changed. "
-                  + error.localizedDescription
-              } else if !self.streamingText.isEmpty {
-                retained = self.streamingText
-              } else {
-                retained =
-                  flag.isCancelled
-                  ? "Generation stopped before an answer was produced."
-                  : "Local generation failed before an answer was produced: "
-                    + error.localizedDescription
-              }
-              self.state.chats[chatIndex].messages.append(
-                ChatMessage(
-                  role: .assistant, text: retained, sources: sources,
-                  state: flag.isCancelled ? .cancelled : .failed, personaID: persona?.id,
-                  provider: self.inferenceName))
-            }
-            if interaction != .ask {
-              self.streamingText = ""
-              self.status = "Edit not applied"
-              return
-            }
-            throw error
-          }
+          } catch { self.report(error) }
+          self.scheduleSave()
+          throw error
         }
       }
     } catch { report(error) }
   }
-  private func commit(_ proposal: StoredProposal) throws {
-    try revalidate(proposal.documents, attachments: proposal.attachments)
+  func finishConsultationResponse(_ text: String, pending: ChatMessage, chatID: UUID,
+    authority: CapturedDocumentAuthority, documentSources: [SourceReference], attachments: [SourceReference]
+  ) async throws -> ChatMessage {
+    guard state.chats.first(where: { $0.id == chatID })?.messages.contains(where: { $0.id == pending.id && $0.state == .pending }) == true else {
+      throw BoomError.stale("The pending response disappeared.")
+    }
+    var answer = text
+    if authority.mode != .ask {
+      let envelope = try AssistantEnvelope.decode(text)
+      answer = envelope.reply
+      if let patch = envelope.edits.first {
+        guard let document = authority.target, let current = selectedDocument else {
+          throw BoomError.stale("The captured document is no longer open.")
+        }
+        _ = try DocumentTools.validate(patch, grant: DocumentGrant(mode: authority.mode, snapshot: document), current: current)
+        let proposal = StoredProposal(id: UUID(), chatID: chatID, messageID: pending.id,
+          patch: patch, document: document, documents: documentSources, attachments: attachments, status: "pending")
+        state.proposals.append(proposal)
+        try await flush()
+        if authority.mode == .edit { try await commit(proposal) }
+      }
+    }
+    guard let chatIndex = state.chats.firstIndex(where: { $0.id == chatID }),
+      let messageIndex = state.chats[chatIndex].messages.firstIndex(where: { $0.id == pending.id }),
+      state.chats[chatIndex].messages[messageIndex].state == .pending
+    else { throw BoomError.stale("The pending response disappeared.") }
+    let message = ChatMessage(id: pending.id, role: .assistant, text: answer, sources: pending.sources,
+      state: .complete, provider: pending.provider, speaker: pending.speaker)
+    state.chats[chatIndex].messages[messageIndex] = message
+    return message
+  }
+  private func revalidateOnDisk(_ sources: [SourceReference], attachments: [SourceReference]) async throws {
+    try revalidate(sources, attachments: attachments)
+    for source in sources { try await store.checkDisk(source.id) }
+    try revalidate(sources, attachments: attachments)
+  }
+  private func commit(_ proposal: StoredProposal) async throws {
+    try await revalidateOnDisk(proposal.documents, attachments: proposal.attachments)
     guard state.selectedDocument == proposal.document.id, let current = selectedDocument else {
       throw BoomError.stale("Choose the original document before accepting this proposal.")
     }
     guard editor?.hasMarkedText() != true else {
       throw BoomError.denied("Finish the current input-method composition before applying an edit.")
     }
+    editingLocked = true
+    let capturedEditor = editor
+    capturedEditor?.isEditable = false
+    defer { editingLocked = false; capturedEditor?.isEditable = true }
     let grant = DocumentGrant(mode: .propose, snapshot: proposal.document)
     let updated = try DocumentTools.apply(proposal.patch, grant: grant, current: current)
     let journal = DocumentEditJournal(
       schema: 1, proposalID: proposal.id, documentID: current.id, beforeRevision: current.revision,
       afterRevision: updated.revision, phase: "prepared")
-    try store.vault.encode(journal, kind: .editJournal, id: proposal.id)
-    try store.saveDocument(updated)
+    let vault = store.vault
+    try await detachedWork { try vault.encode(journal, kind: .editJournal, id: proposal.id) }
+    try Task.checkCancellation()
+    try await store.saveDocument(updated)
     if let editor, editor.documentID == updated.id {
       editor.replaceDocument(updated.text, action: "Apply proposed edit")
     } else {
@@ -1011,11 +958,10 @@ struct CompletionSegment {
     // failure must not leave an old buffer poised to overwrite the applied file.
     // The already-durable prepared journal is sufficient for restart recovery.
     do {
-      try store.vault.encode(
-        DocumentEditJournal(
+      let finalJournal = DocumentEditJournal(
           schema: 1, proposalID: proposal.id, documentID: current.id,
-          beforeRevision: current.revision, afterRevision: updated.revision, phase: "file_written"),
-        kind: .editJournal, id: proposal.id)
+          beforeRevision: current.revision, afterRevision: updated.revision, phase: "file_written")
+      try await detachedWork { try vault.encode(finalJournal, kind: .editJournal, id: proposal.id) }
     } catch {
       throw BoomError.unavailable(
         "The document edit was applied, but its final journal mark could not be saved. The prepared recovery receipt was retained. "
@@ -1025,27 +971,23 @@ struct CompletionSegment {
   private func registerDocumentUndo(_ previous: DocumentSnapshot) {
     let manager = undoManager(previous.id)
     manager.registerUndo(withTarget: self) { owner in
-      guard let index = owner.documents.firstIndex(where: { $0.id == previous.id }) else { return }
+      guard !owner.editingLocked, let index = owner.documents.firstIndex(where: { $0.id == previous.id }) else { return }
       let current = owner.documents[index]
-      do {
-        try owner.store.saveDocument(previous)
+        owner.dirty.insert(previous.id)
         owner.registerDocumentUndo(current)
         owner.documents[index] = previous
         owner.invalidateGhost()
         owner.scheduleSave()
-      } catch { owner.report(error) }
     }
     manager.setActionName("Document edit")
   }
   func accept(_ id: UUID) {
-    guard !isBusy, let index = state.proposals.firstIndex(where: { $0.id == id }),
-      state.proposals[index].status == "pending"
-    else { return }
-    do {
-      try commit(state.proposals[index])
-      state.proposals[index].status = "applied"
-      try flush()
-    } catch { report(error) }
+    guard !isBusy, let proposal = state.proposals.first(where: { $0.id == id }), proposal.status == "pending" else { return }
+    work("Applying the proposed edit…") { [weak self] _ in
+      guard let self else { return }
+      try await self.commit(proposal)
+      try await self.flush()
+    }
   }
   func reject(_ id: UUID) {
     guard let index = state.proposals.firstIndex(where: { $0.id == id }) else { return }
@@ -1069,138 +1011,365 @@ struct CompletionSegment {
       scheduleSave()
     }
   }
-  func clearFollowCache() {
-    guard let runner else { return }
-    work("Clearing the autocomplete reference cache…") { [weak self] flag in
-      guard let self else { return }
-      try flag.check()
-      try await runner.clearFollowCache(vault: self.store.vault)
-      self.status = "Autocomplete reference cache cleared; persona caches unchanged"
-    }
+  func chatVoice(_ id: UUID) -> Voice? { state.voices.first { $0.id == id } }
+  private func retainVoice(_ voice: Voice) {
+    if let index = state.voices.firstIndex(where: { $0.id == voice.id }) { state.voices[index] = voice }
+    else { state.voices.append(voice) }
+    if !state.voiceVersions.contains(where: { $0.revision == voice.revision }) { state.voiceVersions.append(voice) }
   }
-  func savePersona(from chatID: UUID) {
-    guard !isBusy, let runner, let chat = state.chats.first(where: { $0.id == chatID }),
-      let slug = askForText(
-        title: "Save chat as persona",
-        message:
-          "Choose a lowercase @name. The completed conversation will be prefilled and its actual KV tensors encrypted on disk.",
-        initial: "persona")
-    else { return }
-    guard Persona.validSlug(slug), !state.personas.contains(where: { $0.slug == slug }) else {
-      report(
-        BoomError.invalid(
-          "Use a unique lowercase name, starting with a letter; digits, - and _ are allowed."))
-      return
+  private func applyChat(_ chat: ChatRecord) throws {
+    guard let index = state.chats.firstIndex(where: { $0.id == chat.id }) else { throw BoomError.stale("The chat was removed.") }
+    let voice = try chatVoice(chat.id).map { existing in
+      try ProductCore.pinnedVoice(chat, slug: existing.slug, occupied: state.voices.filter { $0.id != chat.id }.map(\.slug))
     }
-    work("Preparing @\(slug) cache…") { [weak self] flag in
-      guard let self else { return }
-      let persona = try await runner.makePersona(
-        slug: slug, title: chat.title, messages: chat.messages, vault: self.store.vault, flag: flag)
-      try flag.check()
-      var candidate = self.state
-      candidate.personas.append(persona)
-      try self.store.persist(candidate)
-      self.state = candidate
-      self.status = "@\(slug) · native cache ready"
-    }
+    state.chats[index] = chat
+    if let voice { retainVoice(voice) }
+    scheduleSave()
   }
-  func rebuildPersona(_ id: UUID) {
-    guard !isBusy, let runner, let persona = state.personas.first(where: { $0.id == id }) else {
-      return
-    }
-    work("Rebuilding @\(persona.slug)…") { [weak self] flag in
-      guard let self else { return }
-      let rebuilt = try await runner.makePersona(
-        slug: persona.slug, title: persona.title, messages: persona.messages,
-        vault: self.store.vault, flag: flag)
-      guard let index = self.state.personas.firstIndex(where: { $0.id == id }) else {
-        throw BoomError.stale("Persona was removed.")
-      }
-      // Preserve persona ID so chat references survive an explicit cache rebuild.
-      try flag.check()
-      var candidate = self.state
-      candidate.personas[index] = try Persona(
-        id: persona.id, slug: rebuilt.slug, title: rebuilt.title, messages: rebuilt.messages,
-        prefixDigest: rebuilt.prefixDigest, model: rebuilt.model, cacheID: rebuilt.cacheID,
-        createdAt: persona.createdAt)
-      try self.store.persist(candidate)
-      self.state = candidate
-      // The old encrypted cache is retained; this operation never silently
-      // deletes evidence or rewrites an incompatible cache in place.
-      self.status = "@\(persona.slug) · native cache ready"
-    }
+  func openChatInstructions(_ id: UUID) {
+    guard !isBusy else { return }
+    if state.selectedChat != id { selectChat(id) }
+    showingChatInstructions = id
   }
-  func deletePersona(_ id: UUID) {
-    guard !isBusy, let index = state.personas.firstIndex(where: { $0.id == id }),
-      confirm(
-        "Delete @\(state.personas[index].slug)?",
-        message: "The persona and its encrypted KV cache will be removed. The source chat stays.")
-    else { return }
+  func setChatInstructions(_ text: String, mention: String?, chatID: UUID) throws {
+    guard !isBusy, var chat = state.chats.first(where: { $0.id == chatID }) else { throw BoomError.stale("The chat is unavailable.") }
+    chat.instructions = try ProductCore.chatText(text, instructions: true)
+    if let existing = chatVoice(chatID) {
+      let voice = try ProductCore.pinnedVoice(chat, slug: mention ?? existing.slug,
+        occupied: state.voices.filter { $0.id != chatID }.map(\.slug))
+      guard let index = state.chats.firstIndex(where: { $0.id == chatID }) else { return }
+      state.chats[index] = chat; retainVoice(voice); scheduleSave()
+    } else { try applyChat(chat) }
+    showingChatInstructions = nil
+  }
+  func pinChat(_ id: UUID) {
+    guard !isBusy, let chat = state.chats.first(where: { $0.id == id }) else { return }
     do {
-      let persona = state.personas.remove(at: index)
-      try flush()
-      try store.vault.remove(.personaCache, id: persona.cacheID)
-    } catch { report(error) }
+      let voice = try ProductCore.pinnedVoice(chat, slug: chatVoice(id)?.slug,
+        occupied: state.voices.filter { $0.id != id }.map(\.slug))
+      retainVoice(voice); scheduleSave(); status = "Pinned as @\(voice.slug)"
+    } catch { composerIssue = error.localizedDescription; selectChat(id) }
+  }
+  func unpinChat(_ id: UUID) { guard !isBusy else { return }; state.voices.removeAll { $0.id == id }; scheduleSave() }
+  private func sourceChat(for voice: Voice) -> ChatRecord {
+    if let chat = state.chats.first(where: { $0.id == voice.id }) { return chat }
+    let messages = voice.examples.flatMap { [ChatMessage(role: .user, text: $0.user),
+      ChatMessage(role: .assistant, text: $0.assistant)] }
+    return ChatRecord(id: voice.id, title: voice.name, messages: messages, instructions: voice.instructions)
+  }
+  func editVoice(_ voice: Voice) {
+    guard !isBusy else { return }
+    if !state.chats.contains(where: { $0.id == voice.id }) { state.chats.append(sourceChat(for: voice)) }
+    selectChat(voice.id); scheduleSave()
+  }
+  func duplicateVoice(_ voice: Voice) {
+    guard !isBusy else { return }
+    let source = sourceChat(for: voice)
+    let copy = ChatRecord(title: source.title + " copy", messages: source.messages, instructions: source.instructions)
+    state.chats.append(copy); selectChat(copy.id); pinChat(copy.id)
+  }
+  func consultVoice(_ voice: Voice) {
+    if state.selectedChat == voice.id { do { try newChat() } catch { report(error); return } }
+    state.showChat = true; compactPane = "chat"; insertVoice(voice); scheduleSave()
+  }
+  func authorChatMessage(_ role: Role) {
+    guard !isBusy else { return }
+    authoredChatRole = role; composerFocusEpoch &+= 1
+  }
+  func appendAuthoredChatMessage() {
+    guard let role = authoredChatRole, var chat = selectedChat else { return }
+    do {
+      let text = try ProductCore.chatText(draft)
+      chat.messages.append(ChatMessage(role: role, text: text, authoredByUser: true))
+      try applyChat(chat); draft = ""; authoredChatRole = nil; composerIssue = nil
+    } catch { composerIssue = error.localizedDescription }
+  }
+  func replaceChatMessage(_ text: String, id: UUID, chatID: UUID) throws {
+    guard !isBusy, var chat = state.chats.first(where: { $0.id == chatID }),
+      let index = chat.messages.firstIndex(where: { $0.id == id }), chat.messages[index].state == .complete else {
+      throw BoomError.stale("The completed message is unavailable.")
+    }
+    let validated = try ProductCore.chatText(text)
+    let original = chat.messages[index]
+    chat.messageVersions = (chat.messageVersions ?? []) + [original]
+    chat.messages[index] = ChatMessage(role: original.role, text: validated,
+      context: original.context, sources: original.sources, provider: original.provider,
+      speaker: original.speaker, authoredByUser: true, editedFrom: original.id)
+    try applyChat(chat); editingChatMessage = nil
+  }
+  func exportChat(_ chatID: UUID) {
+    guard let chat = state.chats.first(where: { $0.id == chatID }) else { return }
+    let panel = NSSavePanel(); panel.nameFieldStringValue = chat.title + ".md"
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+    let instructions = (chat.instructions ?? "").isEmpty ? "" : "## Instructions\n\n" + (chat.instructions ?? "") + "\n\n"
+    let text = "# " + chat.title + "\n\n" + instructions + chat.messages.map { message in
+      "## " + (message.speaker?.name ?? (message.role == .user ? "Human" : "Bloom"))
+        + " · " + message.state.rawValue + "\n\n" + message.text
+        + (message.failure.map { "\n\nStatus: " + $0 } ?? "")
+        + (message.context.isEmpty ? "" : "\n\nCaptured context:\n\n" + message.context)
+        + (message.speaker?.voiceRevision.map { "\n\nVoice revision: " + $0 } ?? "")
+        + (message.editedFrom.map { "\n\nEdited by you; original message: " + $0.uuidString } ??
+          (message.authoredByUser == true && message.role == .assistant ? "\n\nWritten by you." : ""))
+    }.joined(separator: "\n\n") + "\n"
+    work("Exporting readable conversation…") { _ in
+      try await detachedWork { try Data(text.utf8).write(to: url, options: .atomic) }
+    }
+  }
+  func exportVoice(_ voice: Voice) {
+    let panel = NSSavePanel(); panel.nameFieldStringValue = voice.slug + ".json"
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+    work("Exporting voice…") { _ in
+      try await detachedWork {
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(voice).write(to: url, options: .atomic)
+      }
+    }
+  }
+  func importVoice() {
+    guard !isBusy else { return }
+    let panel = NSOpenPanel(); panel.allowsMultipleSelection = false
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+    work("Importing voice…") { [weak self] _ in
+      guard let self else { return }
+      let imported = try await detachedWork {
+        let data = try AttachmentProcessor.readGranted(url)
+        guard data.count <= 2_097_152 else { throw BoomError.budget("Voice exceeds 2 MiB.") }
+        let voice = try JSONDecoder().decode(Voice.self, from: data)
+        guard try ProductCore.voice(voice.draft).revision == voice.revision else { throw BoomError.invalid("Voice revision changed.") }
+        return voice
+      }
+      guard !self.state.chats.contains(where: { $0.id == imported.id }),
+        !self.state.voices.contains(where: { $0.id == imported.id || $0.slug == imported.slug }) else {
+        throw BoomError.invalid("This voice identity or @name already exists. Duplicate the existing chat to make another voice.")
+      }
+      self.state.chats.append(self.sourceChat(for: imported)); self.retainVoice(imported)
+      self.selectChat(imported.id); try await self.flush()
+    }
   }
   func scheduleCompletion() {
-    guard state.autocomplete, state.showDocument, !isBusy,
-      (selectedRunner != nil || completionRunner != nil), caret > 0,
+    guard librarySearch.isEmpty, state.autocomplete, showsDocument, !isBusy, baseRunner != nil, caret > 0,
       let document = selectedDocument, let editor, editor.selectedRange().length == 0,
-      !editor.hasMarkedText()
-    else { return }
-    let capturedEpoch = epoch
-    let offset = caret
-    let flag = CancellationFlag()
-    ghostFlag = flag
+      !editor.hasMarkedText(), !candidateIsCurrent else { return }
+    let previous = ghostTask
+    ghostFlag?.cancel(); previous?.cancel()
+    let capturedEpoch = epoch, offset = caret, profile = samplingProfile
+    let flag = CancellationFlag(); ghostFlag = flag
     ghostTask = Task { [weak self] in
+      if let previous { await previous.value }
       do {
         try await Task.sleep(nanoseconds: 650_000_000)
-        guard let self, !self.isBusy, self.epoch == capturedEpoch else { return }
-        let stamp = try GhostStamp(document: document, caretUTF16: offset, epoch: capturedEpoch)
-        let graph = try ContextGraph.resolve(root: document, all: self.documents)
-        try self.flush()
-        try self.revalidate(graph.sources, attachments: [])
-        self.status = "Local autocomplete · bounded caret context"
-        let onText: @Sendable (String) -> Void = { [weak self] text in
-          Task { @MainActor in
-            guard let self, !flag.isCancelled, let current = self.selectedDocument,
-              stamp.accepts(
-                document: current, caretUTF16: self.caret, epoch: self.epoch,
-                hasMarkedText: self.editor?.hasMarkedText() ?? true),
-              (try? graph.revalidate(against: self.documents)) != nil,
-              let visible = GemmaPrompt.visibleCompletion(text)
-            else { return }
-            self.ghostSources = graph.sources
-            self.ghostStamp = stamp
-            self.ghostText = visible
-            self.editor?.showGhost(self.ghostText, stamp: stamp)
-          }
-        }
-        if let runner = self.completionRunner {
-          let result = try await runner.complete(
-            document: document, caret: offset, context: graph, flag: flag,
-            useDraft: false, onText: onText)
-          if self.epoch == capturedEpoch, !flag.isCancelled {
-            self.status = "Local autocomplete"
-              + (result.window.isExcerpt ? " · " + result.window.scopeDescription : "")
-          }
-        } else if let runner = self.selectedRunner {
-          let result = try await runner.complete(
-            document: document, caret: offset, context: graph, vault: self.store.vault,
-            flag: flag, onText: onText)
-          if self.epoch == capturedEpoch, !flag.isCancelled {
-            self.status = "Local autocomplete · \(result.cachedTokens) reference tokens restored"
-              + (result.window.isExcerpt ? " · " + result.window.scopeDescription : "")
-          }
-        }
+        guard let self, self.epoch == capturedEpoch, !self.isBusy else { return }
+        try await self.generateCandidates(document: document, offset: offset, profile: profile,
+          count: 1, maxTokens: 64, flag: flag)
       } catch is CancellationError {} catch {
-        // An unsupported/oversized autocomplete never inserts text or stops
-        // ordinary editing. Its reason is visible without a modal dialog.
-        if let self, self.epoch == capturedEpoch {
-          self.status = "Autocomplete: " + error.localizedDescription
-        }
+        if let self, self.epoch == capturedEpoch { self.status = "Autocomplete: " + error.localizedDescription }
       }
     }
+  }
+  var canExploreWriting: Bool {
+    guard baseReady, !isBusy, let document = selectedDocument, caret > 0,
+      editor?.selectedRange().length == 0, editor?.hasMarkedText() != true,
+      let prefix = try? ProductCore.authoredPrefix(document, caret: caret) else { return false }
+    return !prefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+  }
+  func setAutocomplete(_ enabled: Bool) {
+    state.autocomplete = enabled
+    invalidateGhost(); scheduleSave()
+    if enabled { scheduleCompletion() }
+  }
+  func exploreWriting() {
+    guard canExploreWriting, let document = selectedDocument else { return }
+    let offset = caret, profile = samplingProfile
+    writingIssue = nil; showingCandidates = true
+    work("Exploring continuations…") { [weak self] flag in
+      guard let self else { return }
+      do {
+        try await self.generateCandidates(document: document, offset: offset, profile: profile,
+          count: 3, maxTokens: 256, flag: flag)
+      } catch is CancellationError { throw CancellationError() }
+      catch { self.writingIssue = error.localizedDescription }
+    }
+  }
+  func openWritingExamples() {
+    guard !isBusy, let document = selectedDocument else { return }
+    editingWritingExamples = WritingExamplesRequest(manuscriptID: document.id)
+  }
+  func moveWritingExample(_ id: UUID, by delta: Int) {
+    guard let index = writingExampleIDs.firstIndex(of: id), writingExampleIDs.indices.contains(index + delta) else { return }
+    writingExampleIDs.swapAt(index, index + delta); invalidateGhost()
+  }
+  func addWritingExample(title: String, prose: String, manuscriptID: UUID) throws {
+    guard state.selectedDocument == manuscriptID, writingExampleIDs.count < 32 else { throw BoomError.stale("Choose the original manuscript and at most 32 examples.") }
+    let validated = try ProductCore.writingExample(title: title, text: prose)
+    let document = DocumentSnapshot(title: validated.title, text: validated.text)
+    documents.append(document); dirty.insert(document.id)
+    writingExampleIDs.append(document.id)
+    invalidateGhost(); scheduleSave()
+  }
+  func importWritingExamples(manuscriptID: UUID) {
+    guard !isBusy, state.selectedDocument == manuscriptID else { return }
+    let panel = NSOpenPanel(); panel.allowedContentTypes = [.plainText]; panel.allowsMultipleSelection = true
+    guard panel.runModal() == .OK else { return }
+    let urls = panel.urls
+    work("Importing writing examples…") { [weak self] flag in
+      guard let self else { return }
+      do {
+        let imported = try await detachedWork {
+          try urls.map { url -> ProductCore.WritingExample in
+            try flag.check()
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            let data = try AttachmentProcessor.readGranted(url)
+            guard data.count <= 2_097_152, let text = String(data: data, encoding: .utf8) else { throw BoomError.invalid("Choose UTF-8 prose of at most 2 MiB.") }
+            return try ProductCore.writingExample(title: url.deletingPathExtension().lastPathComponent, text: text)
+          }
+        }
+        guard self.state.selectedDocument == manuscriptID, self.writingExampleIDs.count + imported.count <= 32 else { throw BoomError.stale("The manuscript changed, or the selection exceeds 32 examples.") }
+        for example in imported { try self.addWritingExample(title: example.title, prose: example.text, manuscriptID: manuscriptID) }
+      } catch { self.writingIssue = error.localizedDescription }
+    }
+  }
+  private func generateCandidates(document: DocumentSnapshot, offset: Int, profile: SamplingProfile,
+    count: Int, maxTokens: Int, flag: CancellationFlag, previous: CandidateBundle? = nil,
+    replaySeed: UInt64? = nil) async throws {
+    guard let runner = baseRunner else { throw BoomError.unavailable("Install the writing model first.") }
+    let capturedEpoch = epoch
+    let examples = try writingExampleIDs.map { id in
+      guard let value = documents.first(where: { $0.id == id }) else { throw BoomError.stale("An example was removed.") }
+      return value
+    }
+    let sources = ([document] + examples).map { SourceReference(id: $0.id, title: $0.title, digest: $0.revision, kind: "document") }
+    try await flush()
+    try await revalidateOnDisk(sources, attachments: [])
+    let recipe: CompletionRecipe
+    if let previous { recipe = previous.recipe }
+    else { recipe = try await runner.completionRecipe(document: document, caret: offset,
+      sources: sources, examples: examples.map(\.text), profile: profile,
+      maxTokens: maxTokens, flag: flag) }
+    guard recipe.model == runner.identity else { throw BoomError.stale("Replay requires the original writing model.") }
+    var bundle = CandidateBundle(id: replaySeed == nil ? previous?.id ?? UUID() : UUID(), recipe: recipe, origin: previous?.origin ?? state.manuscriptOrigins[document.id],
+      candidates: replaySeed == nil ? previous?.candidates ?? [] : [], selected: replaySeed == nil ? previous?.selected ?? 0 : 0)
+    writingFlag = flag
+    defer { if writingFlag === flag { writingFlag = nil } }
+    do {
+      for _ in 0..<count {
+        try flag.check()
+        let index = bundle.candidates.count, seed = replaySeed ?? UInt64.random(in: .min ... .max)
+        bundle.candidates.append(WritingCandidate(id: UUID(), seed: seed, text: "", state: .pending,
+          promptTokens: 0, outputTokens: 0, tokenIDs: [], stopReason: nil))
+        candidates = bundle
+        // The captured prompt and seed exist durably before the first model token.
+        let pendingVault = store.vault, pendingBundle = bundle
+        try await detachedWork { try pendingVault.encode(pendingBundle, kind: .candidate, id: pendingBundle.id) }
+        if !state.candidateIDs.contains(bundle.id) { state.candidateIDs.append(bundle.id) }
+        try await flush()
+        let bundleID = bundle.id
+        let result = try await runner.run(rawPrompt: recipe.prompt, maxTokens: recipe.maxTokens,
+          settings: recipe.settings, seed: seed, flag: flag, background: maxTokens == 64 && !showingCandidates) { [weak self] text in
+            Task { @MainActor in
+              guard let self, self.writingFlag === flag, !flag.isCancelled,
+                self.candidates?.id == bundleID,
+                self.candidates?.candidates.indices.contains(index) == true,
+                self.candidates?.candidates[index].state == .pending else { return }
+              self.candidates?.candidates[index].text = text
+              if index == self.candidates?.selected, self.epoch == capturedEpoch {
+                self.showCandidateGhost(text, recipe: recipe, epoch: capturedEpoch)
+              }
+            }
+          }
+        bundle.candidates[index].text = result.text
+        bundle.candidates[index].state = result.stopReason == "cancelled" ? .cancelled : (result.text.isEmpty ? .failed : .complete)
+        bundle.candidates[index].promptTokens = result.promptTokens
+        bundle.candidates[index].outputTokens = result.outputTokens
+        bundle.candidates[index].tokenIDs = result.tokenIDs
+        bundle.candidates[index].stopReason = result.stopReason
+        candidates = bundle
+        if index == bundle.selected, epoch == capturedEpoch { showCandidateGhost(result.text, recipe: recipe, epoch: capturedEpoch) }
+        let vault = store.vault, saved = bundle
+        try await detachedWork { try vault.encode(saved, kind: .candidate, id: saved.id) }
+        if !state.candidateIDs.contains(bundle.id) { state.candidateIDs.append(bundle.id) }
+        try await flush()
+        try flag.check()
+      }
+      status = "\(bundle.candidates.count) continuation\(bundle.candidates.count == 1 ? "" : "s") · "
+        + (recipe.omittedPrefixCharacters == 0 ? "full preceding manuscript" : "\(recipe.omittedPrefixCharacters) earlier characters omitted")
+    } catch {
+      if let current = candidates, current.id == bundle.id { bundle = current }
+      for index in bundle.candidates.indices where bundle.candidates[index].state == .pending {
+        bundle.candidates[index].state = flag.isCancelled ? .cancelled : .failed
+      }
+      candidates = bundle
+      let vault = store.vault, saved = bundle
+      try await detachedWork { try vault.encode(saved, kind: .candidate, id: saved.id) }
+      if !state.candidateIDs.contains(bundle.id) { state.candidateIDs.append(bundle.id) }
+      try await flush()
+      throw error
+    }
+  }
+  func toggleWritingExample(_ id: UUID) {
+    if writingExampleIDs.contains(id) { writingExampleIDs.removeAll { $0 == id } }
+    else { guard id != state.selectedDocument, writingExampleIDs.count < 32 else { return }; writingExampleIDs.append(id) }
+    invalidateGhost()
+  }
+  func dismissCandidates() { invalidateGhost(); showingCandidates = false; candidates = nil }
+  private func showCandidateGhost(_ text: String, recipe: CompletionRecipe, epoch: UInt64) {
+    guard let document = selectedDocument, document.id == recipe.document.id,
+      document.revision == recipe.document.revision, caret == recipe.caretUTF16,
+      let stamp = try? GhostStamp(document: document, caretUTF16: caret, epoch: epoch),
+      stamp.accepts(document: document, caretUTF16: caret, epoch: self.epoch,
+        hasMarkedText: editor?.hasMarkedText() ?? true), let visible = GemmaPrompt.visibleCompletion(text)
+    else { return }
+    ghostSources = recipe.sources; ghostStamp = stamp; ghostText = visible
+    editor?.showGhost(visible, stamp: stamp)
+  }
+  var candidateIsCurrent: Bool {
+    guard let recipe = candidates?.recipe, let document = selectedDocument else { return false }
+    return document.id == recipe.document.id && document.revision == recipe.document.revision
+      && caret == recipe.caretUTF16 && (try? revalidate(recipe.sources, attachments: [])) != nil
+      && editor?.hasMarkedText() != true
+  }
+  func selectCandidate(_ index: Int) {
+    guard let bundle = candidates, bundle.candidates.indices.contains(index) else { return }
+    candidates?.selected = index
+    if candidateIsCurrent { showCandidateGhost(bundle.candidates[index].text, recipe: bundle.recipe, epoch: epoch) }
+  }
+  func replayCandidate(_ index: Int) {
+    guard !isBusy, let bundle = candidates, bundle.candidates.indices.contains(index) else { return }
+    work("Replaying this seed…") { [weak self] flag in
+      guard let self else { return }
+      try await self.generateCandidates(document: bundle.recipe.document, offset: bundle.recipe.caretUTF16,
+        profile: bundle.recipe.profile, count: 1, maxTokens: bundle.recipe.maxTokens, flag: flag,
+        previous: bundle, replaySeed: bundle.candidates[index].seed)
+    }
+  }
+  func acceptCandidateWord(_ index: Int) {
+    guard !isBusy, candidateIsCurrent, let bundle = candidates, bundle.candidates.indices.contains(index),
+      bundle.candidates[index].state == .complete, let editor else { return }
+    editor.window?.makeFirstResponder(editor)
+    selectCandidate(index)
+    _ = editor.acceptNextGhostWord()
+  }
+  func acceptCandidate(_ index: Int) {
+    guard candidateIsCurrent, let bundle = candidates, bundle.candidates.indices.contains(index),
+      bundle.candidates[index].state == .complete, let editor else { return }
+    let text = bundle.candidates[index].text
+    cancel(); showingCandidates = false
+    editor.window?.makeFirstResponder(editor)
+    editor.insertText(text, replacementRange: NSRange(location: bundle.recipe.caretUTF16, length: 0))
+  }
+  func branchCandidate(_ index: Int) {
+    guard !isBusy, let bundle = candidates, bundle.candidates.indices.contains(index),
+      bundle.candidates[index].state == .complete, editor?.hasMarkedText() != true else { return }
+    do {
+      let snapshot = bundle.recipe.document
+      guard let range = Range(NSRange(location: bundle.recipe.caretUTF16, length: 0), in: snapshot.text) else { throw BoomError.invalid("Invalid captured caret.") }
+      var text = snapshot.text; text.replaceSubrange(range, with: bundle.candidates[index].text)
+      let document = DocumentSnapshot(title: snapshot.title + " · branch", text: text)
+      state.manuscriptOrigins[document.id] = ManuscriptOrigin(documentID: snapshot.id, revision: snapshot.revision,
+        bundleID: bundle.id, candidateID: bundle.candidates[index].id)
+      documents.append(document); dirty.insert(document.id); selectDocument(document.id)
+      showingCandidates = false; scheduleSave()
+    } catch { report(error) }
   }
   func takeGhost(documentID: UUID, caret: Int) -> String? {
     guard let d = selectedDocument, d.id == documentID, let stamp = ghostStamp,
@@ -1213,7 +1382,6 @@ struct CompletionSegment {
     }
     do {
       try revalidate(ghostSources, attachments: [])
-      try store.checkDisk(documentID)
     } catch {
       status = error.localizedDescription
       invalidateGhost()
@@ -1236,7 +1404,6 @@ struct CompletionSegment {
       self.caret == caret, editor?.selectedRange().location == caret,
       editor?.selectedRange().length == 0, editor?.string == document.text,
       (try? revalidate(sources, attachments: [])) != nil,
-      (try? store.checkDisk(documentID)) != nil,
       let stamp = try? GhostStamp(document: document, caretUTF16: caret, epoch: epoch)
     else { return }
     ghostSources = sources
@@ -1245,41 +1412,85 @@ struct CompletionSegment {
     editor?.showGhost(text, stamp: stamp)
   }
   func navigateGhost(_ direction: Int) {
-    guard !ghostText.isEmpty else { scheduleCompletion(); return }
-    // The admitted CoreML decode graph returns only argmax, so retrying the
-    // identical prefix cannot produce an independent candidate.
-    status = "This model provides one deterministic completion at this position."
+    guard let bundle = candidates, candidateIsCurrent else { exploreWriting(); return }
+    if bundle.candidates.count == 1 {
+      guard !isBusy else { return }
+      work("Generating alternatives…") { [weak self] flag in
+        guard let self else { return }
+        try await self.generateCandidates(document: bundle.recipe.document, offset: bundle.recipe.caretUTF16,
+          profile: bundle.recipe.profile, count: 2, maxTokens: bundle.recipe.maxTokens, flag: flag, previous: bundle)
+        self.selectCandidate(direction > 0 ? 1 : 2)
+      }
+    } else {
+      selectCandidate((bundle.selected + direction + bundle.candidates.count) % bundle.candidates.count)
+    }
+  }
+  private func selectImportedDocument(_ id: UUID) {
+    state.selectedDocument = id; selectedDocumentIDs = [id]; state.showDocument = true
+    state.selectedChat = nil; draft = ""; pendingAttachments = []
+    showingChatInstructions = nil; editingChatMessage = nil
+    compactPane = "document"; invalidateGhost(); focusEditor(id)
+  }
+  func importFolder() {
+    guard !isBusy, layout.isAuthor else { return }
+    finishComposition()
+    let panel = NSOpenPanel()
+    panel.canChooseFiles = false; panel.canChooseDirectories = true
+    panel.prompt = "Import"; panel.message = "Copy Markdown and text files into Bloom's encrypted library."
+    guard panel.runModal() == .OK, let root = panel.url else { return }
+    work("Importing folder…") { [weak self] flag in
+      guard let self else { return }
+      let scope = root.startAccessingSecurityScopedResource()
+      defer { if scope { root.stopAccessingSecurityScopedResource() } }
+      let files = try await detachedWork { try FolderImport.read(root, flag: flag) }
+      try flag.check()
+      let vault = self.store.vault
+      try await detachedWork {
+        for file in files { try flag.check(); try vault.put(file.original, kind: .attachment, id: file.id) }
+      }
+      try flag.check()
+      let folder = ImportedFolder(id: UUID(), name: root.lastPathComponent)
+      self.state.importedFolders = (self.state.importedFolders ?? []) + [folder]
+      for file in files {
+        let title = URL(fileURLWithPath: file.path).deletingPathExtension().lastPathComponent
+        self.documents.append(DocumentSnapshot(id: file.id, title: title, text: file.text))
+        self.dirty.insert(file.id)
+        self.state.importedFiles = self.state.importedFiles ?? [:]
+        self.state.importedFiles?[file.id] = ImportedFile(folderID: folder.id, path: file.path,
+          originalDigest: Digest.sha256(file.original))
+      }
+      if let first = files.first { self.selectImportedDocument(first.id) }
+      try await self.flush()
+      self.status = "Imported \(files.count) documents into encrypted storage"
+    }
   }
   func importDocument() {
+    guard !isBusy else { return }
     finishComposition()
-    cancel()
-    do { try flush() } catch {
-      report(error)
-      return
-    }
     let panel = NSOpenPanel()
     panel.allowedContentTypes = [.plainText, .utf8PlainText, .text]
-    panel.allowsMultipleSelection = true
+    panel.allowsMultipleSelection = true; panel.prompt = "Import"
     guard panel.runModal() == .OK else { return }
-    do {
-      for url in panel.urls {
-        let scope = url.startAccessingSecurityScopedResource()
-        defer { if scope { url.stopAccessingSecurityScopedResource() } }
-        let data = try AttachmentProcessor.readGranted(url)
-        guard data.count <= 2_097_152, let text = String(data: data, encoding: .utf8) else {
-          throw BoomError.invalid("Markdown import requires UTF-8 text up to 2 MiB.")
+    let urls = panel.urls
+    work("Importing documents…") { [weak self] flag in
+      guard let self else { return }
+      let imported = try await detachedWork {
+        try urls.map { url -> DocumentSnapshot in
+          try flag.check()
+          let scope = url.startAccessingSecurityScopedResource()
+          defer { if scope { url.stopAccessingSecurityScopedResource() } }
+          let data = try AttachmentProcessor.readGranted(url, limit: 2_097_152, allowEmpty: true)
+          guard data.count <= 2_097_152, let text = String(data: data, encoding: .utf8) else {
+            throw BoomError.invalid("Markdown import requires UTF-8 text up to 2 MiB.")
+          }
+          return DocumentSnapshot(title: url.deletingPathExtension().lastPathComponent, text: text)
         }
-        let document = DocumentSnapshot(
-          title: url.deletingPathExtension().lastPathComponent, text: text)
-        try store.saveDocument(document)
-        documents.append(document)
-        state.selectedDocument = document.id
       }
-      state.showDocument = true
-      compactPane = "document"
-      invalidateGhost()
-      try flush()
-    } catch { report(error) }
+      try flag.check()
+      for document in imported { self.dirty.insert(document.id); self.documents.append(document) }
+      if let document = imported.first { self.selectImportedDocument(document.id) }
+      try await self.flush()
+    }
   }
   func exportDocument(_ id: UUID? = nil) {
     finishComposition()
@@ -1313,9 +1524,8 @@ struct CompletionSegment {
     let current = documents[index]
     let insertion = current.revision == revision
       ? Range(range, in: current.text) : nil
-    let replacement = insertion ?? current.text.endIndex..<current.text.endIndex
-    let prefix = insertion == nil && !current.text.isEmpty ? "\n" : ""
-    let value = prefix + links
+    guard let replacement = insertion else { throw BoomError.stale("The attachment insertion target changed. Its original bytes were retained.") }
+    let value = links
     if state.selectedDocument == id, let editor, editor.documentID == id,
       editor.string == current.text,
       let native = NSRange(replacement, in: current.text) as NSRange? {
@@ -1373,8 +1583,11 @@ struct CompletionSegment {
           }
         }
         try flag.check()
-        try self.store.vault.put(imported.original, kind: .attachment, id: imported.record.id)
-        try self.store.vault.put(imported.receipt, kind: .receipt, id: imported.record.id)
+        let vault = self.store.vault
+        try await detachedWork {
+          try vault.put(imported.original, kind: .attachment, id: imported.record.id)
+          try vault.put(imported.receipt, kind: .receipt, id: imported.record.id)
+        }
         var record = imported.record
         record.isImage = LocalImage.canDecode(imported.original)
         if record.isImage == true {
@@ -1406,9 +1619,10 @@ struct CompletionSegment {
     pendingAttachments.removeAll { $0 == id }
     composerIssue = nil
   }
-  private func imagePayload(for attachment: AttachmentRecord) throws -> Data? {
+  private func imagePayload(for attachment: AttachmentRecord) async throws -> Data? {
     guard attachment.isImage == true || attachment.text.isEmpty else { return nil }
-    let data = try store.vault.get(.attachment, id: attachment.id, limit: 67_108_864)
+    let vault = store.vault
+    let data = try await detachedWork { try vault.get(.attachment, id: attachment.id, limit: 67_108_864) }
     guard Digest.sha256(data) == attachment.rootDigest else {
       throw BoomError.invalid("Stored image bytes changed.")
     }
@@ -1417,6 +1631,13 @@ struct CompletionSegment {
       throw BoomError.invalid("The stored image cannot be decoded locally.")
     }
     return nil
+  }
+  private func describeImage(_ image: CGImage, runner: MLXGemmaRunner, flag: CancellationFlag) async throws -> String {
+    let bitmap = NSBitmapImageRep(cgImage: image)
+    guard let bytes = bitmap.representation(using: .png, properties: [:]) else { throw BoomError.invalid("Could not encode image.") }
+    let plan = try ProductCore.prompt(voice: nil, history: [], instructions: "", context: "",
+      request: "Describe this image carefully. Transcribe legible text and distinguish uncertainty.", routing: [])
+    return try await runner.run(plan: plan, images: [bytes], maxTokens: 512, flag: flag, onText: { _ in }).text
   }
   private func preparedRecord(
     _ attachment: AttachmentRecord, data: Data, sourceURL: URL?, flag: CancellationFlag
@@ -1451,10 +1672,10 @@ struct CompletionSegment {
         ? "Partial local transcript" : "Local speech transcript"
       return updated
     }
-    let audioSeconds = runner?.audioSeconds ?? 0
+    let audioSeconds = 0
     let media = try await detachedWork(priority: .utility) {
       try await NativeMedia.prepare(
-        data: data, name: attachment.name, audioSeconds: audioSeconds, flag: flag)
+        data: data, name: attachment.name, audioSeconds: Double(audioSeconds), flag: flag)
     }
     var text = ""
     var note = ""
@@ -1463,26 +1684,20 @@ struct CompletionSegment {
       text = extracted
       note = coverage
     case .image(let image):
-      guard let runner, runner.supportsImages else {
+      guard let runner = mlxRunner else {
         throw BoomError.unavailable("No local image description model is ready.")
       }
-      text = try await runner.describe(image: image, flag: flag, onText: { _ in }).text
+      text = try await describeImage(image, runner: runner, flag: flag)
       note = "Local model description of the first image, resized to at most 1600 pixels. Machine-generated, not verified OCR or full image coverage."
-    case .audio(let samples, let coverage):
-      guard let runner, runner.supportsAudio else {
-        throw BoomError.unavailable("On-device speech could not read this file and no local audio model is ready.")
-      }
-      text = try await runner.describe(audio: samples, flag: flag, onText: { _ in }).text
-      note = coverage
     case .video(let frames, let coverage):
-      guard let runner, runner.supportsImages else {
+      guard let runner = mlxRunner else {
         throw BoomError.unavailable("No local video-frame description model is ready.")
       }
       var descriptions: [String] = []
       for frame in frames {
         try flag.check()
-        let result = try await runner.describe(image: frame.image, flag: flag, onText: { _ in })
-        descriptions.append("[Frame at \(String(format: "%.2f", frame.seconds)) seconds]\n" + result.text)
+        let result = try await describeImage(frame.image, runner: runner, flag: flag)
+        descriptions.append("[Frame at \(String(format: "%.2f", frame.seconds)) seconds]\n" + result)
       }
       text = descriptions.joined(separator: "\n\n")
       note = coverage
@@ -1500,7 +1715,8 @@ struct CompletionSegment {
     guard !isBusy, let attachment = state.attachments.first(where: { $0.id == id }) else { return }
     work("Preparing \(attachment.name) locally…") { [weak self] flag in
       guard let self else { return }
-      let data = try self.store.vault.get(.attachment, id: id, limit: 67_108_864)
+      let vault = self.store.vault
+      let data = try await detachedWork { try vault.get(.attachment, id: id, limit: 67_108_864) }
       guard Digest.sha256(data) == attachment.rootDigest else {
         throw BoomError.invalid("Stored attachment digest changed.")
       }
@@ -1514,202 +1730,125 @@ struct CompletionSegment {
     }
   }
   private func releaseRunner() async {
-    if let old = runner { await old.join() }
     if let old = mlxRunner { await old.join() }
-    runner = nil
-    mlxRunner = nil
-    modelReady = false
+    mlxRunner = nil; modelReady = false
   }
-  func loadConvertedMLX(_ source: MLXModelStore.Source, assistant: URL) {
-    work("Verifying local Gemma files…") { [weak self] flag in
-      guard let self else { return }
-      let directory = MLXModelStore.convertedURL(for: source)
-      try await detachedWork(priority: .utility) {
-        try MLXModelStore.verify(directory, expected: source)
+  func loadInstalledModels() {
+    if let consultation = ModelPacks.cached(.consultation) { loadPack(consultation, purpose: .consultation) }
+    if layout.isAuthor, let writing = ModelPacks.cached(.writing) {
+      Task { [weak self] in
+        guard let self else { return }
+        if let previous = self.foreground { await previous.value }
+        loadPack(writing, purpose: .writing)
       }
+    }
+  }
+  private func admitModel(_ admission: ModelPacks.Admission, purpose: ModelPurpose) throws {
+    do { try ModelResidency.admit(weightBytes: admission.weightBytes) }
+    catch BoomError.budget {
+      if purpose == .consultation { baseRunner = nil }
+      else { mlxRunner = nil; modelReady = false }
+      try ModelResidency.admit(weightBytes: admission.weightBytes)
+      status = "The inactive model was released to make room. Reopening it will take a moment."
+    }
+  }
+  func loadPack(_ url: URL, purpose: ModelPurpose) {
+    work("Opening \(purpose.title.lowercased()) model…") { [weak self] flag in
+      guard let self else { return }
+      let admission = try await detachedWork { try ModelPacks.admission(url, purpose: purpose) }
       try flag.check()
-      let loaded = try await MLXGemmaRunner.load(
-        directory: directory, assistantDirectory: assistant, size: source.size)
+      if purpose == .consultation { await self.releaseRunner() }
+      else { if let old = self.baseRunner { await old.join() }; self.baseRunner = nil }
+      try self.admitModel(admission, purpose: purpose)
+      let loaded = try await MLXGemmaRunner.load(directory: url, identity: admission.identity)
       try flag.check()
-      await self.releaseRunner()
-      self.mlxRunner = loaded
-      self.modelReady = true
+      if purpose == .consultation { self.mlxRunner = loaded; self.modelReady = true }
+      else { self.baseRunner = loaded }
       self.showingModels = false
-      self.status = "Gemma 4 \(source.size.rawValue) ready · local Metal"
-      self.scheduleCompletion()
+      self.status = "\(purpose.title) ready · on this Mac"
     }
   }
-  func loadConvertedBase(_ source: MLXModelStore.Source) {
-    work("Opening local writing model…") { [weak self] flag in
+  func installModel(_ purpose: ModelPurpose) {
+    work("Installing \(purpose.title.lowercased()) model…") { [weak self] flag in
       guard let self else { return }
-      let directory = MLXModelStore.convertedURL(for: source)
-      try await detachedWork(priority: .utility) {
-        try MLXModelStore.verify(directory, expected: source)
-      }
-      try flag.check()
-      let loaded = try await MLXGemmaRunner.load(directory: directory, size: source.size)
-      try flag.check()
-      if let old = self.baseRunner { await old.join() }
-      self.baseRunner = loaded
-      self.status = "Writing suggestions ready"
-    }
-  }
-  func prepareBase() {
-    guard !isBusy, let size = recommendedBaseSize else { return }
-    work("Preparing writing suggestions…") { [weak self] flag in
-      guard let self else { return }
-      let source = try await MLXModelStore.ensureBaseSource(for: size)
-      try flag.check()
-      let directory = try await detachedWork(priority: .userInitiated) {
-        try await MLXModelStore.prepare(source)
-      }
-      try flag.check()
-      let loaded = try await MLXGemmaRunner.load(directory: directory, size: size)
-      try flag.check()
-      if let old = self.baseRunner { await old.join() }
-      self.baseRunner = loaded
-      self.status = "Writing suggestions ready"
-    }
-  }
-  func prepareCachedMLX() {
-    guard !isBusy else { return }
-    guard let source = MLXModelStore.bestCachedSource(
-      physicalBytes: ProcessInfo.processInfo.physicalMemory)
-    else {
-      report(BoomError.unavailable("No first-party Gemma 4 QAT safetensors are cached."))
-      return
-    }
-    prepareMLX(size: source.size, downloadIfMissing: false)
-  }
-  func downloadRecommendedMLX() {
-    guard let size = recommendedQATSize else {
-      report(BoomError.unavailable("This Mac has too little memory for Gemma 4."))
-      return
-    }
-    prepareMLX(size: size, downloadIfMissing: true)
-  }
-  private func prepareMLX(size: GemmaSize, downloadIfMissing: Bool) {
-    guard !isBusy else { return }
-    work("Preparing Gemma 4 \(size.rawValue)…") { [weak self] flag in
-      guard let self else { return }
-      let source: MLXModelStore.Source
-      if let cached = MLXModelStore.cachedSource(for: size) { source = cached }
-      else if downloadIfMissing {
-        self.status = "Downloading Gemma 4 \(size.rawValue) into the Hugging Face cache…"
-        source = try await MLXModelStore.ensureSource(for: size) { [weak self] progress in
-          Task { @MainActor in
-            guard let self, !flag.isCancelled else { return }
-            self.status = "Gemma 4 \(size.rawValue) · \(Int(progress.fractionCompleted * 100))%"
-          }
-        }
-      } else {
-        throw BoomError.unavailable("No cached QAT source weights for \(size.rawValue).")
-      }
-      try flag.check()
-      self.status = "Converting first-party QAT weights locally…"
-      let directory = try await detachedWork(priority: .userInitiated) {
-        try await MLXModelStore.prepare(source)
-      }
-      try flag.check()
-      self.status = "Loading matching Gemma assistant…"
-      let assistant = try await MLXModelStore.ensureAssistant(for: source.size)
-      try flag.check()
-      let loaded = try await MLXGemmaRunner.load(
-        directory: directory, assistantDirectory: assistant, size: source.size)
-      try flag.check()
-      await self.releaseRunner()
-      self.mlxRunner = loaded
-      self.modelReady = true
-      self.showingModels = false
-      self.status = "Gemma 4 \(source.size.rawValue) ready · local Metal"
-      self.scheduleCompletion()
-    }
-  }
-  func loadModel(_ url: URL) {
-    work("Verifying local model files…") { [weak self] flag in
-      guard let self else { return }
-      await self.releaseRunner()
-      let manifest = try await detachedWork(priority: .utility) {
-        try ModelManifest.loadAndVerify(url)
-      }
-      try flag.check()
-      self.status = "Loading local Gemma 4 E2B…"
-      let loaded = try await detachedWork(priority: .userInitiated) {
-        try await GemmaRunner.load(directory: url, manifestDigest: manifest.identity)
-      }
-      try flag.check()
-      self.runner = loaded
-      self.modelReady = true
-      self.state.installedModel = url.lastPathComponent
-      self.status = "Gemma 4 E2B ready"
-      self.showingModels = false
-    }
-  }
-  func downloadModel() {
-    guard !isBusy else { return }
-    let root = HuggingFaceCache.boomModels
-    work("Downloading Gemma 4 E2B…") { [weak self] flag in
-      guard let self else { return }
-      try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-      let installer = ModelInstaller()
-      let url = try await installer.download(to: root) { [weak self] status in
+      let directory = try await ModelPacks.install(purpose, flag: flag) { progress in
         Task { @MainActor in
-          guard let self, !flag.isCancelled else { return }
-          self.status = status
+          guard !flag.isCancelled else { return }
+          self.status = progress
         }
       }
       try flag.check()
-      let manifest = try await detachedWork(priority: .utility) {
-        try ModelManifest.loadAndVerify(url)
-      }
-      self.status = "Loading the verified local model…"
-      await self.releaseRunner()
-      let loaded = try await detachedWork(priority: .userInitiated) {
-        try await GemmaRunner.load(directory: url, manifestDigest: manifest.identity)
-      }
+      let admission = try await detachedWork { try ModelPacks.admission(directory, purpose: purpose) }
+      if purpose == .consultation { await self.releaseRunner() }
+      else { if let old = self.baseRunner { await old.join() }; self.baseRunner = nil }
+      try self.admitModel(admission, purpose: purpose)
+      let loaded = try await MLXGemmaRunner.load(directory: directory, identity: admission.identity)
       try flag.check()
-      self.runner = loaded
-      self.modelReady = true
-      self.state.installedModel = url.lastPathComponent
-      self.showingModels = false
-      self.status = "Gemma 4 E2B ready · local CoreML"
+      if purpose == .consultation { self.mlxRunner = loaded; self.modelReady = true }
+      else { self.baseRunner = loaded }
+      self.status = "\(purpose.title) ready · on this Mac"
+    }
+  }
+  func backupWorkspace(restoring: Bool) {
+    guard !isBusy else { return }
+    if restoring {
+      let panel = NSOpenPanel(); panel.allowedContentTypes = [.data]
+      guard panel.runModal() == .OK, let url = panel.url else { return }
+      backupRequest = BackupRequest(url: url, restoring: true)
+    } else {
+      let panel = NSSavePanel(); panel.nameFieldStringValue = "Bloom.bloombackup"
+      guard panel.runModal() == .OK, let url = panel.url else { return }
+      backupRequest = BackupRequest(url: url, restoring: false)
+    }
+  }
+  func performBackup(_ request: BackupRequest, passphrase: String) {
+    backupRequest = nil
+    work(request.restoring ? "Restoring encrypted backup…" : "Encrypting complete backup…") { [weak self] _ in
+      guard let self else { return }
+      try await self.flush()
+      if request.restoring {
+        let restored = try await self.store.restoreBackup(passphrase: passphrase, from: request.url)
+        self.state = restored.0; self.documents = restored.1
+        self.dirty.removeAll(); self.undoManagers.removeAll()
+        self.selectedDocumentIDs = Set(self.state.selectedDocument.map { [$0] } ?? [])
+        self.selectedChatIDs = Set(self.state.selectedChat.map { [$0] } ?? [])
+        self.draft = ""; self.pendingAttachments = []; self.invalidateGhost()
+        self.status = "Backup restored"
+      } else {
+        try await self.store.exportBackup(passphrase: passphrase, to: request.url)
+        self.status = "Complete encrypted backup exported"
+      }
+    }
+  }
+  func installSpeechAsset() {
+    work("Setting up on-device speech…") { [weak self] flag in
+      try await VoiceInput().installSpeechAsset()
+      try flag.check()
+      self?.status = "On-device speech ready"
     }
   }
   func importModel() {
     guard !isBusy else { return }
-    let panel = NSOpenPanel()
-    panel.canChooseFiles = false
-    panel.canChooseDirectories = true
-    panel.message =
-      "Choose an unpacked Gemma 4 E2B chunk bundle containing model_config.json, hf_model and chunk1–4. A verified app-owned copy will be made."
+    let panel = NSOpenPanel(); panel.canChooseFiles = false; panel.canChooseDirectories = true
+    panel.message = "Choose a verified Bloom model pack."
     guard panel.runModal() == .OK, let source = panel.url else { return }
-    let root = store.modelsURL
-    work("Importing a local Gemma bundle…") { [weak self] flag in
+    work("Importing a model pack…") { [weak self] flag in
       guard let self else { return }
-      let scope = source.startAccessingSecurityScopedResource()
-      defer { if scope { source.stopAccessingSecurityScopedResource() } }
-      let url = try await detachedWork(priority: .utility) {
-        try ModelInstaller.importDirectory(source, to: root) { [weak self] text in
-          Task { @MainActor in self?.status = text }
-        }
-      }
+      let result = try await detachedWork { try ModelPacks.importPack(source, flag: flag) }
       try flag.check()
-      let manifest = try await detachedWork(priority: .utility) {
-        try ModelManifest.loadAndVerify(url)
+      self.status = "\(result.purpose.title) installed"
+      if let directory = ModelPacks.installed(result.purpose) {
+        let admission = try await detachedWork { try ModelPacks.admission(directory, purpose: result.purpose) }
+        if result.purpose == .consultation { await self.releaseRunner() }
+        else { if let old = self.baseRunner { await old.join() }; self.baseRunner = nil }
+        try self.admitModel(admission, purpose: result.purpose)
+        let runner = try await MLXGemmaRunner.load(directory: directory, identity: admission.identity)
+        if result.purpose == .consultation { self.mlxRunner = runner; self.modelReady = true }
+        else { self.baseRunner = runner }
       }
-      await self.releaseRunner()
-      self.status = "Loading the imported local model…"
-      let loaded = try await detachedWork(priority: .userInitiated) {
-        try await GemmaRunner.load(directory: url, manifestDigest: manifest.identity)
-      }
-      try flag.check()
-      self.runner = loaded
-      self.modelReady = true
-      self.state.installedModel = url.lastPathComponent
-      self.showingModels = false
-      self.status = "Gemma 4 E2B ready · local CoreML"
     }
   }
+
 }
 
 @MainActor func askForText(title: String, message: String = "", initial: String) -> String? {

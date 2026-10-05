@@ -86,7 +86,7 @@ public enum ReferenceParser {
     }
     return result
   }
-  public static func personas(_ text: String) throws -> [String] {
+  public static func voices(_ text: String) throws -> [String] {
     let visible = visibleText(text)
     let ns = visible as NSString
     let regex = try NSRegularExpression(

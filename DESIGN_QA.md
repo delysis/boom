@@ -58,17 +58,27 @@ The Markdown editor stores plain UTF-8. A font trait changed only temporary
 display attributes, so it could never be an authoring command. All formatting
 controls must edit the Markdown source through the text view's normal undo path.
 For each keyboard shortcut and context menu action, select text, apply the
-action, inspect both the editor and saved `.md` bytes, apply it again to remove
+action, inspect both the editor and decrypted document bytes, apply it again to remove
 the syntax, then undo. The native font palette and Writing Tools must not offer
 formatting that cannot be represented in the saved document.
 
-For a deleted document, test both deletion inside Bloom and moving the `.md`
-file away while Bloom is closed. Reopen with the existing workspace index and
-confirm the window opens, the missing document is absent from the library, and
-saved chat messages remain. Do not treat a corrupt or unreadable existing file
-as missing; that should still stop with a clear error and leave its bytes intact.
+Test deletion inside Bloom separately from removing an indexed encrypted record
+while Bloom is closed. An absent, corrupt, or incompatible indexed record must
+stop loading with a clear error and leave the surviving records intact. Never
+replace that workspace with empty state or silently remove the indexed document.
 
 ## Composer, attachment and privacy review
+
+Edit a short chat reply in place. Its native font and wrapping must match the
+conversation, its height must follow the text, and the native checkmark and
+discard icons must remain adjacent with distinct hit areas and hover labels.
+Click both and check the persisted result; an accessibility action returning
+success does not establish that it ran. Check native Undo and Command-Return
+while editing, including when the Writing menu command is enabled. Keep named voice
+attribution visible, retain the original message and captured sources, and
+record human edits as metadata. Generic authorship labels and prompt scaffolding
+do not belong in the conversation prose. Other participants must still be named
+in model input; the current assistant's own answers use their native role.
 
 Attachment ownership is chosen by the receiving surface, before inspection or
 any asynchronous work. The document editor captures its document ID, revision
@@ -122,8 +132,8 @@ extracted text. Expand a long document, scroll its extracted text, collapse it,
 and confirm the document remains one continuous scroll surface with an editable
 caret. No attachment may create a second vertical scroll region or push the
 editor into a separate apparent pane. Reopen the same document and repeat.
-Switch documents and verify playback stops and temporary video files are
-removed. Copy or export the Markdown and confirm the original
+Switch documents and verify playback stops and memory-backed media is released.
+Inspect app-owned storage for plaintext media. Copy or export the Markdown and confirm the original
 attachment reference remains intact despite its styled display. Click around
 the displayed reference and type nearby to catch selection or caret drift.
 
@@ -146,14 +156,20 @@ accept one word and its following space without moving the caret elsewhere;
 Option-Left must reverse only that acceptance. Repeat twice in each direction,
 then type ordinary text, switch documents and check that old acceptances cannot
 be reversed into a new state. Option-Up/Down must not move the document caret.
-Do not mark alternative-candidate navigation as working until the backend
-actually exposes multiple candidates; the current compiled graph returns only
-argmax tokens. After partial acceptance, new generation must use the accepted
-prefix rather than the original prefix.
+Generate actual alternatives with MLX before checking Option-Up/Down. Record each
+captured prompt, seed, model identity, token output, and failure. Requesting
+alternatives from a single short suggestion must use that same captured prompt.
+After partial acceptance, new generation must use the accepted manuscript prefix.
 
-Exercise a chat with a long attached document and autocomplete with a long
-followed document against the loaded model. Inspect the captured context: the
-beginning and end excerpts and an omission marker must correspond to the bytes
-actually sent. Keep the current chat request; if it cannot fit, refuse visibly.
-The bundle's measured compiled token limit takes precedence over advertised
-model architecture or a hardware sizing recommendation.
+Exercise consultation with an explicit long attachment and writing with a long
+manuscript and selected prose examples. Consultation must preserve the captured
+question and attributed speakers; refusal must leave the draft intact. Writing
+must supply only the preceding manuscript and ordered prose examples, using the
+largest contiguous recent suffix when necessary. Inspect the actual prompt and
+omissions. The admitted context budget takes precedence over advertised capacity.
+
+The ordinary writing surface is the manuscript. Check that no permanent writing
+control strip or sampling popover has returned. Explore, examples, and variation
+are native Writing menu actions. Empty-document Explore is disabled. Requested
+alternatives appear in a temporary tray and enter the manuscript only through
+explicit acceptance or branching.

@@ -1,82 +1,57 @@
 # Bloom
 
-A local macOS writing workspace: native Markdown in the center, documents/chats/personas on the left, and chat on the right. SwiftUI presents the shell; AppKit owns the editor, toolbar, menus, selection, composition and undo. The copied Rust attachment host is statically linked in-process through a small C ABI. This repository contains Swift, Rust, C and shell code, with no JavaScript or TypeScript. There is no Tauri, WebView, HTML frontend, localhost server, Python runtime, FTE, account system or cloud inference path in this product.
+Bloom is a native, private macOS workspace for consulting editable voices and writing with a base language model. AppKit owns text editing, selection, input methods and Undo. SwiftUI presents the interface. Safe Rust validates voices, preserves speakers, plans authored prompts, sets sampling and memory policy, derives backup keys, and inspects attachments through a narrow in-process C boundary. MLX performs inference on this Mac.
 
-**Current status:** the macOS build passes the Swift and Rust suites, strict Clippy, release compilation/linking, and sealed ad-hoc local packaging. Real-weight chat and raw autocomplete checks run separately against first-party Gemma 4 12B instruction and base weights. Distribution signing, notarization and a full concurrent-use UI pass remain open gates; see `ACCEPTANCE.md`.
+Bloom has two compile-time layouts. The author build keeps a bounded manuscript beside its document library and optional chat; two native icons control the side panes. The chat build has a conversation library and chat, with no manuscript pane. Live title-bar search finds document bodies and chat text. Imported folders are snapshots inside the encrypted library; ordinary source files are never edited. The native Writing menu offers continuations, writing examples, inline suggestions and variation. Requested alternatives appear in a temporary tray; accepting text uses the editor's normal Undo path. Every chat supports instructions and editable exchanges. Pin a chat as a voice, then mention it elsewhere with `@`. Several mentions give separate answers by default; discussion lets later voices read earlier answers from that round.
 
-## Repository placement
+## Privacy and ownership
 
-Bloom is a separate native source tree. Five narrowly scoped attachment crates were copied from `delysis/native-platform` at commit `637e60b6b044230ed24ed3118615a2e5538cae83`; the app uses them through one Rust C ABI bridge. No native-kit frontend or runtime was imported. Existing applications and stores are not migrated.
+The fresh workspace is `~/Library/Application Support/Bloom/Private`. Documents, conversations, voice revisions, attachment originals, continuations, receipts and recovery journals are authenticated encrypted records. There is no migration, old-store reader, or plaintext workspace mode. Existing Boom stores are left alone.
 
-The CoreML-LLM dependency is pinned to commit `18a9b5fd3d7e1f1f5d182533c94d311a7e649f7c`, tree `9d1e6548d20b9edd4b3e18da32416389aaff7cf4`. No third-party checkout or model weights are embedded in this source archive. Bootstrap verifies exact source blobs before applying the two local model-loading substitutions and appending the original integration extensions in `RuntimeAdditions/`.
+A process-owned vault session reads one Keychain master-key item. The session retains either the key or the failure; another storage consumer cannot trigger another authorization attempt. Missing or invalid keys, corrupt records, unknown schemas and conflicting recovery journals stop safely and retain evidence. Call counts are component evidence; actual macOS dialog behavior has its own native gate.
 
-## Build on the Mac
+Readable Markdown and portable voice JSON are explicit exports. Complete backup uses a separate passphrase-derived key and includes every private record, while excluding model weights and disposable caches. Restore requires a fresh workspace. App-owned media decoding and playback use memory rather than plaintext temporary files. Native speech input and output remain available; speech asset installation is an explicit setup operation.
 
-Use macOS 15 or newer, an Apple Silicon Mac, Xcode with a Swift 6 toolchain, and Rust. Build from this branch in its isolated worktree.
+## Models
+
+Bloom checks the Hugging Face cache, including `HF_HUB_CACHE`, `HF_HOME`, `XDG_CACHE_HOME` and the usual home cache. Verified local 4-bit conversions are preferred. It also recognizes the pinned official `google/gemma-4-12B-it-qat-q4_0-unquantized` and `google/gemma-4-12B` snapshots and can download those public checkpoints anonymously when explicitly requested. Every admitted file is checked against the signed catalog. Startup and inference use local files.
+
+The public full-precision checkpoints require about 24 GB each. Their presence in a cache does not establish that they fit on a 32 GB Mac. The local 4-bit packs contain roughly 7.5 GB each and are built separately with the developer converter. Packs remain local for now; no public Bloom model repository has been published.
+
+The pair shares a measured process budget derived from physical memory and Metal's working-set limit. On a 32 GiB machine the policy reserves at least 8 GiB. One coordinator serializes loading and generation, joins producers, and lets foreground consultation preempt automatic suggestions. Context is capped at 16,384 tokens and further limited by available memory. Pressure releases the inactive model. A draft assistant is optional and is not required for voices.
+
+## Build and checks
+
+Use an Apple Silicon Mac, macOS 15 or later, Xcode with Swift 6, and Rust.
 
 ```sh
 scripts/bootstrap.sh
-scripts/build-macos.sh "$PWD/out/new-build"
-open "$PWD/out/new-build/Bloom.app"
-```
-
-Bootstrap obtains the exact pinned CoreML runtime, normalizes Rust with `rustfmt`, and resolves `RustBridge/Cargo.lock` and `App/Package.resolved`. Retain and review both locks. Subsequent builds use locked Cargo resolution and disabled automatic Swift resolution. The native build asks rustc for its actual static-library linker requirements.
-
-The build records toolchain/SDK, source and lock hashes, notices, linked libraries, executable SHA-256 and bundle size. It embeds source/lock identities in the app; an unbundled `swift run` executable cannot load persistent model caches. SwiftPM resources are retained under `Contents/Resources`; the complete local test bundle is sealed with an ad-hoc signature that binds its privacy descriptions. This is not a distribution signature or notarized package.
-
-Portable verification needs no Mac, model or third-party Swift dependency:
-
-```sh
 scripts/check-portable.sh
+scripts/build-macos.sh "$PWD/out/fresh-build" author
+# Use a different output directory and `chat` to build the conversation-only layout.
+open "$PWD/out/fresh-build/Bloom.app"
 ```
 
-The real-weight native harness runs from the built bundle, using a model directory already imported/downloaded and verified by the application:
+Cargo has one workspace and lock. Swift dependencies are resolved once, with MLX Swift LM pinned to `9afc3b55f75a0d41a3d0c11330b9df6a036d24e4`. Builds use locked dependencies, run Rust and native tests, record actual static linker requirements, and reject source changes during the build. The signed bundle contains source/lock inventories, notices and the model catalog. Development signing uses a stable Apple Development identity; Developer ID distribution is a separate gate.
+
+The developer-only `BloomPackBuilder` converts pinned source checkpoints outside normal installation. Its manifests retain source revisions and hashes, quantization settings, runtime revision, output hashes and licenses. The app executable does not perform conversion.
+
+An explicit real-weight diagnostic preserves every attempt in a fresh evidence directory:
 
 ```sh
-"out/new-build/Bloom.app/Contents/MacOS/Bloom" \
-  --smoke \
-  --model "/absolute/path/to/verified/gemma4-e2b-model-directory" \
-  --evidence "/absolute/path/to/a-new-native-smoke-directory"
+out/fresh-build/Bloom.app/Contents/MacOS/Bloom \
+  --mlx-smoke --pack /absolute/path/to/verified/pack \
+  --evidence /absolute/path/to/new/evidence
+# Add --base and --seed INTEGER for the raw base-model diagnostic.
+# Add --edit-smoke for a real consultation patch, encrypted commit and Undo check.
 ```
 
-The evidence parent must already exist; the final evidence directory must not. The smoke test never substitutes a mock model and never overwrites previous evidence.
+Native interaction checks can open the exact bundle with `--native-check-workspace /absolute/path/to/isolated/workspace`. This is an encrypted test workspace using the same process vault session, not a plaintext mode. Its window is labelled Native check so it cannot be mistaken for the normal workspace. Background checks can add `--native-check-background --native-check-no-models --native-check-theme dark` (or `light`) to avoid activation and model loading. Use a separate workspace for every concurrent check.
 
-## Using the workspace
+The five attachment crates were narrowly copied from `delysis/native-platform` at `637e60b6b044230ed24ed3118615a2e5538cae83`. No parent frontend, web runtime, local server, cloud inference, CoreML runtime, Apple chat fallback or persistent persona KV mechanism is included.
 
-The toolbar contains the three pane toggles. Its background continues through the library sidebar. With the document and chat both open, narrowing the window below 980 points closes the library before either working pane becomes cramped; the toolbar can reopen it explicitly. The chat composer keeps its controls on one row and shortens the model badge to an accessible icon at compact widths. Small add controls in the library create documents and chats. `⌘1`, `⌘2`, `⌘3` toggle the panes. `⌘N` creates a document; `⇧⌘N` creates a chat. `⌘O` imports UTF-8 Markdown; `⇧⌘S` exports it. `⌘F` uses native Find. Documents autosave. System/light/dark appearance is in View → Appearance.
+## Qualification
 
-**Autocomplete:** with Gemma loaded, pause at the caret; press Tab to accept, Option-Right to accept one word, Option-Left to reverse the last accepted word, Escape to dismiss or Control-Space to request it. The grey suggestion lives in a separate display layout, not in document text, clipboard text or the undo stack before acceptance. Selection, input-method composition, editing, document switching, context changes and cancellation invalidate it. Document completion feeds a bounded authored prefix directly to the model after its beginning-of-sequence token, with no chat template. Explicitly linked documents precede that prefix. Long sources retain beginning and end excerpts inside the model's measured token budget. Option-Up/Down reserves completion navigation without moving the caret, but this CoreML export supplies only one deterministic candidate. Apple's session API is used for chat only because it does not expose raw continuation.
+Component checks, a real-weight diagnostic, native interaction evidence, target-machine performance and distribution are separate gates. Nonempty generation does not establish writing quality. Preserve failed outputs and receipts.
 
-**Follow a document:** type `[[Style guide]]`, or use the document's context menu. A stable reference includes its document ID in the saved Markdown; the editor presents only its title. References resolve transitively; cycles, ambiguity, missing references and budget overflows are errors, not silent omissions. The ordered followed-document prefix is prefilled and saved in one encrypted native-KV cache slot; the active draft is outside that prefix. The user can explicitly clear the derived autocomplete cache without deleting personas.
-
-**Consult a persona:** type `@name` in chat or click a persona. Save as Persona in a chat's context menu requires a completed conversation ending with an assistant response. It prefills that exact archived prefix, copies the actual eight native KV tensors, encrypts the record, reads it back and authenticates it before publishing readiness. A consultation restores only a matching model/runtime/prefix. Up to three named personas are consulted separately; their KV states are never merged. Rebuild is explicit after an identity change.
-
-**Chat about a document:** start a chat from a document's context menu or attach a document through the chat paperclip menu. An “About …” chip above the composer shows and can remove the relationship. That document and its `[[links]]` are supplied on each turn. A general chat sees only its own messages, `[[references]]`, `@personas`, and attachments selected for that turn; switching the editor does not silently add a document. Right-click a message to edit and continue on a branch, branch from it, regenerate an answer on a branch, rate an answer, or copy its text.
-
-**Work on the current document:** The compact composer menu defaults to Ask for each turn. Ask is read-only. Propose requests structured, revision-bound changes and presents old/new text with Accept and Reject. Edit explicitly grants automatic application to the current document for that operation. There is no ambient workspace or filesystem grant. Model output is accepted only as one complete JSON envelope; exact-match anchors, ambiguity, overlap, original document revision, source references and active-document identity are checked before mutation. Applied edits use native Undo and an encrypted recovery journal. Multi-persona Edit is refused; compare proposals instead.
-
-**Composer controls:** The Ask/Propose/Edit badge shows the current authority. The paperclip menu chooses local files or pastes an image. The model badge shows the provider actually selected; Automatic prefers a loaded Gemma and otherwise uses Apple's Foundation Model when ready. Apple and Gemma can be selected explicitly when available. Neither backend exposes a genuine reasoning-level control here, so Bloom does not show a switch that would have no effect. Dictate records up to 60 seconds and adds the on-device transcript to the draft. The microphone records a voice turn, sends it as Ask, and speaks a completed reply with Apple's local speech synthesizer. Both recording controls are click-to-start/click-to-stop. On macOS 26+, Bloom uses `SpeechAnalyzer` only after the on-device dictation asset is installed; it requests that model asset on first use and never falls back to a network-capable recognizer. On macOS 15–25, it requires `supportsOnDeviceRecognition` and sets `requiresOnDeviceRecognition` before starting a request. If the local path is unavailable, voice input fails visibly. A transcript is held for manual insertion when the active chat or draft changes during recording. Recorded audio is a temporary WAV file removed after transcription; it is not attached to the chat.
-
-**Attachments:** drag/drop, paste an image or use Attach. The original bytes and inspection receipt are retained encrypted. The existing Rust host performs bounded inspection and canonicalization; automatically supplied context is text only. Prepare Locally explicitly requests native PDF text extraction, first-image description, a bounded audio transcription or sampled MP4 frame descriptions. Coverage and machine-generated text are labelled. Scanned PDFs are not silently OCR'd; missing encoders and blocked/opaque inputs remain visibly unavailable. Attachment previews can show the retained inspection receipt and export original bytes.
-
-## Model and data boundaries
-
-When macOS 26 or newer reports the system model ready, Apple's Foundation Models framework supplies on-device chat. Raw document completion and native KV persona caches require Gemma. `--apple-smoke` tests Apple chat when the system is ready; availability is checked at runtime.
-
-The preferred Gemma route uses first-party QAT instruction weights through native MLX Swift, paired with the corresponding MTP assistant. A separate first-party base checkpoint supplies raw document continuation. The chosen size follows physical memory; loaded-model context follows the measured Metal working set and KV cost. Existing CoreML E2B bundles remain importable as a fallback. The legacy CoreML E2B export has a 2,048-token compiled limit; that limit does not apply to the MLX route.
-
-The downloader checks the Hugging Face Hub cache for verified content-addressed
-blobs before transferring a file. New downloads and the flattened Bloom CoreML
-runtime live in that cache, respecting `HF_HUB_CACHE`, `HF_HOME` and
-`XDG_CACHE_HOME`. The downloader retains verified whole files and completed
-32 MiB ranges if an explicit transfer is interrupted. Choose Download again to
-resume the same immutable revision. Only complete files with matching upstream
-hashes enter the admitted model bundle.
-
-`n1024` names the legacy CoreML prefill branch; it is **not** a promise of context length. Chat retains the current request and beginning/end excerpts of long reference sources, then removes oldest history if needed; the captured turn records the context actually sent. If the current request still cannot fit, generation is refused. Autocomplete similarly excerpts linked sources before reducing the active prefix. The signed local build passed a real-weight 12B chat check with its matching draft head and a separate raw base-model check. The latter still varies by prompt and seed; these checks do not establish 31B compatibility, latency, throughput or memory efficiency.
-
-Workspace storage retains its existing `~/Library/Application Support/Boom/` directory so the Bloom rename does not orphan test documents; downloaded model files are in the Hugging Face cache. Documents are ordinary UUID-named UTF-8 `.md` files. Chat/persona/source metadata, attachment originals/receipts and cache tensors are AES-GCM sealed with a separate Keychain key. Losing that key does not trigger replacement of existing private data. Corrupt, unknown-schema and missing-index cases fail without creating an empty workspace. This is an independent store, not a migration or reuse of Mom's encryption identity.
-
-The only app-owned runtime network client is the explicit Gemma model installer. Apple's `AssetInventory` may download an on-device speech model when voice input is used; it receives a transcriber configuration, never audio content. Document/attachment links are not followed. This is a code-level boundary, **not a demonstrated OS-level per-host sandbox**; network-denied native testing remains mandatory. System framework or tokenizer behavior has not been empirically audited here.
-
-See `ARCHITECTURE.md` for invariants and `NOTICE.md` for source provenance and license-review scope.
+This development Mac has 128 GB. The 32 GB performance targets remain unqualified until measured on an actual 32 GB MacBook. Developer ID signing, notarization and stapling also remain unqualified while only an Apple Development identity is available. See `ACCEPTANCE.md` for the remaining gates and `DESIGN_QA.md` for native interface checks.

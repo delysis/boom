@@ -35,17 +35,16 @@ var sources = packages.compactMap { package -> Source? in
 }
 sources.append(
   Source(
-    name: "swift:CoreML-LLM", directory: root.appendingPathComponent(".deps/CoreML-LLM"),
-    license: "inspect source notice", explicit: nil))
-sources.append(
-  Source(
     name: "swift:MLXSwiftLM", directory: root.appendingPathComponent(".deps/MLXSwiftLM"),
     license: "inspect source notice", explicit: nil))
+let resolved = try JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("App/Package.resolved"))) as? [String: Any]
+let identities = Set((resolved?["pins"] as? [[String: Any]] ?? []).compactMap { $0["identity"] as? String })
 let checkouts = root.appendingPathComponent("App/.build/checkouts")
 if fm.fileExists(atPath: checkouts.path) {
   for folder in try fm.contentsOfDirectory(
     at: checkouts, includingPropertiesForKeys: [.isDirectoryKey])
-  where (try folder.resourceValues(forKeys: [.isDirectoryKey])).isDirectory == true {
+  where identities.contains(folder.lastPathComponent.lowercased()) {
+    guard try folder.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else { continue }
     sources.append(
       Source(
         name: "swift:" + folder.lastPathComponent, directory: folder,

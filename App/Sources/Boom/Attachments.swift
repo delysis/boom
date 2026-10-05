@@ -145,19 +145,19 @@ enum AttachmentProcessor {
         id: UUID(), name: name, rootDigest: digest, text: text, coverage: coverage, transform: nil),
       receipt: response, original: data)
   }
-  static func readGranted(_ url: URL) throws -> Data {
+  static func readGranted(_ url: URL, limit: Int = 67_108_864, allowEmpty: Bool = false) throws -> Data {
     let v = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
-    guard v.isRegularFile == true, v.isSymbolicLink != true, let size = v.fileSize, size > 0,
-      size <= 67_108_864
+    guard v.isRegularFile == true, v.isSymbolicLink != true, let size = v.fileSize, (allowEmpty || size > 0),
+      size <= limit
     else {
       throw BoomError.budget(
         "Choose a regular file up to 64 MiB; symlinks and directories are not attachments.")
     }
     let handle = try FileHandle(forReadingFrom: url)
     defer { try? handle.close() }
-    let data = try handle.read(upToCount: 67_108_865) ?? Data()
-    guard data.count <= 67_108_864 else {
-      throw BoomError.budget("Attachment grew beyond 64 MiB while reading.")
+    let data = try handle.read(upToCount: limit + 1) ?? Data()
+    guard data.count <= limit else {
+      throw BoomError.budget("File grew beyond its import limit while reading.")
     }
     return data
   }
@@ -169,7 +169,6 @@ struct NativeFrame: @unchecked Sendable {
 }
 enum NativePreparedMedia: @unchecked Sendable {
   case image(CGImage)
-  case audio([Float], String)
   case video([NativeFrame], String)
   case text(String, String)
 }
@@ -255,63 +254,15 @@ enum NativeMedia {
       )
     }
     if let image = thumbnail(data) { return .image(image) }
-    let head = Array(data.prefix(16))
-    let isWave =
-      head.count >= 12 && String(bytes: head[0..<4], encoding: .ascii) == "RIFF"
-      && String(bytes: head[8..<12], encoding: .ascii) == "WAVE"
-    let isAIFF =
-      head.count >= 12 && String(bytes: head[0..<4], encoding: .ascii) == "FORM"
-      && ["AIFF", "AIFC"].contains(String(bytes: head[8..<12], encoding: .ascii) ?? "")
-    let isFLAC = data.starts(with: Data("fLaC".utf8))
-    let isMP3 =
-      data.starts(with: Data("ID3".utf8))
-      || (head.count >= 2 && head[0] == 0xff && head[1] & 0xe0 == 0xe0)
-    if isWave || isAIFF || isFLAC || isMP3 {
-      return try await temporary(
-        data, extension: isWave ? "wav" : isAIFF ? "aiff" : isFLAC ? "flac" : "mp3"
-      ) { url in
-        let file = try AVAudioFile(forReading: url)
-        let format = file.processingFormat
-        guard format.sampleRate >= 8000, format.sampleRate <= 192000, format.channelCount > 0,
-          format.channelCount <= 8, audioSeconds > 0
-        else { throw BoomError.invalid("Unsupported audio format or no local audio encoder.") }
-        let seconds = min(audioSeconds, 30)
-        let frames = AVAudioFrameCount(
-          min(file.length, AVAudioFramePosition(seconds * format.sampleRate)))
-        guard frames > 0, let input = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames),
-          let target = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false),
-          let output = AVAudioPCMBuffer(
-            pcmFormat: target, frameCapacity: AVAudioFrameCount(seconds * 16000)),
-          let converter = AVAudioConverter(from: format, to: target)
-        else { throw BoomError.invalid("Cannot allocate the bounded audio conversion.") }
-        try flag.check()
-        try file.read(into: input, frameCount: frames)
-        let source = OneShotAudioInput(input)
-        var error: NSError?
-        let result = converter.convert(to: output, error: &error) { _, status in
-          source.take(status)
-        }
-        if let error { throw error }
-        guard result != .error, let samples = output.floatChannelData?[0], output.frameLength > 0
-        else { throw BoomError.invalid("Native audio decoding failed.") }
-        let array = Array(UnsafeBufferPointer(start: samples, count: Int(output.frameLength)))
-        guard array.allSatisfy(\.isFinite) else {
-          throw BoomError.invalid("Audio contains nonfinite samples.")
-        }
-        return .audio(
-          array,
-          "First \(String(format:"%.2f",Double(array.count)/16000)) seconds of \(String(format:"%.2f",Double(file.length)/format.sampleRate)) seconds; local Gemma transcript, not guaranteed verbatim."
-        )
-      }
-    }
     guard try MediaContainerPolicy.selfContainedMP4(data) else {
       throw BoomError.unavailable(
         "No supported native transform. Use canonical text or a supported image, WAV/AIFF/FLAC/MP3 audio, or self-contained MP4 video. The original and processing receipt remain available."
       )
     }
-    return try await temporary(data, extension: "mp4") { url in
-      let asset = AVURLAsset(url: url)
+    let media = MemoryMedia(bytes: data, extension: "mp4")
+    let asset = media.asset
+    do {
+      defer { withExtendedLifetime(media) {} }
       let duration = try await asset.load(.duration).seconds
       guard duration.isFinite, duration > 0, duration <= 7200 else {
         throw BoomError.budget("Video duration is invalid or exceeds two hours.")
@@ -331,18 +282,5 @@ enum NativeMedia {
         "Four sampled still frames from a \(String(format:"%.1f",duration))-second MP4. No audio or continuous motion was analyzed; descriptions are machine-generated and partial."
       )
     }
-  }
-  private static func temporary<T>(
-    _ data: Data, extension ext: String, body: (URL) async throws -> T
-  ) async throws -> T {
-    let root = FileManager.default.temporaryDirectory.appendingPathComponent(
-      "boom-media-" + UUID().uuidString, isDirectory: true)
-    try FileManager.default.createDirectory(
-      at: root, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
-    let file = root.appendingPathComponent("source." + ext)
-    try data.write(to: file, options: .atomic)
-    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
-    defer { try? FileManager.default.removeItem(at: root) }
-    return try await body(file)
   }
 }

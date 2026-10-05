@@ -4,11 +4,20 @@ import Foundation
 import BoomCore
 import Security
 
-struct DocumentIndex: Codable {
+struct DocumentIndex: Codable, Sendable {
   let id: UUID
   var title: String
 }
-struct AttachmentRecord: Codable, Identifiable, Equatable {
+struct ImportedFolder: Codable, Identifiable, Sendable {
+  let id: UUID
+  let name: String
+}
+struct ImportedFile: Codable, Sendable {
+  let folderID: UUID
+  let path: String
+  let originalDigest: String
+}
+struct AttachmentRecord: Codable, Identifiable, Equatable, Sendable {
   let id: UUID
   let name: String
   let rootDigest: String
@@ -21,7 +30,7 @@ struct AttachmentRecord: Codable, Identifiable, Equatable {
     SourceReference(id: id, title: name, digest: digest, kind: "attachment")
   }
 }
-struct DocumentEditJournal: Codable {
+struct DocumentEditJournal: Codable, Sendable {
   let schema: Int
   let proposalID: UUID
   let documentID: UUID
@@ -29,16 +38,20 @@ struct DocumentEditJournal: Codable {
   let afterRevision: String
   let phase: String
 }
-struct WorkspaceState: Codable {
+struct WorkspaceState: Codable, Sendable {
   var schema = 1
   var documents: [DocumentIndex] = []
   var chats: [ChatRecord] = []
-  var personas: [Persona] = []
+  var voices: [Voice] = []
+  var voiceVersions: [Voice] = []
+  var candidateIDs: [UUID] = []
+  var manuscriptOrigins: [UUID: ManuscriptOrigin] = [:]
+  var importedFolders: [ImportedFolder]? = nil
+  var importedFiles: [UUID: ImportedFile]? = nil
   var attachments: [AttachmentRecord] = []
   var proposals: [StoredProposal] = []
   var selectedDocument: UUID?
   var selectedChat: UUID?
-  var installedModel: String?
   var showLibrary = true
   var showDocument = true
   var showChat = true
@@ -48,8 +61,7 @@ struct WorkspaceState: Codable {
 
 /// One current format. Decryption/schema failure NEVER becomes an empty workspace.
 final class Vault: @unchecked Sendable {
-  enum Kind: String { case workspace, attachment, receipt, personaCache, followCache, editJournal }
-  static let followCacheID = UUID(uuidString: "D735A2F6-5EA7-48AF-B578-E994A32F6E7A")!
+  enum Kind: String, Sendable { case workspace, document, attachment, receipt, candidate, editJournal, saveJournal }
   static let workspaceLimit = 134_217_728
   static let workspaceID = UUID(uuidString: "726B3A82-2EB1-493B-9D8E-F17C7A6E4B8A")!
   let root: URL
@@ -64,44 +76,8 @@ final class Vault: @unchecked Sendable {
       key = testKey
       return
     }
-    let query: [String: Any] = [
-      kSecClass as String: kSecClassGenericPassword,
-      kSecAttrService as String: "com.delysis.Boom.v1",
-      kSecAttrAccount as String: "workspace-key", kSecReturnData as String: true,
-      kSecMatchLimit as String: kSecMatchLimitOne,
-    ]
-    var result: CFTypeRef?
-    let status = SecItemCopyMatching(query as CFDictionary, &result)
-    if status == errSecSuccess, let data = result as? Data, data.count == 32 {
-      key = SymmetricKey(data: data)
-      return
-    }
-    guard status == errSecItemNotFound else {
-      throw BoomError.unavailable(
-        "Keychain access failed (\(status)). Existing files are untouched.")
-    }
-    let sealed =
-      (try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil))
-      .contains { $0.pathExtension == "sealed" }
-    guard !sealed else {
-      throw BoomError.unavailable(
-        "The encryption key is missing but private data exists. Restore the original Keychain key; no replacement key was created."
-      )
-    }
-    let newKey = SymmetricKey(size: .bits256)
-    let data = newKey.withUnsafeBytes { Data($0) }
-    let add: [String: Any] = [
-      kSecClass as String: kSecClassGenericPassword,
-      kSecAttrService as String: "com.delysis.Boom.v1",
-      kSecAttrAccount as String: "workspace-key",
-      kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-      kSecValueData as String: data,
-    ]
-    let added = SecItemAdd(add as CFDictionary, nil)
-    guard added == errSecSuccess else {
-      throw BoomError.unavailable("Could not create the Keychain key (\(added)).")
-    }
-    key = newKey
+    key = try VaultSession.shared.unlock(existingRecords: FileManager.default.contentsOfDirectory(
+      at: root, includingPropertiesForKeys: nil).contains { $0.pathExtension == "sealed" })
   }
   private static func requireDirectory(_ url: URL) throws {
     let v = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
@@ -109,18 +85,20 @@ final class Vault: @unchecked Sendable {
       throw BoomError.invalid("Private storage is not a real directory.")
     }
   }
-  private func url(_ kind: Kind, _ id: UUID) -> URL {
+  func sibling(at root: URL) throws -> Vault { try Vault(root: root, testKey: key) }
+  func recordURL(_ kind: Kind, _ id: UUID) -> URL {
     root.appendingPathComponent(kind.rawValue + "-" + id.uuidString + ".sealed")
   }
+  private func url(_ kind: Kind, _ id: UUID) -> URL { recordURL(kind, id) }
   private func aad(_ kind: Kind, _ id: UUID) -> Data {
-    Data("boom/v1/\(kind.rawValue)/\(id.uuidString)".utf8)
+    Data("bloom/v1/\(kind.rawValue)/\(id.uuidString)".utf8)
   }
   func exists(_ kind: Kind, _ id: UUID) -> Bool {
     FileManager.default.fileExists(atPath: url(kind, id).path)
   }
   func put(_ data: Data, kind: Kind, id: UUID) throws {
     guard data.count <= (kind == .workspace ? Self.workspaceLimit : 1_100_000_000) else {
-      throw BoomError.budget("Private record exceeds the 1.1 GB bound.")
+      throw BoomError.budget("Private record exceeds its bound.")
     }
     lock.lock()
     defer { lock.unlock() }
@@ -142,58 +120,101 @@ final class Vault: @unchecked Sendable {
     lock.lock()
     defer { lock.unlock() }
     let target = url(kind, id)
-    let v = try target.resourceValues(forKeys: [
-      .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey,
-    ])
+    let v = try target.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
     guard v.isRegularFile == true, v.isSymbolicLink != true, let size = v.fileSize,
-      size <= limit + 64
-    else { throw BoomError.invalid("Private record has an unsafe type or size.") }
-    let sealed = try Data(contentsOf: target, options: .mappedIfSafe)
-    return try AES.GCM.open(
-      AES.GCM.SealedBox(combined: sealed), using: key, authenticating: aad(kind, id))
+      size <= limit + 64 else { throw BoomError.invalid("Private record has an unsafe type or size.") }
+    return try AES.GCM.open(AES.GCM.SealedBox(combined: Data(contentsOf: target)),
+      using: key, authenticating: aad(kind, id))
   }
   func encode<T: Encodable>(_ value: T, kind: Kind, id: UUID) throws {
-    let encoder = PropertyListEncoder()
-    encoder.outputFormat = .binary
+    let encoder = PropertyListEncoder(); encoder.outputFormat = .binary
     try put(encoder.encode(value), kind: kind, id: id)
   }
-  func decode<T: Decodable>(_ type: T.Type, kind: Kind, id: UUID, limit: Int = 16_777_216) throws
-    -> T
-  {
+  func decode<T: Decodable>(_ type: T.Type, kind: Kind, id: UUID, limit: Int = 16_777_216) throws -> T {
     try PropertyListDecoder().decode(type, from: get(kind, id: id, limit: limit))
   }
-  /// Delete is called only for an explicit user deletion, never on a cache miss.
   func remove(_ kind: Kind, id: UUID) throws {
-    lock.lock()
-    defer { lock.unlock() }
+    lock.lock(); defer { lock.unlock() }
     let target = url(kind, id)
-    if FileManager.default.fileExists(atPath: target.path) {
-      try FileManager.default.removeItem(at: target)
-    }
+    if FileManager.default.fileExists(atPath: target.path) { try FileManager.default.removeItem(at: target) }
   }
 }
 
-@MainActor final class WorkspaceStore {
-  let root: URL
-  let documentsURL: URL
-  let modelsURL: URL
-  let vault: Vault
+/// One Keychain result for the process, including failures. Initialization of
+/// another consumer can never cause an authorization retry or a replacement key.
+final class VaultSession: @unchecked Sendable {
+  static let shared = VaultSession()
+  private let lock = NSLock()
+  private var result: Result<SymmetricKey, Error>?
+  private var lookups = 0
+  private let loader: (@Sendable (Bool) throws -> SymmetricKey)?
+  init(loader: (@Sendable (Bool) throws -> SymmetricKey)? = nil) { self.loader = loader }
+  var lookupCount: Int { lock.lock(); defer { lock.unlock() }; return lookups }
+  func unlock(existingRecords: Bool) throws -> SymmetricKey {
+    lock.lock(); defer { lock.unlock() }
+    if let result { return try result.get() }
+    lookups += 1
+    let outcome = Result { try loader?(existingRecords) ?? readOrCreate(existingRecords: existingRecords) }
+    result = outcome
+    return try outcome.get()
+  }
+  private func readOrCreate(existingRecords: Bool) throws -> SymmetricKey {
+    let query: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: "com.delysis.Bloom",
+      kSecAttrAccount as String: "workspace-master-key", kSecReturnData as String: true,
+      kSecMatchLimit as String: kSecMatchLimitOne,
+    ]
+    var result: CFTypeRef?
+    let status = SecItemCopyMatching(query as CFDictionary, &result)
+    if status == errSecSuccess {
+      guard let data = result as? Data, data.count == 32 else {
+        throw BoomError.invalid("The Keychain master key has an incompatible format. Existing data and the key were retained.")
+      }
+      return SymmetricKey(data: data)
+    }
+    guard status == errSecItemNotFound else {
+      throw BoomError.unavailable(
+        "Keychain access failed (\(status)). Existing files are untouched.")
+    }
+    guard !existingRecords else {
+      throw BoomError.unavailable(
+        "The encryption key is missing but private data exists. Restore the original Keychain key; no replacement key was created."
+      )
+    }
+    let newKey = SymmetricKey(size: .bits256)
+    let data = newKey.withUnsafeBytes { Data($0) }
+    let add: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: "com.delysis.Bloom",
+      kSecAttrAccount as String: "workspace-master-key",
+      kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+      kSecValueData as String: data,
+    ]
+    let added = SecItemAdd(add as CFDictionary, nil)
+    guard added == errSecSuccess else {
+      throw BoomError.unavailable("Could not create the Keychain key (\(added)).")
+    }
+    return newKey
+  }
+}
+
+actor WorkspaceStore {
+  nonisolated let root: URL
+  nonisolated let vault: Vault
   private var diskRevisions: [UUID: String] = [:]
-  init() throws {
+  init(rootOverride: URL? = nil, testKey: SymmetricKey? = nil) throws {
     #if BOOM_UI_TEST
     let path = ProcessInfo.processInfo.environment["BOOM_UI_TEST_ROOT"]
       ?? "/tmp/boom-ui-test-root"
     guard path.hasPrefix("/") else { throw BoomError.invalid("UI test root must be absolute.") }
     root = URL(fileURLWithPath: path).standardizedFileURL
     #else
-    // Keep the existing workspace path when the app's public name changes.
-    root = try FileManager.default.url(
+    root = try rootOverride ?? FileManager.default.url(
       for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true
-    ).appendingPathComponent("Boom", isDirectory: true)
+    ).appendingPathComponent("Bloom", isDirectory: true)
     #endif
-    documentsURL = root.appendingPathComponent("Documents", isDirectory: true)
-    modelsURL = root.appendingPathComponent("Models", isDirectory: true)
-    for u in [root, documentsURL, modelsURL] {
+    for u in [root] {
       try FileManager.default.createDirectory(
         at: u, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
       let values = try u.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
@@ -206,23 +227,21 @@ final class Vault: @unchecked Sendable {
       root: root.appendingPathComponent("Private", isDirectory: true),
       testKey: SymmetricKey(data: Data(repeating: 0x42, count: 32)))
     #else
-    vault = try Vault(root: root.appendingPathComponent("Private", isDirectory: true))
+    vault = try Vault(root: root.appendingPathComponent("Private", isDirectory: true), testKey: testKey)
     #endif
   }
   func load() -> Result<(WorkspaceState, [DocumentSnapshot]), Error> {
     Result {
+      try recoverSave()
       var state: WorkspaceState
       if vault.exists(.workspace, Vault.workspaceID) {
         state = try vault.decode(
           WorkspaceState.self, kind: .workspace, id: Vault.workspaceID, limit: Vault.workspaceLimit)
       } else {
-        let existingDocuments = try FileManager.default.contentsOfDirectory(
-          at: documentsURL, includingPropertiesForKeys: nil
-        ).contains { $0.pathExtension == "md" }
         let existingPrivate = try FileManager.default.contentsOfDirectory(
           at: vault.root, includingPropertiesForKeys: nil
         ).contains { $0.pathExtension == "sealed" }
-        guard !existingDocuments, !existingPrivate else {
+        guard !existingPrivate else {
           throw BoomError.invalid(
             "The workspace index is missing while local data exists. Existing files were retained; no empty replacement workspace was created."
           )
@@ -234,30 +253,47 @@ final class Vault: @unchecked Sendable {
       }
       guard Set(state.documents.map(\.id)).count == state.documents.count,
         Set(state.chats.map(\.id)).count == state.chats.count,
-        Set(state.personas.map(\.slug)).count == state.personas.count
+        Set(state.voices.map(\.slug)).count == state.voices.count,
+        Set(state.voices.map(\.id)).count == state.voices.count
       else { throw BoomError.invalid("Duplicate identities in workspace index.") }
+      for voice in state.voices + state.voiceVersions {
+        guard try ProductCore.voice(voice.draft).revision == voice.revision else {
+          throw BoomError.invalid("Voice revision changed; encrypted record retained.")
+        }
+      }
+      for chat in state.chats.indices {
+        for message in state.chats[chat].messages.indices where state.chats[chat].messages[message].state == .pending {
+          state.chats[chat].messages[message].state = .cancelled
+          if state.chats[chat].messages[message].text.isEmpty {
+            state.chats[chat].messages[message].failure = "Interrupted before an answer completed."
+          }
+        }
+      }
       var documents: [DocumentSnapshot] = []
-      var missing = Set<UUID>()
       for item in state.documents {
         guard FileManager.default.fileExists(atPath: documentURL(item.id).path) else {
-          missing.insert(item.id)
-          continue
+          throw BoomError.invalid("An indexed encrypted document is missing. Workspace retained.")
         }
         let text = try readDocument(item.id)
         diskRevisions[item.id] = Digest.sha256(text)
         documents.append(DocumentSnapshot(id: item.id, title: item.title, text: text))
       }
-      if !missing.isEmpty {
-        // The bytes are already gone. Drop only stale library pointers; chat
-        // snapshots and edit journals remain intact for provenance/recovery.
-        state.documents.removeAll { missing.contains($0.id) }
-        if state.selectedDocument.map(missing.contains) == true {
-          state.selectedDocument = documents.first?.id
+      let folders = state.importedFolders ?? [], files = state.importedFiles ?? [:]
+      let folderIDs = Set(folders.map(\.id)), documentIDs = Set(documents.map(\.id))
+      guard folderIDs.count == folders.count,
+        files.allSatisfy({ documentIDs.contains($0.key) && folderIDs.contains($0.value.folderID) }) else {
+        throw BoomError.invalid("Inconsistent imported-folder identities; encrypted records retained.")
+      }
+      for folder in folders {
+        let entries = files.filter { $0.value.folderID == folder.id }
+        if !entries.isEmpty {
+          _ = try ProductCore.importedTexts(entries.map { ImportedText(path: $0.value.path, text: "") })
         }
-        for index in state.chats.indices {
-          if state.chats[index].attachedDocumentID.map(missing.contains) == true {
-            state.chats[index].attachedDocumentID = nil
-          }
+      }
+      for (id, file) in files {
+        guard vault.exists(.attachment, id),
+          try Digest.sha256(vault.get(.attachment, id: id, limit: 2_097_152)) == file.originalDigest else {
+          throw BoomError.invalid("An imported original is missing or changed; encrypted records retained.")
         }
       }
       for index in state.proposals.indices where state.proposals[index].status == "pending" {
@@ -281,17 +317,57 @@ final class Vault: @unchecked Sendable {
           state.proposals[index].status = "recovery needs review"
         }
       }
-      if !missing.isEmpty { try persist(state) }
+      try recoverGenerations(&state)
       return (state, documents)
     }
   }
-  func documentURL(_ id: UUID) -> URL { documentsURL.appendingPathComponent(id.uuidString + ".md") }
+  nonisolated func documentURL(_ id: UUID) -> URL { vault.recordURL(.document, id) }
+  private func recoverGenerations(_ state: inout WorkspaceState) throws {
+    var bundles: [CandidateBundle] = [], receipts: [(UUID, ConsultationReceipt)] = []
+    guard Set(state.candidateIDs).count == state.candidateIDs.count else {
+      throw BoomError.invalid("Duplicate continuation identities; records retained.")
+    }
+    // Validate all captured records before finishing any interrupted attempt.
+    for id in state.candidateIDs {
+      var bundle = try vault.decode(CandidateBundle.self, kind: .candidate, id: id)
+      guard bundle.id == id, bundle.recipe.promptDigest == Digest.sha256(bundle.recipe.prompt),
+        Set(bundle.candidates.map(\.id)).count == bundle.candidates.count,
+        bundle.candidates.isEmpty ? bundle.selected == 0 : bundle.candidates.indices.contains(bundle.selected)
+      else { throw BoomError.invalid("Inconsistent continuation record; existing bytes retained.") }
+      var interrupted = false
+      for index in bundle.candidates.indices where bundle.candidates[index].state == .pending {
+        bundle.candidates[index].state = .cancelled
+        bundle.candidates[index].stopReason = "interrupted"
+        interrupted = true
+      }
+      if interrupted { bundles.append(bundle) }
+    }
+    for chat in state.chats {
+      for message in chat.messages where message.role == .assistant && vault.exists(.receipt, message.id) {
+        var receipt = try vault.decode(ConsultationReceipt.self, kind: .receipt, id: message.id)
+        if receipt.state == .pending {
+          receipt.state = .cancelled; receipt.failure = "The app closed before this attempt completed."
+          receipt.stopReason = "interrupted"
+          receipts.append((message.id, receipt))
+        }
+      }
+    }
+    for bundle in bundles { try vault.encode(bundle, kind: .candidate, id: bundle.id) }
+    for (id, receipt) in receipts { try vault.encode(receipt, kind: .receipt, id: id) }
+  }
+  func latestCandidate(for documentID: UUID, ids: [UUID]) throws -> CandidateBundle? {
+    for id in ids.reversed() {
+      let bundle = try vault.decode(CandidateBundle.self, kind: .candidate, id: id)
+      if bundle.recipe.document.id == documentID { return bundle }
+    }
+    return nil
+  }
   func readDocument(_ id: UUID) throws -> String {
     let u = documentURL(id)
     let v = try u.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
-    guard v.isRegularFile == true, v.isSymbolicLink != true, (v.fileSize ?? Int.max) <= 2_097_152
+    guard v.isRegularFile == true, v.isSymbolicLink != true, (v.fileSize ?? Int.max) <= 2_097_152 + 64
     else { throw BoomError.invalid("Document is not a bounded regular UTF-8 file.") }
-    let data = try Data(contentsOf: u)
+    let data = try vault.get(.document, id: id, limit: 2_097_152)
     guard let text = String(data: data, encoding: .utf8) else {
       throw BoomError.invalid("Document is not valid UTF-8; original bytes were retained.")
     }
@@ -300,8 +376,7 @@ final class Vault: @unchecked Sendable {
   func checkDisk(_ id: UUID) throws {
     guard let expected = diskRevisions[id] else { return }
     guard FileManager.default.fileExists(atPath: documentURL(id).path) else {
-      throw BoomError.unavailable(
-        "This document's Markdown file was removed outside Bloom. The open text is still in memory; copy it before closing the window.")
+      throw BoomError.unavailable("The encrypted document is missing. Export the open text before closing.")
     }
     guard Digest.sha256(try readDocument(id)) == expected else {
       throw BoomError.stale(
@@ -326,8 +401,7 @@ final class Vault: @unchecked Sendable {
         {
           throw BoomError.stale("New document UUID collides with an existing file.")
         }
-        try Data(document.text.utf8).write(to: target, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
+        try vault.put(Data(document.text.utf8), kind: .document, id: document.id)
         self.diskRevisions[document.id] = document.revision
       } catch { failure = error }
     }
@@ -345,5 +419,42 @@ final class Vault: @unchecked Sendable {
   }
   func persist(_ state: WorkspaceState) throws {
     try vault.encode(state, kind: .workspace, id: Vault.workspaceID)
+  }
+  struct SaveJournal: Codable {
+    let schema: Int
+    let state: WorkspaceState
+    let documents: [DocumentSnapshot]
+    let before: [UUID: String]
+  }
+  private func recoverSave() throws {
+    guard vault.exists(.saveJournal, Vault.workspaceID) else { return }
+    let journal = try vault.decode(SaveJournal.self, kind: .saveJournal, id: Vault.workspaceID, limit: Vault.workspaceLimit)
+    guard journal.schema == 1, journal.state.schema == 1,
+      Set(journal.documents.map(\.id)).count == journal.documents.count,
+      journal.documents.allSatisfy({ doc in journal.state.documents.contains { $0.id == doc.id } }) else {
+      throw BoomError.invalid("Invalid save journal; existing records retained.")
+    }
+    // Validate every record before repairing any of them.
+    for document in journal.documents {
+      let actual = vault.exists(.document, document.id) ? Digest.sha256(try readDocument(document.id)) : nil
+      guard actual == journal.before[document.id] || actual == document.revision else {
+        throw BoomError.stale("An interrupted save conflicts with a document; journal retained.")
+      }
+    }
+    for document in journal.documents {
+      try vault.put(Data(document.text.utf8), kind: .document, id: document.id)
+      diskRevisions[document.id] = document.revision
+    }
+    try persist(journal.state)
+    try vault.remove(.saveJournal, id: Vault.workspaceID)
+  }
+  func save(_ state: WorkspaceState, documents: [DocumentSnapshot]) throws {
+    try recoverSave()
+    for document in documents { try checkDisk(document.id) }
+    let journal = SaveJournal(schema: 1, state: state, documents: documents, before: diskRevisions)
+    try vault.encode(journal, kind: .saveJournal, id: Vault.workspaceID)
+    for document in documents { try saveDocument(document) }
+    try persist(state)
+    try vault.remove(.saveJournal, id: Vault.workspaceID)
   }
 }

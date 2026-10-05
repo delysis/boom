@@ -1,0 +1,304 @@
+{
+  "entries": [
+    {
+      "purpose": "consultation",
+      "repository": "georgewalker/bloom-gemma4-12b-consultation-mlx-q4",
+      "revision": "",
+      "manifestDigest": "3639bf3342065eb1b2da2bb0ffc786266ee5e5964bdc5727b75e5a410db35cc9",
+      "manifest": {
+        "bits": 4,
+        "calibration": "q4_0",
+        "files": [
+          {
+            "bytes": 11358,
+            "path": "LICENSE.txt",
+            "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+          },
+          {
+            "bytes": 294,
+            "path": "NOTICE.txt",
+            "sha256": "aed57c742f387b6c2556b02e2d2e9f5770ba11f0a9edf40149334d77be69b15f"
+          },
+          {
+            "bytes": 620,
+            "path": "README.md",
+            "sha256": "39cd62eb5ffa1055439e218c7543f912332687f0e3d7e684bd62d51d69cb77f9"
+          },
+          {
+            "bytes": 29351,
+            "path": "UPSTREAM-MODEL-CARD.md",
+            "sha256": "abf6c570689b1346835af53bf629d508fda96040492ce0453cd391f6d225404e"
+          },
+          {
+            "bytes": 18683,
+            "path": "chat_template.jinja",
+            "sha256": "ae53464bf3be25802b3a5b37def7fd89667067d7577049b3b2d74c4d8de4c6d4"
+          },
+          {
+            "bytes": 4584,
+            "path": "config.json",
+            "sha256": "f645a509481b68da5aa0f1cf68134ae5f47da8aefed1e79af1ab99124270a12f"
+          },
+          {
+            "bytes": 260,
+            "path": "generation_config.json",
+            "sha256": "a8349d9bd64cc5841297fcb5002f0fdc4749c473c8f1b10ea337f9ce4ee7014e"
+          },
+          {
+            "bytes": 1067635133,
+            "path": "model-00001-of-00008.safetensors",
+            "sha256": "5a2815ca4d3f5bd7ed500c90de6c99e4411d5d02194fcb64ca8a86d5c27385a8"
+          },
+          {
+            "bytes": 1065618149,
+            "path": "model-00002-of-00008.safetensors",
+            "sha256": "de518a65ed07ad4b92cc62e99c222b227c70fae04175ec50411b3f5833474bad"
+          },
+          {
+            "bytes": 1069339190,
+            "path": "model-00003-of-00008.safetensors",
+            "sha256": "14f896e8ca56e3511de89fdc7c9d4107104024a5b710927606af23868a0a2b85"
+          },
+          {
+            "bytes": 1065618354,
+            "path": "model-00004-of-00008.safetensors",
+            "sha256": "a14f40426913e3460e5e68b2b07e1480ff10239abc8eec376ee1c15f36ebb2fa"
+          },
+          {
+            "bytes": 1058279361,
+            "path": "model-00005-of-00008.safetensors",
+            "sha256": "dcef145b448b8077d1775e99779323126572ab7b464de45b3b74f4457883b2d3"
+          },
+          {
+            "bytes": 1065618362,
+            "path": "model-00006-of-00008.safetensors",
+            "sha256": "77716577e1e8baac9e2425ff90cf2938bd0d9c692f08b1e25639e12aa9aa55b3"
+          },
+          {
+            "bytes": 1065291745,
+            "path": "model-00007-of-00008.safetensors",
+            "sha256": "7bdc9403ba7c9860cd47f95b560b74a7c2138c67b2000aa21c434b7524e89ea5"
+          },
+          {
+            "bytes": 30533451,
+            "path": "model-00008-of-00008.safetensors",
+            "sha256": "9341ac02c3eda5682d2dc6340721ab3f1b8382e3aff5e2594b845a5c3262b048"
+          },
+          {
+            "bytes": 131297,
+            "path": "model.safetensors.index.json",
+            "sha256": "a21af3d6eacb700090f32485d89b525c4fee691f27409ab792747a6c227e5b65"
+          },
+          {
+            "bytes": 1382,
+            "path": "processor_config.json",
+            "sha256": "6b938e76555b3e9946890770e1abcd442a4718f34041a58e8139dc8ad34545c9"
+          },
+          {
+            "bytes": 32169626,
+            "path": "tokenizer.json",
+            "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+          },
+          {
+            "bytes": 3089,
+            "path": "tokenizer_config.json",
+            "sha256": "a62f4e85a47c0c136edaaa3a4f591fd6783717299a9def47e5ad03a49f6a5eb9"
+          }
+        ],
+        "groupSize": 32,
+        "purpose": "consultation",
+        "runtimeRevision": "9afc3b55f75a0d41a3d0c11330b9df6a036d24e4",
+        "schema": 1,
+        "upstreamFiles": [
+          {
+            "bytes": 29351,
+            "path": "README.md",
+            "sha256": "abf6c570689b1346835af53bf629d508fda96040492ce0453cd391f6d225404e"
+          },
+          {
+            "bytes": 18683,
+            "path": "chat_template.jinja",
+            "sha256": "ae53464bf3be25802b3a5b37def7fd89667067d7577049b3b2d74c4d8de4c6d4"
+          },
+          {
+            "bytes": 4310,
+            "path": "config.json",
+            "sha256": "a323d02f68420f6fa3a3548130a0d36356075a4047a622e57148558f8eee7077"
+          },
+          {
+            "bytes": 260,
+            "path": "generation_config.json",
+            "sha256": "a8349d9bd64cc5841297fcb5002f0fdc4749c473c8f1b10ea337f9ce4ee7014e"
+          },
+          {
+            "bytes": 23919549408,
+            "path": "model.safetensors",
+            "sha256": "26f2cee4292298a3f9f92209643c37c80e34e011381e22434088870d9439a0a0"
+          },
+          {
+            "bytes": 1382,
+            "path": "processor_config.json",
+            "sha256": "6b938e76555b3e9946890770e1abcd442a4718f34041a58e8139dc8ad34545c9"
+          },
+          {
+            "bytes": 32169626,
+            "path": "tokenizer.json",
+            "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+          },
+          {
+            "bytes": 3089,
+            "path": "tokenizer_config.json",
+            "sha256": "a62f4e85a47c0c136edaaa3a4f591fd6783717299a9def47e5ad03a49f6a5eb9"
+          }
+        ],
+        "upstreamRepository": "google/gemma-4-12B-it-qat-q4_0-unquantized",
+        "upstreamRevision": "b6ed86275a6a5735884e208bfed95b445a684ca2"
+      }
+    },
+    {
+      "purpose": "writing",
+      "repository": "georgewalker/bloom-gemma4-12b-writing-mlx-q4",
+      "revision": "",
+      "manifestDigest": "d23fe3c210a6cdf25db96ca88f43b0a8dd51330b08d8f632a89894345aabb9fd",
+      "manifest": {
+        "bits": 4,
+        "calibration": "standard",
+        "files": [
+          {
+            "bytes": 11358,
+            "path": "LICENSE.txt",
+            "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+          },
+          {
+            "bytes": 270,
+            "path": "NOTICE.txt",
+            "sha256": "e445e3cde449dece8e8323d29f81da4dba36b0040a30882f19a44395862a59f8"
+          },
+          {
+            "bytes": 591,
+            "path": "README.md",
+            "sha256": "09dc3834e3986b5786a908e5e47af0d00916f4445a5acd79d6fcefc02cda8c32"
+          },
+          {
+            "bytes": 28340,
+            "path": "UPSTREAM-MODEL-CARD.md",
+            "sha256": "131e26f7f1fa69445dc4b0ab98a2251811f8c3128426bf09fcef6ac5ee16e7e4"
+          },
+          {
+            "bytes": 4660,
+            "path": "config.json",
+            "sha256": "b89f4f799b545d67ff9e987f187c9c50b6ed55aea8fa722bffa93ce218933f60"
+          },
+          {
+            "bytes": 233,
+            "path": "generation_config.json",
+            "sha256": "02b56bd11e1cd1e363e701a85a2fd7fbaa2992ec3358c1cd7cc44ead7208f505"
+          },
+          {
+            "bytes": 1067635197,
+            "path": "model-00001-of-00008.safetensors",
+            "sha256": "8aeb01ba3e5ca44ef853c9be0e5c0f1d40c33432fb2817d482fc2da141f6003e"
+          },
+          {
+            "bytes": 1065618173,
+            "path": "model-00002-of-00008.safetensors",
+            "sha256": "d5dc8b3dfd29a3f0ae1c158aa5160e32719a6786e2661e8cdc42ea66aa56cece"
+          },
+          {
+            "bytes": 1069339182,
+            "path": "model-00003-of-00008.safetensors",
+            "sha256": "8c6d45c1e37463936bfac8e5316e996242515dd98ed40a79c36e70b8e7191ab6"
+          },
+          {
+            "bytes": 1065618296,
+            "path": "model-00004-of-00008.safetensors",
+            "sha256": "7eb51db6694e258395acfbfd0f51e8b8508c520ffbf96e69ba49f88aeb754f71"
+          },
+          {
+            "bytes": 1058279389,
+            "path": "model-00005-of-00008.safetensors",
+            "sha256": "7a4ea1b71c2d7ede41cc9e5dc72b3fb48b48ee166deee0304d57d0d8090e1fd9"
+          },
+          {
+            "bytes": 1065618340,
+            "path": "model-00006-of-00008.safetensors",
+            "sha256": "cb8c6aee623280322e07fa0be37d5f91b9f74c728242495612107c818c622737"
+          },
+          {
+            "bytes": 1065291795,
+            "path": "model-00007-of-00008.safetensors",
+            "sha256": "f46d1abed3a63ec38a7be8facc50ea5de57b40b82b10991762f28c5b2fd47d8c"
+          },
+          {
+            "bytes": 30533421,
+            "path": "model-00008-of-00008.safetensors",
+            "sha256": "d6a968a44a61b46e8d49ac5fcb4f9984dce0a4e27fde2cdd795cc8fb229008c6"
+          },
+          {
+            "bytes": 131297,
+            "path": "model.safetensors.index.json",
+            "sha256": "a21af3d6eacb700090f32485d89b525c4fee691f27409ab792747a6c227e5b65"
+          },
+          {
+            "bytes": 1382,
+            "path": "processor_config.json",
+            "sha256": "6b938e76555b3e9946890770e1abcd442a4718f34041a58e8139dc8ad34545c9"
+          },
+          {
+            "bytes": 32170070,
+            "path": "tokenizer.json",
+            "sha256": "12bac982b793c44b03d52a250a9f0d0b666813da566b910c24a6da0695fd11e6"
+          },
+          {
+            "bytes": 888,
+            "path": "tokenizer_config.json",
+            "sha256": "522a38334973725dba8f7c645195b19dda0c284f403f43273f77837679ba2eab"
+          }
+        ],
+        "groupSize": 32,
+        "purpose": "writing",
+        "runtimeRevision": "9afc3b55f75a0d41a3d0c11330b9df6a036d24e4",
+        "schema": 1,
+        "upstreamFiles": [
+          {
+            "bytes": 28340,
+            "path": "README.md",
+            "sha256": "131e26f7f1fa69445dc4b0ab98a2251811f8c3128426bf09fcef6ac5ee16e7e4"
+          },
+          {
+            "bytes": 4383,
+            "path": "config.json",
+            "sha256": "14f38c5492ffc9cbcdf808647ca0c025bb5b9b4eb737526347134d500ace6098"
+          },
+          {
+            "bytes": 233,
+            "path": "generation_config.json",
+            "sha256": "02b56bd11e1cd1e363e701a85a2fd7fbaa2992ec3358c1cd7cc44ead7208f505"
+          },
+          {
+            "bytes": 23919549408,
+            "path": "model.safetensors",
+            "sha256": "fe054ae05ff7f44318fd8ae90d58992531455c7ed31356704088f0f2d8c8009a"
+          },
+          {
+            "bytes": 1382,
+            "path": "processor_config.json",
+            "sha256": "6b938e76555b3e9946890770e1abcd442a4718f34041a58e8139dc8ad34545c9"
+          },
+          {
+            "bytes": 32170070,
+            "path": "tokenizer.json",
+            "sha256": "12bac982b793c44b03d52a250a9f0d0b666813da566b910c24a6da0695fd11e6"
+          },
+          {
+            "bytes": 888,
+            "path": "tokenizer_config.json",
+            "sha256": "522a38334973725dba8f7c645195b19dda0c284f403f43273f77837679ba2eab"
+          }
+        ],
+        "upstreamRepository": "google/gemma-4-12B",
+        "upstreamRevision": "023679ed352de9bb66cc873c9009ce3482585c08"
+      }
+    }
+  ]
+}

@@ -4,6 +4,12 @@ import PackageDescription
 
 let productRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
   .deletingLastPathComponent()
+let buildURL = productRoot.appendingPathComponent(".build-support/RustProductBuild.json")
+let libraryDirectory: String
+if FileManager.default.fileExists(atPath: buildURL.path) {
+  let config = try JSONDecoder().decode([String: String].self, from: Data(contentsOf: buildURL))
+  libraryDirectory = config["libraryDirectory"]!
+} else { libraryDirectory = productRoot.appendingPathComponent("target/release").path }
 let nativeLinkURL = productRoot.appendingPathComponent(".build-support/RustNativeLink.json")
 let nativeLinkFlags: [String]
 if FileManager.default.fileExists(atPath: nativeLinkURL.path) {
@@ -18,22 +24,26 @@ if FileManager.default.fileExists(atPath: nativeLinkURL.path) {
 let package = Package(
   name: "Boom",
   platforms: [.macOS(.v15)],
-  products: [.executable(name: "Boom", targets: ["Boom"])],
+  products: [.executable(name: "Boom", targets: ["Boom"]),
+    .executable(name: "BloomPackBuilder", targets: ["BloomPackBuilder"])],
   dependencies: [
     .package(path: "../Core"),
-    .package(path: "../.deps/CoreML-LLM"),
     .package(path: "../.deps/MLXSwiftLM", traits: []),
     .package(url: "https://github.com/ml-explore/mlx-swift", exact: "0.32.3"),
     .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.4"),
     .package(url: "https://github.com/huggingface/swift-huggingface.git", exact: "0.11.0"),
   ],
   targets: [
+    .executableTarget(name: "BloomPackBuilder", dependencies: [
+      .product(name: "MLXLMCommon", package: "MLXSwiftLM"),
+      .product(name: "MLXVLM", package: "MLXSwiftLM"),
+    ], resources: [.process("Resources")]),
     .target(name: "CAttachment", publicHeadersPath: "include"),
     .executableTarget(
       name: "Boom",
       dependencies: [
         .product(name: "BoomCore", package: "core"),
-        .product(name: "CoreMLLLM", package: "coreml-llm"), "CAttachment",
+        "CAttachment",
         .product(name: "MLXLMCommon", package: "MLXSwiftLM"),
         .product(name: "MLXVLM", package: "MLXSwiftLM"),
         .product(name: "MLXHuggingFace", package: "MLXSwiftLM"),
@@ -41,14 +51,15 @@ let package = Package(
         .product(name: "HuggingFace", package: "swift-huggingface"),
         .product(name: "Tokenizers", package: "swift-transformers"),
       ],
+      resources: [.process("Resources")],
       linkerSettings: [
         .unsafeFlags(
           [
-            "-L" + productRoot.appendingPathComponent("RustBridge/target/release").path,
+            "-L" + libraryDirectory,
             "-lboom_attachment_ffi",
           ] + nativeLinkFlags.flatMap { ["-Xlinker", $0] }),
         .linkedFramework("AppKit"), .linkedFramework("Security"),
-        .linkedFramework("SystemConfiguration"), .linkedFramework("CoreML"),
+        .linkedFramework("SystemConfiguration"),
         .linkedFramework("AVFoundation"), .linkedFramework("Speech"),
       ]),
     .testTarget(name: "BoomTests", dependencies: ["Boom"]),
