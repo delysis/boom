@@ -97,6 +97,21 @@ enum ProductCore {
     try call(["op": "writing_prompt", "text": document.text, "caretUtf16": caret,
       "examples": examples, "retainedCharacters": retaining])
   }
+  static func contextVocabulary(_ descriptor: [String: Any]) throws -> ContextVocabulary {
+    ContextVocabulary(id: try call(["op": "context_vocabulary", "descriptor": descriptor]))
+  }
+  static func writingContext(_ document: DocumentSnapshot, caret: Int, examples: [String],
+    capacity: Int, dictionary: ContextVocabulary) throws -> WritingContextStep {
+    try call(["op": "begin_writing_context", "dictionary": dictionary.id.uuidString,
+      "text": document.text, "caretUtf16": caret, "examples": examples, "capacity": capacity])
+  }
+  static func countedContext(_ step: WritingContextStep, prompt: WritingPrompt, count: Int) throws -> WritingContextStep {
+    try call(["op": "count_writing_context", "id": step.id.uuidString,
+      "promptDigest": prompt.digest, "count": count])
+  }
+  static func releaseContext(_ id: UUID) {
+    let _: Bool? = try? call(["op": "release_writing_context", "id": id.uuidString])
+  }
   struct WritingExample: Decodable { let title: String; let text: String }
   static func writingExample(title: String, text: String) throws -> WritingExample {
     try call(["op": "validate_writing_example", "title": title, "text": text])
@@ -113,6 +128,17 @@ enum ProductCore {
   static func residencyBudget(physical: UInt64, metal: UInt64) throws -> UInt64 {
     try call(["op": "residency_budget", "physicalBytes": physical, "metalBytes": metal])
   }
+}
+final class ContextVocabulary: Sendable {
+  let id: UUID
+  init(id: UUID) { self.id = id }
+  deinit { let _: Bool? = try? ProductCore.call(["op": "release_context_vocabulary", "id": id.uuidString]) }
+}
+struct WritingContextStep: Decodable {
+  let id: UUID
+  let status: String
+  let candidate: WritingPrompt?
+  let testedCandidates: Int
 }
 struct ProductLayout: Codable, Sendable {
   let edition: String
@@ -246,4 +272,4 @@ struct ConsultationReceipt: Codable, Sendable {
   var elapsedSeconds: Double
 }
 
-struct WritingPrompt: Decodable { let prompt: String; let digest: String; let totalCharacters: Int; let omittedCharacters: Int }
+struct WritingPrompt: Codable { let prompt: String; let digest: String; let totalCharacters: Int; let omittedCharacters: Int }

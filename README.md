@@ -6,6 +6,8 @@ Bloom has two compile-time layouts. The author build keeps a bounded manuscript 
 
 Continuation replay uses its saved manuscript, prompt, model, sampling and seed even after live edits. Branching creates a new manuscript from that captured snapshot and retains its lineage. Acceptance requires the current manuscript, caret and example revisions to match the request. Safe Rust validates captured recipes and branch size before either action.
 
+Writing supplies the chosen examples as prose, followed by the manuscript before the caret. When the full prefix exceeds the budget, Rust excludes impossible suffixes using validated vocabulary bounds and asks the loaded tokenizer to check the remaining suffixes in order. The first fit retains the most recent contiguous text possible, without splitting a grapheme. Token counts can decrease when text is added; a binary search cannot establish this result. Text after the caret is excluded.
+
 ## Privacy and ownership
 
 The fresh workspace is `~/Library/Application Support/Bloom/Private`. Documents, conversations, voice revisions, attachment originals, continuations, receipts and recovery journals are authenticated encrypted records. There is no migration, old-store reader, or plaintext workspace mode. Existing Boom stores are left alone.

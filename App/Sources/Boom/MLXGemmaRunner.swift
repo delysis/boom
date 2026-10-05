@@ -52,6 +52,8 @@ actor MLXGemmaRunner {
   private let architectureContext: Int
   private let kvBytesPerToken: UInt64
   private let controlTokens: Set<Int>
+  private let tokenizerDescription: Data
+  private var contextVocabulary: ContextVocabulary?
   private struct Configuration: Decodable {
     let model_type: String
     let text_config: Text
@@ -75,16 +77,19 @@ actor MLXGemmaRunner {
       guard config.model_type == "gemma4_unified", text.max_position_embeddings > 0,
         text.num_hidden_layers > 0, text.num_key_value_heads > 0, text.head_dim > 0
       else { throw BoomError.invalid("This is not the supported Gemma 4 12B model.") }
-      let tokenizer = try JSONDecoder().decode(TokenizerFile.self,
-        from: Data(contentsOf: directory.appendingPathComponent("tokenizer.json")))
+      let tokenizerDescription = try Data(contentsOf: directory.appendingPathComponent("tokenizer.json"))
+      let tokenizer = try JSONDecoder().decode(TokenizerFile.self, from: tokenizerDescription)
       let model = try await VLMModelFactory.shared.loadContainer(
         from: directory, using: #huggingFaceTokenizerLoader())
+      guard tokenizerDescription == (try Data(contentsOf: directory.appendingPathComponent("tokenizer.json"))) else {
+        throw BoomError.stale("The tokenizer changed while the model was loading.")
+      }
       let runner = MLXGemmaRunner(source: directory, container: model,
         identity: try identity ?? ModelInstaller.hashFile(directory.appendingPathComponent(ModelPacks.manifestName), maxBytes: 4_194_304).sha256,
         architectureContext: text.max_position_embeddings,
         kvBytesPerToken: UInt64(text.num_hidden_layers) * UInt64(text.num_key_value_heads)
           * UInt64(text.head_dim) * 4,
-        controlTokens: Set(tokenizer.added_tokens.filter(\.special).map(\.id)))
+        controlTokens: Set(tokenizer.added_tokens.filter(\.special).map(\.id)), tokenizerDescription: tokenizerDescription)
       guard try runner.availableContext() >= 1024 else {
         throw BoomError.budget("The model leaves too little memory for a useful context.")
       }
@@ -93,10 +98,11 @@ actor MLXGemmaRunner {
     } catch { await GenerationCoordinator.shared.leave(); throw error }
   }
   private init(source: URL, container: ModelContainer, identity: String,
-    architectureContext: Int, kvBytesPerToken: UInt64, controlTokens: Set<Int>) {
+    architectureContext: Int, kvBytesPerToken: UInt64, controlTokens: Set<Int>, tokenizerDescription: Data) {
     self.source = source; self.identity = identity
     self.container = container; self.architectureContext = architectureContext
     self.kvBytesPerToken = kvBytesPerToken; self.controlTokens = controlTokens
+    self.tokenizerDescription = tokenizerDescription
   }
   private nonisolated func availableContext() throws -> Int {
     min(16_384, architectureContext, Int(clamping: try ModelResidency.availableBytes() / kvBytesPerToken))
@@ -104,6 +110,51 @@ actor MLXGemmaRunner {
   var contextLength: Int { (try? availableContext()) ?? 0 }
   func tokenCount(_ text: String) async -> Int {
     await container.perform { $0.tokenizer.encode(text: text, addSpecialTokens: false).count }
+  }
+  private func writingVocabulary(tokenizer: any MLXLMCommon.Tokenizer, flag: CancellationFlag) throws -> ContextVocabulary {
+    if let contextVocabulary { return contextVocabulary }
+    guard let description = try JSONSerialization.jsonObject(with: tokenizerDescription) as? [String: Any],
+      var model = description["model"] as? [String: Any], let vocabulary = model["vocab"] as? NSDictionary,
+      let added = description["added_tokens"] as? [[String: Any]],
+      let normalizer = description["normalizer"], let preTokenizer = description["pre_tokenizer"] else {
+      throw BoomError.invalid("Invalid writing tokenizer description.")
+    }
+    // Use the loaded tokenizer's exact strings. A Swift dictionary keyed by
+    // String would collapse canonically equivalent vocabulary entries.
+    let ids = vocabulary.allValues.compactMap { ($0 as? NSNumber)?.intValue }
+      + added.compactMap { ($0["id"] as? NSNumber)?.intValue }
+    var words: [String] = []; words.reserveCapacity(ids.count)
+    for id in Set(ids) {
+      try flag.check()
+      guard let word = tokenizer.convertIdToToken(id) else { throw BoomError.invalid("The loaded tokenizer has an incomplete vocabulary.") }
+      words.append(word)
+    }
+    model.removeValue(forKey: "vocab"); model.removeValue(forKey: "merges")
+    let dictionary = try ProductCore.contextVocabulary(["vocabulary": words, "normalizer": normalizer,
+      "preTokenizer": preTokenizer, "model": model, "addedTokens": added])
+    contextVocabulary = dictionary
+    return dictionary
+  }
+  func writingContext(document: DocumentSnapshot, caret: Int, examples: [String], capacity: Int,
+    flag: CancellationFlag) async throws -> (WritingPrompt, Int) {
+    try flag.check()
+    let tokenizer = await container.perform { $0.tokenizer }
+    let dictionary = try writingVocabulary(tokenizer: tokenizer, flag: flag)
+    var step = try ProductCore.writingContext(document, caret: caret, examples: examples,
+      capacity: capacity, dictionary: dictionary)
+    defer { ProductCore.releaseContext(step.id) }
+    while step.status == "candidate", let prompt = step.candidate {
+      try flag.check()
+      let count = tokenizer.encode(text: prompt.prompt, addSpecialTokens: false).count
+      try flag.check()
+      step = try ProductCore.countedContext(step, prompt: prompt, count: count)
+      await Task.yield()
+    }
+    try flag.check()
+    guard step.status == "selected", let prompt = step.candidate else {
+      throw BoomError.budget("The examples leave no room for text at the caret.")
+    }
+    return (prompt, step.testedCandidates)
   }
   private static func chatInput(_ plan: ConsultationPlan, images: [Data], context: ModelContext) async throws -> LMInput {
     let media = try images.map { UserInput.Image.ciImage(try LocalImage.decode($0)) }
@@ -162,23 +213,9 @@ actor MLXGemmaRunner {
   func completionRecipe(document: DocumentSnapshot, caret: Int, sources: [SourceReference],
     examples: [String], profile: SamplingProfile, maxTokens: Int, flag: CancellationFlag
   ) async throws -> CompletionRecipe {
-    let full = try ProductCore.writingPrompt(document, caret: caret, examples: examples, retaining: Int.max)
-    guard full.totalCharacters > 0 else { throw BoomError.unavailable("Write some text before requesting a continuation.") }
     let capacity = try availableContext() - maxTokens
-    let empty = try ProductCore.writingPrompt(document, caret: caret, examples: examples, retaining: 0)
-    guard capacity > 0, await tokenCount(empty.prompt) < capacity else { throw BoomError.budget("The examples leave no room for the manuscript.") }
-    var selected = full
-    if await tokenCount(full.prompt) > capacity {
-      var low = 1, high = full.totalCharacters
-      while low < high {
-        try flag.check()
-        let middle = low + (high - low + 1) / 2
-        let candidate = try ProductCore.writingPrompt(document, caret: caret, examples: examples, retaining: middle)
-        if await tokenCount(candidate.prompt) <= capacity { low = middle } else { high = middle - 1 }
-      }
-      selected = try ProductCore.writingPrompt(document, caret: caret, examples: examples, retaining: low)
-    }
-    guard await tokenCount(selected.prompt) <= capacity else { throw BoomError.budget("The text at the caret does not fit.") }
+    let (selected, _) = try await writingContext(document: document, caret: caret, examples: examples,
+      capacity: capacity, flag: flag)
     return CompletionRecipe(document: document, caretUTF16: caret, sources: sources,
       prompt: selected.prompt, promptDigest: selected.digest, omittedPrefixCharacters: selected.omittedCharacters,
       model: identity, profile: profile, settings: try ProductCore.sampling(profile), maxTokens: maxTokens)
@@ -274,7 +311,7 @@ actor MLXGemmaRunner {
   func join() async { await GenerationCoordinator.shared.enter(); await GenerationCoordinator.shared.leave() }
 }
 
-private extension Duration {
+extension Duration {
   var timeInterval: Double {
     let value = components
     return Double(value.seconds) + Double(value.attoseconds) / 1e18

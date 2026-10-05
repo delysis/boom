@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 const TEXT_LIMIT: usize = 2 * 1024 * 1024;
 
+mod context;
 mod document;
 mod generation;
 mod import;
@@ -645,6 +646,27 @@ fn sampling(profile: &str) -> Result<Sampling, Error> {
     deny_unknown_fields
 )]
 pub enum Request {
+    ContextVocabulary {
+        descriptor: context::Vocabulary,
+    },
+    ReleaseContextVocabulary {
+        id: Uuid,
+    },
+    BeginWritingContext {
+        dictionary: Uuid,
+        text: String,
+        caret_utf16: usize,
+        examples: Vec<String>,
+        capacity: u32,
+    },
+    CountWritingContext {
+        id: Uuid,
+        prompt_digest: String,
+        count: u32,
+    },
+    ReleaseWritingContext {
+        id: Uuid,
+    },
     ValidateWritingRecipe {
         recipe: Box<writing::Recipe>,
     },
@@ -762,6 +784,31 @@ pub enum Request {
 
 pub fn execute(request: Request) -> Result<Value, Error> {
     match request {
+        Request::ContextVocabulary { descriptor } => {
+            serde_json::to_value(context::vocabulary(descriptor)?)
+        }
+        Request::ReleaseContextVocabulary { id } => {
+            serde_json::to_value(context::release_vocabulary(id)?)
+        }
+        Request::BeginWritingContext {
+            dictionary,
+            text,
+            caret_utf16,
+            examples,
+            capacity,
+        } => serde_json::to_value(context::begin(
+            dictionary,
+            &text,
+            caret_utf16,
+            &examples,
+            capacity,
+        )?),
+        Request::CountWritingContext {
+            id,
+            prompt_digest,
+            count,
+        } => serde_json::to_value(context::counted(id, &prompt_digest, count)?),
+        Request::ReleaseWritingContext { id } => serde_json::to_value(context::release_search(id)?),
         Request::ValidateWritingRecipe { recipe } => {
             serde_json::to_value(writing::validate(&recipe)?)
         }
