@@ -20,7 +20,7 @@ exec > >(tee "$OUT/build.log") 2>&1
 source_inventory() {
   (
     cd "$HERE"
-    { find App/Sources App/Tests Core/Sources Core/Tests RustBridge/src crates scripts -type f; printf '%s\n' App/Package.swift Core/Package.swift RustBridge/Cargo.toml Cargo.toml Info.plist NOTICE.md; } | LC_ALL=C sort | while IFS= read -r path; do shasum -a 256 "$path"; done
+    { find App/Sources App/Tests Core/Sources Core/Tests RustBridge/src crates scripts -type f; printf '%s\n' App/Package.swift Core/Package.swift RustBridge/Cargo.toml Cargo.toml Info.plist Entitlements.plist NOTICE.md; } | LC_ALL=C sort | while IFS= read -r path; do shasum -a 256 "$path"; done
   )
 }
 source_inventory > "$OUT/source-files-before.sha256"
@@ -77,12 +77,23 @@ cp "$HERE/App/Package.resolved" "$OUT/Package.resolved"
 # Signing only the SwiftPM executable leaves Info.plist unbound and can abort
 # Speech or microphone access when launched outside LaunchServices.
 SIGN_IDENTITY="${BLOOM_SIGN_IDENTITY:-Apple Development: georgewalkeriv@gmail.com (FZ4WD25KGG)}"
-codesign --force --deep --options runtime --timestamp=none --sign "$SIGN_IDENTITY" "$APP"
+codesign --force --deep --options runtime --timestamp=none --entitlements "$HERE/Entitlements.plist" --sign "$SIGN_IDENTITY" "$APP"
 codesign --verify --strict --verbose=2 "$APP"
+codesign -d --entitlements - --xml "$APP" > "$OUT/signed-entitlements.plist" 2> "$OUT/entitlements-inspection.log"
+python3 - "$HERE/Entitlements.plist" "$OUT/signed-entitlements.plist" <<'PYENTITLEMENTS'
+import plistlib,sys
+expected = {'com.apple.security.device.audio-input': True}
+for path in sys.argv[1:]:
+    with open(path, 'rb') as stream:
+        actual = plistlib.load(stream)
+    if actual != expected or type(actual.get('com.apple.security.device.audio-input')) is not bool:
+        raise SystemExit(f'Unexpected microphone signing entitlements: {path}')
+PYENTITLEMENTS
 codesign -d -r- "$APP" > "$OUT/designated-requirement.txt" 2>&1
 codesign -dv --verbose=4 "$APP" > "$OUT/code-signing-scope.txt" 2>&1
 rg -q 'Info.plist entries=[1-9]' "$OUT/code-signing-scope.txt"
 rg -q 'Sealed Resources version=2' "$OUT/code-signing-scope.txt"
+rg -q 'flags=.*\(runtime\)' "$OUT/code-signing-scope.txt"
 otool -L "$APP/Contents/MacOS/Bloom" > "$OUT/dynamic-dependencies.txt"
 shasum -a 256 "$APP/Contents/MacOS/Bloom" > "$OUT/executable.sha256"
 du -sk "$APP" > "$OUT/bundle-size-kib.txt"
