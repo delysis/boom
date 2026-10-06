@@ -118,8 +118,12 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
   private var terminating = false
   private var isNativeCheck = false
   static func workspaceWindow(frame: NSRect) -> NSWindow {
-    NSWindow(contentRect: frame, styleMask: [.titled, .closable, .miniaturizable, .resizable],
+    let window = NSWindow(contentRect: frame, styleMask: [.titled, .closable, .miniaturizable, .resizable],
       backing: .buffered, defer: false)
+    // Workspace restoration belongs to the encrypted store, not AppKit Resume.
+    window.isRestorable = false
+    window.disableSnapshotRestoration()
+    return window
   }
   func applicationDidFinishLaunching(_ notification: Notification) {
     Task { await openWorkspace() }

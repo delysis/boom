@@ -39,11 +39,36 @@ final class NativeDemoRecorderTests: XCTestCase {
     XCTAssertEqual(metadata["frame_ledger_sha256"] as? String, Digest.sha256(ledger))
     XCTAssertEqual(metadata["desktop_capture"] as? Bool, false)
     XCTAssertEqual(metadata["physical_interaction_qualified"] as? Bool, false)
+    XCTAssertEqual(metadata["appkit_window_restoration_disabled"] as? Bool, true)
     let frames = try XCTUnwrap(JSONSerialization.jsonObject(with: ledger) as? [[String: Any]])
     XCTAssertTrue(frames.contains { $0["phase"] as? String == "First public native state" })
     XCTAssertTrue(frames.contains { $0["phase"] as? String == "Second public native state" })
     let times = try frames.map { try XCTUnwrap($0["seconds"] as? Double) }
     XCTAssertTrue(zip(times, times.dropFirst()).allSatisfy { $0 < $1 })
     XCTAssertThrowsError(try NativeDemoRecorder(view: view, evidence: root))
+  }
+
+  @MainActor func testRecordingRejectsRestorationEnabledBeforeOrDuringCapture() throws {
+    let app = NSApplication.shared, previous = NSApplication.shared.activationPolicy()
+    app.setActivationPolicy(.prohibited); defer { app.setActivationPolicy(previous) }
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-public-restoration-" + UUID().uuidString)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 1440, height: 900))
+    window.isReleasedWhenClosed = false; defer { window.close() }
+    let view = NSView(frame: NSRect(x: 0, y: 0, width: 1440, height: 900)); window.contentView = view
+    window.isRestorable = true
+    XCTAssertThrowsError(try NativeDemoRecorder(view: view, evidence: root))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("demonstration.mp4").path))
+    window.isRestorable = false
+    let recorder = try NativeDemoRecorder(view: view, evidence: root)
+    defer { recorder.cancel() }
+    try recorder.frame("Public frame before a policy change")
+    window.isRestorable = true
+    XCTAssertThrowsError(try recorder.frame("Public frame after a policy change"))
+    recorder.cancel()
+    let frames = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("demonstration-frames.json"))) as? [[String: Any]])
+    XCTAssertEqual(frames.count, 1)
+    XCTAssertEqual(frames.first?["phase"] as? String, "Public frame before a policy change")
   }
 }

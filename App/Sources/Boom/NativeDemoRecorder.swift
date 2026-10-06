@@ -23,7 +23,7 @@ import Foundation
 
   init(view: NSView, evidence: URL) throws {
     guard NSApp.activationPolicy() == .prohibited, let window = view.window,
-      !window.isVisible,
+      !window.isVisible, !window.isRestorable, window.restorationClass == nil,
       view.bounds.width == 1440, view.bounds.height == 900 else {
       throw BoomError.invalid("Record only an offscreen public diagnostic view.")
     }
@@ -50,7 +50,8 @@ import Foundation
   func frame(_ phase: String) throws {
     let seconds = started.duration(to: clock.now).timeInterval
     guard !ended, seconds <= 300, frames.count < 1800,
-      NSApp.activationPolicy() == .prohibited, view.window?.isVisible == false else {
+      NSApp.activationPolicy() == .prohibited, view.window?.isVisible == false,
+      view.window?.isRestorable == false, view.window?.restorationClass == nil else {
       throw BoomError.invalid("The public recording exceeded its scope or deadline.")
     }
     if let last = frames.last, last.phase == phase, seconds - last.seconds < 0.2 { return }
@@ -95,6 +96,9 @@ import Foundation
 
   func finish() async throws {
     guard !ended, frames.count >= 2 else { throw BoomError.invalid("The demonstration has no recorded journey.") }
+    guard view.window?.isRestorable == false, view.window?.restorationClass == nil else {
+      throw BoomError.invalid("The diagnostic window enabled system restoration; recording retained.")
+    }
     try JSONEncoder().encode(frames).write(to: evidence.appendingPathComponent("demonstration-frames.json"), options: .atomic)
     ended = true; input.markAsFinished()
     await writer.finishWriting()
@@ -108,6 +112,8 @@ import Foundation
       let movie = try ModelInstaller.hashFile(evidence.appendingPathComponent("demonstration.mp4"), maxBytes: 268_435_456)
       let receipt: [String: Any] = ["scope": "offscreen production native view, public controller-driven fixture",
         "desktop_capture": false, "physical_interaction_qualified": false, "keychain_dialogs_qualified": false,
+        "appkit_window_restoration_disabled": true,
+        "appkit_snapshot_policy": "disabled_in_workspace_window_factory",
         "frames": frames.count, "width": 1440, "height": 900,
         "first_frame_seconds": frames[0].seconds, "last_frame_seconds": frames[frames.count - 1].seconds,
         "movie_sha256": movie.sha256, "movie_bytes": movie.bytes,
