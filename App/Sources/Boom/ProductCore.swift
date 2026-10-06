@@ -171,6 +171,19 @@ enum ProductCore {
   static func residencyBudget(physical: UInt64, metal: UInt64) throws -> UInt64 {
     try call(["op": "residency_budget", "physicalBytes": physical, "metalBytes": metal])
   }
+  static func residencyLimits(physical: UInt64, metal: UInt64) throws -> ResidencyLimits {
+    try call(["op": "residency_limits", "physicalBytes": physical, "metalBytes": metal])
+  }
+  static func contextCapacity(configuration: Data, available: UInt64, width: Int) throws -> Int {
+    try call(["op": "context_capacity", "configuration": JSONSerialization.jsonObject(with: configuration),
+      "availableBytes": available, "width": width])
+  }
+}
+struct ResidencyLimits: Codable, Sendable {
+  let applicationBytes: UInt64
+  let allocatorBytes: UInt64
+  let cacheBytes: UInt64
+  let workingReserveBytes: UInt64
 }
 enum MediaContainer: String, Decodable {
   case mp4, wav, aiff, flac, mp3, aac, ogg

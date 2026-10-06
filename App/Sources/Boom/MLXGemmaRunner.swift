@@ -68,8 +68,7 @@ actor MLXGemmaRunner {
   nonisolated let identity: String
   nonisolated let generationPolicy: ModelGenerationPolicy
   private let container: ModelContainer
-  private let architectureContext: Int
-  private let kvBytesPerToken: UInt64
+  private let cacheConfiguration: Data
   private let tokenizerDescription: Data
   private var contextVocabulary: ContextVocabulary?
   private struct Configuration: Decodable {
@@ -90,8 +89,11 @@ actor MLXGemmaRunner {
   static func load(directory: URL, identity: String? = nil) async throws -> MLXGemmaRunner {
     await GenerationCoordinator.shared.enter()
     do {
+      try ModelResidency.configure()
+      try ModelResidency.check()
+      let configuration = try Data(contentsOf: directory.appendingPathComponent("config.json"))
       let config = try JSONDecoder().decode(Configuration.self,
-        from: Data(contentsOf: directory.appendingPathComponent("config.json")))
+        from: configuration)
       let text = config.text_config
       guard config.model_type == "gemma4_unified", text.max_position_embeddings > 0,
         text.num_hidden_layers > 0, text.num_key_value_heads > 0, text.head_dim > 0
@@ -113,12 +115,15 @@ actor MLXGemmaRunner {
       let controls = tokenizer.added_tokens.filter(\.special).map(\.id) + (tokenizerEnds.1.map { [$0] } ?? [])
       let policy = try ProductCore.generationPolicy(vocabularySize: text.vocab_size,
         configuration: generationDescription, controls: controls, tokenizerEOS: tokenizerEnds.0)
+      guard let object = try JSONSerialization.jsonObject(with: configuration) as? [String: Any],
+        let cacheConfiguration = object["text_config"] as? [String: Any] else {
+        throw BoomError.invalid("Missing model cache configuration.")
+      }
       let runner = MLXGemmaRunner(source: directory, container: model,
         identity: try identity ?? ModelInstaller.hashFile(directory.appendingPathComponent(ModelPacks.manifestName), maxBytes: 4_194_304).sha256,
-        architectureContext: text.max_position_embeddings,
-        kvBytesPerToken: UInt64(text.num_hidden_layers) * UInt64(text.num_key_value_heads)
-          * UInt64(text.head_dim) * 4,
+        cacheConfiguration: try JSONSerialization.data(withJSONObject: cacheConfiguration),
         generationPolicy: policy, tokenizerDescription: tokenizerDescription)
+      try ModelResidency.check()
       guard try runner.availableContext() >= 1024 else {
         throw BoomError.budget("The model leaves too little memory for a useful context.")
       }
@@ -127,23 +132,43 @@ actor MLXGemmaRunner {
     } catch { await GenerationCoordinator.shared.leave(); throw error }
   }
   private init(source: URL, container: ModelContainer, identity: String,
-    architectureContext: Int, kvBytesPerToken: UInt64, generationPolicy: ModelGenerationPolicy, tokenizerDescription: Data) {
+    cacheConfiguration: Data, generationPolicy: ModelGenerationPolicy, tokenizerDescription: Data) {
     self.source = source; self.identity = identity
-    self.container = container; self.architectureContext = architectureContext
-    self.kvBytesPerToken = kvBytesPerToken; self.generationPolicy = generationPolicy
+    self.container = container; self.cacheConfiguration = cacheConfiguration
+    self.generationPolicy = generationPolicy
     self.tokenizerDescription = tokenizerDescription
   }
   private nonisolated func availableContext(batchWidth: Int = 1) throws -> Int {
-    guard (1...4).contains(batchWidth) else { throw BoomError.invalid("Invalid inference batch width.") }
-    return min(16_384, architectureContext,
-      // Include the single-row prefill cache while expanded row storage is
-      // being materialized. This is deliberately conservative for shared KV.
-      Int(clamping: try ModelResidency.availableBytes()
-        / (kvBytesPerToken * UInt64(batchWidth == 1 ? 1 : batchWidth + 1))))
+    try ProductCore.contextCapacity(configuration: cacheConfiguration,
+      available: ModelResidency.availableBytes(), width: batchWidth)
   }
   var contextLength: Int { (try? availableContext()) ?? 0 }
+  func contextLength(batchWidth: Int) throws -> Int { try availableContext(batchWidth: batchWidth) }
   func tokenCount(_ text: String) async -> Int {
     await container.perform { $0.tokenizer.encode(text: text, addSpecialTokens: false).count }
+  }
+  /// Public diagnostic fixture construction using this exact loaded tokenizer.
+  func diagnosticPrefix(tokens: Int) async throws -> String {
+    guard (1...16_384).contains(tokens) else { throw BoomError.invalid("Invalid public fixture token bound.") }
+    return try await container.perform { context in
+      let authored = "<bos>" + String(repeating:
+        "The harbor was quiet. A light moved across the water, and the keeper watched from the window.\n", count: 1024)
+      let ids = context.tokenizer.encode(text: authored, addSpecialTokens: false)
+      let text = context.tokenizer.decode(tokenIds: Array(ids.prefix(tokens)))
+      guard context.tokenizer.encode(text: text, addSpecialTokens: false).count == tokens else {
+        throw BoomError.invalid("Public fixture did not round-trip to the requested exact token count.")
+      }
+      return text
+    }
+  }
+  func tokenCount(_ plan: ConsultationPlan) async throws -> Int {
+    await GenerationCoordinator.shared.enter()
+    do {
+      let count = try await container.perform { context in
+        try await Self.chatInput(plan, images: [], context: context).text.tokens.size
+      }
+      await GenerationCoordinator.shared.leave(); return count
+    } catch { await GenerationCoordinator.shared.leave(); throw error }
   }
   private func writingVocabulary(tokenizer: any MLXLMCommon.Tokenizer, flag: CancellationFlag) throws -> ContextVocabulary {
     if let contextVocabulary { return contextVocabulary }
@@ -286,6 +311,10 @@ actor MLXGemmaRunner {
   private func ownedOperation<R: Sendable>(flag: CancellationFlag, background: Bool,
     operation: @escaping @Sendable () async throws -> R) async throws -> R {
     await GenerationCoordinator.shared.enter(flag: flag, background: background)
+    let watch: OperationMemoryWatch
+    do { watch = try OperationMemoryWatch(flag: flag) }
+    catch { await GenerationCoordinator.shared.leave(); throw error }
+    defer { watch.stop() }
     // Own the whole task before preparing input or constructing the iterator.
     // MLX checks Task cancellation between prefill chunks, before a stream
     // producer exists. Every exit fences submitted GPU work before handoff.
@@ -297,6 +326,9 @@ actor MLXGemmaRunner {
       let result = try await withTaskCancellationHandler {
         try await work.value
       } onCancel: { flag.cancel(); work.cancel() }
+      watch.stop()
+      try ModelResidency.check()
+      if watch.exceeded { throw BoomError.budget("The operation reached Bloom's application memory budget.") }
       await GenerationCoordinator.shared.leave()
       return result
     } catch { await GenerationCoordinator.shared.leave(); throw error }
@@ -331,119 +363,121 @@ actor MLXGemmaRunner {
     let capacity = try availableContext(batchWidth: seeds.count), policy = generationPolicy
     let controls = Set(policy.controlTokenIDs), ends = Set(policy.eosTokenIDs)
     return try await container.perform { (context: ModelContext) async throws -> [Output] in
-      defer { Stream.defaultStream.synchronize() }
-      let promptIDs = context.tokenizer.encode(text: raw, addSpecialTokens: false)
-      try ProductCore.admitWritingBatch(width: seeds.count, prompt: promptIDs.count,
-        output: maxTokens, capacity: capacity)
-      let digest = Digest.sha256(try JSONEncoder().encode(promptIDs))
-      let parameters = GenerateParameters(maxTokens: maxTokens, temperature: settings.temperature,
-        topP: settings.topP, topK: settings.topK, minP: settings.minP, repetitionPenalty: nil,
-        prefill: PrefillParameters(progress: { processed, total in
-          onPrefill?(PrefillProgress(operationID: flag.operationID, processedPositions: processed, totalPositions: total))
-        }))
-      let cache = try context.model.newCache(parameters: parameters)
-      let clock = ContinuousClock(), started = clock.now
-      let prepared = try context.model.prepare(LMInput(tokens: MLXArray(promptIDs)),
-        cache: cache, state: nil, prefill: parameters.prefill)
-      let initial: LMOutput
-      switch prepared {
-      case .logits(let output): initial = output
-      case .tokens(let tail):
-        initial = context.model(LMInput.Text(tokens: tail.tokens.expandedDimensions(axis: 0)), cache: cache, state: nil)
-      }
-      guard initial.state == nil else { throw BoomError.invalid("This checkpoint needs unsupported per-row inference state.") }
-      var logits = initial.logits[0..., -1, 0...]
-      eval(logits); eval(cache)
-      try flag.check()
-      // Preserve each existing cache object's offsets and rotating-window
-      // metadata. Only its leading tensor dimension changes.
-      for var entry in cache {
-        let state = entry.state
-        if state.isEmpty { continue } // Gemma's shared-KV layers have no own tensors.
-        guard (entry is KVCacheSimple || entry is RotatingKVCache), state.count == 2,
-          state.allSatisfy({ $0.ndim == 4 && $0.dim(0) == 1 }) else {
-          throw BoomError.invalid("Unsupported cache layout for batched writing.")
+      try await InferenceExecutor.shared.perform { _ in
+        defer { Stream.defaultStream.synchronize() }
+        let promptIDs = context.tokenizer.encode(text: raw, addSpecialTokens: false)
+        try ProductCore.admitWritingBatch(width: seeds.count, prompt: promptIDs.count,
+          output: maxTokens, capacity: capacity)
+        let digest = Digest.sha256(try JSONEncoder().encode(promptIDs))
+        let parameters = GenerateParameters(maxTokens: maxTokens, temperature: settings.temperature,
+          topP: settings.topP, topK: settings.topK, minP: settings.minP, repetitionPenalty: nil,
+          prefill: PrefillParameters(progress: { processed, total in
+            onPrefill?(PrefillProgress(operationID: flag.operationID, processedPositions: processed, totalPositions: total))
+          }))
+        let cache = try context.model.newCache(parameters: parameters)
+        let clock = ContinuousClock(), started = clock.now
+        let prepared = try context.model.prepare(LMInput(tokens: MLXArray(promptIDs)),
+          cache: cache, state: nil, prefill: parameters.prefill)
+        let initial: LMOutput
+        switch prepared {
+        case .logits(let output): initial = output
+        case .tokens(let tail):
+          initial = context.model(LMInput.Text(tokens: tail.tokens.expandedDimensions(axis: 0)), cache: cache, state: nil)
         }
-        entry.state = state.map { broadcast($0, to: [seeds.count] + Array($0.shape.dropFirst())) }
-      }
-      eval(cache)
-      logits = broadcast(logits, to: [seeds.count, logits.dim(1)])
-      let mask = CheckpointTokenMask(policy.suppressedTokenIDs)
-      let samplers = seeds.map { seed in
-        GenerateParameters(temperature: settings.temperature, topP: settings.topP,
-          topK: settings.topK, minP: settings.minP, repetitionPenalty: nil, seed: seed).sampler()
-      }
-      var tokens = Array(repeating: [Int](), count: seeds.count)
-      var texts = Array(repeating: "", count: seeds.count)
-      var first = Array<Double?>(repeating: nil, count: seeds.count)
-      var reasons = Array<String?>(repeating: nil, count: seeds.count)
-      var stops = Array<Int?>(repeating: nil, count: seeds.count)
-      var elapsed = Array(repeating: 0.0, count: seeds.count)
-      var decodePasses = 0
-      // Finished rows remain inert occupants of the original shape. They never
-      // sample again or emit another checkpoint, and cannot affect other rows.
-      let inertToken = policy.eosTokenIDs[0]
-      while reasons.contains(nil), !flag.isCancelled, !Task.isCancelled {
-        let sampled: [Int] = autoreleasepool {
-          let filtered = mask.process(logits: logits)
-          let next = samplers.indices.map { lane in
-            reasons[lane] == nil
-              ? samplers[lane].sample(logits: filtered[lane].expandedDimensions(axis: 0)).reshaped([1])
-              : MLXArray([inertToken])
+        guard initial.state == nil else { throw BoomError.invalid("This checkpoint needs unsupported per-row inference state.") }
+        var logits = initial.logits[0..., -1, 0...]
+        eval(logits); eval(cache)
+        try flag.check()
+        // Preserve each existing cache object's offsets and rotating-window
+        // metadata. Only its leading tensor dimension changes.
+        for var entry in cache {
+          let state = entry.state
+          if state.isEmpty { continue } // Gemma's shared-KV layers have no own tensors.
+          guard (entry is KVCacheSimple || entry is RotatingKVCache), state.count == 2,
+            state.allSatisfy({ $0.ndim == 4 && $0.dim(0) == 1 }) else {
+            throw BoomError.invalid("Unsupported cache layout for batched writing.")
           }
-          let joined = concatenated(next, axis: 0)
-          eval(joined)
-          return joined.asArray(Int.self)
+          entry.state = state.map { broadcast($0, to: [seeds.count] + Array($0.shape.dropFirst())) }
+        }
+        eval(cache)
+        logits = broadcast(logits, to: [seeds.count, logits.dim(1)])
+        let mask = CheckpointTokenMask(policy.suppressedTokenIDs)
+        let samplers = seeds.map { seed in
+          GenerateParameters(temperature: settings.temperature, topP: settings.topP,
+            topK: settings.topK, minP: settings.minP, repetitionPenalty: nil, seed: seed).sampler()
+        }
+        var tokens = Array(repeating: [Int](), count: seeds.count)
+        var texts = Array(repeating: "", count: seeds.count)
+        var first = Array<Double?>(repeating: nil, count: seeds.count)
+        var reasons = Array<String?>(repeating: nil, count: seeds.count)
+        var stops = Array<Int?>(repeating: nil, count: seeds.count)
+        var elapsed = Array(repeating: 0.0, count: seeds.count)
+        var decodePasses = 0
+        // Finished rows remain inert occupants of the original shape. They never
+        // sample again or emit another checkpoint, and cannot affect other rows.
+        let inertToken = policy.eosTokenIDs[0]
+        while reasons.contains(nil), !flag.isCancelled, !Task.isCancelled {
+          let sampled: [Int] = autoreleasepool {
+            let filtered = mask.process(logits: logits)
+            let next = samplers.indices.map { lane in
+              reasons[lane] == nil
+                ? samplers[lane].sample(logits: filtered[lane].expandedDimensions(axis: 0)).reshaped([1])
+                : MLXArray([inertToken])
+            }
+            let joined = concatenated(next, axis: 0)
+            eval(joined)
+            return joined.asArray(Int.self)
+          }
+          for lane in seeds.indices where reasons[lane] == nil {
+            let token = sampled[lane]
+            guard !policy.suppressedTokenIDs.contains(token) else {
+              throw BoomError.invalid("A batch row emitted an excluded checkpoint token.")
+            }
+            if controls.contains(token) {
+              reasons[lane] = ends.contains(token) ? "eos" : "model_control"; stops[lane] = token
+            } else {
+              if first[lane] == nil { first[lane] = started.duration(to: clock.now).timeInterval }
+              tokens[lane].append(token)
+              if tokens[lane].count == maxTokens { reasons[lane] = "output_limit" }
+            }
+            let decoded = context.tokenizer.decode(tokenIds: tokens[lane])
+            elapsed[lane] = started.duration(to: clock.now).timeInterval
+            if reasons[lane] != nil || (!decoded.hasSuffix("\u{FFFD}") && decoded != texts[lane]) {
+              try await onCheckpoint?(lane, GenerationProgress(text: decoded, tokenIDs: tokens[lane],
+                promptDigest: digest, promptTokens: promptIDs.count, firstTokenSeconds: first[lane],
+                elapsedSeconds: elapsed[lane]), reasons[lane], stops[lane])
+              texts[lane] = decoded
+            }
+          }
+          if reasons.contains(nil), !flag.isCancelled, !Task.isCancelled {
+            logits = try autoreleasepool {
+              let output = context.model(LMInput.Text(tokens: MLXArray(sampled).reshaped([seeds.count, 1])),
+                cache: cache, state: nil)
+              guard output.state == nil else { throw BoomError.invalid("Unexpected batch inference state.") }
+              let next = output.logits[0..., -1, 0...]
+              guard next.ndim == 2, next.dim(0) == seeds.count else { throw BoomError.invalid("The model lost its batch rows.") }
+              eval(next); eval(cache)
+              return next
+            }
+            decodePasses += 1
+          }
         }
         for lane in seeds.indices where reasons[lane] == nil {
-          let token = sampled[lane]
-          guard !policy.suppressedTokenIDs.contains(token) else {
-            throw BoomError.invalid("A batch row emitted an excluded checkpoint token.")
-          }
-          if controls.contains(token) {
-            reasons[lane] = ends.contains(token) ? "eos" : "model_control"; stops[lane] = token
-          } else {
-            if first[lane] == nil { first[lane] = started.duration(to: clock.now).timeInterval }
-            tokens[lane].append(token)
-            if tokens[lane].count == maxTokens { reasons[lane] = "output_limit" }
-          }
-          let decoded = context.tokenizer.decode(tokenIds: tokens[lane])
+          reasons[lane] = "cancelled"
           elapsed[lane] = started.duration(to: clock.now).timeInterval
-          if reasons[lane] != nil || (!decoded.hasSuffix("\u{FFFD}") && decoded != texts[lane]) {
-            try await onCheckpoint?(lane, GenerationProgress(text: decoded, tokenIDs: tokens[lane],
-              promptDigest: digest, promptTokens: promptIDs.count, firstTokenSeconds: first[lane],
-              elapsedSeconds: elapsed[lane]), reasons[lane], stops[lane])
-            texts[lane] = decoded
-          }
+          texts[lane] = context.tokenizer.decode(tokenIds: tokens[lane])
+          try await onCheckpoint?(lane, GenerationProgress(text: texts[lane], tokenIDs: tokens[lane],
+            promptDigest: digest, promptTokens: promptIDs.count, firstTokenSeconds: first[lane],
+            elapsedSeconds: elapsed[lane]), reasons[lane], nil)
         }
-        if reasons.contains(nil), !flag.isCancelled, !Task.isCancelled {
-          logits = try autoreleasepool {
-            let output = context.model(LMInput.Text(tokens: MLXArray(sampled).reshaped([seeds.count, 1])),
-              cache: cache, state: nil)
-            guard output.state == nil else { throw BoomError.invalid("Unexpected batch inference state.") }
-            let next = output.logits[0..., -1, 0...]
-            guard next.ndim == 2, next.dim(0) == seeds.count else { throw BoomError.invalid("The model lost its batch rows.") }
-            eval(next); eval(cache)
-            return next
-          }
-          decodePasses += 1
+        await onMetrics?(BatchMetrics(width: seeds.count, sharedPromptPrefills: 1,
+          decodeForwardPasses: decodePasses,
+          cacheBatchDimensions: cache.flatMap { $0.state.map { $0.dim(0) } }))
+        return seeds.indices.map { lane in
+          Output(text: texts[lane], tokenIDs: tokens[lane], promptDigest: digest, promptTokens: promptIDs.count,
+            outputTokens: tokens[lane].count, endedByEOS: stops[lane] != nil, stopReason: reasons[lane] ?? "cancelled",
+            stopTokenID: stops[lane], firstTokenSeconds: first[lane], elapsedSeconds: elapsed[lane])
         }
-      }
-      for lane in seeds.indices where reasons[lane] == nil {
-        reasons[lane] = "cancelled"
-        elapsed[lane] = started.duration(to: clock.now).timeInterval
-        texts[lane] = context.tokenizer.decode(tokenIds: tokens[lane])
-        try await onCheckpoint?(lane, GenerationProgress(text: texts[lane], tokenIDs: tokens[lane],
-          promptDigest: digest, promptTokens: promptIDs.count, firstTokenSeconds: first[lane],
-          elapsedSeconds: elapsed[lane]), reasons[lane], nil)
-      }
-      await onMetrics?(BatchMetrics(width: seeds.count, sharedPromptPrefills: 1,
-        decodeForwardPasses: decodePasses,
-        cacheBatchDimensions: cache.flatMap { $0.state.map { $0.dim(0) } }))
-      return seeds.indices.map { lane in
-        Output(text: texts[lane], tokenIDs: tokens[lane], promptDigest: digest, promptTokens: promptIDs.count,
-          outputTokens: tokens[lane].count, endedByEOS: stops[lane] != nil, stopReason: reasons[lane] ?? "cancelled",
-          stopTokenID: stops[lane], firstTokenSeconds: first[lane], elapsedSeconds: elapsed[lane])
       }
     }
   }
@@ -456,78 +490,80 @@ actor MLXGemmaRunner {
     let capacity = try availableContext(), policy = generationPolicy
     let controls = Set(policy.controlTokenIDs), ends = Set(policy.eosTokenIDs)
     return try await container.perform { (context: ModelContext) async throws -> Output in
-      defer { Stream.defaultStream.synchronize() }
-      let input: LMInput
-      if let plan { input = try await Self.chatInput(plan, images: images, context: context) }
-      else if let raw { input = LMInput(tokens: MLXArray(context.tokenizer.encode(text: raw, addSpecialTokens: false))) }
-      else { throw BoomError.invalid("No compiled model input.") }
-      let promptIDs = input.text.tokens.asArray(Int.self)
-      guard promptIDs.count + maxTokens <= capacity else { throw BoomError.budget("The request exceeds available context.") }
-      let parameters = GenerateParameters(maxTokens: maxTokens, temperature: settings.temperature,
-        topP: settings.topP, topK: settings.topK, minP: settings.minP, repetitionPenalty: nil,
-        prefill: PrefillParameters(progress: { processed, total in
-          onPrefill?(PrefillProgress(operationID: flag.operationID, processedPositions: processed, totalPositions: total))
-        }), seed: seed)
-      let preparedDigest = Digest.sha256(try JSONEncoder().encode(promptIDs))
-      // TokenIterator performs prompt prefill during task construction.
-      // Start before it so first-token and elapsed time include that work.
-      let clock = ContinuousClock(), started = clock.now
-      let components = GenerationComponents(logitProcessorFactory: { CheckpointTokenMask(policy.suppressedTokenIDs) })
-      let (stream, task) = try generateTokensTask(input: input, parameters: parameters, context: context,
-        includeStopToken: true, components: components)
-      var tokens: [Int] = [], text = "", ended = false, reason = "output_limit"
-      var first: Double?; var stopToken: Int?
-      do {
-        for await event in stream {
-          if flag.isCancelled || Task.isCancelled { task.cancel(); break }
-          switch event {
-          case .token(let token):
-            guard !policy.suppressedTokenIDs.contains(token) else {
-              throw BoomError.invalid("The model emitted a token excluded by its checkpoint policy.")
+      try await InferenceExecutor.shared.perform { _ in
+        defer { Stream.defaultStream.synchronize() }
+        let input: LMInput
+        if let plan { input = try await Self.chatInput(plan, images: images, context: context) }
+        else if let raw { input = LMInput(tokens: MLXArray(context.tokenizer.encode(text: raw, addSpecialTokens: false))) }
+        else { throw BoomError.invalid("No compiled model input.") }
+        let promptIDs = input.text.tokens.asArray(Int.self)
+        guard promptIDs.count + maxTokens <= capacity else { throw BoomError.budget("The request exceeds available context.") }
+        let parameters = GenerateParameters(maxTokens: maxTokens, temperature: settings.temperature,
+          topP: settings.topP, topK: settings.topK, minP: settings.minP, repetitionPenalty: nil,
+          prefill: PrefillParameters(progress: { processed, total in
+            onPrefill?(PrefillProgress(operationID: flag.operationID, processedPositions: processed, totalPositions: total))
+          }), seed: seed)
+        let preparedDigest = Digest.sha256(try JSONEncoder().encode(promptIDs))
+        // TokenIterator performs prompt prefill during task construction.
+        // Start before it so first-token and elapsed time include that work.
+        let clock = ContinuousClock(), started = clock.now
+        let components = GenerationComponents(logitProcessorFactory: { CheckpointTokenMask(policy.suppressedTokenIDs) })
+        let (stream, task) = try generateTokensTask(input: input, parameters: parameters, context: context,
+          includeStopToken: true, components: components)
+        var tokens: [Int] = [], text = "", ended = false, reason = "output_limit"
+        var first: Double?; var stopToken: Int?
+        do {
+          for await event in stream {
+            if flag.isCancelled || Task.isCancelled { task.cancel(); break }
+            switch event {
+            case .token(let token):
+              guard !policy.suppressedTokenIDs.contains(token) else {
+                throw BoomError.invalid("The model emitted a token excluded by its checkpoint policy.")
+              }
+              if controls.contains(token) {
+                stopToken = token; reason = ends.contains(token) ? "eos" : "model_control"
+                ended = true; task.cancel(); break
+              }
+              if first == nil { first = started.duration(to: clock.now).timeInterval }
+              tokens.append(token)
+              let decoded = context.tokenizer.decode(tokenIds: tokens)
+              if !decoded.hasSuffix("\u{FFFD}"), decoded != text {
+                // Every displayed update is durable before it reaches a view.
+                // Awaiting the store also bounds the checkpoint producer.
+                try await onCheckpoint?(GenerationProgress(text: decoded,
+                  tokenIDs: tokens, promptDigest: preparedDigest, promptTokens: promptIDs.count,
+                  firstTokenSeconds: first, elapsedSeconds: started.duration(to: clock.now).timeInterval), nil, nil)
+                text = decoded; onText(text)
+              }
+            case .info(let info):
+              switch info.stopReason {
+              case .stop: ended = true; reason = "eos"
+              case .length: reason = "output_limit"
+              case .cancelled: reason = "cancelled"
+              }
             }
-            if controls.contains(token) {
-              stopToken = token; reason = ends.contains(token) ? "eos" : "model_control"
-              ended = true; task.cancel(); break
-            }
-            if first == nil { first = started.duration(to: clock.now).timeInterval }
-            tokens.append(token)
-            let decoded = context.tokenizer.decode(tokenIds: tokens)
-            if !decoded.hasSuffix("\u{FFFD}"), decoded != text {
-              // Every displayed update is durable before it reaches a view.
-              // Awaiting the store also bounds the checkpoint producer.
-              try await onCheckpoint?(GenerationProgress(text: decoded,
-                tokenIDs: tokens, promptDigest: preparedDigest, promptTokens: promptIDs.count,
-                firstTokenSeconds: first, elapsedSeconds: started.duration(to: clock.now).timeInterval), nil, nil)
-              text = decoded; onText(text)
-            }
-          case .info(let info):
-            switch info.stopReason {
-            case .stop: ended = true; reason = "eos"
-            case .length: reason = "output_limit"
-            case .cancelled: reason = "cancelled"
-            }
+            if ended { break }
           }
-          if ended { break }
+        } catch {
+          task.cancel()
+          await task.value
+          throw error
         }
-      } catch {
-        task.cancel()
+        if flag.isCancelled || Task.isCancelled { task.cancel() }
         await task.value
-        throw error
+        // Joining must retain the producer's emitted tokens even on cancellation.
+        // Callers persist this receipt before propagating their cancelled operation.
+        if flag.isCancelled || Task.isCancelled { reason = "cancelled" }
+        let final = context.tokenizer.decode(tokenIds: tokens)
+        let elapsed = started.duration(to: clock.now).timeInterval
+        try await onCheckpoint?(GenerationProgress(text: final, tokenIDs: tokens,
+          promptDigest: preparedDigest, promptTokens: promptIDs.count, firstTokenSeconds: first,
+          elapsedSeconds: elapsed), reason, stopToken)
+        if final != text, reason != "cancelled" { onText(final) }
+        return Output(text: final, tokenIDs: tokens, promptDigest: preparedDigest,
+          promptTokens: promptIDs.count, outputTokens: tokens.count, endedByEOS: ended, stopReason: reason, stopTokenID: stopToken,
+          firstTokenSeconds: first, elapsedSeconds: elapsed)
       }
-      if flag.isCancelled || Task.isCancelled { task.cancel() }
-      await task.value
-      // Joining must retain the producer's emitted tokens even on cancellation.
-      // Callers persist this receipt before propagating their cancelled operation.
-      if flag.isCancelled || Task.isCancelled { reason = "cancelled" }
-      let final = context.tokenizer.decode(tokenIds: tokens)
-      let elapsed = started.duration(to: clock.now).timeInterval
-      try await onCheckpoint?(GenerationProgress(text: final, tokenIDs: tokens,
-        promptDigest: preparedDigest, promptTokens: promptIDs.count, firstTokenSeconds: first,
-        elapsedSeconds: elapsed), reason, stopToken)
-      if final != text, reason != "cancelled" { onText(final) }
-      return Output(text: final, tokenIDs: tokens, promptDigest: preparedDigest,
-        promptTokens: promptIDs.count, outputTokens: tokens.count, endedByEOS: ended, stopReason: reason, stopTokenID: stopToken,
-        firstTokenSeconds: first, elapsedSeconds: elapsed)
     }
   }
   func join() async { await GenerationCoordinator.shared.enter(); await GenerationCoordinator.shared.leave() }

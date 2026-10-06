@@ -190,7 +190,7 @@ selected. Cancel during decoding and before the first token, then run a new
 operation. Completed rows remain complete while unfinished rows retain their
 partial tokens as cancelled. Benchmark matched serial and batch workloads and
 retain every output; report aggregate throughput and memory separately from
-individual row latency and 32 GB qualification.
+individual row latency and the paired full-context 24 GiB application budget.
 
 Every manuscript window must retain ordinary AppKit keyboard focus. Never make
 a visible test editor unable to become key to avoid interrupting the user.

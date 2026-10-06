@@ -17,6 +17,7 @@ mod inventory;
 mod layout;
 mod markdown;
 mod media;
+mod memory;
 mod restore;
 mod sampling_policy;
 mod search;
@@ -814,6 +815,15 @@ pub enum Request {
         physical_bytes: u64,
         metal_bytes: u64,
     },
+    ResidencyLimits {
+        physical_bytes: u64,
+        metal_bytes: u64,
+    },
+    ContextCapacity {
+        configuration: memory::CacheConfiguration,
+        available_bytes: u64,
+        width: u64,
+    },
     BackupKey {
         passphrase: String,
         salt: Vec<u8>,
@@ -987,14 +997,20 @@ pub fn execute(request: Request) -> Result<Value, Error> {
         Request::ResidencyBudget {
             physical_bytes,
             metal_bytes,
-        } => {
-            let reserve = (8 * 1024 * 1024 * 1024).max(physical_bytes / 4);
-            serde_json::to_value(
-                physical_bytes
-                    .saturating_sub(reserve)
-                    .min(metal_bytes / 100 * 85),
-            )
-        }
+        } => serde_json::to_value(memory::limits(physical_bytes, metal_bytes).application_bytes),
+        Request::ResidencyLimits {
+            physical_bytes,
+            metal_bytes,
+        } => serde_json::to_value(memory::limits(physical_bytes, metal_bytes)),
+        Request::ContextCapacity {
+            configuration,
+            available_bytes,
+            width,
+        } => serde_json::to_value(memory::context_capacity(
+            &configuration,
+            available_bytes,
+            width,
+        )?),
         Request::BackupKey { passphrase, salt } => {
             require(
                 (8..=1024).contains(&passphrase.len()) && salt.len() == 16,

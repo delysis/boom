@@ -23,6 +23,10 @@ enum MLXNativeSmoke {
     else { throw BoomError.invalid("Use absolute paths and a fresh evidence directory.") }
     try FileManager.default.createDirectory(at: evidence, withIntermediateDirectories: false,
       attributes: [.posixPermissions: 0o700])
+    if arguments.contains("--memory-budget") {
+      try await ApplicationMemorySmoke.run(writingPack: directory, evidence: evidence)
+      return
+    }
     if arguments.contains("--preempt") {
       try await GenerationPreemptionSmoke.run(writingPack: directory, evidence: evidence, batch: arguments.contains("--batch"))
       return

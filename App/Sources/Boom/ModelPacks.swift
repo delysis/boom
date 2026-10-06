@@ -34,7 +34,7 @@ struct ModelCatalogEntry: Codable, Sendable {
 private struct ModelCatalog: Codable { let entries: [ModelCatalogEntry] }
 
 enum ModelResidency {
-  static func footprint() -> UInt64 {
+  static func memoryAccounting() -> (current: UInt64, peak: UInt64) {
     var info = task_vm_info_data_t()
     var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
     let capacity = Int(count)
@@ -43,12 +43,29 @@ enum ModelResidency {
         task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
       }
     }
-    return status == KERN_SUCCESS ? info.phys_footprint : 0
+    return status == KERN_SUCCESS ? (info.phys_footprint, UInt64(max(0, info.ledger_phys_footprint_peak))) : (0, 0)
   }
-  static func budget() throws -> UInt64 {
+  static func footprint() -> UInt64 { memoryAccounting().current }
+  static func limits() throws -> ResidencyLimits {
     guard let device = MTLCreateSystemDefaultDevice() else { throw BoomError.unavailable("Metal is unavailable.") }
-    return try ProductCore.residencyBudget(physical: ProcessInfo.processInfo.physicalMemory,
+    return try ProductCore.residencyLimits(physical: ProcessInfo.processInfo.physicalMemory,
       metal: device.recommendedMaxWorkingSetSize)
+  }
+  static func budget() throws -> UInt64 { try limits().applicationBytes }
+  // MLX's allocator setting is a reclamation threshold, not an OS hard limit.
+  // Admission and measured process footprint remain authoritative.
+  static func configure() throws {
+    let policy = try limits()
+    Memory.memoryLimit = Int(clamping: policy.allocatorBytes)
+    Memory.cacheLimit = Int(clamping: policy.cacheBytes)
+    Memory.clearCache()
+  }
+  static func check() throws {
+    let measured = footprint()
+    guard measured > 0 else { throw BoomError.unavailable("Process memory accounting is unavailable.") }
+    guard max(measured, UInt64(max(0, Memory.activeMemory + Memory.cacheMemory))) <= (try budget()) else {
+      throw BoomError.budget("The operation exceeded Bloom's application memory budget. Its output was retained.")
+    }
   }
   static func availableBytes() throws -> UInt64 {
     let used = max(footprint(), UInt64(max(0, Memory.activeMemory + Memory.cacheMemory)))
@@ -56,8 +73,9 @@ enum ModelResidency {
     return used < limit ? limit - used : 0
   }
   static func admit(weightBytes: UInt64) throws {
-    Memory.clearCache()
-    guard weightBytes + 1_073_741_824 < (try availableBytes()) else {
+    try configure(); try check()
+    let available = try availableBytes(), reserve = try limits().workingReserveBytes
+    guard reserve < available, weightBytes < available - reserve else {
       throw BoomError.budget("This model does not fit alongside the resident model. Close the inactive model before loading it.")
     }
   }

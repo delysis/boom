@@ -74,6 +74,16 @@ import SwiftUI
       dispatchMain()
     }
     if CommandLine.arguments.contains("--mlx-smoke") {
+      if CommandLine.arguments.contains("--memory-budget") {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.prohibited)
+        Task {
+          do { try await MLXNativeSmoke.run(arguments: CommandLine.arguments); exit(0) }
+          catch { fputs("Memory diagnostic failed: \(error.localizedDescription)\n", stderr); exit(1) }
+        }
+        app.run()
+        return
+      }
       Task {
         do {
           try await MLXNativeSmoke.run(arguments: CommandLine.arguments)

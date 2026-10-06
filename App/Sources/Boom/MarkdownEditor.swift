@@ -69,6 +69,7 @@ import SwiftUI
   }
 
   func clearGhost() {
+    guard displayStorage != nil || visibleStamp != nil || displayGhostLength != 0 else { return }
     displayStorage = nil
     displayLayout = nil
     displayContainer = nil
