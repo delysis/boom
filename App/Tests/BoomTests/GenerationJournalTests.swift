@@ -145,30 +145,32 @@ final class GenerationJournalTests: XCTestCase {
       configuration: Data(#"{"eos_token_id":1,"suppress_tokens":[15,14]}"#.utf8),
       controls: [0, 1, 3, 14, 15], tokenizerEOS: 1)
     XCTAssertEqual(small.prefill, PrefillGeometry(chunking: "balanced_v1", tokenCeiling: 512))
-    let large = try ProductCore.generationPolicy(vocabularySize: 16,
-      configuration: Data(#"{"eos_token_id":1,"suppress_tokens":[15,14]}"#.utf8),
-      controls: [0, 1, 3, 14, 15], tokenizerEOS: 1, prefillTokens: 1024)
-    let f = try await fixture(large); defer { try? FileManager.default.removeItem(at: f.root) }
-    try await f.store.checkpoint(progress(tokens: [4, 5]), identity: f.writing, stopReason: "cancelled")
-    let url = f.store.vault.recordURL(.generationJournal, f.writing.attemptID)
-    let before = try Data(contentsOf: url)
-    let fresh = try WorkspaceStore(rootOverride: f.root, testKey: f.key)
-    _ = try await fresh.load().get()
-    let recovered = try await fresh.generationCheckpoint(identity: f.writing)
-    let journal = try XCTUnwrap(recovered)
-    XCTAssertEqual(journal.identity.generationPolicy?.prefill,
-      PrefillGeometry(chunking: "balanced_v1", tokenCeiling: 1024))
-    try ProductCore.admitGenerationPolicy(large, loaded: large)
-    XCTAssertThrowsError(try ProductCore.admitGenerationPolicy(large, loaded: small))
-    var unrecorded = small; unrecorded.prefill = nil
-    XCTAssertThrowsError(try ProductCore.admitGenerationPolicy(unrecorded, loaded: small))
-    let changed = GenerationIdentity(kind: f.writing.kind, operationID: f.writing.operationID,
-      recordID: f.writing.recordID, attemptID: f.writing.attemptID, model: f.writing.model,
-      seed: f.writing.seed, requestDigest: f.writing.requestDigest, maxTokens: f.writing.maxTokens,
-      generationPolicy: small)
-    do { _ = try await fresh.generationCheckpoint(identity: changed); XCTFail("Changed prefill geometry was accepted") }
-    catch {}
-    XCTAssertEqual(try Data(contentsOf: url), before)
+    for ceiling in [UInt32(256), UInt32(1024)] {
+      let alternate = try ProductCore.generationPolicy(vocabularySize: 16,
+        configuration: Data(#"{"eos_token_id":1,"suppress_tokens":[15,14]}"#.utf8),
+        controls: [0, 1, 3, 14, 15], tokenizerEOS: 1, prefillTokens: ceiling)
+      let f = try await fixture(alternate); defer { try? FileManager.default.removeItem(at: f.root) }
+      try await f.store.checkpoint(progress(tokens: [4, 5]), identity: f.writing, stopReason: "cancelled")
+      let url = f.store.vault.recordURL(.generationJournal, f.writing.attemptID)
+      let before = try Data(contentsOf: url)
+      let fresh = try WorkspaceStore(rootOverride: f.root, testKey: f.key)
+      _ = try await fresh.load().get()
+      let recovered = try await fresh.generationCheckpoint(identity: f.writing)
+      let journal = try XCTUnwrap(recovered)
+      XCTAssertEqual(journal.identity.generationPolicy?.prefill,
+        PrefillGeometry(chunking: "balanced_v1", tokenCeiling: Int(ceiling)))
+      try ProductCore.admitGenerationPolicy(alternate, loaded: alternate)
+      XCTAssertThrowsError(try ProductCore.admitGenerationPolicy(alternate, loaded: small))
+      var unrecorded = small; unrecorded.prefill = nil
+      XCTAssertThrowsError(try ProductCore.admitGenerationPolicy(unrecorded, loaded: small))
+      let changed = GenerationIdentity(kind: f.writing.kind, operationID: f.writing.operationID,
+        recordID: f.writing.recordID, attemptID: f.writing.attemptID, model: f.writing.model,
+        seed: f.writing.seed, requestDigest: f.writing.requestDigest, maxTokens: f.writing.maxTokens,
+        generationPolicy: small)
+      do { _ = try await fresh.generationCheckpoint(identity: changed); XCTFail("Changed prefill geometry was accepted") }
+      catch {}
+      XCTAssertEqual(try Data(contentsOf: url), before)
+    }
   }
   func testStaleCheckpointAndCorruptionRetainExactSealedBytesAndIndex() async throws {
     let f = try await fixture(); defer { try? FileManager.default.removeItem(at: f.root) }

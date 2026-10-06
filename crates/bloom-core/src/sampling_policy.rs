@@ -33,7 +33,7 @@ impl Default for Prefill {
 impl Prefill {
     pub fn validate(self) -> Result<(), Error> {
         require(
-            matches!(self.token_ceiling, 512 | 1024),
+            matches!(self.token_ceiling, 256 | 512 | 1024),
             "Unsupported prefill geometry.",
         )
     }
@@ -239,7 +239,7 @@ mod tests {
         changed.prefill = None;
         changed.validate()?;
         assert!(admit(Some(&changed), &steady).is_err());
-        for ceiling in [0, 1, 511, 513, 1025, u32::MAX] {
+        for ceiling in [0, 1, 255, 257, 511, 513, 1025, u32::MAX] {
             assert!(
                 compile(
                     16,
@@ -254,6 +254,35 @@ mod tests {
         let mut captured = serde_json::to_value(&steady).map_err(|e| Error(e.to_string()))?;
         captured["prefill"]["chunking"] = json!("unknown_chunking");
         assert!(serde_json::from_value::<Policy>(captured).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn smaller_prefill_is_captured_without_changing_the_default() -> Result<(), Error> {
+        let default = policy()?;
+        let smaller = compile(
+            16,
+            json!({"eos_token_id":1,"suppress_tokens":[]}),
+            vec![0, 1, 3, 14, 15],
+            Some(1),
+            Some(256),
+        )?;
+        assert_eq!(Prefill::default().token_ceiling, 512);
+        assert_eq!(default.prefill, Some(Prefill::default()));
+        assert_eq!(
+            smaller.prefill,
+            Some(Prefill {
+                token_ceiling: 256,
+                ..Prefill::default()
+            })
+        );
+        assert!(admit(Some(&smaller), &smaller)?);
+        assert!(admit(Some(&smaller), &default).is_err());
+        assert!(admit(Some(&default), &smaller).is_err());
+        let encoded = serde_json::to_vec(&smaller).map_err(|e| Error(e.to_string()))?;
+        let restored: Policy =
+            serde_json::from_slice(&encoded).map_err(|e| Error(e.to_string()))?;
+        assert_eq!(restored, smaller);
         Ok(())
     }
 }
