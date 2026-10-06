@@ -1,5 +1,6 @@
 import BoomCore
 import Foundation
+import Darwin
 import Metal
 import MLX
 import MLXLMCommon
@@ -68,6 +69,18 @@ actor MLXGemmaRunner {
     let firstTokenSeconds: Double?
     let elapsedSeconds: Double
     var executionPriority: UInt8? = nil
+    var setupMetrics: SetupMetrics? = nil
+  }
+  /// Native execution observations, separate from replay and sampling policy.
+  /// A returned setup call may still have queued GPU work; it is not a GPU timer.
+  struct SetupMetrics: Codable, Sendable {
+    let path: String
+    let returnedSeconds: Double
+    let threadQoSBefore: UInt32
+    let threadQoSAfter: UInt32
+    let firstDeliveryThreadQoS: UInt32?
+    let tokenShape: [Int]
+    let maskShape: [Int]?
   }
   struct BatchMetrics: Codable, Sendable {
     let width: Int
@@ -305,10 +318,12 @@ actor MLXGemmaRunner {
   }
   func run(plan: ConsultationPlan, images: [Data], maxTokens: Int, seed: UInt64? = nil,
     flag: CancellationFlag,
+    onPrefill: (@Sendable (PrefillProgress) -> Void)? = nil,
     onCheckpoint: (@Sendable (GenerationProgress, String?, Int?) async throws -> Void)? = nil,
     onText: @escaping @Sendable (String) -> Void) async throws -> Output {
     try await generate(plan: plan, raw: nil, images: images, maxTokens: maxTokens,
-      settings: ProductCore.sampling(.standard), seed: seed, flag: flag, onCheckpoint: onCheckpoint, onText: onText)
+      settings: ProductCore.sampling(.standard), seed: seed, flag: flag, onPrefill: onPrefill,
+      onCheckpoint: onCheckpoint, onText: onText)
   }
   func run(rawPrompt: String, maxTokens: Int, settings: SamplingSettings? = nil, seed: UInt64? = nil,
     flag: CancellationFlag, background: Bool = false,
@@ -398,8 +413,11 @@ actor MLXGemmaRunner {
           prefill: prefill)
         let cache = try context.model.newCache(parameters: parameters)
         let clock = ContinuousClock(), started = clock.now
+        let setupQoSBefore = qos_class_self().rawValue
         let prepared = try context.model.prepare(LMInput(tokens: MLXArray(promptIDs)),
           cache: cache, state: nil, prefill: parameters.prefill)
+        let setupReturnedSeconds = started.duration(to: clock.now).timeInterval
+        let setupQoSAfter = qos_class_self().rawValue
         let initial: LMOutput
         switch prepared {
         case .logits(let output): initial = output
@@ -431,6 +449,7 @@ actor MLXGemmaRunner {
         var tokens = Array(repeating: [Int](), count: seeds.count)
         var texts = Array(repeating: "", count: seeds.count)
         var first = Array<Double?>(repeating: nil, count: seeds.count)
+        var firstDeliveryQoS: UInt32?
         var reasons = Array<String?>(repeating: nil, count: seeds.count)
         var stops = Array<Int?>(repeating: nil, count: seeds.count)
         var elapsed = Array(repeating: 0.0, count: seeds.count)
@@ -450,6 +469,7 @@ actor MLXGemmaRunner {
             eval(joined)
             return joined.asArray(Int.self)
           }
+          if firstDeliveryQoS == nil { firstDeliveryQoS = qos_class_self().rawValue }
           for lane in seeds.indices where reasons[lane] == nil {
             let token = sampled[lane]
             guard !policy.suppressedTokenIDs.contains(token) else {
@@ -499,7 +519,11 @@ actor MLXGemmaRunner {
           Output(text: texts[lane], tokenIDs: tokens[lane], promptDigest: digest, promptTokens: promptIDs.count,
             outputTokens: tokens[lane].count, endedByEOS: stops[lane] != nil, stopReason: reasons[lane] ?? "cancelled",
             stopTokenID: stops[lane], firstTokenSeconds: first[lane], elapsedSeconds: elapsed[lane],
-            executionPriority: Task.currentPriority.rawValue)
+            executionPriority: Task.currentPriority.rawValue,
+            setupMetrics: SetupMetrics(path: "shared-prefill-model-prepare",
+              returnedSeconds: setupReturnedSeconds, threadQoSBefore: setupQoSBefore,
+              threadQoSAfter: setupQoSAfter, firstDeliveryThreadQoS: firstDeliveryQoS,
+              tokenShape: [promptIDs.count], maskShape: nil))
         }
       }
     }
@@ -529,16 +553,21 @@ actor MLXGemmaRunner {
         // TokenIterator performs prompt prefill during task construction.
         // Start before it so first-token and elapsed time include that work.
         let clock = ContinuousClock(), started = clock.now
+        let setupQoSBefore = qos_class_self().rawValue
         let components = GenerationComponents(logitProcessorFactory: { CheckpointTokenMask(policy.suppressedTokenIDs) })
         let (stream, task) = try generateTokensTask(input: input, parameters: parameters, context: context,
           includeStopToken: true, components: components)
+        let setupReturnedSeconds = started.duration(to: clock.now).timeInterval
+        let setupQoSAfter = qos_class_self().rawValue
         var tokens: [Int] = [], text = "", ended = false, reason = "output_limit"
         var first: Double?; var stopToken: Int?
+        var firstDeliveryQoS: UInt32?
         do {
           for await event in stream {
             if flag.isCancelled || Task.isCancelled { task.cancel(); break }
             switch event {
             case .token(let token):
+              if firstDeliveryQoS == nil { firstDeliveryQoS = qos_class_self().rawValue }
               guard !policy.suppressedTokenIDs.contains(token) else {
                 throw BoomError.invalid("The model emitted a token excluded by its checkpoint policy.")
               }
@@ -585,7 +614,11 @@ actor MLXGemmaRunner {
         return Output(text: final, tokenIDs: tokens, promptDigest: preparedDigest,
           promptTokens: promptIDs.count, outputTokens: tokens.count, endedByEOS: ended, stopReason: reason, stopTokenID: stopToken,
           firstTokenSeconds: first, elapsedSeconds: elapsed,
-          executionPriority: Task.currentPriority.rawValue)
+          executionPriority: Task.currentPriority.rawValue,
+          setupMetrics: SetupMetrics(path: "token-iterator-constructor",
+            returnedSeconds: setupReturnedSeconds, threadQoSBefore: setupQoSBefore,
+            threadQoSAfter: setupQoSAfter, firstDeliveryThreadQoS: firstDeliveryQoS,
+            tokenShape: input.text.tokens.shape, maskShape: input.text.mask?.shape))
       }
     }
   }

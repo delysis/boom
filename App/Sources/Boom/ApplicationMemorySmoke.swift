@@ -6,6 +6,7 @@ import Foundation
 import Metal
 import MLX
 import SwiftUI
+import Synchronization
 
 /// Explicit public fixtures, actual paired MLX allocations and production
 /// encrypted checkpoints. No shown window, user workspace, Keychain or network.
@@ -75,6 +76,27 @@ import SwiftUI
     func cancellationSeconds() -> Double? {
       cancelledAt.map { $0.duration(to: ContinuousClock().now).timeInterval }
     }
+  }
+  /// Callbacks mark submitted chunks, not completed GPU execution. Capturing
+  /// the calling thread here preserves its QoS instead of an actor-hop value.
+  private final class PrefillTrace: Sendable {
+    struct Observation: Codable, Sendable {
+      let operationID: UUID
+      let processedPositions: Int
+      let totalPositions: Int
+      let requestElapsedSeconds: Double
+      let threadQoS: UInt32
+    }
+    private let started = ContinuousClock().now
+    private let observations = Mutex<[Observation]>([])
+    func record(_ progress: MLXGemmaRunner.PrefillProgress) {
+      let value = Observation(operationID: progress.operationID,
+        processedPositions: progress.processedPositions, totalPositions: progress.totalPositions,
+        requestElapsedSeconds: started.duration(to: ContinuousClock().now).timeInterval,
+        threadQoS: qos_class_self().rawValue)
+      observations.withLock { $0.append(value) }
+    }
+    func captured() -> [Observation] { observations.withLock { $0 } }
   }
   private static func write(_ value: [String: Any], _ name: String, evidence: URL) throws {
     try JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys])
@@ -269,7 +291,7 @@ import SwiftUI
       func trial(_ name: String, runner: MLXGemmaRunner, prompt: String?, plan: ConsultationPlan?,
         seeds: [UInt64], maxTokens: Int, cancellation: Bool = false) async throws -> [String: Any] {
         probe.mark(name)
-        let flag = CancellationFlag(), trace = TrialTrace()
+        let flag = CancellationFlag(), trace = TrialTrace(), prefillTrace = PrefillTrace()
         let batch = seeds.count > 1
         let identities = seeds.enumerated().map { lane, seed in
           GenerationIdentity(kind: plan == nil ? .writing : .consultation, operationID: flag.operationID,
@@ -289,6 +311,7 @@ import SwiftUI
           if let prompt {
             outputs = try await runner.runBatch(rawPrompt: prompt, maxTokens: maxTokens,
               settings: ProductCore.sampling(.standard), seeds: seeds, flag: flag,
+              onPrefill: { prefillTrace.record($0) },
               onCheckpoint: { lane, progress, stop, token in
                 try await store.checkpoint(progress, identity: identities[lane], stopReason: stop, stopTokenID: token)
                 if cancellation, lane == 0, progress.tokenIDs.count >= 8 { await trace.cancel(flag) }
@@ -297,6 +320,7 @@ import SwiftUI
             guard let plan, seeds.count == 1 else { throw BoomError.invalid("Missing diagnostic input.") }
             outputs = [try await runner.run(plan: plan, images: [], maxTokens: maxTokens,
               seed: seeds[0], flag: flag,
+              onPrefill: { prefillTrace.record($0) },
               onCheckpoint: { progress, stop, token in
                 try await store.checkpoint(progress, identity: identities[0], stopReason: stop, stopTokenID: token)
                 if cancellation, progress.tokenIDs.count >= 8 { await trace.cancel(flag) }
@@ -305,13 +329,16 @@ import SwiftUI
           record["elapsed_including_checkpoint_seconds"] = started.duration(to: clock.now).timeInterval
           record["cancellation_join_seconds"] = await trace.cancellationSeconds() as Any? ?? NSNull()
           record["batch_metrics"] = try await trace.metrics.map { try ProductCore.object($0) } ?? NSNull()
-          record["outputs"] = outputs.map { value -> [String: Any] in
+          record["prefill_submissions"] = try ProductCore.object(prefillTrace.captured())
+          record["prefill_observation_scope"] = "CPU chunk submission callbacks, request-relative wall clock and calling-thread QoS; no per-chunk GPU completion timing"
+          record["outputs"] = try outputs.map { value -> [String: Any] in
             ["text": value.text, "token_ids": value.tokenIDs, "prompt_digest": value.promptDigest,
               "prompt_tokens": value.promptTokens, "output_tokens": value.outputTokens,
               "stop_reason": value.stopReason, "stop_token_id": value.stopTokenID as Any? ?? NSNull(),
               "first_token_seconds": value.firstTokenSeconds as Any? ?? NSNull(),
               "elapsed_seconds": value.elapsedSeconds,
               "execution_task_priority": value.executionPriority as Any? ?? NSNull(),
+              "native_setup_metrics": try value.setupMetrics.map { try ProductCore.object($0) } ?? NSNull(),
               "sustained_decode_tokens_per_second": value.firstTokenSeconds.map {
                 Double(max(0, value.outputTokens - 1)) / max(0.000001, value.elapsedSeconds - $0)
               } as Any? ?? NSNull()]
@@ -326,6 +353,7 @@ import SwiftUI
           print("\(name): \(outputs.map(\.promptTokens)) input, \(outputs.map(\.outputTokens)) output tokens")
           return record
         } catch {
+          record["prefill_submissions"] = try ProductCore.object(prefillTrace.captured())
           record["status"] = "failed"; record["error"] = String(describing: error)
           try write(record, name + ".json", evidence: evidence); throw error
         }
