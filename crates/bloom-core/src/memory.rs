@@ -2,6 +2,7 @@ use crate::{Error, require, sampling_policy::Prefill};
 use serde::{Deserialize, Serialize};
 
 const GIB: u64 = 1 << 30;
+const CONTEXT_CEILING: u64 = 16_384;
 const APPLICATION_CEILING: u64 = 24 * GIB;
 const WORKING_RESERVE: u64 = 2 * GIB;
 
@@ -12,6 +13,30 @@ pub struct Limits {
     pub allocator_bytes: u64,
     pub cache_bytes: u64,
     pub working_reserve_bytes: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FullContextInputs {
+    pub context_tokens: u64,
+    pub input_tokens: [u64; 2],
+    pub output_tokens: u64,
+}
+
+/// Qualification preserves its registered workload even under memory pressure.
+/// Ordinary admission may shrink; that is a failed gate, never a shorter trial.
+pub fn qualification_context(writing: u64, consultation: u64) -> Result<FullContextInputs, Error> {
+    require(
+        writing == CONTEXT_CEILING && consultation == CONTEXT_CEILING,
+        &format!(
+            "Full-context qualification requires both {CONTEXT_CEILING}-token contexts; writing admits {writing}, consultation admits {consultation}. The registered workload was not shortened."
+        ),
+    )?;
+    Ok(FullContextInputs {
+        context_tokens: CONTEXT_CEILING,
+        input_tokens: [CONTEXT_CEILING - 256; 2],
+        output_tokens: 256,
+    })
 }
 
 pub fn limits(physical: u64, metal: u64) -> Limits {
@@ -120,7 +145,7 @@ pub fn context_capacity(
     require((1..=4).contains(&width), "Invalid inference batch width.")?;
     let budget = available.saturating_sub(WORKING_RESERVE);
     let mut low = 0;
-    let mut high = 16_384.min(config.max_position_embeddings);
+    let mut high = CONTEXT_CEILING.min(config.max_position_embeddings);
     while low < high {
         let middle = low + (high - low).div_ceil(2);
         if config.bytes(middle, width, prefill) <= budget {
@@ -135,6 +160,29 @@ pub fn context_capacity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qualification_keeps_both_full_context_inputs_and_output_reservations() -> Result<(), Error> {
+        let inputs = qualification_context(16_384, 16_384)?;
+        assert_eq!(inputs.context_tokens, 16_384);
+        assert_eq!(inputs.input_tokens, [16_128; 2]);
+        assert_eq!(inputs.output_tokens, 256);
+        Ok(())
+    }
+
+    #[test]
+    fn qualification_rejects_reduced_or_changed_admission_instead_of_resizing_the_trial() {
+        for (writing, consultation) in [
+            (16_128, 16_384),
+            (16_384, 16_128),
+            (0, 16_384),
+            (16_384, 0),
+            (16_385, 16_384),
+            (u64::MAX, u64::MAX),
+        ] {
+            assert!(qualification_context(writing, consultation).is_err());
+        }
+    }
 
     fn gemma() -> CacheConfiguration {
         CacheConfiguration {

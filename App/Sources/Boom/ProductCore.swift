@@ -178,6 +178,9 @@ enum ProductCore {
   static func residencyLimits(physical: UInt64, metal: UInt64) throws -> ResidencyLimits {
     try call(["op": "residency_limits", "physicalBytes": physical, "metalBytes": metal])
   }
+  static func qualificationContext(writing: Int, consultation: Int) throws -> FullContextInputs {
+    try call(["op": "qualification_context", "writing": writing, "consultation": consultation])
+  }
   static func admitCacheProbe(physical: UInt64, metal: UInt64, cache: UInt64) throws {
     let _: Bool = try call(["op": "residency_cache_probe", "physicalBytes": physical,
       "metalBytes": metal, "cacheBytes": cache])
@@ -191,6 +194,11 @@ enum ProductCore {
     try call(["op": "context_capacity", "configuration": JSONSerialization.jsonObject(with: configuration),
       "availableBytes": available, "width": width, "prefill": try prefill.map { try object($0) } ?? NSNull()])
   }
+}
+struct FullContextInputs: Codable, Sendable {
+  let contextTokens: Int
+  let inputTokens: [Int]
+  let outputTokens: Int
 }
 struct ResidencyLimits: Codable, Sendable {
   let applicationBytes: UInt64

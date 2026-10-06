@@ -71,3 +71,16 @@ The five attachment crates were narrowly copied from `delysis/native-platform` a
 Component checks, a real-weight diagnostic, native interaction evidence, target-machine performance and distribution are separate gates. Nonempty generation does not establish writing quality. Preserve failed outputs and receipts.
 
 This development Mac has 128 GiB. The approved performance gate now measures the app here under a 24 GiB application budget, including both resident models and full admitted context; it no longer requires an actual 32 GiB MacBook. Use `--mlx-smoke --memory-budget --pack ABSOLUTE_WRITING_PACK --evidence NEW_DIRECTORY` on the exact author bundle with consultation cached and outbound networking denied. Memory, latency, throughput, cancellation and typing retain separate measured targets. Developer ID signing, notarization and stapling remain unqualified while only an Apple Development identity is available. See `ACCEPTANCE.md` for the remaining gates and `DESIGN_QA.md` for native interface checks.
+
+### Developer prefill checks
+
+The Rust `bloom-kernel-probe` binary owns an offline, bounded arithmetic screen for the pinned consultation pack. Give it the verified pack directory, the built `BloomPackBuilder` executable, and a fresh evidence directory, all as absolute paths:
+
+```sh
+cargo build --release -p bloom-core --bin bloom-kernel-probe --locked
+target/release/bloom-kernel-probe /absolute/consultation-pack /absolute/BloomPackBuilder /absolute/new-evidence
+```
+
+The native MLX backend compares fused group-32 quantized multiplication with BF16 and FP16 dense multiplication, including dequantization in each measured operation. The Rust driver registers the order, checks source hashes, denies outbound networking, bounds the child process group and joins it. All 72 observations and 18 distinct complete output tensors are retained. This is a developer arithmetic screen, not application performance or model-quality qualification; it neither converts the pack nor changes ordinary inference.
+
+The application memory diagnostic requires both complete 16,384-token contexts before running its registered 16,128-input/256-output trials. Rust rejects reduced admission rather than letting the diagnostic silently shorten its workload. The 24 GiB application cap and separate latency, decoding, cancellation and typing targets remain unchanged.

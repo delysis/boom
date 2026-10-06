@@ -824,6 +824,10 @@ pub enum Request {
         physical_bytes: u64,
         metal_bytes: u64,
     },
+    QualificationContext {
+        writing: u64,
+        consultation: u64,
+    },
     ResidencyCacheProbe {
         physical_bytes: u64,
         metal_bytes: u64,
@@ -1025,6 +1029,10 @@ pub fn execute(request: Request) -> Result<Value, Error> {
             physical_bytes,
             metal_bytes,
         } => serde_json::to_value(memory::limits(physical_bytes, metal_bytes)),
+        Request::QualificationContext {
+            writing,
+            consultation,
+        } => serde_json::to_value(memory::qualification_context(writing, consultation)?),
         Request::ResidencyCacheProbe {
             physical_bytes,
             metal_bytes,

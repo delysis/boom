@@ -343,11 +343,13 @@ import SwiftUI
       receipt["full_writing_admitted_context"] = fullWritingCapacity
       receipt["full_consultation_admitted_context"] = fullConsultationCapacity
       try write(receipt, "receipt.json", evidence: evidence)
+      let fullContext = try ProductCore.qualificationContext(writing: fullWritingCapacity, consultation: fullConsultationCapacity)
+      receipt["registered_full_context_workload"] = try ProductCore.object(fullContext)
       _ = try await trial("full-context-writing-three", runner: writing,
-        prompt: writing.diagnosticPrefix(tokens: fullWritingCapacity - 256), plan: nil,
-        seeds: [42, 2026, 8675309], maxTokens: 256)
+        prompt: writing.diagnosticPrefix(tokens: fullContext.inputTokens[0]), plan: nil,
+        seeds: [42, 2026, 8675309], maxTokens: fullContext.outputTokens)
       _ = try await trial("full-context-consultation", runner: consultation,
-        prompt: nil, plan: consultationPlan(tokens: fullConsultationCapacity - 256), seeds: [42], maxTokens: 256)
+        prompt: nil, plan: consultationPlan(tokens: fullContext.inputTokens[1]), seeds: [42], maxTokens: fullContext.outputTokens)
       let cancelled = try await trial("decode-cancellation-three", runner: writing,
         prompt: short, plan: nil, seeds: [17, 42, 314], maxTokens: 256, cancellation: true)
       _ = try await trial("after-cancellation", runner: writing, prompt: short, plan: nil, seeds: [17], maxTokens: 16)

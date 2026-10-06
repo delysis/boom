@@ -40,6 +40,9 @@ import MLXVLM
   }
   static func main() throws {
     let args = CommandLine.arguments
+    if args.count > 1, args[1] == "--prefill-kernel-probe" {
+      try PrefillKernelProbe.run(args); return
+    }
     let sealOnly = args.count > 1 && args[1].hasSuffix("-seal")
     let purpose = args.count > 1 ? args[1].replacingOccurrences(of: "-seal", with: "") : ""
     guard args.count == 6, ["consultation", "writing"].contains(purpose),
