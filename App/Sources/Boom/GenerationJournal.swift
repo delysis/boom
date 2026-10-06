@@ -12,6 +12,7 @@ struct GenerationIdentity: Codable, Equatable, Sendable {
   let requestDigest: String
   let maxTokens: Int
   let generationPolicy: ModelGenerationPolicy?
+  var batch: WritingBatchExecution? = nil
 }
 struct GenerationProgress: Codable, Sendable {
   let text: String
@@ -70,7 +71,7 @@ extension WorkspaceStore {
     let expected = GenerationIdentity(kind: .writing, operationID: journal.identity.operationID,
       recordID: bundle.id, attemptID: candidate.id, model: bundle.recipe.model,
       seed: candidate.seed, requestDigest: bundle.recipe.promptDigest, maxTokens: bundle.recipe.maxTokens,
-      generationPolicy: bundle.recipe.generationPolicy)
+      generationPolicy: bundle.recipe.generationPolicy, batch: candidate.batch)
     return try ProductCore.generationCheckpoint(journal, expected: expected)
   }
 }

@@ -133,7 +133,7 @@ struct WritingAlternatives: View {
         .disabled(model.isBusy || !model.candidateIsCurrent || candidate.state != .complete)
       Button("Branch from this continuation") { model.branchCandidate(bundle.selected) }
         .disabled(model.isBusy || candidate.state != .complete)
-      Button("Replay seed") { model.replayCandidate(bundle.selected) }
+      Button(candidate.batch == nil ? "Replay seed" : "Replay this set") { model.replayCandidate(bundle.selected) }
         .disabled(model.isBusy || candidate.state != .complete)
       Divider()
       Button("Try three more") { model.exploreWriting() }.disabled(!model.canExploreWriting)

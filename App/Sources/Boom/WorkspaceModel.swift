@@ -1170,7 +1170,9 @@ struct CompletionSegment {
     }
   }
   func scheduleCompletion() {
-    guard librarySearch.isEmpty, state.autocomplete, showsDocument, !isBusy, baseRunner != nil, caret > 0,
+    // An open tray retains its captured choices for branching after edits.
+    // Background suggestions must not replace the visible bundle.
+    guard !showingCandidates, librarySearch.isEmpty, state.autocomplete, showsDocument, !isBusy, baseRunner != nil, caret > 0,
       let document = selectedDocument, let editor, editor.selectedRange().length == 0,
       !editor.hasMarkedText(), !candidateIsCurrent else { return }
     let previous = ghostTask
@@ -1181,7 +1183,7 @@ struct CompletionSegment {
       if let previous { await previous.value }
       do {
         try await Task.sleep(nanoseconds: 650_000_000)
-        guard let self, self.epoch == capturedEpoch, !self.isBusy else { return }
+        guard let self, self.epoch == capturedEpoch, !self.isBusy, !self.showingCandidates else { return }
         try await self.generateCandidates(document: document, offset: offset, profile: profile,
           count: 1, maxTokens: 64, flag: flag)
       } catch is CancellationError {} catch {
@@ -1254,8 +1256,14 @@ struct CompletionSegment {
   }
   private func generateCandidates(document: DocumentSnapshot, offset: Int, profile: SamplingProfile,
     count: Int, maxTokens: Int, flag: CancellationFlag, previous: CandidateBundle? = nil,
-    replaySeed: UInt64? = nil) async throws {
+    replay: WritingCandidate? = nil) async throws {
     guard let runner = baseRunner else { throw BoomError.unavailable("Install the writing model first.") }
+    if let execution = replay?.batch, let seed = replay?.seed {
+      try ProductCore.validateWritingBatch(execution, seed: seed)
+    }
+    let seeds = replay.map { $0.batch?.seeds ?? [$0.seed] }
+      ?? (0..<count).map { _ in UInt64.random(in: .min ... .max) }
+    try ProductCore.admitWritingBatch(width: seeds.count, prompt: 1, output: maxTokens, capacity: 16_384)
     let capturedEpoch = epoch
     try await flush()
     let recipe: CompletionRecipe
@@ -1269,36 +1277,42 @@ struct CompletionSegment {
       try await revalidateOnDisk(sources, attachments: [])
       recipe = try await runner.completionRecipe(document: document, caret: offset,
         sources: sources, examples: examples.map(\.text), profile: profile,
-        maxTokens: maxTokens, flag: flag)
+        maxTokens: maxTokens, flag: flag, batchWidth: seeds.count)
     }
     try ProductCore.validateWritingRecipe(recipe)
     guard recipe.model == runner.identity else { throw BoomError.stale("Replay requires the original writing model.") }
     try ProductCore.admitGenerationPolicy(recipe.generationPolicy, loaded: runner.generationPolicy)
-    var bundle = CandidateBundle(id: replaySeed == nil ? previous?.id ?? UUID() : UUID(), recipe: recipe, origin: previous?.origin ?? state.manuscriptOrigins[document.id],
-      candidates: replaySeed == nil ? previous?.candidates ?? [] : [], selected: replaySeed == nil ? previous?.selected ?? 0 : 0)
+    var bundle = CandidateBundle(id: replay == nil ? previous?.id ?? UUID() : UUID(), recipe: recipe,
+      origin: previous?.origin ?? state.manuscriptOrigins[document.id],
+      candidates: replay == nil ? previous?.candidates ?? [] : [],
+      selected: replay == nil ? previous?.selected ?? 0 : replay?.batch?.lane ?? 0)
     writingFlag = flag
     defer { if writingFlag === flag { writingFlag = nil } }
     do {
-      for _ in 0..<count {
-        try flag.check()
-        let index = bundle.candidates.count, seed = replaySeed ?? UInt64.random(in: .min ... .max)
+      try flag.check()
+      let startIndex = bundle.candidates.count
+      for (lane, seed) in seeds.enumerated() {
         bundle.candidates.append(WritingCandidate(id: UUID(), seed: seed, text: "", state: .pending,
-          promptTokens: 0, outputTokens: 0, tokenIDs: [], stopReason: nil))
-        candidates = bundle
-        // The captured prompt and seed exist durably before the first model token.
-        let pendingVault = store.vault, pendingBundle = bundle
-        try await detachedWork { try pendingVault.encode(pendingBundle, kind: .candidate, id: pendingBundle.id) }
-        if !state.candidateIDs.contains(bundle.id) { state.candidateIDs.append(bundle.id) }
-        try await flush()
-        let bundleID = bundle.id
-        let checkpointStore = store
-        let generation = GenerationIdentity(kind: .writing, operationID: flag.operationID,
-          recordID: bundleID, attemptID: bundle.candidates[index].id, model: recipe.model,
+          promptTokens: 0, outputTokens: 0, tokenIDs: [], stopReason: nil,
+          batch: seeds.count > 1 ? WritingBatchExecution(seeds: seeds, lane: lane) : nil))
+      }
+      candidates = bundle
+      // Every row's identity, seed and captured batch exist before shared prefill.
+      let pendingVault = store.vault, pendingBundle = bundle
+      try await detachedWork { try pendingVault.encode(pendingBundle, kind: .candidate, id: pendingBundle.id) }
+      if !state.candidateIDs.contains(bundle.id) { state.candidateIDs.append(bundle.id) }
+      try await flush()
+      let bundleID = bundle.id, checkpointStore = store
+      let generations = seeds.enumerated().map { lane, seed in
+        GenerationIdentity(kind: .writing, operationID: flag.operationID,
+          recordID: bundleID, attemptID: bundle.candidates[startIndex + lane].id, model: recipe.model,
           seed: seed, requestDigest: recipe.promptDigest, maxTokens: recipe.maxTokens,
-          generationPolicy: recipe.generationPolicy)
-        let result = try await runner.run(rawPrompt: recipe.prompt, maxTokens: recipe.maxTokens,
-          settings: recipe.settings, seed: seed, flag: flag, background: maxTokens == 64 && !showingCandidates,
-          onCheckpoint: { [weak self] progress, stop, token in
+          generationPolicy: recipe.generationPolicy, batch: bundle.candidates[startIndex + lane].batch)
+      }
+      let results = try await runner.runBatch(rawPrompt: recipe.prompt, maxTokens: recipe.maxTokens,
+          settings: recipe.settings, seeds: seeds, flag: flag, background: maxTokens == 64 && !showingCandidates,
+          onCheckpoint: { [weak self] lane, progress, stop, token in
+            let generation = generations[lane], index = startIndex + lane
             try await checkpointStore.checkpoint(progress, identity: generation, stopReason: stop, stopTokenID: token)
             guard let owner = self else { return }
             await MainActor.run {
@@ -1308,11 +1322,18 @@ struct CompletionSegment {
                 owner.candidates?.candidates[index].id == generation.attemptID,
                 owner.candidates?.candidates[index].state == .pending else { return }
               owner.candidates?.candidates[index].retain(progress)
+              if let stop {
+                owner.candidates?.candidates[index].state = stop == "cancelled" ? .cancelled : (progress.text.isEmpty ? .failed : .complete)
+                owner.candidates?.candidates[index].stopReason = stop
+                owner.candidates?.candidates[index].stopTokenID = token
+              }
               if index == owner.candidates?.selected, owner.epoch == capturedEpoch {
                 owner.showCandidateGhost(progress.text, recipe: recipe, epoch: capturedEpoch)
               }
             }
-          }, onText: { _ in })
+          })
+      for (lane, result) in results.enumerated() {
+        let index = startIndex + lane
         bundle.candidates[index].text = result.text
         bundle.candidates[index].state = result.stopReason == "cancelled" ? .cancelled : (result.text.isEmpty ? .failed : .complete)
         bundle.candidates[index].promptTokens = result.promptTokens
@@ -1320,14 +1341,13 @@ struct CompletionSegment {
         bundle.candidates[index].tokenIDs = result.tokenIDs
         bundle.candidates[index].stopReason = result.stopReason
         bundle.candidates[index].stopTokenID = result.stopTokenID
-        candidates = bundle
-        if index == bundle.selected, epoch == capturedEpoch { showCandidateGhost(result.text, recipe: recipe, epoch: capturedEpoch) }
-        let vault = store.vault, saved = bundle
-        try await detachedWork { try vault.encode(saved, kind: .candidate, id: saved.id) }
-        if !state.candidateIDs.contains(bundle.id) { state.candidateIDs.append(bundle.id) }
-        try await flush()
-        try flag.check()
       }
+      candidates = bundle
+      if epoch == capturedEpoch { showCandidateGhost(bundle.candidates[bundle.selected].text, recipe: recipe, epoch: capturedEpoch) }
+      let vault = store.vault, saved = bundle
+      try await detachedWork { try vault.encode(saved, kind: .candidate, id: saved.id) }
+      try await flush()
+      try flag.check()
       status = "\(bundle.candidates.count) continuation\(bundle.candidates.count == 1 ? "" : "s") · "
         + (recipe.omittedPrefixCharacters == 0 ? "full preceding manuscript" : "\(recipe.omittedPrefixCharacters) earlier characters omitted")
     } catch {
@@ -1380,7 +1400,7 @@ struct CompletionSegment {
       guard let self else { return }
       try await self.generateCandidates(document: bundle.recipe.document, offset: bundle.recipe.caretUTF16,
         profile: bundle.recipe.profile, count: 1, maxTokens: bundle.recipe.maxTokens, flag: flag,
-        previous: bundle, replaySeed: bundle.candidates[index].seed)
+        previous: bundle, replay: bundle.candidates[index])
     }
   }
   func acceptCandidateWord(_ index: Int) {

@@ -155,6 +155,13 @@ enum ProductCore {
   static func validateWritingRecipe(_ recipe: CompletionRecipe) throws {
     let _: Bool = try call(["op": "validate_writing_recipe", "recipe": object(recipe)])
   }
+  static func validateWritingBatch(_ execution: WritingBatchExecution, seed: UInt64) throws {
+    let _: Bool = try call(["op": "validate_writing_batch", "execution": object(execution), "seed": seed])
+  }
+  static func admitWritingBatch(width: Int, prompt: Int, output: Int, capacity: Int) throws {
+    let _: Bool = try call(["op": "admit_writing_batch", "width": width,
+      "prompt": prompt, "output": output, "capacity": capacity])
+  }
   static func branchWriting(_ recipe: CompletionRecipe, continuation: String) throws -> String {
     try call(["op": "branch_writing", "recipe": object(recipe), "continuation": continuation])
   }
@@ -271,6 +278,11 @@ struct CompletionRecipe: Codable, Sendable {
   let maxTokens: Int
   let generationPolicy: ModelGenerationPolicy?
 }
+struct WritingBatchExecution: Codable, Equatable, Sendable {
+  var algorithm = "shared-prefill-fixed-batch-v1"
+  let seeds: [UInt64]
+  let lane: Int
+}
 struct WritingCandidate: Codable, Identifiable, Sendable {
   let id: UUID
   let seed: UInt64
@@ -281,6 +293,7 @@ struct WritingCandidate: Codable, Identifiable, Sendable {
   var tokenIDs: [Int]
   var stopReason: String?
   var stopTokenID: Int? = nil
+  var batch: WritingBatchExecution? = nil
 }
 struct CandidateBundle: Codable, Identifiable, Sendable {
   let id: UUID

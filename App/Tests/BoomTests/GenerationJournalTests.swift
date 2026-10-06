@@ -50,6 +50,41 @@ final class GenerationJournalTests: XCTestCase {
     GenerationProgress(text: text, tokenIDs: tokens, promptDigest: Digest.sha256("prepared tokens"),
       promptTokens: 12, firstTokenSeconds: 0.2, elapsedSeconds: elapsed)
   }
+  func testBatchRowsRecoverIndependentlyAndRejectChangedGeometryWithoutOverwriting() async throws {
+    let f = try await fixture(); defer { try? FileManager.default.removeItem(at: f.root) }
+    var bundle = f.bundle
+    let seeds: [UInt64] = [.max, 17, 42]
+    bundle.candidates = seeds.enumerated().map { lane, seed in
+      WritingCandidate(id: UUID(), seed: seed, text: "", state: .pending,
+        promptTokens: 0, outputTokens: 0, tokenIDs: [], stopReason: nil,
+        batch: WritingBatchExecution(seeds: seeds, lane: lane))
+    }
+    try f.store.vault.encode(bundle, kind: .candidate, id: bundle.id)
+    for lane in seeds.indices {
+      let identity = GenerationIdentity(kind: .writing, operationID: f.writing.operationID,
+        recordID: bundle.id, attemptID: bundle.candidates[lane].id, model: bundle.recipe.model,
+        seed: seeds[lane], requestDigest: bundle.recipe.promptDigest, maxTokens: 256,
+        generationPolicy: nil, batch: bundle.candidates[lane].batch)
+      try await f.store.checkpoint(progress("Row \(lane) 👩🏽‍💻é"), identity: identity,
+        stopReason: lane == 0 ? "output_limit" : nil)
+    }
+    // Simulate death before the final bundle save: every stored row is pending,
+    // but the first row has a durable terminal journal.
+    let fresh = try WorkspaceStore(rootOverride: f.root, testKey: f.key)
+    let (_, documents) = try await fresh.load().get()
+    let recovered = try fresh.vault.decode(CandidateBundle.self, kind: .candidate, id: bundle.id)
+    XCTAssertEqual(recovered.candidates.map(\.state), [.complete, .cancelled, .cancelled])
+    XCTAssertEqual(recovered.candidates.map(\.text), ["Row 0 👩🏽‍💻é", "Row 1 👩🏽‍💻é", "Row 2 👩🏽‍💻é"])
+    XCTAssertEqual(recovered.candidates.map(\.batch), bundle.candidates.map(\.batch))
+    XCTAssertEqual(documents[0], f.document)
+    var altered = recovered
+    altered.candidates[1].batch = WritingBatchExecution(seeds: [.max, 17], lane: 1)
+    try fresh.vault.encode(altered, kind: .candidate, id: altered.id)
+    let candidateURL = fresh.vault.recordURL(.candidate, altered.id)
+    let before = try Data(contentsOf: candidateURL)
+    switch await fresh.load() { case .success: XCTFail("Changed batch shape was admitted"); case .failure: break }
+    XCTAssertEqual(try Data(contentsOf: candidateURL), before)
+  }
   func testFreshStoreRecoversOnlyDurableTokensAndKeepsManuscriptAndSpeaker() async throws {
     let f = try await fixture(); defer { try? FileManager.default.removeItem(at: f.root) }
     let checkpoint = progress()
@@ -97,7 +132,8 @@ final class GenerationJournalTests: XCTestCase {
     let bundle = try fresh.vault.decode(CandidateBundle.self, kind: .candidate, id: f.bundle.id)
     XCTAssertEqual(bundle.recipe.generationPolicy, policy)
     XCTAssertEqual(bundle.candidates[0].stopTokenID, 1)
-    XCTAssertEqual(bundle.candidates[0].stopReason, "interrupted")
+    XCTAssertEqual(bundle.candidates[0].stopReason, "eos")
+    XCTAssertEqual(bundle.candidates[0].state, .complete)
     let receipt = try fresh.vault.decode(ConsultationReceipt.self, kind: .receipt, id: f.consultation.attemptID)
     XCTAssertEqual(receipt.generationPolicy, policy); XCTAssertEqual(receipt.stopTokenID, 1)
     let journal = try await fresh.writingCheckpoint(bundle: bundle, candidate: bundle.candidates[0])

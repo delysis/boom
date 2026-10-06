@@ -30,6 +30,8 @@ The public full-precision checkpoints require about 24 GB each. Their presence i
 
 The pair shares a measured process budget derived from physical memory and Metal's working-set limit. On a 32 GiB machine the policy reserves at least 8 GiB. One coordinator serializes loading and generation, joins producers, and lets foreground consultation preempt automatic suggestions. Context is capped at 16,384 tokens and further limited by available memory. Pressure releases the inactive model. A draft assistant is optional and is not required for voices.
 
+Explore prefills its captured prose once, expands that cache to three rows, and decodes the alternatives in one MLX tensor batch. Rows use independent seeded samplers and stop independently; completed rows keep their positions until the batch finishes. Replay repeats the recorded batch width and ordered seeds, retaining all replayed alternatives and selecting the requested row. A short suggestion uses one row; requesting its other two alternatives uses a two-row batch. Context admission accounts for every row and the cache expansion overlap. `--mlx-smoke --batch --pack ABSOLUTE_DIRECTORY --evidence NEW_DIRECTORY` retains public-prose serial/batch measurements, raw outputs, exact replay, cache dimensions, cancellation and subsequent-operation results. Measurements on the development Mac do not qualify the 32 GB target.
+
 ## Build and checks
 
 Use an Apple Silicon Mac, macOS 15 or later, Xcode with Swift 6, and Rust.

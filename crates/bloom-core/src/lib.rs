@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 const TEXT_LIMIT: usize = 2 * 1024 * 1024;
 
+mod batch;
 mod context;
 mod document;
 mod generation;
@@ -689,6 +690,16 @@ pub enum Request {
     ValidateWritingRecipe {
         recipe: Box<writing::Recipe>,
     },
+    ValidateWritingBatch {
+        execution: batch::Execution,
+        seed: u64,
+    },
+    AdmitWritingBatch {
+        width: usize,
+        prompt: usize,
+        output: usize,
+        capacity: usize,
+    },
     BranchWriting {
         recipe: Box<writing::Recipe>,
         continuation: String,
@@ -842,6 +853,15 @@ pub fn execute(request: Request) -> Result<Value, Error> {
         Request::ValidateWritingRecipe { recipe } => {
             serde_json::to_value(writing::validate(&recipe)?)
         }
+        Request::ValidateWritingBatch { execution, seed } => {
+            serde_json::to_value(execution.validate(seed)?)
+        }
+        Request::AdmitWritingBatch {
+            width,
+            prompt,
+            output,
+            capacity,
+        } => serde_json::to_value(batch::admit(width, prompt, output, capacity)?),
         Request::BranchWriting {
             recipe,
             continuation,

@@ -26,6 +26,7 @@ pub struct Identity {
     pub request_digest: String,
     pub max_tokens: usize,
     pub generation_policy: Option<crate::sampling_policy::Policy>,
+    pub batch: Option<crate::batch::Execution>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -74,6 +75,19 @@ fn valid(checkpoint: &Checkpoint, expected: &Identity) -> Result<(), Error> {
         "Invalid captured generation identity.",
     )?;
     let progress = &checkpoint.progress;
+    if let Some(batch) = &expected.batch {
+        require(
+            expected.kind == Kind::Writing,
+            "Only writing uses a captured inference batch.",
+        )?;
+        batch.validate(expected.seed)?;
+        crate::batch::admit(
+            batch.seeds.len(),
+            progress.prompt_tokens,
+            expected.max_tokens,
+            16_384,
+        )?;
+    }
     if let Some(policy) = &expected.generation_policy {
         policy.validate()?;
         require(
@@ -183,6 +197,7 @@ mod tests {
                 request_digest: "a".repeat(64),
                 max_tokens: 64,
                 generation_policy: None,
+                batch: None,
             },
             progress: Progress {
                 text: "At the shore, 👩🏽‍💻é".into(),
@@ -225,6 +240,32 @@ mod tests {
             let changed = serde_json::from_value(wire).map_err(|e| Error(e.to_string()))?;
             assert!(validate(&expected, None, changed).is_err(), "{field}");
         }
+        Ok(())
+    }
+    #[test]
+    fn batch_geometry_is_authenticated_and_cannot_be_changed_on_recovery() -> Result<(), Error> {
+        let mut next = checkpoint();
+        next.identity.batch = Some(crate::batch::Execution {
+            algorithm: "shared-prefill-fixed-batch-v1".into(),
+            seeds: vec![17, u64::MAX, 42],
+            lane: 1,
+        });
+        let expected = next.identity.clone();
+        validate(&expected, None, next.clone())?;
+        let mut changed = next.clone();
+        changed
+            .identity
+            .batch
+            .as_mut()
+            .ok_or_else(|| Error("Missing fixture batch".into()))?
+            .seeds
+            .pop();
+        assert!(validate(&expected, None, changed.clone()).is_err());
+        changed.identity.kind = Kind::Consultation;
+        assert!(validate(&changed.identity, None, changed.clone()).is_err());
+        changed.identity.kind = Kind::Writing;
+        changed.identity.seed = 42;
+        assert!(validate(&changed.identity, None, changed.clone()).is_err());
         Ok(())
     }
     #[test]

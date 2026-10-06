@@ -342,11 +342,26 @@ actor WorkspaceStore {
       else { throw BoomError.invalid("Inconsistent continuation record; existing bytes retained.") }
       var interrupted = false
       for index in bundle.candidates.indices {
+        if let execution = bundle.candidates[index].batch {
+          try ProductCore.validateWritingBatch(execution, seed: bundle.candidates[index].seed)
+        }
         let journal = try writingCheckpoint(bundle: bundle, candidate: bundle.candidates[index])
         guard bundle.candidates[index].state == .pending else { continue }
-        if let journal { bundle.candidates[index].retain(journal) }
-        bundle.candidates[index].state = .cancelled
-        bundle.candidates[index].stopReason = "interrupted"
+        if let journal {
+          bundle.candidates[index].retain(journal)
+          if let stop = journal.stopReason, stop != "cancelled" {
+            // A row may have finished while the other rows were still decoding.
+            // Its terminal journal is durable even before the bundle's final save.
+            bundle.candidates[index].state = journal.progress.text.isEmpty ? .failed : .complete
+            bundle.candidates[index].stopReason = stop
+          } else {
+            bundle.candidates[index].state = .cancelled
+            bundle.candidates[index].stopReason = "interrupted"
+          }
+        } else {
+          bundle.candidates[index].state = .cancelled
+          bundle.candidates[index].stopReason = "interrupted"
+        }
         interrupted = true
       }
       if interrupted { bundles.append(bundle) }

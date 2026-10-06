@@ -173,3 +173,29 @@ control strip or sampling popover has returned. Explore, examples, and variation
 are native Writing menu actions. Empty-document Explore is disabled. Requested
 alternatives appear in a temporary tray and enter the manuscript only through
 explicit acceptance or branching.
+
+Leave inline suggestions enabled while partially accepting an explored
+continuation. Wait beyond the autocomplete delay, then edit the manuscript or
+move its caret. The open tray must retain the same captured alternatives and
+seeds, with stale acceptance disabled and branching still available. Background
+autocomplete must not replace that tray with a new short candidate. Also open
+the tray while a delayed autocomplete request is pending and check that the
+request cannot replace the displayed choices.
+
+Explore must advance all three alternatives in one inference batch. Inspect
+the retained row seeds, shared prompt prefill and cache batch dimensions; three
+concurrent single-row tasks do not establish batching. Replay a non-first row
+and verify the same ordered batch seeds and all token ledgers, with that row
+selected. Cancel during decoding and before the first token, then run a new
+operation. Completed rows remain complete while unfinished rows retain their
+partial tokens as cancelled. Benchmark matched serial and batch workloads and
+retain every output; report aggregate throughput and memory separately from
+individual row latency and 32 GB qualification.
+
+Every manuscript window must retain ordinary AppKit keyboard focus. Never make
+a visible test editor unable to become key to avoid interrupting the user.
+Background native checks live offscreen; foreground use ends automation and
+hands the window over without closing it. Check a first click in the editor,
+including its empty page area, then caret placement and typing during generation.
+Offscreen first-responder and persistence checks are component evidence; they
+do not qualify actual focused mouse/keyboard behavior or typing latency.

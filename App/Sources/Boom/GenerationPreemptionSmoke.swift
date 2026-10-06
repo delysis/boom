@@ -21,20 +21,21 @@ enum GenerationPreemptionSmoke {
       lock.lock(); defer { lock.unlock() }; return (chunks, updates)
     }
   }
-  static func run(writingPack: URL, evidence: URL) async throws {
+  static func run(writingPack: URL, evidence: URL, batch: Bool = false) async throws {
     var receipt: [String: Any] = ["status": "running", "schema": 1,
       "scope": "public real-model prefill preemption; no window or workspace",
       "source_inventory_sha256": Bundle.main.infoDictionary?["BoomSourceSHA256"] ?? "unavailable",
       "runtime_revision": ModelPacks.runtimeRevision,
       "hardware_bytes": ProcessInfo.processInfo.physicalMemory,
       "target_32gb_qualified": false, "interactive_native_qualified": false]
+    receipt["background_batch_width"] = batch ? 3 : 1
     func persist() throws {
       try JSONSerialization.data(withJSONObject: receipt, options: [.prettyPrinted, .sortedKeys])
         .write(to: evidence.appendingPathComponent("receipt.json"), options: .atomic)
     }
     try persist()
     let backgroundFlag = CancellationFlag(), foregroundFlag = CancellationFlag()
-    var backgroundTask: Task<MLXGemmaRunner.Output, Error>?
+    var backgroundTask: Task<[MLXGemmaRunner.Output], Error>?
     var foregroundTask: Task<(Int, MLXGemmaRunner.Output), Error>?
     do {
       guard let consultationPack = ModelPacks.cached(.consultation) else {
@@ -62,10 +63,11 @@ enum GenerationPreemptionSmoke {
       let events = AsyncStream<MLXGemmaRunner.PrefillProgress>.makeStream()
       let background = Task {
         defer { events.continuation.finish() }
-        return try await writing.run(rawPrompt: prompt, maxTokens: 64, seed: 42,
+        return try await writing.runBatch(rawPrompt: prompt, maxTokens: 64,
+          settings: ProductCore.sampling(.standard), seeds: batch ? [42, 17, 314] : [42],
           flag: backgroundFlag, background: true, onPrefill: { progress in
             trace.prefill(progress); events.continuation.yield(progress)
-          }, onText: { _ in trace.text() })
+          }, onCheckpoint: { _, progress, _, _ in if !progress.text.isEmpty { trace.text() } })
       }
       backgroundTask = background
       let watchdog = DispatchSource.makeTimerSource(queue: .global())
@@ -110,9 +112,9 @@ enum GenerationPreemptionSmoke {
       case .failure(let error):
         receipt["background_error"] = String(describing: error)
         receipt["prefill_interrupted"] = error is CancellationError
-      case .success(let output):
-        receipt["background_output"] = output.text; receipt["background_token_ids"] = output.tokenIDs
-        receipt["background_stop"] = output.stopReason; receipt["prefill_interrupted"] = false
+      case .success(let outputs):
+        receipt["background_outputs"] = outputs.map { ["text": $0.text, "token_ids": $0.tokenIDs, "stop": $0.stopReason] as [String: Any] }
+        receipt["prefill_interrupted"] = false
       }
       try persist()
       let result: (Int, MLXGemmaRunner.Output)

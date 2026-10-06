@@ -24,7 +24,11 @@ enum MLXNativeSmoke {
     try FileManager.default.createDirectory(at: evidence, withIntermediateDirectories: false,
       attributes: [.posixPermissions: 0o700])
     if arguments.contains("--preempt") {
-      try await GenerationPreemptionSmoke.run(writingPack: directory, evidence: evidence)
+      try await GenerationPreemptionSmoke.run(writingPack: directory, evidence: evidence, batch: arguments.contains("--batch"))
+      return
+    }
+    if arguments.contains("--batch") {
+      try await BatchGenerationSmoke.run(directory: directory, evidence: evidence)
       return
     }
     if arguments.contains("--writing-fixtures") {

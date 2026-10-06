@@ -58,6 +58,12 @@ actor MLXGemmaRunner {
     let firstTokenSeconds: Double?
     let elapsedSeconds: Double
   }
+  struct BatchMetrics: Codable, Sendable {
+    let width: Int
+    let sharedPromptPrefills: Int
+    let decodeForwardPasses: Int
+    let cacheBatchDimensions: [Int]
+  }
   nonisolated let source: URL
   nonisolated let identity: String
   nonisolated let generationPolicy: ModelGenerationPolicy
@@ -127,8 +133,13 @@ actor MLXGemmaRunner {
     self.kvBytesPerToken = kvBytesPerToken; self.generationPolicy = generationPolicy
     self.tokenizerDescription = tokenizerDescription
   }
-  private nonisolated func availableContext() throws -> Int {
-    min(16_384, architectureContext, Int(clamping: try ModelResidency.availableBytes() / kvBytesPerToken))
+  private nonisolated func availableContext(batchWidth: Int = 1) throws -> Int {
+    guard (1...4).contains(batchWidth) else { throw BoomError.invalid("Invalid inference batch width.") }
+    return min(16_384, architectureContext,
+      // Include the single-row prefill cache while expanded row storage is
+      // being materialized. This is deliberately conservative for shared KV.
+      Int(clamping: try ModelResidency.availableBytes()
+        / (kvBytesPerToken * UInt64(batchWidth == 1 ? 1 : batchWidth + 1))))
   }
   var contextLength: Int { (try? availableContext()) ?? 0 }
   func tokenCount(_ text: String) async -> Int {
@@ -234,9 +245,9 @@ actor MLXGemmaRunner {
     }
   }
   func completionRecipe(document: DocumentSnapshot, caret: Int, sources: [SourceReference],
-    examples: [String], profile: SamplingProfile, maxTokens: Int, flag: CancellationFlag
+    examples: [String], profile: SamplingProfile, maxTokens: Int, flag: CancellationFlag, batchWidth: Int = 1
   ) async throws -> CompletionRecipe {
-    let capacity = try availableContext() - maxTokens
+    let capacity = try availableContext(batchWidth: batchWidth) - maxTokens
     let (selected, _) = try await writingContext(document: document, caret: caret, examples: examples,
       capacity: capacity, flag: flag)
     return CompletionRecipe(document: document, caretUTF16: caret, sources: sources,
@@ -266,15 +277,19 @@ actor MLXGemmaRunner {
     onPrefill: (@Sendable (PrefillProgress) -> Void)? = nil,
     onCheckpoint: (@Sendable (GenerationProgress, String?, Int?) async throws -> Void)? = nil,
     onText: @escaping @Sendable (String) -> Void) async throws -> Output {
-    await GenerationCoordinator.shared.enter(flag: flag, background: background)
-    // Own the whole task before preparing input or constructing the iterator.
-    // MLX checks Task cancellation between prefill chunks, before a stream
-    // producer exists. Every exit fences submitted GPU work before handoff.
-    let work = Task {
+    try await ownedOperation(flag: flag, background: background) {
       try await self.generateOwned(plan: plan, raw: raw, images: images, maxTokens: maxTokens,
         settings: settings, seed: seed, flag: flag, onPrefill: onPrefill,
         onCheckpoint: onCheckpoint, onText: onText)
     }
+  }
+  private func ownedOperation<R: Sendable>(flag: CancellationFlag, background: Bool,
+    operation: @escaping @Sendable () async throws -> R) async throws -> R {
+    await GenerationCoordinator.shared.enter(flag: flag, background: background)
+    // Own the whole task before preparing input or constructing the iterator.
+    // MLX checks Task cancellation between prefill chunks, before a stream
+    // producer exists. Every exit fences submitted GPU work before handoff.
+    let work = Task { try await operation() }
     let registration = flag.onCancel { work.cancel() }
     defer { flag.removeCancellationHandler(registration) }
     await GenerationCoordinator.shared.own(work)
@@ -285,6 +300,152 @@ actor MLXGemmaRunner {
       await GenerationCoordinator.shared.leave()
       return result
     } catch { await GenerationCoordinator.shared.leave(); throw error }
+  }
+  /// One producer, one prompt prefill, and one weight-reading forward pass per
+  /// decoding step. Rows never compact: their shape is part of seeded replay.
+  func runBatch(rawPrompt: String, maxTokens: Int, settings: SamplingSettings, seeds: [UInt64],
+    flag: CancellationFlag, background: Bool = false,
+    onPrefill: (@Sendable (PrefillProgress) -> Void)? = nil,
+    onCheckpoint: (@Sendable (Int, GenerationProgress, String?, Int?) async throws -> Void)? = nil,
+    onMetrics: (@Sendable (BatchMetrics) async -> Void)? = nil
+  ) async throws -> [Output] {
+    try ProductCore.admitWritingBatch(width: seeds.count, prompt: 1, output: maxTokens, capacity: 16_384)
+    if seeds.count == 1 {
+      return [try await run(rawPrompt: rawPrompt, maxTokens: maxTokens, settings: settings,
+        seed: seeds[0], flag: flag, background: background, onPrefill: onPrefill,
+        onCheckpoint: { progress, stop, token in try await onCheckpoint?(0, progress, stop, token) },
+        onText: { _ in })]
+    }
+    return try await ownedOperation(flag: flag, background: background) {
+      try await self.generateBatchOwned(raw: rawPrompt, maxTokens: maxTokens, settings: settings,
+        seeds: seeds, flag: flag, onPrefill: onPrefill, onCheckpoint: onCheckpoint, onMetrics: onMetrics)
+    }
+  }
+  private func generateBatchOwned(raw: String, maxTokens: Int, settings: SamplingSettings,
+    seeds: [UInt64], flag: CancellationFlag,
+    onPrefill: (@Sendable (PrefillProgress) -> Void)?,
+    onCheckpoint: (@Sendable (Int, GenerationProgress, String?, Int?) async throws -> Void)?,
+    onMetrics: (@Sendable (BatchMetrics) async -> Void)?
+  ) async throws -> [Output] {
+    try flag.check()
+    let capacity = try availableContext(batchWidth: seeds.count), policy = generationPolicy
+    let controls = Set(policy.controlTokenIDs), ends = Set(policy.eosTokenIDs)
+    return try await container.perform { (context: ModelContext) async throws -> [Output] in
+      defer { Stream.defaultStream.synchronize() }
+      let promptIDs = context.tokenizer.encode(text: raw, addSpecialTokens: false)
+      try ProductCore.admitWritingBatch(width: seeds.count, prompt: promptIDs.count,
+        output: maxTokens, capacity: capacity)
+      let digest = Digest.sha256(try JSONEncoder().encode(promptIDs))
+      let parameters = GenerateParameters(maxTokens: maxTokens, temperature: settings.temperature,
+        topP: settings.topP, topK: settings.topK, minP: settings.minP, repetitionPenalty: nil,
+        prefill: PrefillParameters(progress: { processed, total in
+          onPrefill?(PrefillProgress(operationID: flag.operationID, processedPositions: processed, totalPositions: total))
+        }))
+      let cache = try context.model.newCache(parameters: parameters)
+      let clock = ContinuousClock(), started = clock.now
+      let prepared = try context.model.prepare(LMInput(tokens: MLXArray(promptIDs)),
+        cache: cache, state: nil, prefill: parameters.prefill)
+      let initial: LMOutput
+      switch prepared {
+      case .logits(let output): initial = output
+      case .tokens(let tail):
+        initial = context.model(LMInput.Text(tokens: tail.tokens.expandedDimensions(axis: 0)), cache: cache, state: nil)
+      }
+      guard initial.state == nil else { throw BoomError.invalid("This checkpoint needs unsupported per-row inference state.") }
+      var logits = initial.logits[0..., -1, 0...]
+      eval(logits); eval(cache)
+      try flag.check()
+      // Preserve each existing cache object's offsets and rotating-window
+      // metadata. Only its leading tensor dimension changes.
+      for var entry in cache {
+        let state = entry.state
+        if state.isEmpty { continue } // Gemma's shared-KV layers have no own tensors.
+        guard (entry is KVCacheSimple || entry is RotatingKVCache), state.count == 2,
+          state.allSatisfy({ $0.ndim == 4 && $0.dim(0) == 1 }) else {
+          throw BoomError.invalid("Unsupported cache layout for batched writing.")
+        }
+        entry.state = state.map { broadcast($0, to: [seeds.count] + Array($0.shape.dropFirst())) }
+      }
+      eval(cache)
+      logits = broadcast(logits, to: [seeds.count, logits.dim(1)])
+      let mask = CheckpointTokenMask(policy.suppressedTokenIDs)
+      let samplers = seeds.map { seed in
+        GenerateParameters(temperature: settings.temperature, topP: settings.topP,
+          topK: settings.topK, minP: settings.minP, repetitionPenalty: nil, seed: seed).sampler()
+      }
+      var tokens = Array(repeating: [Int](), count: seeds.count)
+      var texts = Array(repeating: "", count: seeds.count)
+      var first = Array<Double?>(repeating: nil, count: seeds.count)
+      var reasons = Array<String?>(repeating: nil, count: seeds.count)
+      var stops = Array<Int?>(repeating: nil, count: seeds.count)
+      var elapsed = Array(repeating: 0.0, count: seeds.count)
+      var decodePasses = 0
+      // Finished rows remain inert occupants of the original shape. They never
+      // sample again or emit another checkpoint, and cannot affect other rows.
+      let inertToken = policy.eosTokenIDs[0]
+      while reasons.contains(nil), !flag.isCancelled, !Task.isCancelled {
+        let sampled: [Int] = autoreleasepool {
+          let filtered = mask.process(logits: logits)
+          let next = samplers.indices.map { lane in
+            reasons[lane] == nil
+              ? samplers[lane].sample(logits: filtered[lane].expandedDimensions(axis: 0)).reshaped([1])
+              : MLXArray([inertToken])
+          }
+          let joined = concatenated(next, axis: 0)
+          eval(joined)
+          return joined.asArray(Int.self)
+        }
+        for lane in seeds.indices where reasons[lane] == nil {
+          let token = sampled[lane]
+          guard !policy.suppressedTokenIDs.contains(token) else {
+            throw BoomError.invalid("A batch row emitted an excluded checkpoint token.")
+          }
+          if controls.contains(token) {
+            reasons[lane] = ends.contains(token) ? "eos" : "model_control"; stops[lane] = token
+          } else {
+            if first[lane] == nil { first[lane] = started.duration(to: clock.now).timeInterval }
+            tokens[lane].append(token)
+            if tokens[lane].count == maxTokens { reasons[lane] = "output_limit" }
+          }
+          let decoded = context.tokenizer.decode(tokenIds: tokens[lane])
+          elapsed[lane] = started.duration(to: clock.now).timeInterval
+          if reasons[lane] != nil || (!decoded.hasSuffix("\u{FFFD}") && decoded != texts[lane]) {
+            try await onCheckpoint?(lane, GenerationProgress(text: decoded, tokenIDs: tokens[lane],
+              promptDigest: digest, promptTokens: promptIDs.count, firstTokenSeconds: first[lane],
+              elapsedSeconds: elapsed[lane]), reasons[lane], stops[lane])
+            texts[lane] = decoded
+          }
+        }
+        if reasons.contains(nil), !flag.isCancelled, !Task.isCancelled {
+          logits = try autoreleasepool {
+            let output = context.model(LMInput.Text(tokens: MLXArray(sampled).reshaped([seeds.count, 1])),
+              cache: cache, state: nil)
+            guard output.state == nil else { throw BoomError.invalid("Unexpected batch inference state.") }
+            let next = output.logits[0..., -1, 0...]
+            guard next.ndim == 2, next.dim(0) == seeds.count else { throw BoomError.invalid("The model lost its batch rows.") }
+            eval(next); eval(cache)
+            return next
+          }
+          decodePasses += 1
+        }
+      }
+      for lane in seeds.indices where reasons[lane] == nil {
+        reasons[lane] = "cancelled"
+        elapsed[lane] = started.duration(to: clock.now).timeInterval
+        texts[lane] = context.tokenizer.decode(tokenIds: tokens[lane])
+        try await onCheckpoint?(lane, GenerationProgress(text: texts[lane], tokenIDs: tokens[lane],
+          promptDigest: digest, promptTokens: promptIDs.count, firstTokenSeconds: first[lane],
+          elapsedSeconds: elapsed[lane]), reasons[lane], nil)
+      }
+      await onMetrics?(BatchMetrics(width: seeds.count, sharedPromptPrefills: 1,
+        decodeForwardPasses: decodePasses,
+        cacheBatchDimensions: cache.flatMap { $0.state.map { $0.dim(0) } }))
+      return seeds.indices.map { lane in
+        Output(text: texts[lane], tokenIDs: tokens[lane], promptDigest: digest, promptTokens: promptIDs.count,
+          outputTokens: tokens[lane].count, endedByEOS: stops[lane] != nil, stopReason: reasons[lane] ?? "cancelled",
+          stopTokenID: stops[lane], firstTokenSeconds: first[lane], elapsedSeconds: elapsed[lane])
+      }
+    }
   }
   private func generateOwned(plan: ConsultationPlan?, raw: String?, images: [Data], maxTokens: Int,
     settings: SamplingSettings, seed: UInt64?, flag: CancellationFlag,

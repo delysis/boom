@@ -71,8 +71,7 @@ import SwiftUI
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     guard model.layout.isAuthor else { throw BoomError.unavailable("Use the author edition for this writing diagnostic.") }
     let host = NSHostingView(rootView: WorkspaceView(model: model))
-    let window = NSWindow(contentRect: NSRect(x: -5000, y: -5000, width: 1440, height: 900),
-      styleMask: [.borderless], backing: .buffered, defer: false)
+    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 1440, height: 900))
     window.isReleasedWhenClosed = false; window.contentView = host
     defer { window.close() }
     host.layoutSubtreeIfNeeded()
@@ -91,6 +90,7 @@ import SwiftUI
       throw BoomError.invalid("Explore did not produce three completed alternatives without changing the manuscript; all attempts retained.")
     }
     try write(alternatives, to: evidence.appendingPathComponent("alternatives.json"))
+    model.setAutocomplete(true)
     let editor = try await Self.editor(model, documentID: fixture.document.id)
     let manager = model.undoManager(fixture.document.id)
     manager.groupsByEvent = false; manager.removeAllActions(); manager.beginUndoGrouping()
@@ -101,6 +101,20 @@ import SwiftUI
     guard let partial = model.selectedDocument, partial.text != fixture.document.text, manager.canUndo,
       !model.candidateIsCurrent else { throw BoomError.invalid("Partial acceptance failed or left obsolete alternatives admissible.") }
     try write(partial, to: evidence.appendingPathComponent("partial-acceptance.json"))
+    // Keep suggestions enabled while the captured choices become stale. The
+    // open tray must retain all three, so the writer can still branch from them.
+    let retainedIDs = model.state.candidateIDs
+    try await Task.sleep(for: .seconds(2))
+    guard model.showingCandidates, let retained = model.candidates, retained.id == alternatives.id,
+      retained.selected == 1, try canonical(retained.recipe) == canonical(alternatives.recipe),
+      try canonical(retained.candidates) == canonical(alternatives.candidates), model.state.candidateIDs == retainedIDs,
+      model.selectedDocument == partial else {
+      throw BoomError.invalid("Autocomplete replaced the visible captured choices after partial acceptance.")
+    }
+    try write(["bundle": retained.id.uuidString, "choices": String(retained.candidates.count),
+      "selected": String(retained.selected), "autocomplete_enabled": String(model.state.autocomplete)],
+      to: evidence.appendingPathComponent("visible-choice-retention.json"))
+    model.setAutocomplete(false)
     guard editor.tryToPerform(NSSelectorFromString("undo:"), with: nil) else {
       throw BoomError.invalid("The native editor did not handle its Undo action.")
     }
@@ -128,14 +142,14 @@ import SwiftUI
     try write(branch, to: evidence.appendingPathComponent("branch.json"))
     model.selectDocument(fixture.document.id)
     _ = try await Self.editor(model, documentID: fixture.document.id)
-    model.replayCandidate(0)
+    model.replayCandidate(1)
     try await finish(model, evidence: evidence, phase: "replay")
-    guard let replay = model.candidates, replay.id != alternatives.id, replay.candidates.count == 1,
+    guard let replay = model.candidates, replay.id != alternatives.id, replay.candidates.count == 3, replay.selected == 1,
       try canonical(replay.recipe) == canonical(alternatives.recipe),
-      replay.candidates[0].seed == alternatives.candidates[0].seed,
-      replay.candidates[0].tokenIDs == alternatives.candidates[0].tokenIDs,
-      replay.candidates[0].text == alternatives.candidates[0].text,
-      replay.candidates[0].state == .complete,
+      zip(replay.candidates, alternatives.candidates).allSatisfy({ again, original in
+        again.seed == original.seed && again.tokenIDs == original.tokenIDs
+          && again.text == original.text && again.state == .complete && again.batch == original.batch
+      }),
       model.documents.first(where: { $0.id == fixture.document.id })?.text == liveText else {
       throw BoomError.invalid("Replay changed its captured recipe, seed or output, or modified the live manuscript.")
     }
@@ -177,6 +191,10 @@ import SwiftUI
   private static func finish(_ model: WorkspaceModel, evidence: URL, phase: String) async throws {
     let start = ContinuousClock().now
     while model.isBusy {
+      if phase == "alternatives", let editor = model.editor, let window = editor.window {
+        guard editor.isEditable, window.canBecomeKey, window.makeFirstResponder(editor),
+          window.firstResponder === editor else { throw BoomError.invalid("Generation took keyboard focus away from the native manuscript editor.") }
+      }
       guard start.duration(to: ContinuousClock().now) < .seconds(240) else { throw BoomError.unavailable("Writing diagnostic timed out during " + phase) }
       if let bundle = model.candidates { try write(bundle, to: evidence.appendingPathComponent(phase + "-latest.json")) }
       try await Task.sleep(for: .milliseconds(100))
@@ -209,6 +227,7 @@ import SwiftUI
           journal.identity.seed == candidate.seed, journal.progress.tokenIDs == candidate.tokenIDs,
           journal.progress.text == candidate.text, journal.stopReason == candidate.stopReason,
           journal.stopTokenID == candidate.stopTokenID,
+          journal.identity.batch == candidate.batch,
           journal.identity.generationPolicy == bundle.recipe.generationPolicy else {
           throw BoomError.invalid("Generation journal disagreed with the retained candidate.")
         }
