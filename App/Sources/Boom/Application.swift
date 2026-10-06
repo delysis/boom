@@ -84,7 +84,9 @@ import SwiftUI
       dispatchMain()
     }
     let app = NSApplication.shared
-    app.setActivationPolicy(.regular)
+    let background = CommandLine.arguments.contains("--native-check-workspace")
+      && CommandLine.arguments.contains("--native-check-background")
+    app.setActivationPolicy(background ? .accessory : .regular)
     let delegate = ApplicationDelegate()
     app.delegate = delegate
     withExtendedLifetime(delegate) { app.run() }
@@ -103,6 +105,10 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
   private var searchField: NSSearchField?
   private var terminating = false
   private var isNativeCheck = false
+  static func workspaceWindow(frame: NSRect) -> NSWindow {
+    NSWindow(contentRect: frame, styleMask: [.titled, .closable, .miniaturizable, .resizable],
+      backing: .buffered, defer: false)
+  }
   func applicationDidFinishLaunching(_ notification: Notification) {
     Task { await openWorkspace() }
   }
@@ -132,10 +138,8 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
       #else
       let initialWidth: CGFloat = model.layout.isAuthor ? 1190 : 1000
       #endif
-      let window = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: initialWidth, height: 780),
-        styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered,
-        defer: false)
+      let frame = NSRect(x: 0, y: 0, width: initialWidth, height: 780)
+      let window = Self.workspaceWindow(frame: frame)
       #if BOOM_UI_TEST
       window.contentMinSize = NSSize(width: 300, height: 440)
       #else
@@ -162,9 +166,12 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
       observer = model.objectWillChange.sink { [weak self] _ in
         DispatchQueue.main.async { self?.refreshToolbar() }
       }
-      window.center()
-      if backgroundCheck { window.orderBack(nil) }
-      else { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
+      if backgroundCheck {
+        window.setFrameOrigin(NSPoint(x: -10_000, y: -10_000))
+        window.orderBack(nil)
+      } else {
+        window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+      }
       refreshToolbar()
     } catch {
       let alert = NSAlert()

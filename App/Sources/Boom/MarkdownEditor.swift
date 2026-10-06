@@ -61,6 +61,7 @@ import SwiftUI
   private var acceptedSteps: [AcceptedStep] = []
   override var undoManager: UndoManager? { documentUndo }
   override var acceptsFirstResponder: Bool { true }
+  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
   override func becomeFirstResponder() -> Bool {
     let accepted = super.becomeFirstResponder()
     if accepted { owner?.noteInputFocus(.document) }
