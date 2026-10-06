@@ -405,7 +405,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
     case #selector(toggleDocument): menuItem.state = model.showsDocument ? .on : .off
     case #selector(toggleChat): menuItem.state = model.showsChat ? .on : .off
     case #selector(exploreWriting): return model.showsDocument && model.canExploreWriting
-    case #selector(showContinuations): menuItem.title = model.showingCandidates ? "Hide continuations" : "Show continuations"; return model.showsDocument && model.candidates != nil
+    case #selector(showContinuations): menuItem.title = model.showingCandidates ? "Hide continuations" : "Show continuations"; return model.showsDocument && model.canShowContinuations
     case #selector(writingExamples): return model.showsDocument && model.selectedDocument != nil && !model.isBusy
     case #selector(changeVariation): menuItem.state = (menuItem.representedObject as? String) == model.samplingProfile.rawValue ? .on : .off
     case #selector(toggleCompletion): menuItem.state = model.state.autocomplete ? .on : .off
@@ -449,7 +449,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
   @objc private func exportBackup() { model?.backupWorkspace(restoring: false) }
   @objc private func restoreBackup() { model?.backupWorkspace(restoring: true) }
   @objc private func models() { model?.showingModels = true }
-  @objc private func showContinuations() { model?.showingCandidates.toggle() }
+  @objc private func showContinuations() { model?.showContinuations() }
   @objc private func writingExamples() { model?.openWritingExamples() }
   @objc private func exploreWriting() { model?.exploreWriting() }
   @objc private func changeVariation(_ sender: NSMenuItem) {

@@ -156,6 +156,9 @@ enum ProductCore {
   static func validateWritingRecipe(_ recipe: CompletionRecipe) throws {
     let _: Bool = try call(["op": "validate_writing_recipe", "recipe": object(recipe)])
   }
+  static func writingHistory(documentID: UUID, entries: [WritingHistoryEntry]) throws -> WritingHistoryPlan {
+    try call(["op": "writing_history", "documentId": documentID.uuidString, "entries": object(entries)])
+  }
   static func validateWritingBatch(_ execution: WritingBatchExecution, seed: UInt64) throws {
     let _: Bool = try call(["op": "validate_writing_batch", "execution": object(execution), "seed": seed])
   }
@@ -340,6 +343,24 @@ struct CandidateBundle: Codable, Identifiable, Sendable {
   let origin: ManuscriptOrigin?
   var candidates: [WritingCandidate]
   var selected: Int
+}
+struct WritingHistoryEntry: Codable, Sendable {
+  let id: UUID
+  let documentId: UUID
+  let maxTokens: Int
+  let candidates: Int
+}
+struct WritingHistoryPlan: Codable, Sendable {
+  let explorations: [UUID]
+  let latest: UUID?
+}
+struct SavedExploration: Identifiable, Sendable {
+  let id: UUID
+  let preview: String
+}
+struct SavedWritingHistory: Sendable {
+  let explorations: [SavedExploration]
+  let latest: UUID?
 }
 struct ManuscriptOrigin: Codable, Sendable {
   let documentID: UUID

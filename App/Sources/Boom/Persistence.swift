@@ -335,11 +335,7 @@ actor WorkspaceStore {
     var changed = false
     // Validate all captured records before finishing any interrupted attempt.
     for id in state.candidateIDs {
-      var bundle = try vault.decode(CandidateBundle.self, kind: .candidate, id: id)
-      guard bundle.id == id, bundle.recipe.promptDigest == Digest.sha256(bundle.recipe.prompt),
-        Set(bundle.candidates.map(\.id)).count == bundle.candidates.count,
-        bundle.candidates.isEmpty ? bundle.selected == 0 : bundle.candidates.indices.contains(bundle.selected)
-      else { throw BoomError.invalid("Inconsistent continuation record; existing bytes retained.") }
+      var bundle = try readCandidate(id)
       var interrupted = false
       for index in bundle.candidates.indices {
         if let execution = bundle.candidates[index].batch {
@@ -398,11 +394,36 @@ actor WorkspaceStore {
     if changed || !bundles.isEmpty || !receipts.isEmpty { try persist(state) }
   }
   func latestCandidate(for documentID: UUID, ids: [UUID]) throws -> CandidateBundle? {
-    for id in ids.reversed() {
-      let bundle = try vault.decode(CandidateBundle.self, kind: .candidate, id: id)
-      if bundle.recipe.document.id == documentID { return bundle }
+    guard let latest = try candidateHistory(for: documentID, ids: ids).latest else { return nil }
+    return try readCandidate(latest)
+  }
+  func readCandidate(_ id: UUID) throws -> CandidateBundle {
+    let bundle = try vault.decode(CandidateBundle.self, kind: .candidate, id: id)
+    guard bundle.id == id, Set(bundle.candidates.map(\.id)).count == bundle.candidates.count,
+      bundle.candidates.isEmpty ? bundle.selected == 0 : bundle.candidates.indices.contains(bundle.selected)
+    else { throw BoomError.invalid("Inconsistent continuation record; existing bytes retained.") }
+    try ProductCore.validateWritingRecipe(bundle.recipe)
+    let _ = try ProductCore.writingHistory(documentID: bundle.recipe.document.id, entries: [
+      WritingHistoryEntry(id: bundle.id, documentId: bundle.recipe.document.id,
+        maxTokens: bundle.recipe.maxTokens, candidates: bundle.candidates.count)
+    ])
+    return bundle
+  }
+  func candidateHistory(for documentID: UUID, ids: [UUID]) throws -> SavedWritingHistory {
+    var entries: [WritingHistoryEntry] = [], previews: [UUID: String] = [:]
+    for id in ids {
+      let value = try autoreleasepool { () throws -> (WritingHistoryEntry, String) in
+        let bundle = try readCandidate(id)
+        let prose = bundle.candidates.indices.contains(bundle.selected) ? bundle.candidates[bundle.selected].text : ""
+        let preview = prose.split(whereSeparator: \.isNewline).first.map { String($0.prefix(80)) } ?? "No prose retained"
+        return (WritingHistoryEntry(id: id, documentId: bundle.recipe.document.id,
+          maxTokens: bundle.recipe.maxTokens, candidates: bundle.candidates.count), preview)
+      }
+      entries.append(value.0); previews[id] = value.1
     }
-    return nil
+    let plan = try ProductCore.writingHistory(documentID: documentID, entries: entries)
+    return SavedWritingHistory(explorations: plan.explorations.map { SavedExploration(id: $0,
+      preview: previews[$0] ?? "No prose retained") }, latest: plan.latest)
   }
   func readDocument(_ id: UUID) throws -> String {
     let u = documentURL(id)

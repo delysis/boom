@@ -692,6 +692,10 @@ pub enum Request {
     ValidateWritingRecipe {
         recipe: Box<writing::Recipe>,
     },
+    WritingHistory {
+        document_id: Uuid,
+        entries: Vec<writing::HistoryEntry>,
+    },
     ValidateWritingBatch {
         execution: batch::Execution,
         seed: u64,
@@ -880,6 +884,10 @@ pub fn execute(request: Request) -> Result<Value, Error> {
         Request::ValidateWritingRecipe { recipe } => {
             serde_json::to_value(writing::validate(&recipe)?)
         }
+        Request::WritingHistory {
+            document_id,
+            entries,
+        } => serde_json::to_value(writing::history(document_id, &entries)?),
         Request::ValidateWritingBatch { execution, seed } => {
             serde_json::to_value(execution.validate(seed)?)
         }

@@ -2,9 +2,63 @@
 use crate::{
     Error, Sampling, TEXT_LIMIT, authored_prefix, digest, document::Document, require, sampling,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HistoryEntry {
+    pub id: Uuid,
+    pub document_id: Uuid,
+    pub max_tokens: usize,
+    pub candidates: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct History {
+    pub explorations: Vec<Uuid>,
+    pub latest: Option<Uuid>,
+}
+
+pub fn history(document: Uuid, entries: &[HistoryEntry]) -> Result<History, Error> {
+    require(
+        !document.is_nil() && entries.len() <= 16_384,
+        "Invalid continuation history.",
+    )?;
+    let mut ids = std::collections::BTreeSet::new();
+    for entry in entries {
+        require(
+            !entry.id.is_nil()
+                && !entry.document_id.is_nil()
+                && ids.insert(entry.id)
+                && (1..=256).contains(&entry.max_tokens)
+                && entry.candidates <= 3,
+            "Continuation history contains an invalid or repeated record.",
+        )?;
+    }
+    let matching = entries
+        .iter()
+        .rev()
+        .filter(|entry| entry.document_id == document)
+        .collect::<Vec<_>>();
+    // A long request or alternatives requested from a short suggestion is an
+    // explicit exploration; automatic single suggestions remain out of its menu.
+    let explorations = matching
+        .iter()
+        .filter(|entry| entry.max_tokens > 64 || entry.candidates > 1)
+        .map(|entry| entry.id)
+        .collect::<Vec<_>>();
+    let latest = explorations
+        .first()
+        .copied()
+        .or_else(|| matching.first().map(|entry| entry.id));
+    Ok(History {
+        explorations,
+        latest,
+    })
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -99,6 +153,93 @@ pub fn branch(recipe: &Recipe, continuation: &str) -> Result<String, Error> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn history_is_document_scoped_and_preserves_explicit_sets_before_auto_suggestions()
+    -> Result<(), Error> {
+        let document = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let first = Uuid::new_v4();
+        let alternatives = Uuid::new_v4();
+        let automatic = Uuid::new_v4();
+        let entries = [
+            HistoryEntry {
+                id: first,
+                document_id: document,
+                max_tokens: 256,
+                candidates: 3,
+            },
+            HistoryEntry {
+                id: Uuid::new_v4(),
+                document_id: other,
+                max_tokens: 256,
+                candidates: 3,
+            },
+            HistoryEntry {
+                id: alternatives,
+                document_id: document,
+                max_tokens: 64,
+                candidates: 3,
+            },
+            HistoryEntry {
+                id: automatic,
+                document_id: document,
+                max_tokens: 64,
+                candidates: 1,
+            },
+        ];
+        let plan = history(document, &entries)?;
+        assert_eq!(plan.explorations, [alternatives, first]);
+        assert_eq!(plan.latest, Some(alternatives));
+        assert_eq!(history(document, &entries[3..])?.latest, Some(automatic));
+        assert!(history(Uuid::new_v4(), &entries)?.latest.is_none());
+        assert!(history(Uuid::nil(), &entries).is_err());
+        assert!(
+            history(
+                document,
+                &[HistoryEntry {
+                    id: automatic,
+                    document_id: document,
+                    max_tokens: 64,
+                    candidates: 4
+                }]
+            )
+            .is_err()
+        );
+        assert!(
+            history(
+                document,
+                &[HistoryEntry {
+                    id: automatic,
+                    document_id: document,
+                    max_tokens: 0,
+                    candidates: 1
+                }]
+            )
+            .is_err()
+        );
+        let duplicate = HistoryEntry {
+            id: first,
+            document_id: document,
+            max_tokens: 256,
+            candidates: 3,
+        };
+        assert!(
+            history(
+                document,
+                &[
+                    duplicate,
+                    HistoryEntry {
+                        id: first,
+                        document_id: other,
+                        max_tokens: 256,
+                        candidates: 3
+                    }
+                ]
+            )
+            .is_err()
+        );
+        Ok(())
+    }
     fn recipe() -> Result<Recipe, serde_json::Error> {
         let prompt = "<bos>Example prose.\n\nCafé 👩‍💻 waits";
         serde_json::from_value(

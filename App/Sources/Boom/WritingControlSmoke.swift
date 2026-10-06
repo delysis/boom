@@ -182,7 +182,10 @@ import SwiftUI
     model.updateDocument(example.text + "\nA later example revision.\n", id: example.id, caret: model.caret)
     try await model.flush()
     guard !model.candidateIsCurrent else { throw BoomError.invalid("Changed manuscript or examples did not invalidate acceptance.") }
-    model.showingCandidates = true; model.selectCandidate(2)
+    model.dismissCandidates()
+    model.reviewContinuation(alternatives.id)
+    try await finish(model, evidence: evidence, phase: "reopen-before-branch", recorder: recorder)
+    model.selectCandidate(2)
     try await recorder?.checkpoint("Selected third captured alternative for branching")
     model.branchCandidate(2)
     guard let branch = model.selectedDocument, branch.id != fixture.document.id,
@@ -195,7 +198,12 @@ import SwiftUI
     try write(branch, to: evidence.appendingPathComponent("branch.json"))
     model.selectDocument(fixture.document.id)
     _ = try await Self.editor(model, documentID: fixture.document.id)
-    model.showingCandidates = true; model.selectCandidate(1)
+    guard model.candidates == nil, !model.showingCandidates else {
+      throw BoomError.invalid("A document switch retained foreign continuations.")
+    }
+    model.reviewContinuation(alternatives.id)
+    try await finish(model, evidence: evidence, phase: "reopen-before-replay", recorder: recorder)
+    model.selectCandidate(1)
     try await recorder?.checkpoint("Selected second captured alternative for replay")
     model.replayCandidate(1)
     try await finish(model, evidence: evidence, phase: "replay", recorder: recorder)

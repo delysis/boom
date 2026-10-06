@@ -139,6 +139,13 @@ struct WritingAlternatives: View {
       Divider()
       Button("Try three more") { model.exploreWriting() }.disabled(!model.canExploreWriting)
       Button("Supplied context…") { showingContext = true }
+      if !model.savedExplorations.isEmpty {
+        Menu("Saved explorations") {
+          ForEach(model.savedExplorations) { exploration in
+            Button(exploration.preview) { model.reviewContinuation(exploration.id) }
+          }
+        }.disabled(model.isBusy)
+      }
     }.fixedSize()
   }
 }

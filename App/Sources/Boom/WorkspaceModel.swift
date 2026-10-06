@@ -55,6 +55,10 @@ struct CompletionSegment {
   @Published var candidates: CandidateBundle?
   @Published var showingCandidates = false
   @Published var writingIssue: String?
+  @Published private(set) var savedExplorations: [SavedExploration] = []
+  private var latestSavedCandidate: UUID?
+  private var historyRequest: UUID?
+  private var historyTask: Task<Void, Never>?
   @Published var editingWritingExamples: WritingExamplesRequest?
   @Published var editingLocked = false
   @Published var backupRequest: BackupRequest?
@@ -187,7 +191,10 @@ struct CompletionSegment {
     if layout.isAuthor && documents.isEmpty { try newDocument() }
     if state.chats.isEmpty && !layout.isAuthor { try newChat() }
     if let id = state.selectedDocument {
-      candidates = try await store.latestCandidate(for: id, ids: state.candidateIDs)
+      let history = try await store.candidateHistory(for: id, ids: state.candidateIDs)
+      savedExplorations = history.explorations
+      latestSavedCandidate = history.latest
+      if let latest = history.latest { candidates = try await store.readCandidate(latest) }
     }
     compactPane = layout.primaryPane
     #if BOOM_UI_TEST
@@ -341,6 +348,7 @@ struct CompletionSegment {
     dirty.insert(document.id)
     documents.append(document)
     state.selectedDocument = document.id
+    resetContinuationView()
     selectedDocumentIDs = [document.id]
     state.showDocument = true
     compactPane = "document"
@@ -453,6 +461,7 @@ struct CompletionSegment {
       scheduleSave()
       cancel()
       state.selectedDocument = id
+      resetContinuationView()
       if layout.isAuthor, selectedChat?.attachedDocumentID != id {
         state.selectedChat = state.chats.last(where: { $0.attachedDocumentID == id })?.id
         draft = ""; pendingAttachments = []; showingChatInstructions = nil; editingChatMessage = nil
@@ -497,7 +506,11 @@ struct CompletionSegment {
       try await self.flush()
       self.documents.removeAll { ids.contains($0.id) }
       self.state.importedFiles = self.state.importedFiles?.filter { !ids.contains($0.key) }
-      if self.state.selectedDocument.map(ids.contains) == true { self.state.selectedDocument = self.documents.first?.id }
+      if self.state.selectedDocument.map(ids.contains) == true {
+        self.state.selectedDocument = self.documents.first?.id
+        self.caret = 0
+        self.resetContinuationView()
+      }
       self.selectedDocumentIDs.subtract(ids)
       self.invalidateGhost()
       try await self.flush()
@@ -709,6 +722,8 @@ struct CompletionSegment {
     cancel()
     saveTask?.cancel()
     searchEpoch &+= 1; searchTask?.cancel()
+    historyRequest = nil; historyTask?.cancel()
+    if let historyTask { await historyTask.value }
     if let foreground { await foreground.value }
     if let ghostTask { await ghostTask.value }
     if let mlxRunner { await mlxRunner.join() }
@@ -1296,12 +1311,13 @@ struct CompletionSegment {
           promptTokens: 0, outputTokens: 0, tokenIDs: [], stopReason: nil,
           batch: seeds.count > 1 ? WritingBatchExecution(seeds: seeds, lane: lane) : nil))
       }
-      candidates = bundle
+      if state.selectedDocument == recipe.document.id, !flag.isCancelled { candidates = bundle }
       // Every row's identity, seed and captured batch exist before shared prefill.
       let pendingVault = store.vault, pendingBundle = bundle
       try await detachedWork { try pendingVault.encode(pendingBundle, kind: .candidate, id: pendingBundle.id) }
       if !state.candidateIDs.contains(bundle.id) { state.candidateIDs.append(bundle.id) }
       try await flush()
+      refreshContinuationHistory()
       let bundleID = bundle.id, checkpointStore = store
       let generations = seeds.enumerated().map { lane, seed in
         GenerationIdentity(kind: .writing, operationID: flag.operationID,
@@ -1317,6 +1333,7 @@ struct CompletionSegment {
             guard let owner = self else { return }
             await MainActor.run {
               guard owner.writingFlag === flag, !flag.isCancelled,
+                owner.state.selectedDocument == recipe.document.id,
                 owner.candidates?.id == bundleID,
                 owner.candidates?.candidates.indices.contains(index) == true,
                 owner.candidates?.candidates[index].id == generation.attemptID,
@@ -1345,11 +1362,14 @@ struct CompletionSegment {
       if let current = candidates, current.id == bundle.id, bundle.candidates.indices.contains(current.selected) {
         bundle.selected = current.selected
       }
-      candidates = bundle
-      if epoch == capturedEpoch { showCandidateGhost(bundle.candidates[bundle.selected].text, recipe: recipe, epoch: capturedEpoch) }
+      if state.selectedDocument == recipe.document.id, candidates?.id == bundle.id, writingFlag === flag {
+        candidates = bundle
+        if epoch == capturedEpoch { showCandidateGhost(bundle.candidates[bundle.selected].text, recipe: recipe, epoch: capturedEpoch) }
+      }
       let vault = store.vault, saved = bundle
       try await detachedWork { try vault.encode(saved, kind: .candidate, id: saved.id) }
       try await flush()
+      refreshContinuationHistory()
       try flag.check()
       status = "\(bundle.candidates.count) continuation\(bundle.candidates.count == 1 ? "" : "s") · "
         + (recipe.omittedPrefixCharacters == 0 ? "full preceding manuscript" : "\(recipe.omittedPrefixCharacters) earlier characters omitted")
@@ -1362,11 +1382,14 @@ struct CompletionSegment {
         bundle.candidates[index].state = flag.isCancelled ? .cancelled : .failed
         bundle.candidates[index].stopReason = flag.isCancelled ? "cancelled" : "failed"
       }
-      candidates = bundle
+      if state.selectedDocument == recipe.document.id, candidates?.id == bundle.id, writingFlag === flag {
+        candidates = bundle
+      }
       let vault = store.vault, saved = bundle
       try await detachedWork { try vault.encode(saved, kind: .candidate, id: saved.id) }
       if !state.candidateIDs.contains(bundle.id) { state.candidateIDs.append(bundle.id) }
       try await flush()
+      refreshContinuationHistory()
       throw error
     }
   }
@@ -1374,6 +1397,57 @@ struct CompletionSegment {
     if writingExampleIDs.contains(id) { writingExampleIDs.removeAll { $0 == id } }
     else { guard id != state.selectedDocument, writingExampleIDs.count < 32 else { return }; writingExampleIDs.append(id) }
     invalidateGhost()
+  }
+  private func resetContinuationView() {
+    candidates = nil; showingCandidates = false; writingIssue = nil
+    savedExplorations = []; latestSavedCandidate = nil
+    refreshContinuationHistory()
+  }
+  private func refreshContinuationHistory() {
+    historyTask?.cancel()
+    let request = UUID(); historyRequest = request
+    guard let documentID = state.selectedDocument else { return }
+    let ids = state.candidateIDs, capturedStore = store
+    historyTask = Task { [weak self] in
+      do {
+        let history = try await capturedStore.candidateHistory(for: documentID, ids: ids)
+        guard let self, !Task.isCancelled, self.historyRequest == request,
+          self.state.selectedDocument == documentID else { return }
+        self.savedExplorations = history.explorations
+        self.latestSavedCandidate = history.latest
+      } catch {
+        guard let self, !Task.isCancelled, self.historyRequest == request,
+          self.state.selectedDocument == documentID else { return }
+        self.writingIssue = error.localizedDescription
+      }
+    }
+  }
+  var canShowContinuations: Bool {
+    guard let documentID = state.selectedDocument else { return false }
+    return showingCandidates || (!isBusy && (candidates?.recipe.document.id == documentID || latestSavedCandidate != nil))
+  }
+  func showContinuations() {
+    if showingCandidates { showingCandidates = false; return }
+    guard !isBusy else { return }
+    if candidates?.recipe.document.id == state.selectedDocument { showingCandidates = true }
+    else if let id = latestSavedCandidate { reviewContinuation(id) }
+  }
+  func reviewContinuation(_ id: UUID) {
+    guard !isBusy, let document = selectedDocument, state.candidateIDs.contains(id) else { return }
+    let capturedCaret = caret
+    work("Opening continuations…") { [weak self] flag in
+      guard let self else { return }
+      let capturedEpoch = self.epoch
+      let bundle = try await self.store.readCandidate(id)
+      try flag.check()
+      guard self.activeFlag === flag, self.selectedDocument == document,
+        self.caret == capturedCaret, self.epoch == capturedEpoch else { throw CancellationError() }
+      guard bundle.recipe.document.id == document.id else {
+        throw BoomError.invalid("These continuations belong to another manuscript.")
+      }
+      self.candidates = bundle; self.showingCandidates = true; self.writingIssue = nil
+      self.refreshContinuationHistory()
+    }
   }
   func dismissCandidates() { invalidateGhost(); showingCandidates = false; candidates = nil }
   private func showCandidateGhost(_ text: String, recipe: CompletionRecipe, epoch: UInt64) {
@@ -1399,7 +1473,9 @@ struct CompletionSegment {
     if candidateIsCurrent { showCandidateGhost(bundle.candidates[index].text, recipe: bundle.recipe, epoch: epoch) }
   }
   func replayCandidate(_ index: Int) {
-    guard !isBusy, let bundle = candidates, bundle.candidates.indices.contains(index) else { return }
+    guard !isBusy, let bundle = candidates, bundle.recipe.document.id == state.selectedDocument,
+      bundle.candidates.indices.contains(index) else { return }
+    showingCandidates = true
     work("Replaying this seed…") { [weak self] flag in
       guard let self else { return }
       try await self.generateCandidates(document: bundle.recipe.document, offset: bundle.recipe.caretUTF16,
@@ -1498,6 +1574,7 @@ struct CompletionSegment {
   }
   private func selectImportedDocument(_ id: UUID) {
     state.selectedDocument = id; selectedDocumentIDs = [id]; state.showDocument = true
+    caret = 0; resetContinuationView()
     state.selectedChat = nil; draft = ""; pendingAttachments = []
     showingChatInstructions = nil; editingChatMessage = nil
     compactPane = "document"; invalidateGhost(); focusEditor(id)
