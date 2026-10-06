@@ -56,6 +56,8 @@ Audio/video preview and extraction must use the same Rust admission before nativ
 
 Inspect the exact bundle at wide and narrow sizes in light and dark appearances, including focused empty controls, typing, selection, Unicode, input methods, Undo and accessibility. A quiet empty page must have no active operation that merely opens an avoidable error alert. Every visible control must lead to a working action or state its availability.
 
+Exercise native mouse-event delivery in the unshown public-fixture manuscript, rather than assigning editor focus before the check. Clicking text or blank page space must acquire focus and place the caret. Clicking the unchanged caret must preserve the captured request and word-acceptance reversal; changed selections and text still invalidate obsolete candidates through the editor delegates. The writing-control capture retains a same-caret click during real generation and requires all three rows to complete afterward. These isolated AppKit events never post WindowServer input and do not qualify physical mouse/keyboard/IME or app activation behavior.
+
 ## 24 GiB application budget
 
 The approved performance gate uses this 128 GiB development Mac with an application ceiling of 24 GiB. An actual 32 GiB MacBook is no longer required. This qualifies the measured application budget and timings on the recorded host; it does not reproduce a smaller machine's bandwidth or system-wide memory pressure. Preserve earlier receipts with their original hardware boundaries.

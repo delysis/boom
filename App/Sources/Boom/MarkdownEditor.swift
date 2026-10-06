@@ -164,12 +164,14 @@ import SwiftUI
     }
   }
   override func mouseDown(with event: NSEvent) {
+    let previousSelection = selectedRange()
     super.mouseDown(with: event)
     // A click in an editor embedded in HSplitView can leave a SwiftUI sidebar
     // field as first responder. Ensure the insertion point owns subsequent keys.
     if window?.firstResponder !== self { window?.makeFirstResponder(self) }
-    owner?.invalidateGhost()
-    acceptedSteps.removeAll()
+    // The selection/text delegates invalidate changed captures. Refocusing at
+    // the same caret leaves the captured manuscript and continuation valid.
+    if selectedRange() != previousSelection { acceptedSteps.removeAll() }
   }
   @discardableResult func acceptNextGhostWord() -> Bool {
     guard !hasMarkedText(), selectedRange().length == 0 else { return false }

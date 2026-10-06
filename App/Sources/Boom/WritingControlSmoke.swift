@@ -256,6 +256,7 @@ import SwiftUI
   private static func finish(_ model: WorkspaceModel, evidence: URL, phase: String, recorder: NativeDemoRecorder?) async throws {
     let start = ContinuousClock().now
     var selectedDuringGeneration = false
+    var clickedDuringGeneration = false
     while model.isBusy {
       if phase == "alternatives", let editor = model.editor, let window = editor.window {
         guard editor.isEditable, window.canBecomeKey, window.makeFirstResponder(editor),
@@ -264,12 +265,29 @@ import SwiftUI
       if phase == "alternatives", !selectedDuringGeneration, model.candidates?.candidates.count == 3 {
         model.selectCandidate(1); selectedDuringGeneration = true
       }
+      if phase == "alternatives", !clickedDuringGeneration, let stamp = model.ghostStamp,
+        let editor = model.editor, let document = model.selectedDocument {
+        let range = editor.selectedRange()
+        guard range.length == 0 else { throw BoomError.invalid("The public writing fixture lost its insertion point.") }
+        let point = try NativeCaretProbe.point(at: range.location, in: editor)
+        let observation = try NativeCaretProbe.click(point, in: editor)
+        try write(observation, to: evidence.appendingPathComponent("caret-during-generation.json"))
+        guard editor.selectedRange() == range, model.ghostStamp == stamp,
+          model.selectedDocument == document else {
+          throw BoomError.invalid("Refocusing the same caret changed the public manuscript or invalidated its real-model continuation.")
+        }
+        clickedDuringGeneration = true
+        try await recorder?.checkpoint("Native click preserves the captured caret during generation")
+      }
       guard start.duration(to: ContinuousClock().now) < .seconds(240) else { throw BoomError.unavailable("Writing diagnostic timed out during " + phase) }
       if let bundle = model.candidates { try write(bundle, to: evidence.appendingPathComponent(phase + "-latest.json")) }
       try recorder?.frame(phase)
       try await Task.sleep(for: .milliseconds(100))
     }
     if let bundle = model.candidates { try write(bundle, to: evidence.appendingPathComponent(phase + "-latest.json")) }
+    if phase == "alternatives", !clickedDuringGeneration {
+      throw BoomError.invalid("The real-model writing fixture never exercised its native caret click.")
+    }
     if let error = model.errorMessage ?? model.writingIssue { throw BoomError.invalid(error) }
   }
   private static func verify(_ evidence: URL) async throws {
