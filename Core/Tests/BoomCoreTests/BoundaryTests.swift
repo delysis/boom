@@ -3,6 +3,12 @@ import XCTest
 @testable import BoomCore
 
 final class BoundaryTests: XCTestCase {
+  func testParagraphContinuationKeepsLeadingWhitespaceAndUnicode() {
+    XCTAssertEqual(GemmaPrompt.visibleCompletion("\n\nCafé 👩🏽‍💻 waits.\n\nAnother paragraph."),
+      "\n\nCafé 👩🏽‍💻 waits.")
+    XCTAssertEqual(GemmaPrompt.visibleCompletion("\r\n\r\n\tFirst line\nSecond line\nThird line\nFourth line"),
+      "\r\n\r\n\tFirst line\nSecond line\nThird line")
+  }
   func testMultilineInlineCodeCannotImportReferences() throws {
     XCTAssertEqual(
       try ReferenceParser.wiki("`code\n[[Hidden]]\n` [[Visible]]").map(\.title), ["Visible"])

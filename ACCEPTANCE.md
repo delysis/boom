@@ -64,6 +64,8 @@ Escape must reach AppKit's native command handling during marked composition and
 
 Control-Space belongs to native text/input handling; Bloom must not intercept it to invalidate a captured continuation or request completion. Compare native command dispatch and marked state in both text surfaces against `NSTextView`. During real writing generation, retain before/after documents, bundles, caret and capture stamps and require the request to stay active. Complete the batch and exact replay afterward. These process-local events do not exercise the system's global input-source shortcut or a physical input method.
 
+Continuations beginning with paragraph breaks must still appear inline and support word acceptance. Preserve their leading whitespace exactly; do not discard the continuation because its first paragraph is empty. Add `--require-paragraph-continuation` to the recorded writing capture to exercise a real generated alternative with that opening. Retain all alternatives, the selected index and exact accepted fragment, compare manuscript bytes against the full captured continuation, then Undo. This is functional input coverage, not selection for literary quality.
+
 ## 24 GiB application budget
 
 The approved performance gate uses this 128 GiB development Mac with an application ceiling of 24 GiB. An actual 32 GiB MacBook is no longer required. This qualifies the measured application budget and timings on the recorded host; it does not reproduce a smaller machine's bandwidth or system-wide memory pressure. Preserve earlier receipts with their original hardware boundaries.

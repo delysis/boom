@@ -64,6 +64,12 @@ final class GeneratedTextTests: XCTestCase {
     XCTAssertEqual(reloaded.0.manuscriptOrigins[branch.id]?.candidateID, candidate.id)
   }
   @MainActor func testNativePartialAcceptanceUndoRestoresExactManuscript() async throws {
+    try await verifyWordAcceptance(continuation: " quietly by the window.", accepted: " quietly ")
+  }
+  @MainActor func testNativeParagraphContinuationAcceptanceUndo() async throws {
+    try await verifyWordAcceptance(continuation: "\n\n\tCafé 👩🏽‍💻 waits.", accepted: "\n\n\tCafé ")
+  }
+  @MainActor private func verifyWordAcceptance(continuation: String, accepted: String) async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-writing-undo-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
     let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
@@ -93,13 +99,13 @@ final class GeneratedTextTests: XCTestCase {
       promptDigest: compiled.digest, omittedPrefixCharacters: 0, model: "unit-test-model", profile: .standard,
       settings: try ProductCore.sampling(.standard), maxTokens: 64, generationPolicy: nil)
     // Authored fixture; no inference or writing-quality claim.
-    let candidate = WritingCandidate(id: UUID(), seed: 42, text: " quietly by the window.", state: .complete,
+    let candidate = WritingCandidate(id: UUID(), seed: 42, text: continuation, state: .complete,
       promptTokens: 0, outputTokens: 0, tokenIDs: [], stopReason: "unit-fixture")
     model.candidates = CandidateBundle(id: UUID(), recipe: recipe, origin: nil, candidates: [candidate], selected: 0)
     manager.groupsByEvent = false; manager.removeAllActions(); manager.beginUndoGrouping()
     model.acceptCandidateWord(0); manager.endUndoGrouping()
     try await Task.sleep(for: .milliseconds(50))
-    XCTAssertEqual(model.selectedDocument?.text, before + " quietly  AFTER")
+    XCTAssertEqual(model.selectedDocument?.text, before + accepted + " AFTER")
     XCTAssertTrue(manager.canUndo); XCTAssertFalse(model.candidateIsCurrent)
     XCTAssertTrue(view.tryToPerform(NSSelectorFromString("undo:"), with: nil))
     XCTAssertEqual(view.string, document.text)

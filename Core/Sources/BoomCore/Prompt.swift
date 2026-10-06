@@ -8,8 +8,12 @@ public enum GemmaPrompt {
     return true
   }
   public static func visibleCompletion(_ text: String) -> String? {
-    let paragraph = text.components(separatedBy: "\n\n").first ?? ""
-    let visible = paragraph.components(separatedBy: "\n").prefix(3).joined(separator: "\n")
+    guard let content = text.firstIndex(where: { !$0.isWhitespace }) else {
+      return admissibleCompletion(text) ? text : nil
+    }
+    let paragraph = text[content...].components(separatedBy: "\n\n").first ?? ""
+    let visible = String(text[..<content])
+      + paragraph.components(separatedBy: "\n").prefix(3).joined(separator: "\n")
     return admissibleCompletion(visible) ? visible : nil
   }
 }

@@ -7,6 +7,13 @@ import SwiftUI
 /// Explicit exported fixtures only. Exercises production controller/editor paths
 /// without showing or activating a window, or accessing the user's Keychain.
 @MainActor enum WritingControlSmoke {
+  private struct WordAcceptance: Encodable {
+    let selected: Int
+    let paragraph_required: Bool
+    let leading_paragraph: Bool
+    let accepted: String
+    let expected_manuscript: String
+  }
   private struct EscapeDismissal: Encodable {
     let dismissed_inline_continuation: Bool
     let manuscript_unchanged: Bool
@@ -79,7 +86,8 @@ import SwiftUI
     watchdog.resume()
     defer { watchdog.cancel() }
     do {
-      try await capture(fixture, pack: pack, evidence: evidence, record: arguments.contains("--record-demonstration"))
+      try await capture(fixture, pack: pack, evidence: evidence, record: arguments.contains("--record-demonstration"),
+        requireParagraph: arguments.contains("--require-paragraph-continuation"))
       try receipt("captured", evidence: evidence)
     } catch {
       try receipt("failed", evidence: evidence, failure: error.localizedDescription)
@@ -89,7 +97,8 @@ import SwiftUI
   private static func store(_ evidence: URL) throws -> WorkspaceStore {
     try WorkspaceStore(rootOverride: evidence.appendingPathComponent("encrypted-workspace"), testKey: key)
   }
-  private static func capture(_ fixture: WritingEvaluation.Fixture, pack: URL, evidence: URL, record: Bool) async throws {
+  private static func capture(_ fixture: WritingEvaluation.Fixture, pack: URL, evidence: URL, record: Bool,
+    requireParagraph: Bool) async throws {
     _ = try ProductCore.authoredPrefix(fixture.document, caret: fixture.caretUTF16)
     let store = try store(evidence)
     var state = WorkspaceState(); state.autocomplete = false
@@ -170,14 +179,26 @@ import SwiftUI
       "captured_settings_restored": true], to: evidence.appendingPathComponent("replay-availability.json"))
     model.setAutocomplete(true)
     let editor = try await Self.editor(model, documentID: fixture.document.id)
+    let paragraphIndex = alternatives.candidates.firstIndex { $0.text.hasPrefix("\n\n") }
+    guard !requireParagraph || paragraphIndex != nil else {
+      throw BoomError.invalid("No captured alternative begins with a paragraph break; that acceptance case remains untested.")
+    }
+    let wordIndex = requireParagraph ? (paragraphIndex ?? 1) : 1
+    model.selectCandidate(wordIndex)
+    let word = CompletionNavigation.nextChunk(alternatives.candidates[wordIndex].text).accepted
+    let expectedPartial = try ProductCore.branchWriting(alternatives.recipe, continuation: word)
+    try write(WordAcceptance(selected: wordIndex, paragraph_required: requireParagraph,
+      leading_paragraph: alternatives.candidates[wordIndex].text.hasPrefix("\n\n"),
+      accepted: word, expected_manuscript: expectedPartial),
+      to: evidence.appendingPathComponent("word-acceptance-input.json"))
     let manager = model.undoManager(fixture.document.id)
     manager.groupsByEvent = false; manager.removeAllActions(); manager.beginUndoGrouping()
-    model.acceptCandidateWord(1)
+    model.acceptCandidateWord(wordIndex)
     manager.endUndoGrouping()
     try await recorder?.checkpoint("Accepted next word")
     // Separate native commands by an event-loop turn, as actual input does.
     try await Task.sleep(for: .milliseconds(50))
-    guard let partial = model.selectedDocument, partial.text != fixture.document.text, manager.canUndo,
+    guard let partial = model.selectedDocument, partial.text == expectedPartial, partial.text != fixture.document.text, manager.canUndo,
       !model.candidateIsCurrent else { throw BoomError.invalid("Partial acceptance failed or left obsolete alternatives admissible.") }
     try write(partial, to: evidence.appendingPathComponent("partial-acceptance.json"))
     // Keep suggestions enabled while the captured choices become stale. The
@@ -185,7 +206,7 @@ import SwiftUI
     let retainedIDs = model.state.candidateIDs
     try await Task.sleep(for: .seconds(2))
     guard model.showingCandidates, let retained = model.candidates, retained.id == alternatives.id,
-      retained.selected == 1, try canonical(retained.recipe) == canonical(alternatives.recipe),
+      retained.selected == wordIndex, try canonical(retained.recipe) == canonical(alternatives.recipe),
       try canonical(retained.candidates) == canonical(alternatives.candidates), model.state.candidateIDs == retainedIDs,
       model.selectedDocument == partial else {
       throw BoomError.invalid("Autocomplete replaced the visible captured choices after partial acceptance.")
