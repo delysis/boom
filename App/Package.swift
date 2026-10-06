@@ -37,6 +37,8 @@ let package = Package(
     .executableTarget(name: "BloomPackBuilder", dependencies: [
       .product(name: "MLXLMCommon", package: "MLXSwiftLM"),
       .product(name: "MLXVLM", package: "MLXSwiftLM"),
+      .product(name: "MLXHuggingFace", package: "MLXSwiftLM"),
+      .product(name: "Tokenizers", package: "swift-transformers"),
     ], resources: [.process("Resources")]),
     .target(name: "CAttachment", publicHeadersPath: "include"),
     .executableTarget(

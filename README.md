@@ -87,6 +87,14 @@ target/release/bloom-kernel-probe /absolute/consultation-pack /absolute/BloomPac
 
 The native MLX backend compares fused group-32 quantized multiplication with BF16 and FP16 dense multiplication, including dequantization in each measured operation. The Rust driver registers the order, checks source hashes, denies outbound networking, bounds the child process group and joins it. All 72 observations and 18 distinct complete output tensors are retained. This is a developer arithmetic screen, not application performance or model-quality qualification; it neither converts the pack nor changes ordinary inference.
 
+`BloomPackBuilder` also provides an input-packaging comparison for a captured 4,096-token consultation fixture:
+
+```sh
+/absolute/BloomPackBuilder --input-packaging-probe /absolute/consultation-pack /absolute/captured-fixture.json /absolute/new-evidence
+```
+
+It verifies the captured model and prompt identities, then compares native processor input with flat tokens in a fixed native/flat/flat/native order, using fresh KV caches and balanced 512-token prefill. It retains every full-vocabulary logit vector and observation, including partial evidence on failure. This one-model component check measures prefill and cache/logit settlement; it does not sample, qualify application performance, or change application behavior or defaults. Use an owning offline driver with a deadline, and compare complete vectors independently. The retained first comparison found identical logits and no supported speed benefit from flattening; the app keeps its native input path.
+
 The application memory diagnostic requires both complete 16,384-token contexts before running its registered 16,128-input/256-output trials. Rust rejects reduced admission rather than letting the diagnostic silently shorten its workload. The 24 GiB application cap and separate latency, decoding, cancellation and typing targets remain unchanged.
 
 The explicit memory diagnostic accepts `--benchmark-prefill-tokens 256`, `512`, or `1024`. Ordinary generation remains balanced 512-token prefill. Each diagnostic captures its geometry in receipts and encrypted journals; replay under another geometry is refused. Register comparisons before execution and retain every failed target. A smaller chunk is an experimental measurement option, not a qualified latency improvement.

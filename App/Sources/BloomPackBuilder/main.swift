@@ -38,8 +38,11 @@ import MLXVLM
           sha256: digest.finalize().map { String(format: "%02x", $0) }.joined())
       }
   }
-  static func main() throws {
+  static func main() async throws {
     let args = CommandLine.arguments
+    if args.count > 1, args[1] == "--input-packaging-probe" {
+      try await InputPackagingProbe.run(args); return
+    }
     if args.count > 1, args[1] == "--prefill-kernel-probe" {
       try PrefillKernelProbe.run(args); return
     }
