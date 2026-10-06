@@ -179,6 +179,10 @@ enum ProductCore {
     let _: Bool = try call(["op": "residency_cache_probe", "physicalBytes": physical,
       "metalBytes": metal, "cacheBytes": cache])
   }
+  static func admitModelLoad(physical: UInt64, metal: UInt64, resident: UInt64, weights: UInt64) throws -> Bool {
+    try call(["op": "residency_load", "physicalBytes": physical, "metalBytes": metal,
+      "residentBytes": resident, "weightBytes": weights])
+  }
   static func contextCapacity(configuration: Data, available: UInt64, width: Int,
     prefill: PrefillGeometry? = nil) throws -> Int {
     try call(["op": "context_capacity", "configuration": JSONSerialization.jsonObject(with: configuration),

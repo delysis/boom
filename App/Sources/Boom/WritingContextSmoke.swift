@@ -43,8 +43,8 @@ import Foundation
     watchdog.setEventHandler { fputs("Context diagnostic exceeded its deadline; evidence retained.\n", stderr); exit(2) }
     watchdog.resume(); defer { watchdog.cancel() }
     do {
-      _ = try ModelPacks.verify(pack, purpose: .writing)
-      let runner = try await MLXGemmaRunner.load(directory: pack)
+      let admission = try await detachedWork { try ModelPacks.admission(pack, purpose: .writing) }
+      let runner = try await MLXGemmaRunner.load(admission: admission)
       receipt["model"] = runner.identity; try persist()
       var rows: [[String: Any]] = []
       for (index, fixture) in suite.cases.enumerated() {

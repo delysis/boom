@@ -67,6 +67,7 @@ actor MLXGemmaRunner {
     let stopTokenID: Int?
     let firstTokenSeconds: Double?
     let elapsedSeconds: Double
+    var executionPriority: UInt8? = nil
   }
   struct BatchMetrics: Codable, Sendable {
     let width: Int
@@ -96,11 +97,13 @@ actor MLXGemmaRunner {
     let added_tokens: [Added]
     struct Added: Decodable { let id: Int; let special: Bool }
   }
-  static func load(directory: URL, identity: String? = nil, prefillTokens: UInt32? = nil) async throws -> MLXGemmaRunner {
+  static func load(admission: ModelPacks.Admission, prefillTokens: UInt32? = nil) async throws -> MLXGemmaRunner {
+    let directory = admission.directory
     await GenerationCoordinator.shared.enter()
     do {
+      try Task.checkCancellation()
       try ModelResidency.configure()
-      try ModelResidency.check()
+      try ModelResidency.admit(weightBytes: admission.weightBytes)
       let configuration = try Data(contentsOf: directory.appendingPathComponent("config.json"))
       let config = try JSONDecoder().decode(Configuration.self,
         from: configuration)
@@ -131,7 +134,7 @@ actor MLXGemmaRunner {
         throw BoomError.invalid("Missing model cache configuration.")
       }
       let runner = MLXGemmaRunner(source: directory, container: model,
-        identity: try identity ?? ModelInstaller.hashFile(directory.appendingPathComponent(ModelPacks.manifestName), maxBytes: 4_194_304).sha256,
+        identity: admission.identity,
         cacheConfiguration: try JSONSerialization.data(withJSONObject: cacheConfiguration),
         generationPolicy: policy, tokenizerDescription: tokenizerDescription)
       try ModelResidency.check()
@@ -338,7 +341,7 @@ actor MLXGemmaRunner {
     // Own the whole task before preparing input or constructing the iterator.
     // MLX checks Task cancellation between prefill chunks, before a stream
     // producer exists. Every exit fences submitted GPU work before handoff.
-    let work = Task { try await operation() }
+    let work = Task(priority: background ? .background : .userInitiated) { try await operation() }
     let registration = flag.onCancel { work.cancel() }
     defer { flag.removeCancellationHandler(registration) }
     await GenerationCoordinator.shared.own(work)
@@ -495,7 +498,8 @@ actor MLXGemmaRunner {
         return seeds.indices.map { lane in
           Output(text: texts[lane], tokenIDs: tokens[lane], promptDigest: digest, promptTokens: promptIDs.count,
             outputTokens: tokens[lane].count, endedByEOS: stops[lane] != nil, stopReason: reasons[lane] ?? "cancelled",
-            stopTokenID: stops[lane], firstTokenSeconds: first[lane], elapsedSeconds: elapsed[lane])
+            stopTokenID: stops[lane], firstTokenSeconds: first[lane], elapsedSeconds: elapsed[lane],
+            executionPriority: Task.currentPriority.rawValue)
         }
       }
     }
@@ -580,7 +584,8 @@ actor MLXGemmaRunner {
         if final != text, reason != "cancelled" { onText(final) }
         return Output(text: final, tokenIDs: tokens, promptDigest: preparedDigest,
           promptTokens: promptIDs.count, outputTokens: tokens.count, endedByEOS: ended, stopReason: reason, stopTokenID: stopToken,
-          firstTokenSeconds: first, elapsedSeconds: elapsed)
+          firstTokenSeconds: first, elapsedSeconds: elapsed,
+          executionPriority: Task.currentPriority.rawValue)
       }
     }
   }

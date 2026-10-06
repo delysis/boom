@@ -86,6 +86,54 @@ import SwiftUI
     return ["available": status == 0, "used_bytes": value.xsu_used,
       "total_bytes": value.xsu_total, "scope": "host-wide; other applications can contribute"]
   }
+  private static func overlapProbe(_ admission: ModelPacks.Admission, prefillTokens: UInt32?) async throws -> [String: Any] {
+    guard let device = MTLCreateSystemDefaultDevice() else { throw BoomError.unavailable("Metal is unavailable.") }
+    let usedBefore = max(ModelResidency.footprint(), UInt64(max(0, Memory.activeMemory + Memory.cacheMemory)))
+    let preview = try ProductCore.admitModelLoad(physical: ProcessInfo.processInfo.physicalMemory,
+      metal: device.recommendedMaxWorkingSetSize, resident: usedBefore, weights: admission.weightBytes)
+    let coordinator = GenerationCoordinator.shared
+    await coordinator.enter()
+    let queued = Task { try await MLXGemmaRunner.load(admission: admission, prefillTokens: prefillTokens) }
+    var released = false
+    do {
+      let deadline = ContinuousClock().now.advanced(by: .seconds(2))
+      while await coordinator.queuedOperations != 1 {
+        try Task.checkCancellation()
+        guard ContinuousClock().now < deadline else { throw BoomError.unavailable("The overlap load did not queue.") }
+        await Task.yield()
+      }
+      // Public process memory changes after the load queues. Allocate off the
+      // UI thread and keep it alive until the waiting loader has finished.
+      let reservation = try await detachedWork { Data(repeating: 0xa5, count: 1_073_741_824) }
+      let before = ModelResidency.memoryAccounting()
+      let usedWhileQueued = max(before.current, UInt64(max(0, Memory.activeMemory + Memory.cacheMemory)))
+      await coordinator.leave(); released = true
+      let outcome = await queued.result
+      let after = withExtendedLifetime(reservation) { ModelResidency.memoryAccounting() }
+      switch outcome {
+      case .success: throw BoomError.invalid("The queued model ignored the changed resident allocations.")
+      case .failure(let error):
+        guard let failure = error as? BoomError, case .budget(let message) = failure,
+          message == "This model does not fit alongside the resident model. Close the inactive model before loading it." else {
+          throw BoomError.invalid("The queued model failed after admission rather than before weight loading: " + String(describing: error))
+        }
+      }
+      let growth = after.peak > before.peak ? after.peak - before.peak : 0
+      guard growth <= 67_108_864 else { throw BoomError.invalid("The rejected load exceeded its 64 MiB metadata allowance.") }
+      return ["preview_admitted_before_queue": preview, "rejected_before_weight_loading": true,
+        "attempted_model": admission.identity, "attempted_weight_bytes": admission.weightBytes,
+        "fixture_resident_bytes": reservation.count, "resident_accounted_before_queue_bytes": usedBefore,
+        "resident_accounted_while_queued_bytes": usedWhileQueued,
+        "before_current_bytes": before.current, "before_peak_bytes": before.peak,
+        "after_current_bytes": after.current, "after_peak_bytes": after.peak,
+        "kernel_peak_growth_bytes": growth]
+    } catch {
+      queued.cancel()
+      if !released { await coordinator.leave() }
+      _ = await queued.result
+      throw error
+    }
+  }
   static func run(writingPack: URL, evidence: URL, cacheProbe: UInt64? = nil,
     prefillTokens: UInt32? = nil) async throws {
     let limits = try ModelResidency.limits()
@@ -105,6 +153,7 @@ import SwiftUI
       "keychain_dialogs_qualified": false, "physical_keyboard_or_ime_qualified": false,
       "swap_before": swap(), "sample_interval_ms": 20,
       "durable_encrypted_checkpoint_overhead_included": true,
+      "producer_priority_scope": "explicit operations request user-initiated task priority; autocomplete requests background priority; receipts record effective task priority, not OS thread QoS",
       "inference_activity_scope": "GPU lease through producer joining; explicit operations request user-initiated activity while allowing idle system sleep; autocomplete requests background activity",
       "clock_scope": "ContinuousClock includes system sleep; SuspendingClock excludes system sleep; recorded wall-clock gates are unchanged"]
     receipt["requested_cache_probe_bytes"] = cacheProbe as Any? ?? NSNull()
@@ -121,13 +170,15 @@ import SwiftUI
       let store = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("encrypted-workspace"),
         testKey: SymmetricKey(data: Data(repeating: 0x6a, count: 32)))
       let clock = ContinuousClock()
+      var writingAdmission: ModelPacks.Admission?
       func load(_ directory: URL, _ purpose: ModelPurpose) async throws -> MLXGemmaRunner {
         probe.mark("verify-" + purpose.rawValue)
         let admission = try await detachedWork { try ModelPacks.admission(directory, purpose: purpose) }
+        if purpose == .writing { writingAdmission = admission }
         try ModelResidency.admit(weightBytes: admission.weightBytes)
         probe.mark("load-" + purpose.rawValue)
         let started = clock.now
-        let runner = try await MLXGemmaRunner.load(directory: directory, identity: admission.identity, prefillTokens: prefillTokens)
+        let runner = try await MLXGemmaRunner.load(admission: admission, prefillTokens: prefillTokens)
         receipt[purpose.rawValue + "_generation_policy"] = try ProductCore.object(runner.generationPolicy)
         receipt[purpose.rawValue + "_load_seconds"] = started.duration(to: clock.now).timeInterval
         receipt[purpose.rawValue + "_model"] = admission.identity
@@ -141,6 +192,10 @@ import SwiftUI
       receipt["loading_scope"] = "fresh process; OS filesystem cache was not flushed"
       let consultation = try await load(consultationPack, .consultation)
       let writing = try await load(writingPack, .writing)
+      probe.mark("reject-resident-overlap")
+      guard let duplicate = writingAdmission else { throw BoomError.invalid("The writing admission was not captured.") }
+      receipt["overlap_load_admission_probe"] = try await overlapProbe(duplicate, prefillTokens: prefillTokens)
+      try write(receipt, "receipt.json", evidence: evidence)
       if let cacheProbe { Memory.cacheLimit = Int(clamping: cacheProbe); Memory.clearCache() }
       receipt["effective_allocator_cache_limit_bytes"] = Memory.cacheLimit
       probe.mark("pair-resident")
@@ -256,6 +311,7 @@ import SwiftUI
               "stop_reason": value.stopReason, "stop_token_id": value.stopTokenID as Any? ?? NSNull(),
               "first_token_seconds": value.firstTokenSeconds as Any? ?? NSNull(),
               "elapsed_seconds": value.elapsedSeconds,
+              "execution_task_priority": value.executionPriority as Any? ?? NSNull(),
               "sustained_decode_tokens_per_second": value.firstTokenSeconds.map {
                 Double(max(0, value.outputTokens - 1)) / max(0.000001, value.elapsedSeconds - $0)
               } as Any? ?? NSNull()]

@@ -144,7 +144,7 @@ enum WritingEvaluation {
       receipt["weight_bytes"] = admission.weightBytes
       receipt["admitted_identity"] = admission.identity
       try persist()
-      let runner = try await MLXGemmaRunner.load(directory: directory, identity: admission.identity)
+      let runner = try await MLXGemmaRunner.load(admission: admission)
       receipt["model"] = runner.identity
       if batched {
         receipt = try await runBatched(suite, plan: plan, runner: runner, evidence: evidence, receipt: receipt)

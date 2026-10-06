@@ -43,10 +43,10 @@ enum GenerationPreemptionSmoke {
       }
       let writingAdmission = try ModelPacks.admission(writingPack, purpose: .writing)
       try ModelResidency.admit(weightBytes: writingAdmission.weightBytes)
-      let writing = try await MLXGemmaRunner.load(directory: writingPack, identity: writingAdmission.identity)
+      let writing = try await MLXGemmaRunner.load(admission: writingAdmission)
       let consultationAdmission = try ModelPacks.admission(consultationPack, purpose: .consultation)
       try ModelResidency.admit(weightBytes: consultationAdmission.weightBytes)
-      let consultation = try await MLXGemmaRunner.load(directory: consultationPack, identity: consultationAdmission.identity)
+      let consultation = try await MLXGemmaRunner.load(admission: consultationAdmission)
       receipt["writing_model"] = writing.identity; receipt["consultation_model"] = consultation.identity
       // Recompute after both loads. The diagnostic cannot bypass residency.
       let capacity = await writing.contextLength

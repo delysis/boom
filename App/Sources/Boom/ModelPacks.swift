@@ -73,9 +73,11 @@ enum ModelResidency {
     return used < limit ? limit - used : 0
   }
   static func admit(weightBytes: UInt64) throws {
-    try configure(); try check()
-    let available = try availableBytes(), reserve = try limits().workingReserveBytes
-    guard reserve < available, weightBytes < available - reserve else {
+    try check()
+    guard let device = MTLCreateSystemDefaultDevice() else { throw BoomError.unavailable("Metal is unavailable.") }
+    let used = max(footprint(), UInt64(max(0, Memory.activeMemory + Memory.cacheMemory)))
+    guard try ProductCore.admitModelLoad(physical: ProcessInfo.processInfo.physicalMemory,
+      metal: device.recommendedMaxWorkingSetSize, resident: used, weights: weightBytes) else {
       throw BoomError.budget("This model does not fit alongside the resident model. Close the inactive model before loading it.")
     }
   }
@@ -122,22 +124,37 @@ enum ModelPacks {
     }
   }
   struct Admission: Sendable {
+    let directory: URL
     let identity: String
     let weightBytes: UInt64
     let converted: Bool
+  }
+  static func admission(_ directory: URL) throws -> Admission {
+    let manifest = directory.appendingPathComponent(manifestName)
+    if FileManager.default.fileExists(atPath: manifest.path) {
+      let digest = try ModelInstaller.hashFile(manifest, maxBytes: 4_194_304).sha256
+      guard let purpose = try entries().first(where: { $0.manifestDigest == digest })?.purpose else {
+        throw BoomError.invalid("This is not a catalog-qualified model pack.")
+      }
+      return try admission(directory, purpose: purpose)
+    }
+    guard let purpose = ModelPurpose.allCases.first(where: {
+      officialCached($0)?.standardizedFileURL == directory.standardizedFileURL
+    }) else { throw BoomError.invalid("This is not a pinned public Gemma checkpoint.") }
+    return try admission(directory, purpose: purpose)
   }
   static func admission(_ directory: URL, purpose: ModelPurpose) throws -> Admission {
     let specification = try entry(purpose)
     if FileManager.default.fileExists(atPath: directory.appendingPathComponent(manifestName).path) {
       let manifest = try verify(directory, purpose: purpose)
-      return Admission(identity: specification.manifestDigest, weightBytes: manifest.weightBytes, converted: true)
+      return Admission(directory: directory, identity: specification.manifestDigest, weightBytes: manifest.weightBytes, converted: true)
     }
     guard let official = officialCached(purpose), directory.standardizedFileURL == official.standardizedFileURL else {
       throw BoomError.invalid("This directory is not the pinned public Gemma checkpoint.")
     }
     try verifyPublicFiles(directory, specification: specification.manifest)
     let weights = specification.manifest.upstreamFiles.filter { $0.path.hasSuffix(".safetensors") }.reduce(UInt64(0)) { $0 + UInt64($1.bytes) }
-    return Admission(identity: specification.manifest.upstreamRepository + "@" + specification.manifest.upstreamRevision,
+    return Admission(directory: directory, identity: specification.manifest.upstreamRepository + "@" + specification.manifest.upstreamRevision,
       weightBytes: weights, converted: false)
   }
   static func cached(_ purpose: ModelPurpose) -> URL? { installed(purpose) ?? officialCached(purpose) }

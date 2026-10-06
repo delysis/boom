@@ -68,7 +68,8 @@ enum MLXNativeSmoke {
     }
     try persist()
     do {
-      let runner = try await MLXGemmaRunner.load(directory: directory)
+      let admission = try await detachedWork { try ModelPacks.admission(directory) }
+      let runner = try await MLXGemmaRunner.load(admission: admission)
       let output: MLXGemmaRunner.Output
       var editDocument: DocumentSnapshot?
       if arguments.contains("--edit-smoke") {

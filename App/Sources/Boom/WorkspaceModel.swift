@@ -1811,7 +1811,7 @@ struct CompletionSegment {
       if purpose == .consultation { await self.releaseRunner() }
       else { if let old = self.baseRunner { await old.join() }; self.baseRunner = nil }
       try self.admitModel(admission, purpose: purpose)
-      let loaded = try await MLXGemmaRunner.load(directory: url, identity: admission.identity)
+      let loaded = try await MLXGemmaRunner.load(admission: admission)
       try flag.check()
       if purpose == .consultation { self.mlxRunner = loaded; self.modelReady = true }
       else { self.baseRunner = loaded }
@@ -1833,7 +1833,7 @@ struct CompletionSegment {
       if purpose == .consultation { await self.releaseRunner() }
       else { if let old = self.baseRunner { await old.join() }; self.baseRunner = nil }
       try self.admitModel(admission, purpose: purpose)
-      let loaded = try await MLXGemmaRunner.load(directory: directory, identity: admission.identity)
+      let loaded = try await MLXGemmaRunner.load(admission: admission)
       try flag.check()
       if purpose == .consultation { self.mlxRunner = loaded; self.modelReady = true }
       else { self.baseRunner = loaded }
@@ -1893,7 +1893,7 @@ struct CompletionSegment {
         if result.purpose == .consultation { await self.releaseRunner() }
         else { if let old = self.baseRunner { await old.join() }; self.baseRunner = nil }
         try self.admitModel(admission, purpose: result.purpose)
-        let runner = try await MLXGemmaRunner.load(directory: directory, identity: admission.identity)
+        let runner = try await MLXGemmaRunner.load(admission: admission)
         if result.purpose == .consultation { self.mlxRunner = runner; self.modelReady = true }
         else { self.baseRunner = runner }
       }

@@ -42,7 +42,7 @@ enum BatchGenerationSmoke {
     do {
       let admission = try ModelPacks.admission(directory, purpose: .writing)
       try ModelResidency.admit(weightBytes: admission.weightBytes)
-      let runner = try await MLXGemmaRunner.load(directory: directory, identity: admission.identity)
+      let runner = try await MLXGemmaRunner.load(admission: admission)
       try Data(contentsOf: directory.appendingPathComponent(ModelPacks.manifestName))
         .write(to: evidence.appendingPathComponent("model-manifest.json"))
       let settings = try ProductCore.sampling(.standard)

@@ -35,10 +35,13 @@ enum ModelInstaller {
       let size = info.fileSize, Int64(size) <= maxBytes else { throw BoomError.invalid("Unsafe model file.") }
     let handle = try FileHandle(forReadingFrom: url); defer { try? handle.close() }
     var hash = SHA256(), total: Int64 = 0
-    while let chunk = try handle.read(upToCount: 4_194_304), !chunk.isEmpty {
+    while try autoreleasepool(invoking: { () throws -> Bool in
+      guard let chunk = try handle.read(upToCount: 4_194_304), !chunk.isEmpty else { return false }
       total += Int64(chunk.count)
       guard total <= maxBytes else { throw BoomError.budget("Model file grew during verification.") }
       hash.update(data: chunk)
+      return true
+    }) {
     }
     return (hash.finalize().map { String(format: "%02x", $0) }.joined(), total)
   }

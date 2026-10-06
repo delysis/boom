@@ -39,6 +39,14 @@ pub fn admit_cache_probe(physical: u64, metal: u64, cache: u64) -> Result<bool, 
     Ok(true)
 }
 
+pub fn admit_load(physical: u64, metal: u64, resident: u64, weights: u64) -> Result<bool, Error> {
+    require(weights > 0, "The model has no weight files.")?;
+    let policy = limits(physical, metal);
+    let available = policy.application_bytes.saturating_sub(resident);
+    Ok(policy.working_reserve_bytes < available
+        && weights < available - policy.working_reserve_bytes)
+}
+
 /// Fields used by the pinned Gemma runtime's full/sliding cache construction.
 /// Other checkpoint configuration fields do not affect this calculation.
 #[derive(Deserialize)]
@@ -165,6 +173,20 @@ mod tests {
         let plan = limits(128 * GIB, 96 * GIB);
         assert_eq!(plan.allocator_bytes, 23 * GIB);
         assert_eq!(plan.cache_bytes, 128 << 20);
+    }
+
+    #[test]
+    fn load_admission_accounts_for_new_residents_and_keeps_the_reserve() -> Result<(), Error> {
+        assert!(admit_load(128 * GIB, 96 * GIB, 8 * GIB, 8 * GIB)?);
+        assert!(!admit_load(128 * GIB, 96 * GIB, 16 * GIB, 8 * GIB)?);
+        assert!(admit_load(32 * GIB, 32 * GIB, 16 * GIB, 6 * GIB - 1)?);
+        assert!(!admit_load(32 * GIB, 32 * GIB, 16 * GIB, 6 * GIB)?);
+        assert!(!admit_load(32 * GIB, 24 * GIB, 16 * GIB, 6 * GIB - 1)?);
+        assert!(!admit_load(8 * GIB, 8 * GIB, 0, 1)?);
+        assert!(!admit_load(u64::MAX, u64::MAX, u64::MAX, u64::MAX)?);
+        assert!(!admit_load(128 * GIB, 96 * GIB, 0, u64::MAX)?);
+        assert!(admit_load(128 * GIB, 96 * GIB, 0, 0).is_err());
+        Ok(())
     }
 
     #[test]
