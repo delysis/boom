@@ -1342,6 +1342,9 @@ struct CompletionSegment {
         bundle.candidates[index].stopReason = result.stopReason
         bundle.candidates[index].stopTokenID = result.stopTokenID
       }
+      if let current = candidates, current.id == bundle.id, bundle.candidates.indices.contains(current.selected) {
+        bundle.selected = current.selected
+      }
       candidates = bundle
       if epoch == capturedEpoch { showCandidateGhost(bundle.candidates[bundle.selected].text, recipe: recipe, epoch: capturedEpoch) }
       let vault = store.vault, saved = bundle
@@ -1392,6 +1395,7 @@ struct CompletionSegment {
   func selectCandidate(_ index: Int) {
     guard let bundle = candidates, bundle.candidates.indices.contains(index) else { return }
     candidates?.selected = index
+    ghostText = ""; ghostStamp = nil; ghostSources = []; editor?.clearGhost()
     if candidateIsCurrent { showCandidateGhost(bundle.candidates[index].text, recipe: bundle.recipe, epoch: epoch) }
   }
   func replayCandidate(_ index: Int) {

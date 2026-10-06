@@ -85,6 +85,7 @@ import SwiftUI
     model.exploreWriting()
     try await finish(model, evidence: evidence, phase: "alternatives")
     guard let alternatives = model.candidates, alternatives.candidates.count == 3,
+      alternatives.selected == 1,
       alternatives.candidates.allSatisfy({ $0.state == .complete && !$0.text.isEmpty }),
       model.selectedDocument == fixture.document else {
       throw BoomError.invalid("Explore did not produce three completed alternatives without changing the manuscript; all attempts retained.")
@@ -190,10 +191,14 @@ import SwiftUI
   }
   private static func finish(_ model: WorkspaceModel, evidence: URL, phase: String) async throws {
     let start = ContinuousClock().now
+    var selectedDuringGeneration = false
     while model.isBusy {
       if phase == "alternatives", let editor = model.editor, let window = editor.window {
         guard editor.isEditable, window.canBecomeKey, window.makeFirstResponder(editor),
           window.firstResponder === editor else { throw BoomError.invalid("Generation took keyboard focus away from the native manuscript editor.") }
+      }
+      if phase == "alternatives", !selectedDuringGeneration, model.candidates?.candidates.count == 3 {
+        model.selectCandidate(1); selectedDuringGeneration = true
       }
       guard start.duration(to: ContinuousClock().now) < .seconds(240) else { throw BoomError.unavailable("Writing diagnostic timed out during " + phase) }
       if let bundle = model.candidates { try write(bundle, to: evidence.appendingPathComponent(phase + "-latest.json")) }
