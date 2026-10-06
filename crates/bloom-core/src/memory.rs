@@ -28,6 +28,17 @@ pub fn limits(physical: u64, metal: u64) -> Limits {
     }
 }
 
+pub fn admit_cache_probe(physical: u64, metal: u64, cache: u64) -> Result<bool, Error> {
+    let policy = limits(physical, metal);
+    require(
+        cache > 0
+            && cache <= policy.working_reserve_bytes / 2
+            && cache <= policy.application_bytes / 16,
+        "The allocator-cache probe exceeds the application reserve.",
+    )?;
+    Ok(true)
+}
+
 /// Fields used by the pinned Gemma runtime's full/sliding cache construction.
 /// Other checkpoint configuration fields do not affect this calculation.
 #[derive(Deserialize)]
@@ -193,5 +204,17 @@ mod tests {
         config = gemma();
         config.num_kv_shared_layers = 48;
         assert!(context_capacity(&config, u64::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn cache_probe_stays_inside_the_existing_reserve() -> Result<(), Error> {
+        for cache in [128 << 20, 512 << 20, GIB] {
+            assert!(admit_cache_probe(128 * GIB, 96 * GIB, cache)?);
+        }
+        assert!(admit_cache_probe(128 * GIB, 96 * GIB, 0).is_err());
+        assert!(admit_cache_probe(128 * GIB, 96 * GIB, GIB + 1).is_err());
+        assert!(admit_cache_probe(8 * GIB, 8 * GIB, 128 << 20).is_err());
+        assert!(admit_cache_probe(32 * GIB, GIB, 128 << 20).is_err());
+        Ok(())
     }
 }

@@ -29,6 +29,7 @@ import SwiftUI
       source.resume()
     }
     func mark(_ value: String) { lock.lock(); phase = value; lock.unlock(); sample() }
+    func currentPhase() -> String { lock.lock(); defer { lock.unlock() }; return phase }
     private func sample() {
       lock.lock(); defer { lock.unlock() }
       let accounting = ModelResidency.memoryAccounting(), footprint = accounting.current
@@ -73,8 +74,13 @@ import SwiftUI
     return ["available": status == 0, "used_bytes": value.xsu_used,
       "total_bytes": value.xsu_total, "scope": "host-wide; other applications can contribute"]
   }
-  static func run(writingPack: URL, evidence: URL) async throws {
+  static func run(writingPack: URL, evidence: URL, cacheProbe: UInt64? = nil) async throws {
     let limits = try ModelResidency.limits()
+    let metal = MTLCreateSystemDefaultDevice()?.recommendedMaxWorkingSetSize ?? 0
+    if let cacheProbe {
+      try ProductCore.admitCacheProbe(physical: ProcessInfo.processInfo.physicalMemory,
+        metal: metal, cache: cacheProbe)
+    }
     var receipt: [String: Any] = ["schema": 1, "status": "running",
       "gate": "24 GiB application budget on the development Mac; full admitted context",
       "source_inventory_sha256": Bundle.main.infoDictionary?["BoomSourceSHA256"] ?? "unavailable",
@@ -86,6 +92,7 @@ import SwiftUI
       "keychain_dialogs_qualified": false, "physical_keyboard_or_ime_qualified": false,
       "swap_before": swap(), "sample_interval_ms": 20,
       "durable_encrypted_checkpoint_overhead_included": true]
+    receipt["requested_cache_probe_bytes"] = cacheProbe as Any? ?? NSNull()
     try write(receipt, "receipt.json", evidence: evidence)
     let probe = try Probe(evidence.appendingPathComponent("memory-samples.jsonl"))
     var typing: Task<[Double], Error>?
@@ -117,6 +124,8 @@ import SwiftUI
       receipt["loading_scope"] = "fresh process; OS filesystem cache was not flushed"
       let consultation = try await load(consultationPack, .consultation)
       let writing = try await load(writingPack, .writing)
+      if let cacheProbe { Memory.cacheLimit = Int(clamping: cacheProbe); Memory.clearCache() }
+      receipt["effective_allocator_cache_limit_bytes"] = Memory.cacheLimit
       probe.mark("pair-resident")
       let writingCapacity = try await writing.contextLength(batchWidth: 3)
       let consultationCapacity = await consultation.contextLength
@@ -141,17 +150,27 @@ import SwiftUI
         throw BoomError.invalid("The production offscreen editor did not accept keyboard focus.")
       }
       workspace.isBusy = true
+      var typingObservations: [[String: Any]] = []
       typing = Task { @MainActor in
         var delays: [Double] = []
         while !Task.isCancelled {
           let expected = clock.now.advanced(by: .milliseconds(100))
           do { try await Task.sleep(until: expected, clock: clock) } catch { break }
           let started = clock.now
+          let phase = probe.currentPhase()
           editor.setSelectedRange(NSRange(location: 0, length: 0))
           editor.insertText("x", replacementRange: editor.selectedRange())
+          let inserted = clock.now
           editor.insertText("", replacementRange: NSRange(location: 0, length: 1))
+          let deleted = clock.now
           host.layoutSubtreeIfNeeded()
           delays.append(max(0, expected.duration(to: clock.now).timeInterval))
+          typingObservations.append(["phase": phase,
+            "scheduled_delay_seconds": max(0, expected.duration(to: started).timeInterval),
+            "insertion_seconds": started.duration(to: inserted).timeInterval,
+            "deletion_seconds": inserted.duration(to: deleted).timeInterval,
+            "layout_seconds": deleted.duration(to: clock.now).timeInterval,
+            "combined_seconds": delays.last!])
           guard editor.string == document.text, editor.isEditable,
             testWindow.firstResponder === editor else { throw BoomError.invalid("Native typing changed fixture bytes or lost focus.") }
           if started.duration(to: clock.now) > .seconds(2) { throw BoomError.unavailable("Native typing stalled.") }
@@ -163,7 +182,7 @@ import SwiftUI
         for _ in 0..<8 {
           let prefix = try await consultation.diagnosticPrefix(tokens: length)
           let plan = try ProductCore.prompt(voice: nil, history: [], instructions: "",
-            context: "", request: prefix + "\nContinue in the same prose.", routing: [])
+            context: prefix, request: "Write a detailed continuation of the harbor scene. Introduce a person whose arrival changes what the keeper intends. Use at least three paragraphs.", routing: [])
           let actual = try await consultation.tokenCount(plan)
           if actual == tokens { return plan }
           length += tokens - actual
@@ -261,6 +280,7 @@ import SwiftUI
       let measured = try probe.finish()
       receipt["peak_sampled_process_footprint_bytes"] = measured.0; receipt["memory_samples"] = measured.1
       receipt["typing_samples_seconds"] = typingDelays
+      receipt["typing_observations"] = typingObservations
       receipt["typing_scope"] = "offscreen production editor insertion, deletion, model update and layout plus main-actor scheduling; not physical keystrokes"
       receipt["maximum_typing_latency_seconds"] = typingDelays.max() ?? 0
       receipt["swap_after"] = swap()

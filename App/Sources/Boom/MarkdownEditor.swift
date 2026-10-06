@@ -438,7 +438,10 @@ private struct MarkdownSpan: Decodable {
       }
   }
   static func apply(to view: NSTextView, bodyFont: NSFont? = nil, lineSpacing: CGFloat = 4, reading: Bool = false) {
-    guard let storage = view.textStorage else { return }
+    guard let current = view.textStorage else { return }
+    // Compute the same projection without invalidating the live text layout.
+    // Most inserted prose already has its correct native typing attributes.
+    let storage = NSMutableAttributedString(string: current.string)
     let bodyFont = bodyFont ?? body
     let manager = view.undoManager
     let registered = view.undoManager?.isUndoRegistrationEnabled == true
@@ -453,9 +456,8 @@ private struct MarkdownSpan: Decodable {
     let text = storage.string as NSString
     let full = NSRange(location: 0, length: text.length)
     var attachmentRanges: [NSRange] = []
-    storage.beginEditing()
     defer {
-      storage.endEditing()
+      synchronize(storage, into: current)
       for range in attachmentRanges { view.setSpellingState(0, range: range) }
     }
     let paragraph = NSMutableParagraphStyle()
@@ -531,6 +533,32 @@ private struct MarkdownSpan: Decodable {
     view.typingAttributes = [
       .font: bodyFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: paragraph,
     ]
+  }
+  private static func synchronize(_ desired: NSAttributedString, into current: NSTextStorage) {
+    let owned: Set<NSAttributedString.Key> = [
+      .font, .foregroundColor, .paragraphStyle, .backgroundColor,
+      .strikethroughStyle, .underlineStyle,
+    ]
+    var edits: [(NSRange, [NSAttributedString.Key: Any])] = []
+    desired.enumerateAttributes(in: NSRange(location: 0, length: desired.length)) { expected, range, _ in
+      var position = range.location
+      while position < NSMaxRange(range) {
+        var effective = NSRange()
+        let existing = current.attributes(at: position, effectiveRange: &effective)
+        let intersection = NSIntersectionRange(range, effective)
+        let before = existing.filter { owned.contains($0.key) }
+        if !(before as NSDictionary).isEqual(expected as NSDictionary) {
+          var replacement = existing.filter { !owned.contains($0.key) }
+          replacement.merge(expected) { _, value in value }
+          edits.append((intersection, replacement))
+        }
+        position = NSMaxRange(intersection)
+      }
+    }
+    guard !edits.isEmpty else { return }
+    current.beginEditing()
+    for (range, attributes) in edits { current.setAttributes(attributes, range: range) }
+    current.endEditing()
   }
 }
 

@@ -24,7 +24,14 @@ enum MLXNativeSmoke {
     try FileManager.default.createDirectory(at: evidence, withIntermediateDirectories: false,
       attributes: [.posixPermissions: 0o700])
     if arguments.contains("--memory-budget") {
-      try await ApplicationMemorySmoke.run(writingPack: directory, evidence: evidence)
+      let cache: UInt64?
+      if arguments.contains("--benchmark-cache-mib") {
+        guard let mib = UInt64(try argument("--benchmark-cache-mib")), mib <= UInt64.max / 1_048_576 else {
+          throw BoomError.invalid("Invalid allocator-cache probe.")
+        }
+        cache = mib * 1_048_576
+      } else { cache = nil }
+      try await ApplicationMemorySmoke.run(writingPack: directory, evidence: evidence, cacheProbe: cache)
       return
     }
     if arguments.contains("--preempt") {

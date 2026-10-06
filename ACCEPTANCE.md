@@ -62,6 +62,8 @@ The Rust policy caps every host at 24 GiB, applies the lower physical/Metal allo
 
 Blocking MLX prefill and batch evaluation must run on the dedicated serial inference executor, outside Swift's cooperative pool. Verify that main-actor timer/input tasks continue during prefill as well as decoding. Require at least 64 decoded tokens when assessing sustained throughput; shorter EOS answers retain their measured rate but cannot qualify sustained decoding. Keep input dispatch delay separate from editor handling time when investigating a failure. Never infer a focus refusal or locked screen from an idle event loop.
 
+Allocator-cache experiments use `--benchmark-cache-mib` only with the explicit memory diagnostic. Rust admits the probe inside the existing reserve; the application budget and context policy remain unchanged. Register every cache setting before execution, run the same exact inputs/seeds and native editing workload, and retain every result. Capture the effective cache setting, scheduling delay, insertion, deletion and layout timings separately. Consultation uses an explicit source and a multi-paragraph request; an abbreviated EOS answer cannot qualify sustained throughput. A chosen cache setting becomes a product default only after measured admission and timing checks.
+
 ## Distribution and receipts
 
 Deliver the exact runnable bundle, pinned manifests, native demonstration recordings, complete failure/output evidence and source/build/model-bound receipts. Integrate tested commits into the private source repository. Model packs remain local until publication is authorized and account access is available.

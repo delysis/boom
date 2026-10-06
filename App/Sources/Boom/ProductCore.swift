@@ -174,6 +174,10 @@ enum ProductCore {
   static func residencyLimits(physical: UInt64, metal: UInt64) throws -> ResidencyLimits {
     try call(["op": "residency_limits", "physicalBytes": physical, "metalBytes": metal])
   }
+  static func admitCacheProbe(physical: UInt64, metal: UInt64, cache: UInt64) throws {
+    let _: Bool = try call(["op": "residency_cache_probe", "physicalBytes": physical,
+      "metalBytes": metal, "cacheBytes": cache])
+  }
   static func contextCapacity(configuration: Data, available: UInt64, width: Int) throws -> Int {
     try call(["op": "context_capacity", "configuration": JSONSerialization.jsonObject(with: configuration),
       "availableBytes": available, "width": width])
