@@ -14,10 +14,17 @@ actor GenerationCoordinator {
   private var background = false
   private var producer: Task<Void, Never>?
   private var cancelProducer: (@Sendable () -> Void)?
+  private var activity: NSObjectProtocol?
   private var waiting: [(CancellationFlag?, Bool, CheckedContinuation<Void, Never>)] = []
   var queuedOperations: Int { waiting.count }
+  private func admitOwner(flag: CancellationFlag?, background: Bool) {
+    occupied = true; activeFlag = flag; self.background = background
+    activity = ProcessInfo.processInfo.beginActivity(
+      options: background ? .background : .userInitiatedAllowingIdleSystemSleep,
+      reason: "On-device model operation")
+  }
   func enter(flag: CancellationFlag? = nil, background: Bool = false) async {
-    if !occupied { occupied = true; activeFlag = flag; self.background = background; return }
+    if !occupied { admitOwner(flag: flag, background: background); return }
     if !background, self.background { activeFlag?.cancel(); cancelProducer?() }
     await withCheckedContinuation { waiting.append((flag, background, $0)) }
   }
@@ -31,10 +38,13 @@ actor GenerationCoordinator {
   func leave() async {
     if let producer { await producer.value }
     producer = nil; cancelProducer = nil; activeFlag = nil
+    if let activity { ProcessInfo.processInfo.endActivity(activity) }
+    activity = nil
     if waiting.isEmpty { occupied = false; background = false }
     else {
       let index = waiting.firstIndex { !$0.1 } ?? 0
-      let next = waiting.remove(at: index); activeFlag = next.0; background = next.1; next.2.resume()
+      let next = waiting.remove(at: index)
+      admitOwner(flag: next.0, background: next.1); next.2.resume()
     }
   }
 }

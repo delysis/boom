@@ -12,14 +12,18 @@ import SwiftUI
 @MainActor enum ApplicationMemorySmoke {
   private final class Probe: @unchecked Sendable {
     private let lock = NSLock()
-    private let source = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+    private let queue = DispatchQueue(label: "com.delysis.Bloom.memory-sampler", qos: .utility)
+    private let source: DispatchSourceTimer
     private let handle: FileHandle
     private let started = ContinuousClock().now
+    private let suspendingStarted = SuspendingClock().now
     private var phase = "startup"
     private var failure: String?
     private var peak: UInt64 = 0
     private var samples = 0
+    private var finished = false
     init(_ url: URL) throws {
+      source = DispatchSource.makeTimerSource(queue: queue)
       guard FileManager.default.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
         throw BoomError.unavailable("Memory sample ledger could not be created.")
       }
@@ -28,16 +32,22 @@ import SwiftUI
       source.setEventHandler { [weak self] in self?.sample() }
       source.resume()
     }
-    func mark(_ value: String) { lock.lock(); phase = value; lock.unlock(); sample() }
+    func mark(_ value: String) {
+      lock.lock(); phase = value; lock.unlock()
+      queue.async { [weak self] in self?.sample() }
+    }
     func currentPhase() -> String { lock.lock(); defer { lock.unlock() }; return phase }
+    func elapsedSeconds() -> Double { started.duration(to: ContinuousClock().now).timeInterval }
     private func sample() {
-      lock.lock(); defer { lock.unlock() }
+      guard !finished else { return }
+      let sampledPhase = currentPhase(), seconds = elapsedSeconds()
+      let suspendingSeconds = suspendingStarted.duration(to: SuspendingClock().now).timeInterval
       let accounting = ModelResidency.memoryAccounting(), footprint = accounting.current
       peak = max(peak, footprint, accounting.peak); samples += 1
       do {
         var bytes = try JSONSerialization.data(withJSONObject: [
-          "seconds": started.duration(to: ContinuousClock().now).timeInterval,
-          "phase": phase, "process_footprint_bytes": footprint,
+          "seconds": seconds, "suspending_seconds": suspendingSeconds,
+          "phase": sampledPhase, "process_footprint_bytes": footprint,
           "kernel_process_peak_footprint_bytes": accounting.peak,
           "mlx_active_bytes": Memory.activeMemory, "mlx_cache_bytes": Memory.cacheMemory,
           "mlx_peak_active_bytes": Memory.peakMemory], options: [.sortedKeys])
@@ -45,11 +55,13 @@ import SwiftUI
       } catch { failure = error.localizedDescription }
     }
     func finish() throws -> (UInt64, Int) {
-      source.cancel(); sample()
-      lock.lock(); defer { lock.unlock() }
-      try handle.synchronize()
-      if let failure { throw BoomError.unavailable(failure) }
-      return (peak, samples)
+      source.cancel()
+      return try queue.sync {
+        sample(); finished = true
+        try handle.synchronize()
+        if let failure { throw BoomError.unavailable(failure) }
+        return (peak, samples)
+      }
     }
     deinit { source.cancel(); try? handle.close() }
   }
@@ -91,7 +103,9 @@ import SwiftUI
       "network_permission": "outbound denied by the invoking OS sandbox",
       "keychain_dialogs_qualified": false, "physical_keyboard_or_ime_qualified": false,
       "swap_before": swap(), "sample_interval_ms": 20,
-      "durable_encrypted_checkpoint_overhead_included": true]
+      "durable_encrypted_checkpoint_overhead_included": true,
+      "inference_activity_scope": "GPU lease through producer joining; explicit operations request user-initiated activity while allowing idle system sleep; autocomplete requests background activity",
+      "clock_scope": "ContinuousClock includes system sleep; SuspendingClock excludes system sleep; recorded wall-clock gates are unchanged"]
     receipt["requested_cache_probe_bytes"] = cacheProbe as Any? ?? NSNull()
     try write(receipt, "receipt.json", evidence: evidence)
     let probe = try Probe(evidence.appendingPathComponent("memory-samples.jsonl"))
@@ -155,8 +169,10 @@ import SwiftUI
         var delays: [Double] = []
         while !Task.isCancelled {
           let expected = clock.now.advanced(by: .milliseconds(100))
+          let expectedSuspending = SuspendingClock().now.advanced(by: .milliseconds(100))
           do { try await Task.sleep(until: expected, clock: clock) } catch { break }
           let started = clock.now
+          let suspendingWake = SuspendingClock().now
           let phase = probe.currentPhase()
           editor.setSelectedRange(NSRange(location: 0, length: 0))
           editor.insertText("x", replacementRange: editor.selectedRange())
@@ -164,12 +180,15 @@ import SwiftUI
           editor.insertText("", replacementRange: NSRange(location: 0, length: 1))
           let deleted = clock.now
           host.layoutSubtreeIfNeeded()
-          delays.append(max(0, expected.duration(to: clock.now).timeInterval))
+          let ended = clock.now
+          delays.append(max(0, expected.duration(to: ended).timeInterval))
           typingObservations.append(["phase": phase,
+            "observation_seconds": probe.elapsedSeconds(),
             "scheduled_delay_seconds": max(0, expected.duration(to: started).timeInterval),
+            "scheduled_delay_excluding_system_sleep_seconds": max(0, expectedSuspending.duration(to: suspendingWake).timeInterval),
             "insertion_seconds": started.duration(to: inserted).timeInterval,
             "deletion_seconds": inserted.duration(to: deleted).timeInterval,
-            "layout_seconds": deleted.duration(to: clock.now).timeInterval,
+            "layout_seconds": deleted.duration(to: ended).timeInterval,
             "combined_seconds": delays.last!])
           guard editor.string == document.text, editor.isEditable,
             testWindow.firstResponder === editor else { throw BoomError.invalid("Native typing changed fixture bytes or lost focus.") }

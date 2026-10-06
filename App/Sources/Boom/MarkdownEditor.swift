@@ -16,6 +16,17 @@ import SwiftUI
   private var displayContainer: NSTextContainer?
   private var searchRanges: [NSRange] = []
   private var searchIdentity: String?
+  func manuscriptSize(width: CGFloat, minimumHeight: CGFloat) -> CGSize? {
+    guard width > 0, let storage = textStorage, let container = textContainer,
+      let layout = layoutManager else { return nil }
+    let target = NSSize(width: max(1, width - textContainerInset.width * 2),
+      height: CGFloat.greatestFiniteMagnitude)
+    if container.size != target { container.size = target }
+    layout.ensureGlyphs(forCharacterRange: NSRange(location: 0, length: storage.length))
+    layout.ensureLayout(for: container)
+    return CGSize(width: width,
+      height: max(layout.usedRect(for: container).height + textContainerInset.height * 2, minimumHeight))
+  }
   func highlightSearch(_ ranges: [NSRange], identity: String?) {
     guard let layout = layoutManager, let storage = textStorage else { return }
     for range in searchRanges where NSMaxRange(range) <= storage.length {
@@ -628,15 +639,8 @@ struct MarkdownEditor: NSViewRepresentable {
   func sizeThatFits(
     _ proposal: ProposedViewSize, nsView text: MarkdownTextView, context: Context
   ) -> CGSize? {
-    guard let width = proposal.width, width > 0, let container = text.textContainer,
-      let layout = text.layoutManager else { return nil }
-    container.size = NSSize(
-      width: max(1, width - text.textContainerInset.width * 2),
-      height: CGFloat.greatestFiniteMagnitude)
-    layout.ensureLayout(for: container)
-    let used = layout.usedRect(for: container)
-    return CGSize(width: width,
-      height: max(used.height + text.textContainerInset.height * 2, minimumHeight))
+    guard let width = proposal.width else { return nil }
+    return text.manuscriptSize(width: width, minimumHeight: minimumHeight)
   }
   private func update(_ text: MarkdownTextView, document: DocumentSnapshot) {
     // SwiftUI status/streaming updates must never overwrite in-flight marked text.
