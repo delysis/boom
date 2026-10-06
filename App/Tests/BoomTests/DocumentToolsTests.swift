@@ -4,6 +4,95 @@ import XCTest
 @testable import Boom
 
 final class DocumentToolsTests: XCTestCase {
+  @MainActor func testEmptyEditResponsePreservesBytesAndReportsNoChanges() async throws {
+    for mode in [InteractionMode.propose, .edit] {
+      let (model, store, root, document, chatID, pending) = try await responseFixture()
+      defer { try? FileManager.default.removeItem(at: root) }
+      let response = AssistantEnvelope(reply: "The harbor is quiet.", edits: [])
+      let answer = try await model.finishConsultationResponse(
+        String(decoding: JSONEncoder().encode(response), as: UTF8.self), pending: pending, chatID: chatID,
+        authority: CapturedDocumentAuthority(mode: mode, target: document), documentSources: [], attachments: [])
+      XCTAssertEqual(answer.state, .complete)
+      XCTAssertEqual(model.status, "No document changes")
+      XCTAssertEqual(model.selectedDocument, document)
+      XCTAssertTrue(model.state.proposals.isEmpty)
+      XCTAssertFalse(model.undoManager(document.id).canUndo)
+      try await model.flush()
+      let persisted = try await store.load().get().1.first { $0.id == document.id }
+      XCTAssertEqual(persisted, document)
+      try await model.shutdown()
+    }
+  }
+  @MainActor func testProposalRequiresAcceptanceAndRetainsNativeUndo() async throws {
+    let (model, store, root, document, chatID, pending) = try await responseFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let response = AssistantEnvelope(reply: "Here is a brighter harbor.",
+      edits: [patch(document, [Replacement(old: "quiet", new: "bright")])])
+    _ = try await model.finishConsultationResponse(
+      String(decoding: JSONEncoder().encode(response), as: UTF8.self), pending: pending, chatID: chatID,
+      authority: CapturedDocumentAuthority(mode: .propose, target: document), documentSources: [], attachments: [])
+    let proposal = try XCTUnwrap(model.state.proposals.last)
+    XCTAssertEqual(proposal.status, "pending")
+    XCTAssertEqual(model.status, "Proposal ready for review")
+    XCTAssertEqual(model.selectedDocument, document)
+    let persisted = try await store.load().get().1.first { $0.id == document.id }
+    XCTAssertEqual(persisted, document)
+    XCTAssertFalse(model.undoManager(document.id).canUndo)
+    model.accept(proposal.id)
+    try await waitForResponse(model)
+    XCTAssertNil(model.errorMessage)
+    XCTAssertEqual(model.status, "Document edited")
+    XCTAssertEqual(model.selectedDocument?.text, document.text.replacingOccurrences(of: "quiet", with: "bright"))
+    XCTAssertEqual(model.state.proposals.last?.status, "applied")
+    XCTAssertTrue(model.undoManager(document.id).canUndo)
+    model.undoProposal(try XCTUnwrap(model.state.proposals.last))
+    XCTAssertEqual(model.selectedDocument, document)
+    XCTAssertEqual(model.state.proposals.last?.status, "undone")
+    try await model.shutdown()
+  }
+  @MainActor func testStaleProposalCannotOverwriteLaterAuthoredText() async throws {
+    let (model, store, root, document, chatID, pending) = try await responseFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let response = AssistantEnvelope(reply: "A suggested change.",
+      edits: [patch(document, [Replacement(old: "quiet", new: "bright")])])
+    _ = try await model.finishConsultationResponse(
+      String(decoding: JSONEncoder().encode(response), as: UTF8.self), pending: pending, chatID: chatID,
+      authority: CapturedDocumentAuthority(mode: .propose, target: document), documentSources: [], attachments: [])
+    let proposal = try XCTUnwrap(model.state.proposals.last)
+    let authored = document.text + "\n\nLater text by the author."
+    model.updateDocument(authored, id: document.id, caret: 0)
+    try await model.flush()
+    model.accept(proposal.id)
+    try await waitForResponse(model)
+    XCTAssertNotNil(model.errorMessage)
+    XCTAssertEqual(model.selectedDocument?.text, authored)
+    XCTAssertEqual(model.state.proposals.last?.status, "pending")
+    let persisted = try await store.load().get().1.first { $0.id == document.id }
+    XCTAssertEqual(persisted?.text, authored)
+    try await model.shutdown()
+  }
+  @MainActor private func responseFixture() async throws
+    -> (WorkspaceModel, WorkspaceStore, URL, DocumentSnapshot, UUID, ChatMessage) {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-response-outcome-" + UUID().uuidString)
+    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    if model.selectedDocument == nil { try model.newDocument() }
+    let selected = try XCTUnwrap(model.selectedDocument)
+    model.updateDocument("Café 👩🏽‍💻 waited.\n\nThe harbor was quiet.\n\nA final line.", id: selected.id, caret: 0)
+    try model.newChat(about: selected.id)
+    let document = try XCTUnwrap(model.selectedDocument), chatID = try XCTUnwrap(model.state.selectedChat)
+    let pending = ChatMessage(role: .assistant, text: "", state: .pending)
+    let index = try XCTUnwrap(model.state.chats.firstIndex { $0.id == chatID })
+    model.state.chats[index].messages.append(pending)
+    try await model.flush()
+    model.undoManager(document.id).removeAllActions()
+    return (model, store, root, document, chatID, pending)
+  }
+  @MainActor private func waitForResponse(_ model: WorkspaceModel) async throws {
+    let deadline = ContinuousClock.now + .seconds(3)
+    while model.isBusy && ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+    XCTAssertFalse(model.isBusy)
+  }
   @MainActor func testResponseCompletesOnlyAfterAValidatedEditAndPreservesUndo() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-edit-response-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }

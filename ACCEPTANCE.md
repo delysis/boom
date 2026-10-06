@@ -8,6 +8,8 @@ Start fresh. Give two ordinary chats instructions and editable exchanges, then p
 
 Explicit attachments and references determine context. Inspect supplied context and omissions. Ask cannot edit. Propose requires acceptance. Edit grants one voice one document revision. Stale document/source changes, IME composition, malformed edits and interrupted writes must retain evidence and refuse unsafe application.
 
+The explicit real-model `--mlx-smoke --edit-smoke`, `--propose-smoke`, and `--unchanged-smoke` diagnostics use public document fixtures and ephemeral keys. Check exact persisted bytes and native Undo for Edit; Propose must preserve the original both in memory and on disk until acceptance. A no-patch response must create neither a proposal nor an Undo action and report no document changes. Retain the raw model response before validation. These checks do not measure real Keychain dialogs or physical interaction.
+
 ## Writing
 
 Use substantial authored prose and chosen literary examples. Verify exact bytes supplied before the cursor and the exclusion of following text. Generate three distinct real-model alternatives in one shared-prefill batch, replay the captured seed set and row shape, request another set, navigate with Option-Up/Down, branch one alternative, partially accept another and undo. Verify manuscript bytes and lineage throughout. Automatic ghost text stays out of Copy, export, storage and Undo until accepted. Edits, cursor movement, example changes and partial acceptance invalidate obsolete results.

@@ -880,8 +880,7 @@ struct CompletionSegment {
             let completedReceipt = receipt
             try await detachedWork { try vault.encode(completedReceipt, kind: .receipt, id: replyID) }
             self.streamingText = ""
-            self.status = interaction == .ask ? "Local answer · \(result.promptTokens) prompt tokens"
-              : interaction == .edit ? "Document edit checked" : "Proposal ready for review"
+            if interaction == .ask { self.status = "Local answer · \(result.promptTokens) prompt tokens" }
             try await self.flush()
           }
         } catch {
@@ -931,6 +930,7 @@ struct CompletionSegment {
       throw BoomError.stale("The pending response disappeared.")
     }
     var answer = text
+    var documentStatus: String?
     if authority.mode != .ask {
       let envelope = try AssistantEnvelope.decode(text)
       answer = envelope.reply
@@ -945,6 +945,8 @@ struct CompletionSegment {
         try await flush()
         if authority.mode == .edit { try await commit(proposal) }
       }
+      documentStatus = envelope.edits.isEmpty ? "No document changes"
+        : authority.mode == .edit ? "Document edited" : "Proposal ready for review"
     }
     guard let chatIndex = state.chats.firstIndex(where: { $0.id == chatID }),
       let messageIndex = state.chats[chatIndex].messages.firstIndex(where: { $0.id == pending.id }),
@@ -953,6 +955,7 @@ struct CompletionSegment {
     let message = ChatMessage(id: pending.id, role: .assistant, text: answer, sources: pending.sources,
       state: .complete, provider: pending.provider, speaker: pending.speaker)
     state.chats[chatIndex].messages[messageIndex] = message
+    if let documentStatus { status = documentStatus }
     return message
   }
   private func revalidateOnDisk(_ sources: [SourceReference], attachments: [SourceReference]) async throws {
@@ -1002,6 +1005,7 @@ struct CompletionSegment {
           schema: 1, proposalID: proposal.id, documentID: current.id,
           beforeRevision: current.revision, afterRevision: updated.revision, phase: "file_written")
       try await detachedWork { try vault.encode(finalJournal, kind: .editJournal, id: proposal.id) }
+      status = "Document edited"
     } catch {
       throw BoomError.unavailable(
         "The document edit was applied, but its final journal mark could not be saved. The prepared recovery receipt was retained. "

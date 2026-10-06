@@ -71,22 +71,28 @@ enum MLXNativeSmoke {
       let admission = try await detachedWork { try ModelPacks.admission(directory) }
       let runner = try await MLXGemmaRunner.load(admission: admission)
       let output: MLXGemmaRunner.Output
-      var editDocument: DocumentSnapshot?
-      if arguments.contains("--edit-smoke") {
+      var editDocument: (DocumentSnapshot, InteractionMode, Bool)?
+      let documentCases = ["--edit-smoke", "--propose-smoke", "--unchanged-smoke"].filter { arguments.contains($0) }
+      guard documentCases.count <= 1 else { throw BoomError.invalid("Choose one document response diagnostic.") }
+      if !documentCases.isEmpty {
         let document = DocumentSnapshot(id: UUID(uuidString: "77D4A505-273A-487B-85AF-07EF1E524131")!,
           title: "Public edit fixture", text: "The harbor was quiet.")
         let graph = try ContextGraph.resolveChat(request: "", attachedDocumentID: document.id,
           editingDocumentID: document.id, all: [document])
-        let authority = CapturedDocumentAuthority(mode: .edit, target: document)
+        let mode: InteractionMode = arguments.contains("--edit-smoke") ? .edit : .propose
+        let expectsEdit = !arguments.contains("--unchanged-smoke")
+        let authority = CapturedDocumentAuthority(mode: mode, target: document)
         let plan = try ProductCore.prompt(voice: nil, history: [], instructions: "", context: graph.text,
-          request: "In the document, replace quiet with bright. Keep every other character unchanged. Return the actual edit patch.",
+          request: expectsEdit
+            ? "In the document, replace quiet with bright. Keep every other character unchanged. Return the actual edit patch."
+            : "Explain the sentence briefly. Do not change any document text. Return edits: [] with your reply.",
           routing: [], authority: authority)
         receipt["plan"] = try ProductCore.object(plan)
         receipt["authority"] = try ProductCore.object(authority)
         try persist()
         output = try await runner.run(plan: plan, images: [], maxTokens: 1024,
           seed: seed, flag: CancellationFlag(), onText: { _ in })
-        editDocument = document
+        editDocument = (document, mode, expectsEdit)
       } else if arguments.contains("--base") {
         let text = "The harbor lighthouse was built from"
         output = try await runner.run(rawPrompt: "<bos>" + text, maxTokens: 64,
@@ -110,8 +116,9 @@ enum MLXNativeSmoke {
       try persist() // Retain raw output even if tool decoding or the real commit fails.
       guard !output.text.isEmpty else { throw BoomError.invalid("The real model returned no text.") }
       await runner.join()
-      if let document = editDocument {
-        receipt["document_edit"] = try await checkDocumentEdit(output.text, document: document, evidence: evidence)
+      if let (document, mode, expectsEdit) = editDocument {
+        receipt["document_edit"] = try await checkDocumentEdit(output.text, document: document,
+          mode: mode, expectsEdit: expectsEdit, evidence: evidence)
       }
       receipt["status"] = "passed"
       try persist()
@@ -121,7 +128,8 @@ enum MLXNativeSmoke {
       try persist(); throw error
     }
   }
-  @MainActor private static func checkDocumentEdit(_ text: String, document: DocumentSnapshot, evidence: URL) async throws -> Any {
+  @MainActor private static func checkDocumentEdit(_ text: String, document: DocumentSnapshot,
+    mode: InteractionMode, expectsEdit: Bool, evidence: URL) async throws -> Any {
     // This explicit public diagnostic exercises encrypted admission and Undo,
     // using an ephemeral key. It does not qualify real Keychain authorization.
     let store = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("encrypted-workspace"),
@@ -138,10 +146,40 @@ enum MLXNativeSmoke {
     }
     model.state.chats[chatIndex].messages.append(pending)
     try await model.flush()
-    _ = try await model.finishConsultationResponse(text, pending: pending, chatID: chat.id,
-      authority: CapturedDocumentAuthority(mode: .edit, target: document), documentSources: [], attachments: [])
+    let sources = try ContextGraph.resolveChat(request: "", attachedDocumentID: document.id,
+      editingDocumentID: document.id, all: [document]).sources
+    let message = try await model.finishConsultationResponse(text, pending: pending, chatID: chat.id,
+      authority: CapturedDocumentAuthority(mode: mode, target: document), documentSources: sources, attachments: [])
+    if !expectsEdit {
+      guard message.state == .complete, model.selectedDocument == document,
+        model.state.proposals.isEmpty, !model.undoManager(document.id).canUndo,
+        model.status == "No document changes" else {
+        throw BoomError.invalid("The no-change response changed document state or reported a proposal.")
+      }
+      try await model.flush()
+      let persisted = try await store.load().get().1.first { $0.id == document.id }
+      guard persisted == document else { throw BoomError.invalid("The no-change response altered persisted bytes.") }
+      try await model.shutdown()
+      return ["mode": mode.rawValue, "status": "No document changes", "expected_text": document.text,
+        "persisted_text": persisted?.text ?? "", "no_changes": true, "no_proposal": true,
+        "no_undo_action": true, "keychain_acceptance": false, "interactive_ui_acceptance": false] as [String: Any]
+    }
+    if mode == .propose {
+      guard model.selectedDocument == document, let proposal = model.state.proposals.last,
+        proposal.status == "pending", model.status == "Proposal ready for review",
+        !model.undoManager(document.id).canUndo else {
+        throw BoomError.invalid("The model proposal was missing or applied without acceptance.")
+      }
+      let preview = try await store.load().get().1.first { $0.id == document.id }
+      guard preview == document else { throw BoomError.invalid("An unaccepted proposal changed persisted bytes.") }
+      model.accept(proposal.id)
+      let deadline = ContinuousClock.now + .seconds(3)
+      while model.isBusy && ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+      guard !model.isBusy, model.errorMessage == nil else { throw BoomError.invalid("Proposal acceptance did not finish.") }
+    }
     let expected = "The harbor was bright."
-    guard model.selectedDocument?.text == expected, model.state.proposals.last?.status == "applied" else {
+    guard model.selectedDocument?.text == expected, model.state.proposals.last?.status == "applied",
+      model.status == "Document edited" else {
       throw BoomError.invalid("Real model did not produce and commit the requested exact edit.")
     }
     try await model.flush()
@@ -150,7 +188,8 @@ enum MLXNativeSmoke {
     model.undoManager(document.id).undo()
     guard model.selectedDocument?.text == document.text else { throw BoomError.invalid("Native Undo did not restore the original bytes.") }
     try await model.shutdown()
-    return ["expected_text": expected, "persisted_text": persisted?.text ?? "", "undone_text": document.text,
+    return ["mode": mode.rawValue, "status": "Document edited", "proposal_required_acceptance": mode == .propose,
+      "expected_text": expected, "persisted_text": persisted?.text ?? "", "undone_text": document.text,
       "validated_and_committed": true, "native_undo_restored_original": true,
       "keychain_acceptance": false, "interactive_ui_acceptance": false] as [String: Any]
   }
