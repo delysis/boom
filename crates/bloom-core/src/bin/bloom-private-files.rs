@@ -7,6 +7,7 @@ use std::{
     error::Error,
     fs,
     io::{self, Write},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
 
@@ -14,6 +15,7 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const MAX_FILE: u64 = 134_217_728;
 const MAX_TOTAL: u64 = 536_870_912;
 const WIDTH: usize = 32;
+const MIN_PATTERN: usize = 8;
 
 fn require(condition: bool, message: &str) -> Result<()> {
     if condition {
@@ -44,7 +46,23 @@ fn collect_strings(value: &Value, strings: &mut BTreeSet<String>) {
             }
         }
         Value::Object(values) => {
-            for value in values.values() {
+            for (field, value) in values {
+                if [
+                    "title",
+                    "name",
+                    "slug",
+                    "instructions",
+                    "user",
+                    "assistant",
+                    "text",
+                    "path",
+                    "query",
+                ]
+                .contains(&field.as_str())
+                    && let Some(text) = value.as_str().filter(|text| text.len() >= MIN_PATTERN)
+                {
+                    strings.insert(text.to_owned());
+                }
                 collect_strings(value, strings);
             }
         }
@@ -61,25 +79,56 @@ fn encodings(text: &str) -> Result<Vec<Vec<u8>>> {
         quoted[1..quoted.len() - 1].replace('/', "\\/").into_bytes(),
     ])
 }
-fn needles(strings: &BTreeSet<String>) -> Result<HashSet<[u8; WIDTH]>> {
-    let mut result = HashSet::new();
+struct Needles {
+    fragments: HashSet<[u8; WIDTH]>,
+    short: regex::bytes::RegexSet,
+}
+impl Needles {
+    fn len(&self) -> usize {
+        self.fragments.len() + self.short.len()
+    }
+}
+fn needles(strings: &BTreeSet<String>) -> Result<Needles> {
+    let mut fragments = HashSet::new();
+    let mut short = BTreeSet::new();
     for text in strings {
         for encoded in encodings(text)? {
-            for chunk in encoded.chunks_exact(WIDTH) {
-                result.insert(chunk.try_into()?);
+            if encoded.len() < MIN_PATTERN {
+                continue;
+            } else if encoded.len() < WIDTH {
+                short.insert(
+                    encoded
+                        .iter()
+                        .map(|byte| format!("\\x{byte:02x}"))
+                        .collect::<String>(),
+                );
+            } else {
+                for chunk in encoded.chunks_exact(WIDTH) {
+                    fragments.insert(chunk.try_into()?);
+                }
             }
         }
     }
     require(
-        !result.is_empty() && result.len() <= 20_000,
+        !fragments.is_empty() || !short.is_empty(),
+        "Empty canary set",
+    )?;
+    require(
+        fragments.len() + short.len() <= 20_000,
         "Empty or oversized canary set",
     )?;
-    Ok(result)
+    Ok(Needles {
+        fragments,
+        short: regex::bytes::RegexSetBuilder::new(short)
+            .unicode(false)
+            .size_limit(8_388_608)
+            .build()?,
+    })
 }
-fn detected(bytes: &[u8], needles: &HashSet<[u8; WIDTH]>) -> bool {
-    bytes
-        .windows(WIDTH)
-        .any(|window| <&[u8; WIDTH]>::try_from(window).is_ok_and(|piece| needles.contains(piece)))
+fn detected(bytes: &[u8], needles: &Needles) -> bool {
+    bytes.windows(WIDTH).any(|window| {
+        <&[u8; WIDTH]>::try_from(window).is_ok_and(|piece| needles.fragments.contains(piece))
+    }) || needles.short.is_match(bytes)
 }
 fn walk(root: &Path, files: &mut Vec<PathBuf>, total: &mut u64, depth: usize) -> Result<()> {
     require(depth <= 16, "Audit directory nesting exceeds its limit")?;
@@ -182,8 +231,13 @@ fn main() -> Result<()> {
     }
     // Detect each exercised representation independently before inspecting
     // ciphertext. A detector that simply returns false cannot pass this audit.
+    let mut excluded_short_encodings = 0;
     for text in &strings {
         for bytes in encodings(text)? {
+            if bytes.len() < MIN_PATTERN {
+                excluded_short_encodings += 1;
+                continue;
+            }
             require(
                 detected(&bytes, &patterns),
                 "Encoding control did not trigger",
@@ -221,18 +275,23 @@ fn main() -> Result<()> {
             "Audit file total exceeds its limit",
         )?;
         let relative = file.strip_prefix(root)?;
-        let leak = detected(&bytes, &patterns);
+        let content_leak = detected(&bytes, &patterns);
+        let name_leak = detected(relative.as_os_str().as_bytes(), &patterns);
+        let leak = content_leak || name_leak;
         if leak {
             leaks.push(relative.to_path_buf());
         }
-        inventory.push(json!({"file":relative, "bytes":bytes.len(), "sha256":digest(&bytes), "canary_detected":leak}));
+        inventory.push(json!({"file":relative, "bytes":bytes.len(), "sha256":digest(&bytes), "canary_detected":leak,
+            "content_canary_detected":content_leak,"name_canary_detected":name_leak}));
     }
     let result = json!({"status":if leaks.is_empty(){"passed"}else{"failed"},
         "source_inventory_sha256":verification["source_inventory_sha256"],
-        "fixture":name, "scanned_bytes":scanned_bytes, "canary_strings":strings.len(), "fragments":patterns.len(), "fragment_bytes":WIDTH,
+        "fixture":name, "scanned_bytes":scanned_bytes, "canary_strings":strings.len(), "fragments":patterns.fragments.len(), "fragment_bytes":WIDTH,
+        "short_patterns":patterns.short.len(), "minimum_short_pattern_bytes":MIN_PATTERN,
+        "excluded_short_encodings":excluded_short_encodings,
         "representations":["utf8", "utf16le", "utf16be", "json_literal", "json_escaped_slash"],
         "positive_controls":positive_controls, "files":inventory, "leaks":leaks,
-        "scope":"owned encrypted workspace roots, complete backup and present fixture logs; public explicit controls excluded",
+        "scope":"owned encrypted workspace roots, complete backup and present fixture logs, including file names; public explicit controls excluded",
         "all_encodings_qualified":false, "os_caches_qualified":false, "real_keychain_qualified":false});
     let bytes = serde_json::to_vec_pretty(&result)?;
     fs::OpenOptions::new()
@@ -245,7 +304,7 @@ fn main() -> Result<()> {
         "Plaintext fragments found; failed audit retained",
     )?;
     println!(
-        "{} files checked against {} canary fragments; all positive controls triggered.",
+        "{} files checked against {} canary patterns; all positive controls triggered.",
         files.len(),
         patterns.len()
     );
@@ -271,6 +330,42 @@ mod tests {
             }
         }
         assert!(!detected(&[0xa5; 4096], &patterns));
+        Ok(())
+    }
+    #[test]
+    fn scanner_detects_short_private_metadata_from_captured_exports() -> Result<()> {
+        let captured = json!({"voice":{"slug":"export-fixture","name":"Public export voice"},
+            "document":{"title":"Café privé","path":"notes/🦋.md"},"other":{"title":"猫の窓"},"state":"complete"});
+        let mut strings = BTreeSet::new();
+        collect_strings(&captured, &mut strings);
+        require(
+            strings
+                == [
+                    "export-fixture",
+                    "Public export voice",
+                    "Café privé",
+                    "notes/🦋.md",
+                    "猫の窓",
+                ]
+                .map(str::to_owned)
+                .into(),
+            "Private metadata was omitted or unrelated state became a canary",
+        )?;
+        let patterns = needles(&strings)?;
+        for text in strings {
+            for bytes in encodings(&text)? {
+                if bytes.len() < MIN_PATTERN {
+                    require(
+                        !detected(&bytes, &patterns),
+                        "Excluded short encoding unexpectedly matched",
+                    )?;
+                    continue;
+                }
+                let mut leak = b"retained diagnostic prefix\0".to_vec();
+                leak.extend(bytes);
+                require(detected(&leak, &patterns), "Short metadata leak was missed")?;
+            }
+        }
         Ok(())
     }
     #[test]
