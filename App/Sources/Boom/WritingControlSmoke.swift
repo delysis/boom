@@ -14,6 +14,30 @@ import SwiftUI
     let window_unshown: Bool
     let caret: Int
   }
+  private struct InputShortcut: Encodable {
+    struct Stamp: Encodable {
+      let documentID: UUID
+      let revision: String
+      let caretUTF16: Int
+      let epoch: UInt64
+      init(_ value: GhostStamp) {
+        documentID = value.documentID; revision = value.revision
+        caretUTF16 = value.caretUTF16; epoch = value.epoch
+      }
+    }
+    let key: String
+    let beforeDocument: DocumentSnapshot
+    let afterDocument: DocumentSnapshot
+    let beforeStamp: Stamp
+    let afterStamp: Stamp
+    let beforeBundle: CandidateBundle
+    let afterBundle: CandidateBundle
+    let beforeCaret: Int
+    let afterCaret: Int
+    let requestActiveBefore: Bool
+    let requestActiveAfter: Bool
+    let windowUnshown: Bool
+  }
   private struct Capture: Codable {
     let fixture: WritingEvaluation.Fixture
     let alternatives: CandidateBundle
@@ -283,6 +307,7 @@ import SwiftUI
     let start = ContinuousClock().now
     var selectedDuringGeneration = false
     var clickedDuringGeneration = false
+    var shortcutDuringGeneration = false
     while model.isBusy {
       if phase == "alternatives", let editor = model.editor, let window = editor.window {
         guard editor.isEditable, window.canBecomeKey, window.makeFirstResponder(editor),
@@ -305,6 +330,33 @@ import SwiftUI
         clickedDuringGeneration = true
         try await recorder?.checkpoint("Native click preserves the captured caret during generation")
       }
+      if phase == "alternatives", !shortcutDuringGeneration, model.isBusy,
+        let stamp = model.ghostStamp, let bundle = model.candidates,
+        let editor = model.editor, let window = editor.window, let document = model.selectedDocument {
+        let range = editor.selectedRange()
+        guard range.length == 0, let shortcut = NSEvent.keyEvent(with: .keyDown, location: .zero,
+          modifierFlags: .control, timestamp: ProcessInfo.processInfo.systemUptime,
+          windowNumber: window.windowNumber, context: nil, characters: "\u{0}",
+          charactersIgnoringModifiers: " ", isARepeat: false, keyCode: 49) else {
+          throw BoomError.invalid("Cannot deliver the public native input shortcut.")
+        }
+        editor.keyDown(with: shortcut)
+        guard let afterStamp = model.ghostStamp, let afterBundle = model.candidates,
+          let afterDocument = model.selectedDocument else {
+          throw BoomError.invalid("The native input shortcut discarded a real-model capture.")
+        }
+        try write(InputShortcut(key: "control-space", beforeDocument: document, afterDocument: afterDocument,
+          beforeStamp: .init(stamp), afterStamp: .init(afterStamp), beforeBundle: bundle, afterBundle: afterBundle,
+          beforeCaret: range.location, afterCaret: editor.selectedRange().location,
+          requestActiveBefore: true, requestActiveAfter: model.isBusy, windowUnshown: !window.isVisible),
+          to: evidence.appendingPathComponent("input-shortcut-during-generation.json"))
+        guard editor.selectedRange() == range, afterStamp == stamp, afterDocument == document,
+          try canonical(afterBundle) == canonical(bundle), model.isBusy, !window.isVisible else {
+          throw BoomError.invalid("The native input shortcut changed or cancelled its captured generation.")
+        }
+        shortcutDuringGeneration = true
+        try await recorder?.checkpoint("Native input shortcut preserves captured generation")
+      }
       guard start.duration(to: ContinuousClock().now) < .seconds(240) else { throw BoomError.unavailable("Writing diagnostic timed out during " + phase) }
       if let bundle = model.candidates { try write(bundle, to: evidence.appendingPathComponent(phase + "-latest.json")) }
       try recorder?.frame(phase)
@@ -313,6 +365,9 @@ import SwiftUI
     if let bundle = model.candidates { try write(bundle, to: evidence.appendingPathComponent(phase + "-latest.json")) }
     if phase == "alternatives", !clickedDuringGeneration {
       throw BoomError.invalid("The real-model writing fixture never exercised its native caret click.")
+    }
+    if phase == "alternatives", !shortcutDuringGeneration {
+      throw BoomError.invalid("The real-model writing fixture never exercised its native input shortcut.")
     }
     if let error = model.errorMessage ?? model.writingIssue { throw BoomError.invalid(error) }
   }

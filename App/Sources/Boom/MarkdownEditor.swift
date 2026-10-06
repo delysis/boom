@@ -231,11 +231,6 @@ import SwiftUI
       owner?.invalidateGhost()
       return
     }
-    if event.keyCode == 49, event.modifierFlags.contains(.control) {
-      owner?.invalidateGhost()
-      owner?.scheduleCompletion()
-      return
-    }
     super.keyDown(with: event)
   }
   private func wrapSelection(_ marker: String, placeholder: String = "") {
