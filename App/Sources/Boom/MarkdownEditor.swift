@@ -226,7 +226,8 @@ import SwiftUI
       manager?.endUndoGrouping()
       return
     }
-    if event.keyCode == 53 {
+    if event.keyCode == 53, modifiers.isEmpty, !hasMarkedText(),
+      owner?.ghostStamp != nil || owner?.showingCandidates == true {
       owner?.invalidateGhost()
       return
     }

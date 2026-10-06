@@ -58,6 +58,8 @@ Inspect the exact bundle at wide and narrow sizes in light and dark appearances,
 
 Exercise native mouse-event delivery in the unshown public-fixture manuscript, rather than assigning editor focus before the check. Clicking text or blank page space must acquire focus and place the caret. Clicking the unchanged caret must preserve the captured request and word-acceptance reversal; changed selections and text still invalidate obsolete candidates through the editor delegates. The writing-control capture retains a same-caret click during real generation and requires all three rows to complete afterward. These isolated AppKit events never post WindowServer input and do not qualify physical mouse/keyboard/IME or app activation behavior.
 
+Escape must reach AppKit's native command handling during marked composition and when there is no continuation to dismiss. Compare the manuscript's process-local key events with a plain native text view, including the marked state seen by its command delegate. Plain Escape may dismiss an inline continuation outside composition; the real-model writing capture must retain the manuscript, caret and alternatives unchanged afterward. These checks do not qualify a physical input method or its candidate window.
+
 ## 24 GiB application budget
 
 The approved performance gate uses this 128 GiB development Mac with an application ceiling of 24 GiB. An actual 32 GiB MacBook is no longer required. This qualifies the measured application budget and timings on the recorded host; it does not reproduce a smaller machine's bandwidth or system-wide memory pressure. Preserve earlier receipts with their original hardware boundaries.

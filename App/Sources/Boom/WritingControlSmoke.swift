@@ -7,6 +7,13 @@ import SwiftUI
 /// Explicit exported fixtures only. Exercises production controller/editor paths
 /// without showing or activating a window, or accessing the user's Keychain.
 @MainActor enum WritingControlSmoke {
+  private struct EscapeDismissal: Encodable {
+    let dismissed_inline_continuation: Bool
+    let manuscript_unchanged: Bool
+    let retained_alternatives_unchanged: Bool
+    let window_unshown: Bool
+    let caret: Int
+  }
   private struct Capture: Codable {
     let fixture: WritingEvaluation.Fixture
     let alternatives: CandidateBundle
@@ -101,6 +108,25 @@ import SwiftUI
     }
     try await recorder?.checkpoint("Three shared-prefill alternatives")
     try write(alternatives, to: evidence.appendingPathComponent("alternatives.json"))
+    guard let dismissStamp = model.ghostStamp else {
+      throw BoomError.invalid("The completed continuation has no captured insertion point.")
+    }
+    let escape = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+      timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil,
+      characters: "\u{1b}", charactersIgnoringModifiers: "\u{1b}", isARepeat: false, keyCode: 53)
+    guard let escape else { throw BoomError.invalid("Cannot construct the public Escape event.") }
+    initialEditor.keyDown(with: escape)
+    guard model.ghostStamp == nil, model.ghostText.isEmpty,
+      model.selectedDocument == fixture.document, initialEditor.string == fixture.document.text,
+      initialEditor.selectedRange().location == dismissStamp.caretUTF16,
+      try canonical(model.candidates) == canonical(Optional(alternatives)), !window.isVisible else {
+      throw BoomError.invalid("Escape changed the manuscript, insertion point or retained alternatives.")
+    }
+    try write(EscapeDismissal(dismissed_inline_continuation: true, manuscript_unchanged: true,
+      retained_alternatives_unchanged: true, window_unshown: true, caret: dismissStamp.caretUTF16),
+      to: evidence.appendingPathComponent("escape-dismissal.json"))
+    try await recorder?.checkpoint("Escape dismissed inline continuation")
+    model.selectCandidate(1)
     guard model.canReplayCandidate(1) else { throw BoomError.invalid("The captured continuation is unexpectedly unavailable for replay.") }
     guard var legacyObject = try ProductCore.object(alternatives) as? [String: Any],
       var legacyRecipe = legacyObject["recipe"] as? [String: Any],
