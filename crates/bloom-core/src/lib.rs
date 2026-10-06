@@ -700,6 +700,10 @@ pub enum Request {
         output: usize,
         capacity: usize,
     },
+    WritingEvaluationPlan {
+        fixtures: usize,
+        seeds: Vec<u64>,
+    },
     BranchWriting {
         recipe: Box<writing::Recipe>,
         continuation: String,
@@ -855,6 +859,9 @@ pub fn execute(request: Request) -> Result<Value, Error> {
         }
         Request::ValidateWritingBatch { execution, seed } => {
             serde_json::to_value(execution.validate(seed)?)
+        }
+        Request::WritingEvaluationPlan { fixtures, seeds } => {
+            serde_json::to_value(batch::evaluation_plan(fixtures, &seeds)?)
         }
         Request::AdmitWritingBatch {
             width,

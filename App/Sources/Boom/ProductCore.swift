@@ -162,6 +162,9 @@ enum ProductCore {
     let _: Bool = try call(["op": "admit_writing_batch", "width": width,
       "prompt": prompt, "output": output, "capacity": capacity])
   }
+  static func writingEvaluationPlan(fixtures: Int, seeds: [UInt64]) throws -> [WritingEvaluationGroup] {
+    try call(["op": "writing_evaluation_plan", "fixtures": fixtures, "seeds": seeds])
+  }
   static func branchWriting(_ recipe: CompletionRecipe, continuation: String) throws -> String {
     try call(["op": "branch_writing", "recipe": object(recipe), "continuation": continuation])
   }
@@ -282,6 +285,14 @@ struct WritingBatchExecution: Codable, Equatable, Sendable {
   var algorithm = "shared-prefill-fixed-batch-v1"
   let seeds: [UInt64]
   let lane: Int
+}
+struct WritingEvaluationGroup: Codable, Sendable {
+  let id: String
+  let fixture: Int
+  let profile: SamplingProfile
+  let seeds: [UInt64]
+  let names: [String]
+  let replayOf: String?
 }
 struct WritingCandidate: Codable, Identifiable, Sendable {
   let id: UUID

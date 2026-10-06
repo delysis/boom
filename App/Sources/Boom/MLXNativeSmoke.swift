@@ -27,14 +27,15 @@ enum MLXNativeSmoke {
       try await GenerationPreemptionSmoke.run(writingPack: directory, evidence: evidence, batch: arguments.contains("--batch"))
       return
     }
-    if arguments.contains("--batch") {
-      try await BatchGenerationSmoke.run(directory: directory, evidence: evidence)
-      return
-    }
     if arguments.contains("--writing-fixtures") {
       let path = try argument("--writing-fixtures")
       guard path.hasPrefix("/") else { throw BoomError.invalid("Use an absolute evaluation fixture path.") }
-      try await WritingEvaluation.run(fixtureURL: URL(fileURLWithPath: path), directory: directory, evidence: evidence)
+      try await WritingEvaluation.run(fixtureURL: URL(fileURLWithPath: path), directory: directory,
+        evidence: evidence, batched: arguments.contains("--batch"))
+      return
+    }
+    if arguments.contains("--batch") {
+      try await BatchGenerationSmoke.run(directory: directory, evidence: evidence)
       return
     }
     var receipt: [String: Any] = ["schema": 1, "status": "running", "seed": seed,
