@@ -59,7 +59,7 @@ import SwiftUI
     }
     watchdog.resume(); defer { watchdog.cancel() }
     do {
-      try await capture(pack: pack, evidence: evidence)
+      try await capture(pack: pack, evidence: evidence, record: arguments.contains("--record-demonstration"))
       try await receipt("captured", evidence: evidence)
     } catch {
       try await receipt("failed", evidence: evidence, failure: error.localizedDescription)
@@ -69,7 +69,7 @@ import SwiftUI
   private static func store(_ evidence: URL) throws -> WorkspaceStore {
     try WorkspaceStore(rootOverride: evidence.appendingPathComponent("encrypted-workspace"), testKey: key)
   }
-  private static func capture(pack: URL, evidence: URL) async throws {
+  private static func capture(pack: URL, evidence: URL, record: Bool) async throws {
     let store = try store(evidence)
     let document = DocumentSnapshot(title: "Public decision notes",
       text: "I have until Friday to choose whether to accept a new project. I feel hurried, although nobody has asked for an answer today. I want to keep my own judgment and identify one small next step.")
@@ -78,14 +78,22 @@ import SwiftUI
     state.selectedDocument = document.id
     try await store.save(state, documents: [document])
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
-    let reflective = try createVoice(model, name: "Reflective Listener", slug: "reflective",
+    let host = NSHostingView(rootView: WorkspaceView(model: model))
+    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 1440, height: 900))
+    window.isReleasedWhenClosed = false; window.contentView = host
+    defer { window.close() }
+    host.layoutSubtreeIfNeeded()
+    let recorder = record ? try NativeDemoRecorder(view: host, evidence: evidence) : nil
+    defer { recorder?.cancel() }
+    try await recorder?.checkpoint("Fresh consultation workspace")
+    let reflective = try await createVoice(model, name: "Reflective Listener", slug: "reflective",
       instructions: "Offer a calm reflective question. Preserve the person's choice. Speak only as this voice and use fewer than sixty words.",
       example: VoiceExchange(user: "I am rushing into a decision.",
-        assistant: "What changes if you give yourself a moment to notice the hesitation?"))
-    let practical = try createVoice(model, name: "Practical Guide", slug: "practical",
+        assistant: "What changes if you give yourself a moment to notice the hesitation?"), recorder: recorder)
+    let practical = try await createVoice(model, name: "Practical Guide", slug: "practical",
       instructions: "Offer one concrete next step. Preserve the person's choice. Speak only as this voice and use fewer than sixty words.",
       example: VoiceExchange(user: "I am rushing into a decision.",
-        assistant: "Write down the real deadline and one question you can answer before then."))
+        assistant: "Write down the real deadline and one question you can answer before then."), recorder: recorder)
     let initial = [reflective, practical]
     guard let exampleID = model.state.chats.first(where: { $0.id == reflective.id })?.messages.last?.id else {
       throw BoomError.invalid("The ordinary chat did not retain its authored example.")
@@ -94,6 +102,9 @@ import SwiftUI
       id: exampleID, chatID: reflective.id)
     try model.setChatInstructions("Offer a calm reflective question about the actual situation. Preserve the person's choice. Speak only as this voice and use fewer than sixty words.",
       mention: "reflective", chatID: reflective.id)
+    model.editVoice(reflective); model.openChatInstructions(reflective.id)
+    try await recorder?.checkpoint("Edited ordinary-chat instructions and example")
+    model.showingChatInstructions = nil
     let edited = try initial.map { voice -> Voice in
       guard let current = model.chatVoice(voice.id) else { throw BoomError.invalid("A pinned voice disappeared.") }
       return current
@@ -107,10 +118,11 @@ import SwiftUI
     try await write(initial, to: evidence.appendingPathComponent("initial-voices.json"))
     try await write(edited, to: evidence.appendingPathComponent("edited-voices.json"))
     model.loadPack(pack, purpose: .consultation)
-    try await finish(model, evidence: evidence, phase: "loading")
+    try await finish(model, evidence: evidence, phase: "loading", recorder: recorder)
     try newConsultation(model, document: document)
     let separate = try await round(model, voices: edited, style: .separate,
-      text: "I feel hurried about this project. What would you each suggest?", evidence: evidence)
+      text: "I feel hurried about this project. What would you each suggest?", evidence: evidence, recorder: recorder)
+    try await recorder?.checkpoint("Two separately attributed answers")
     try await render(model, name: "separate", evidence: evidence)
 
     // Later edits must not rewrite the speaker, instructions or examples in
@@ -123,8 +135,11 @@ import SwiftUI
       model.selectedChat?.messages == [separate.question] + separate.replies.map(\.message) else {
       throw BoomError.invalid("A later voice edit changed historical consultation attribution.")
     }
+    try await recorder?.checkpoint("Renamed voice; historical speakers preserved")
     let discussed = try await round(model, voices: [renamed, edited[1]], style: .discuss,
-      text: "Consider the same project together. What should I attend to before Friday?", evidence: evidence)
+      text: "Consider the same project together. What should I attend to before Friday?", evidence: evidence, recorder: recorder)
+    try await recorder?.checkpoint("Discuss together")
+    try await recorder?.finish()
     try await render(model, name: "discussion", evidence: evidence)
     guard model.documents == [document] else { throw BoomError.invalid("Read-only consultation changed the attached document.") }
     try await model.shutdown()
@@ -138,15 +153,21 @@ import SwiftUI
     print("Named voices, ordinary-chat editing, separate answers and discussion passed with real MLX.")
   }
   private static func createVoice(_ model: WorkspaceModel, name: String, slug: String,
-    instructions: String, example: VoiceExchange) throws -> Voice {
+    instructions: String, example: VoiceExchange, recorder: NativeDemoRecorder?) async throws -> Voice {
     try model.newChat()
     guard let id = model.state.selectedChat else { throw BoomError.invalid("New chat did not become selected.") }
     model.renameChat(id, to: name)
     try model.setChatInstructions(instructions, mention: nil, chatID: id)
+    model.openChatInstructions(id)
+    try await recorder?.checkpoint(name + ": ordinary chat instructions")
+    model.showingChatInstructions = nil
     model.authorChatMessage(.user); model.draft = example.user; model.send()
+    try await recorder?.checkpoint(name + ": authored question")
     model.authorChatMessage(.assistant); model.draft = example.assistant; model.send()
+    try await recorder?.checkpoint(name + ": authored answer")
     model.pinChat(id)
     try model.setChatInstructions(instructions, mention: slug, chatID: id)
+    try await recorder?.checkpoint(name + ": pinned as @" + slug)
     guard let voice = model.chatVoice(id), voice.name == name, voice.slug == slug,
       voice.examples == [example] else { throw BoomError.invalid("Ordinary chat did not become the requested named voice.") }
     return voice
@@ -158,7 +179,7 @@ import SwiftUI
     }
   }
   private static func round(_ model: WorkspaceModel, voices: [Voice], style: ConsultationStyle,
-    text: String, evidence: URL) async throws -> Round {
+    text: String, evidence: URL, recorder: NativeDemoRecorder?) async throws -> Round {
     guard let before = model.selectedChat else { throw BoomError.invalid("Consultation chat disappeared.") }
     model.consultationStyle = style; model.mode = .ask; model.draft = ""
     for voice in voices {
@@ -167,11 +188,13 @@ import SwiftUI
         throw BoomError.invalid("The @ completion did not find a named voice.")
       }
       model.insertVoice(voice)
+      try await recorder?.checkpoint("Selected @" + voice.slug)
     }
     model.draft += text
     let request = model.draft
+    try await recorder?.checkpoint("Captured question: " + style.rawValue)
     model.send()
-    try await finish(model, evidence: evidence, phase: style == .separate ? "separate" : "discussion")
+    try await finish(model, evidence: evidence, phase: style == .separate ? "separate" : "discussion", recorder: recorder)
     guard let chat = model.selectedChat, chat.id == before.id,
       Array(chat.messages.prefix(before.messages.count)) == before.messages,
       chat.messages.count == before.messages.count + 3 else {
@@ -223,13 +246,14 @@ import SwiftUI
       }
     }
   }
-  private static func finish(_ model: WorkspaceModel, evidence: URL, phase: String) async throws {
+  private static func finish(_ model: WorkspaceModel, evidence: URL, phase: String, recorder: NativeDemoRecorder?) async throws {
     let started = ContinuousClock().now
     while model.isBusy {
       guard started.duration(to: ContinuousClock().now) < .seconds(240) else {
         throw BoomError.unavailable("Consultation diagnostic timed out during " + phase)
       }
       try await write(model.selectedChat, to: evidence.appendingPathComponent(phase + "-latest.json"))
+      try recorder?.frame(phase)
       try await Task.sleep(for: .milliseconds(100))
     }
     try await write(model.selectedChat, to: evidence.appendingPathComponent(phase + "-latest.json"))

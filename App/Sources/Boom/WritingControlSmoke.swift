@@ -48,7 +48,7 @@ import SwiftUI
     watchdog.resume()
     defer { watchdog.cancel() }
     do {
-      try await capture(fixture, pack: pack, evidence: evidence)
+      try await capture(fixture, pack: pack, evidence: evidence, record: arguments.contains("--record-demonstration"))
       try receipt("captured", evidence: evidence)
     } catch {
       try receipt("failed", evidence: evidence, failure: error.localizedDescription)
@@ -58,7 +58,7 @@ import SwiftUI
   private static func store(_ evidence: URL) throws -> WorkspaceStore {
     try WorkspaceStore(rootOverride: evidence.appendingPathComponent("encrypted-workspace"), testKey: key)
   }
-  private static func capture(_ fixture: WritingEvaluation.Fixture, pack: URL, evidence: URL) async throws {
+  private static func capture(_ fixture: WritingEvaluation.Fixture, pack: URL, evidence: URL, record: Bool) async throws {
     _ = try ProductCore.authoredPrefix(fixture.document, caret: fixture.caretUTF16)
     let store = try store(evidence)
     var state = WorkspaceState(); state.autocomplete = false
@@ -75,21 +75,31 @@ import SwiftUI
     window.isReleasedWhenClosed = false; window.contentView = host
     defer { window.close() }
     host.layoutSubtreeIfNeeded()
-    for example in fixture.examples { model.toggleWritingExample(example.id) }
+    let recorder = record ? try NativeDemoRecorder(view: host, evidence: evidence) : nil
+    defer { recorder?.cancel() }
+    try await recorder?.checkpoint("Authored manuscript")
+    for example in fixture.examples {
+      model.toggleWritingExample(example.id)
+      try await recorder?.checkpoint("Selected literary example: " + example.title)
+    }
     model.loadPack(pack, purpose: .writing)
-    try await finish(model, evidence: evidence, phase: "loading")
+    try await finish(model, evidence: evidence, phase: "loading", recorder: recorder)
     let initialEditor = try await editor(model, documentID: fixture.document.id)
     initialEditor.setSelectedRange(NSRange(location: fixture.caretUTF16, length: 0))
+    initialEditor.scrollRangeToVisible(initialEditor.selectedRange())
     model.movedCaret(fixture.caretUTF16, hasMarkedText: false)
     guard model.canExploreWriting else { throw BoomError.invalid("Explore was unavailable in the actual native editor.") }
+    try await recorder?.checkpoint("Explore at captured caret")
     model.exploreWriting()
-    try await finish(model, evidence: evidence, phase: "alternatives")
+    try await finish(model, evidence: evidence, phase: "alternatives", recorder: recorder)
     guard let alternatives = model.candidates, alternatives.candidates.count == 3,
       alternatives.selected == 1,
       alternatives.candidates.allSatisfy({ $0.state == .complete && !$0.text.isEmpty }),
+      Set(alternatives.candidates.map(\.text)).count == 3,
       model.selectedDocument == fixture.document else {
       throw BoomError.invalid("Explore did not produce three completed alternatives without changing the manuscript; all attempts retained.")
     }
+    try await recorder?.checkpoint("Three shared-prefill alternatives")
     try write(alternatives, to: evidence.appendingPathComponent("alternatives.json"))
     guard model.canReplayCandidate(1) else { throw BoomError.invalid("The captured continuation is unexpectedly unavailable for replay.") }
     guard var legacyObject = try ProductCore.object(alternatives) as? [String: Any],
@@ -114,6 +124,7 @@ import SwiftUI
     manager.groupsByEvent = false; manager.removeAllActions(); manager.beginUndoGrouping()
     model.acceptCandidateWord(1)
     manager.endUndoGrouping()
+    try await recorder?.checkpoint("Accepted next word")
     // Separate native commands by an event-loop turn, as actual input does.
     try await Task.sleep(for: .milliseconds(50))
     guard let partial = model.selectedDocument, partial.text != fixture.document.text, manager.canUndo,
@@ -141,7 +152,28 @@ import SwiftUI
     guard model.selectedDocument == fixture.document, editor.string == fixture.document.text else {
       throw BoomError.invalid("Native Undo did not restore the exact captured manuscript bytes.")
     }
+    try await recorder?.checkpoint("Native Undo restored exact manuscript")
     try write(model.selectedDocument, to: evidence.appendingPathComponent("after-undo.json"))
+    model.selectCandidate(0)
+    try await recorder?.checkpoint("Selected first alternative for full acceptance")
+    manager.beginUndoGrouping()
+    model.acceptCandidate(0)
+    manager.endUndoGrouping()
+    try await Task.sleep(for: .milliseconds(50))
+    let prefix = try ProductCore.authoredPrefix(fixture.document, caret: fixture.caretUTF16)
+    let fullText = prefix + alternatives.candidates[0].text + fixture.document.text.dropFirst(prefix.count)
+    guard model.selectedDocument?.text == fullText, editor.string == fullText, manager.canUndo else {
+      throw BoomError.invalid("Full acceptance changed text outside the captured insertion point.")
+    }
+    try write(model.selectedDocument, to: evidence.appendingPathComponent("full-acceptance.json"))
+    try await recorder?.checkpoint("Accepted full continuation")
+    guard editor.tryToPerform(NSSelectorFromString("undo:"), with: nil) else {
+      throw BoomError.invalid("The native editor did not undo full acceptance.")
+    }
+    guard model.selectedDocument == fixture.document, editor.string == fixture.document.text else {
+      throw BoomError.invalid("Undo of full acceptance changed the captured manuscript.")
+    }
+    try await recorder?.checkpoint("Undo restored manuscript after full acceptance")
     let liveText = fixture.document.text + "\nA later human revision, absent from the captured request.\n"
     manager.beginUndoGrouping()
     editor.insertText(liveText, replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
@@ -150,6 +182,8 @@ import SwiftUI
     model.updateDocument(example.text + "\nA later example revision.\n", id: example.id, caret: model.caret)
     try await model.flush()
     guard !model.candidateIsCurrent else { throw BoomError.invalid("Changed manuscript or examples did not invalidate acceptance.") }
+    model.showingCandidates = true; model.selectCandidate(2)
+    try await recorder?.checkpoint("Selected third captured alternative for branching")
     model.branchCandidate(2)
     guard let branch = model.selectedDocument, branch.id != fixture.document.id,
       branch.text == (try ProductCore.branchWriting(alternatives.recipe, continuation: alternatives.candidates[2].text)),
@@ -157,11 +191,14 @@ import SwiftUI
       model.state.manuscriptOrigins[branch.id]?.candidateID == alternatives.candidates[2].id else {
       throw BoomError.invalid("Branch did not use the captured manuscript and retain its lineage.")
     }
+    try await recorder?.checkpoint("Branch from captured continuation")
     try write(branch, to: evidence.appendingPathComponent("branch.json"))
     model.selectDocument(fixture.document.id)
     _ = try await Self.editor(model, documentID: fixture.document.id)
+    model.showingCandidates = true; model.selectCandidate(1)
+    try await recorder?.checkpoint("Selected second captured alternative for replay")
     model.replayCandidate(1)
-    try await finish(model, evidence: evidence, phase: "replay")
+    try await finish(model, evidence: evidence, phase: "replay", recorder: recorder)
     guard let replay = model.candidates, replay.id != alternatives.id, replay.candidates.count == 3, replay.selected == 1,
       try canonical(replay.recipe) == canonical(alternatives.recipe),
       zip(replay.candidates, alternatives.candidates).allSatisfy({ again, original in
@@ -171,6 +208,8 @@ import SwiftUI
       model.documents.first(where: { $0.id == fixture.document.id })?.text == liveText else {
       throw BoomError.invalid("Replay changed its captured recipe, seed or output, or modified the live manuscript.")
     }
+    try await recorder?.checkpoint("Captured seeds replayed after later human edits")
+    try await recorder?.finish()
     try write(replay, to: evidence.appendingPathComponent("replay.json"))
     let captured = Capture(fixture: fixture, alternatives: alternatives, replay: replay,
       partialText: partial.text, branch: branch, documents: model.documents, origins: model.state.manuscriptOrigins)
@@ -206,7 +245,7 @@ import SwiftUI
     }
     throw BoomError.invalid("The production native manuscript editor did not attach.")
   }
-  private static func finish(_ model: WorkspaceModel, evidence: URL, phase: String) async throws {
+  private static func finish(_ model: WorkspaceModel, evidence: URL, phase: String, recorder: NativeDemoRecorder?) async throws {
     let start = ContinuousClock().now
     var selectedDuringGeneration = false
     while model.isBusy {
@@ -219,6 +258,7 @@ import SwiftUI
       }
       guard start.duration(to: ContinuousClock().now) < .seconds(240) else { throw BoomError.unavailable("Writing diagnostic timed out during " + phase) }
       if let bundle = model.candidates { try write(bundle, to: evidence.appendingPathComponent(phase + "-latest.json")) }
+      try recorder?.frame(phase)
       try await Task.sleep(for: .milliseconds(100))
     }
     if let bundle = model.candidates { try write(bundle, to: evidence.appendingPathComponent(phase + "-latest.json")) }
