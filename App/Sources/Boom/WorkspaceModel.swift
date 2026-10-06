@@ -141,6 +141,7 @@ struct CompletionSegment {
   private var ghostFlag: CancellationFlag?
   private var pressureWatch: MemoryPressureWatch?
   private var saveTask: Task<Void, Never>?
+  private var exportTasks: [URL: (id: UUID, task: Task<Void, Never>)] = [:]
   private var dirty = Set<UUID>()
   private var undoManagers: [UUID: UndoManager] = [:]
   private var ghostSources: [SourceReference] = []
@@ -728,6 +729,7 @@ struct CompletionSegment {
     if let ghostTask { await ghostTask.value }
     if let mlxRunner { await mlxRunner.join() }
     if let baseRunner { await baseRunner.join() }
+    for operation in Array(exportTasks.values) { await operation.task.value }
     try await flush()
   }
   private func revalidate(_ sources: [SourceReference], attachments: [SourceReference]) throws {
@@ -1139,29 +1141,40 @@ struct CompletionSegment {
     guard let chat = state.chats.first(where: { $0.id == chatID }) else { return }
     let panel = NSSavePanel(); panel.nameFieldStringValue = chat.title + ".md"
     guard panel.runModal() == .OK, let url = panel.url else { return }
-    let instructions = (chat.instructions ?? "").isEmpty ? "" : "## Instructions\n\n" + (chat.instructions ?? "") + "\n\n"
-    let text = "# " + chat.title + "\n\n" + instructions + chat.messages.map { message in
-      "## " + (message.speaker?.name ?? (message.role == .user ? "Human" : "Bloom"))
-        + " · " + message.state.rawValue + "\n\n" + message.text
-        + (message.failure.map { "\n\nStatus: " + $0 } ?? "")
-        + (message.context.isEmpty ? "" : "\n\nCaptured context:\n\n" + message.context)
-        + (message.speaker?.voiceRevision.map { "\n\nVoice revision: " + $0 } ?? "")
-        + (message.editedFrom.map { "\n\nEdited by you; original message: " + $0.uuidString } ??
-          (message.authoredByUser == true && message.role == .assistant ? "\n\nWritten by you." : ""))
-    }.joined(separator: "\n\n") + "\n"
-    work("Exporting readable conversation…") { _ in
-      try await detachedWork { try Data(text.utf8).write(to: url, options: .atomic) }
+    exportFile(to: url) {
+      let instructions = (chat.instructions ?? "").isEmpty ? "" : "## Instructions\n\n" + (chat.instructions ?? "") + "\n\n"
+      let text = "# " + chat.title + "\n\n" + instructions + chat.messages.map { message in
+        "## " + (message.speaker?.name ?? (message.role == .user ? "Human" : "Bloom"))
+          + " · " + message.state.rawValue + "\n\n" + message.text
+          + (message.failure.map { "\n\nStatus: " + $0 } ?? "")
+          + (message.context.isEmpty ? "" : "\n\nCaptured context:\n\n" + message.context)
+          + (message.speaker?.voiceRevision.map { "\n\nVoice revision: " + $0 } ?? "")
+          + (message.editedFrom.map { "\n\nEdited by you; original message: " + $0.uuidString } ??
+            (message.authoredByUser == true && message.role == .assistant ? "\n\nWritten by you." : ""))
+      }.joined(separator: "\n\n") + "\n"
+      return Data(text.utf8)
     }
   }
   func exportVoice(_ voice: Voice) {
     let panel = NSSavePanel(); panel.nameFieldStringValue = voice.slug + ".json"
     guard panel.runModal() == .OK, let url = panel.url else { return }
-    work("Exporting voice…") { _ in
-      try await detachedWork {
-        let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(voice).write(to: url, options: .atomic)
-      }
+    exportFile(to: url) {
+      let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+      return try encoder.encode(voice)
     }
+  }
+  /// Export owns a captured value and a user-selected URL. It neither consumes
+  /// a generation slot nor reads mutable workspace state from its worker.
+  func exportFile(to url: URL, contents: @escaping @Sendable () throws -> Data) {
+    let id = UUID(), target = url.standardizedFileURL
+    let previous = exportTasks[target]?.task
+    let task = Task { [weak self] in
+      if let previous { await previous.value }
+      do { try await ExplicitFileExport.write(to: target, contents: contents) }
+      catch { self?.report(error) }
+      if self?.exportTasks[target]?.id == id { self?.exportTasks[target] = nil }
+    }
+    exportTasks[target] = (id, task)
   }
   func importVoice() {
     guard !isBusy else { return }
@@ -1645,7 +1658,7 @@ struct CompletionSegment {
     let panel = NSSavePanel()
     panel.nameFieldStringValue = d.title + ".md"
     guard panel.runModal() == .OK, let url = panel.url else { return }
-    do { try Data(d.text.utf8).write(to: url, options: .atomic) } catch { report(error) }
+    exportFile(to: url) { Data(d.text.utf8) }
   }
   func revealDocument(_ id: UUID) {
     NSWorkspace.shared.activateFileViewerSelecting([store.documentURL(id)])

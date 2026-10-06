@@ -123,8 +123,7 @@ struct AttachmentInlineCard: View {
     let panel = NSSavePanel()
     panel.nameFieldStringValue = record.name
     guard panel.runModal() == .OK, let url = panel.url else { return }
-    do { try bytes.write(to: url, options: .atomic) }
-    catch { failure = error.localizedDescription }
+    model.exportFile(to: url) { bytes }
   }
 }
 
