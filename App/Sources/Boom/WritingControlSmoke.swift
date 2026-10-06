@@ -91,6 +91,23 @@ import SwiftUI
       throw BoomError.invalid("Explore did not produce three completed alternatives without changing the manuscript; all attempts retained.")
     }
     try write(alternatives, to: evidence.appendingPathComponent("alternatives.json"))
+    guard model.canReplayCandidate(1) else { throw BoomError.invalid("The captured continuation is unexpectedly unavailable for replay.") }
+    guard var legacyObject = try ProductCore.object(alternatives) as? [String: Any],
+      var legacyRecipe = legacyObject["recipe"] as? [String: Any],
+      var legacyPolicy = legacyRecipe["generationPolicy"] as? [String: Any] else {
+      throw BoomError.invalid("The captured continuation has no model settings.")
+    }
+    legacyPolicy.removeValue(forKey: "prefill")
+    legacyRecipe["generationPolicy"] = legacyPolicy; legacyObject["recipe"] = legacyRecipe
+    model.candidates = try JSONDecoder().decode(CandidateBundle.self,
+      from: JSONSerialization.data(withJSONObject: legacyObject))
+    let unrecordedAvailable = model.canReplayCandidate(1)
+    model.candidates = alternatives
+    guard !unrecordedAvailable, model.canReplayCandidate(1), model.selectedDocument == fixture.document else {
+      throw BoomError.invalid("Replay availability did not preserve the original manuscript and captured alternatives.")
+    }
+    try write(["captured_settings_available": true, "unrecorded_geometry_available": false,
+      "captured_settings_restored": true], to: evidence.appendingPathComponent("replay-availability.json"))
     model.setAutocomplete(true)
     let editor = try await Self.editor(model, documentID: fixture.document.id)
     let manager = model.undoManager(fixture.document.id)

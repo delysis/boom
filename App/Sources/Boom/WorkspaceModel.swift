@@ -1407,6 +1407,13 @@ struct CompletionSegment {
         previous: bundle, replay: bundle.candidates[index])
     }
   }
+  func canReplayCandidate(_ index: Int) -> Bool {
+    guard !isBusy, let bundle = candidates, bundle.candidates.indices.contains(index),
+      bundle.candidates[index].state == .complete, let runner = baseRunner,
+      bundle.recipe.model == runner.identity else { return false }
+    do { try ProductCore.admitGenerationPolicy(bundle.recipe.generationPolicy, loaded: runner.generationPolicy); return true }
+    catch { return false }
+  }
   func acceptCandidateWord(_ index: Int) {
     guard !isBusy, candidateIsCurrent, let bundle = candidates, bundle.candidates.indices.contains(index),
       bundle.candidates[index].state == .complete, let editor else { return }

@@ -134,7 +134,8 @@ struct WritingAlternatives: View {
       Button("Branch from this continuation") { model.branchCandidate(bundle.selected) }
         .disabled(model.isBusy || candidate.state != .complete)
       Button(candidate.batch == nil ? "Replay seed" : "Replay this set") { model.replayCandidate(bundle.selected) }
-        .disabled(model.isBusy || candidate.state != .complete)
+        .disabled(!model.canReplayCandidate(bundle.selected))
+        .help("Replay is available when the original model settings are loaded")
       Divider()
       Button("Try three more") { model.exploreWriting() }.disabled(!model.canExploreWriting)
       Button("Supplied context…") { showingContext = true }

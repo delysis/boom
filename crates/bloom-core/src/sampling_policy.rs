@@ -8,6 +8,37 @@ pub enum TextDecoding {
     CheckpointRawV1,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum PrefillChunking {
+    #[serde(rename = "balanced_v1")]
+    BalancedV1,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Prefill {
+    pub chunking: PrefillChunking,
+    pub token_ceiling: u32,
+}
+
+impl Default for Prefill {
+    fn default() -> Self {
+        Self {
+            chunking: PrefillChunking::BalancedV1,
+            token_ceiling: 512,
+        }
+    }
+}
+
+impl Prefill {
+    pub fn validate(self) -> Result<(), Error> {
+        require(
+            matches!(self.token_ceiling, 512 | 1024),
+            "Unsupported prefill geometry.",
+        )
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Policy {
@@ -23,10 +54,15 @@ pub struct Policy {
     // decoder that preserves punctuation and spacing exactly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_decoding: Option<TextDecoding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill: Option<Prefill>,
 }
 
 impl Policy {
     pub fn validate(&self) -> Result<(), Error> {
+        if let Some(prefill) = self.prefill {
+            prefill.validate()?;
+        }
         require(
             self.schema == 1 && (2..=1_048_576).contains(&self.vocabulary_size),
             "Unsupported model generation policy.",
@@ -76,6 +112,7 @@ pub fn compile(
     configuration: serde_json::Value,
     mut control_token_ids: Vec<u32>,
     tokenizer_eos: Option<u32>,
+    prefill_tokens: Option<u32>,
 ) -> Result<Policy, Error> {
     let config: Configuration = serde_json::from_value(configuration)
         .map_err(|_| Error("Invalid checkpoint generation configuration.".into()))?;
@@ -100,6 +137,10 @@ pub fn compile(
         suppressed_token_ids,
         control_token_ids,
         text_decoding: Some(TextDecoding::CheckpointRawV1),
+        prefill: Some(Prefill {
+            token_ceiling: prefill_tokens.unwrap_or(Prefill::default().token_ceiling),
+            ..Prefill::default()
+        }),
     };
     policy.validate()?;
     Ok(policy)
@@ -107,12 +148,16 @@ pub fn compile(
 
 pub fn admit(captured: Option<&Policy>, loaded: &Policy) -> Result<bool, Error> {
     loaded.validate()?;
+    require(
+        loaded.text_decoding.is_some() && loaded.prefill.is_some(),
+        "The loaded model must declare decoding and prefill geometry.",
+    )?;
     let captured = captured.ok_or_else(|| Error(
-        "This earlier continuation did not record its token policy. Explore again to create replayable alternatives.".into()))?;
+        "This continuation cannot be replayed in this build. The original is saved; Explore creates a new set.".into()))?;
     captured.validate()?;
     require(
         captured == loaded,
-        "Replay requires the original token and decoding policy. Captured outputs were retained; Explore again to create new alternatives.",
+        "Replay requires the original model settings. Your saved continuations were retained; Explore creates a new set.",
     )?;
     Ok(true)
 }
@@ -127,6 +172,7 @@ mod tests {
             json!({"eos_token_id": [1, 3], "suppress_tokens": [15, 14]}),
             vec![0, 1, 3, 14, 15],
             Some(1),
+            None,
         )
     }
     #[test]
@@ -143,7 +189,7 @@ mod tests {
             json!({"eos_token_id": 1, "suppress_tokens": [7]}),
             json!({"eos_token_id": [], "suppress_tokens": []}),
         ] {
-            assert!(compile(16, config, vec![0, 1, 3, 14, 15], None).is_err());
+            assert!(compile(16, config, vec![0, 1, 3, 14, 15], None, None).is_err());
         }
         Ok(())
     }
@@ -171,6 +217,43 @@ mod tests {
         assert!(serde_json::from_value::<Policy>(encoded).is_err());
         changed.schema = 2;
         assert!(admit(Some(&changed), &changed).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn prefill_geometry_is_bounded_and_part_of_replay_identity() -> Result<(), Error> {
+        let steady = policy()?;
+        assert_eq!(steady.prefill, Some(Prefill::default()));
+        let wider = compile(
+            16,
+            json!({"eos_token_id":1,"suppress_tokens":[]}),
+            vec![0, 1, 3, 14, 15],
+            Some(1),
+            Some(1024),
+        )?;
+        let mut changed = steady.clone();
+        changed.prefill = wider.prefill;
+        changed.validate()?;
+        assert!(admit(Some(&changed), &steady).is_err());
+        assert!(admit(Some(&changed), &changed)?);
+        changed.prefill = None;
+        changed.validate()?;
+        assert!(admit(Some(&changed), &steady).is_err());
+        for ceiling in [0, 1, 511, 513, 1025, u32::MAX] {
+            assert!(
+                compile(
+                    16,
+                    json!({"eos_token_id":1,"suppress_tokens":[]}),
+                    vec![0, 1],
+                    Some(1),
+                    Some(ceiling)
+                )
+                .is_err()
+            );
+        }
+        let mut captured = serde_json::to_value(&steady).map_err(|e| Error(e.to_string()))?;
+        captured["prefill"]["chunking"] = json!("unknown_chunking");
+        assert!(serde_json::from_value::<Policy>(captured).is_err());
         Ok(())
     }
 }

@@ -86,7 +86,8 @@ import SwiftUI
     return ["available": status == 0, "used_bytes": value.xsu_used,
       "total_bytes": value.xsu_total, "scope": "host-wide; other applications can contribute"]
   }
-  static func run(writingPack: URL, evidence: URL, cacheProbe: UInt64? = nil) async throws {
+  static func run(writingPack: URL, evidence: URL, cacheProbe: UInt64? = nil,
+    prefillTokens: UInt32? = nil) async throws {
     let limits = try ModelResidency.limits()
     let metal = MTLCreateSystemDefaultDevice()?.recommendedMaxWorkingSetSize ?? 0
     if let cacheProbe {
@@ -107,6 +108,7 @@ import SwiftUI
       "inference_activity_scope": "GPU lease through producer joining; explicit operations request user-initiated activity while allowing idle system sleep; autocomplete requests background activity",
       "clock_scope": "ContinuousClock includes system sleep; SuspendingClock excludes system sleep; recorded wall-clock gates are unchanged"]
     receipt["requested_cache_probe_bytes"] = cacheProbe as Any? ?? NSNull()
+    receipt["requested_prefill_token_ceiling"] = prefillTokens as Any? ?? NSNull()
     try write(receipt, "receipt.json", evidence: evidence)
     let probe = try Probe(evidence.appendingPathComponent("memory-samples.jsonl"))
     var typing: Task<[Double], Error>?
@@ -125,7 +127,8 @@ import SwiftUI
         try ModelResidency.admit(weightBytes: admission.weightBytes)
         probe.mark("load-" + purpose.rawValue)
         let started = clock.now
-        let runner = try await MLXGemmaRunner.load(directory: directory, identity: admission.identity)
+        let runner = try await MLXGemmaRunner.load(directory: directory, identity: admission.identity, prefillTokens: prefillTokens)
+        receipt[purpose.rawValue + "_generation_policy"] = try ProductCore.object(runner.generationPolicy)
         receipt[purpose.rawValue + "_load_seconds"] = started.duration(to: clock.now).timeInterval
         receipt[purpose.rawValue + "_model"] = admission.identity
         receipt[purpose.rawValue + "_loaded_footprint_bytes"] = ModelResidency.footprint()
@@ -221,6 +224,7 @@ import SwiftUI
             batch: batch ? WritingBatchExecution(algorithm: "shared-prefill-fixed-batch-v1", seeds: seeds, lane: lane) : nil)
         }
         var record: [String: Any] = ["status": "pending", "model": runner.identity,
+          "generation_policy": try ProductCore.object(runner.generationPolicy),
           "seeds": seeds, "max_tokens_per_row": maxTokens, "batch_width": seeds.count,
           "prompt": prompt as Any? ?? NSNull(), "plan": try plan.map { try ProductCore.object($0) } ?? NSNull()]
         try write(record, name + ".json", evidence: evidence)

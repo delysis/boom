@@ -24,6 +24,13 @@ enum MLXNativeSmoke {
     try FileManager.default.createDirectory(at: evidence, withIntermediateDirectories: false,
       attributes: [.posixPermissions: 0o700])
     if arguments.contains("--memory-budget") {
+      let prefill: UInt32?
+      if arguments.contains("--benchmark-prefill-tokens") {
+        guard let value = UInt32(try argument("--benchmark-prefill-tokens")) else {
+          throw BoomError.invalid("Invalid prefill-token probe.")
+        }
+        prefill = value
+      } else { prefill = nil }
       let cache: UInt64?
       if arguments.contains("--benchmark-cache-mib") {
         guard let mib = UInt64(try argument("--benchmark-cache-mib")), mib <= UInt64.max / 1_048_576 else {
@@ -31,8 +38,12 @@ enum MLXNativeSmoke {
         }
         cache = mib * 1_048_576
       } else { cache = nil }
-      try await ApplicationMemorySmoke.run(writingPack: directory, evidence: evidence, cacheProbe: cache)
+      try await ApplicationMemorySmoke.run(writingPack: directory, evidence: evidence, cacheProbe: cache,
+        prefillTokens: prefill)
       return
+    }
+    guard !arguments.contains("--benchmark-prefill-tokens") else {
+      throw BoomError.invalid("Prefill probes require the explicit memory-budget diagnostic.")
     }
     if arguments.contains("--preempt") {
       try await GenerationPreemptionSmoke.run(writingPack: directory, evidence: evidence, batch: arguments.contains("--batch"))

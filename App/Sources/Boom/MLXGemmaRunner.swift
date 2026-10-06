@@ -96,7 +96,7 @@ actor MLXGemmaRunner {
     let added_tokens: [Added]
     struct Added: Decodable { let id: Int; let special: Bool }
   }
-  static func load(directory: URL, identity: String? = nil) async throws -> MLXGemmaRunner {
+  static func load(directory: URL, identity: String? = nil, prefillTokens: UInt32? = nil) async throws -> MLXGemmaRunner {
     await GenerationCoordinator.shared.enter()
     do {
       try ModelResidency.configure()
@@ -124,7 +124,8 @@ actor MLXGemmaRunner {
       let tokenizerEnds = await model.perform { ($0.tokenizer.eosTokenId, $0.tokenizer.unknownTokenId) }
       let controls = tokenizer.added_tokens.filter(\.special).map(\.id) + (tokenizerEnds.1.map { [$0] } ?? [])
       let policy = try ProductCore.generationPolicy(vocabularySize: text.vocab_size,
-        configuration: generationDescription, controls: controls, tokenizerEOS: tokenizerEnds.0)
+        configuration: generationDescription, controls: controls, tokenizerEOS: tokenizerEnds.0,
+        prefillTokens: prefillTokens)
       guard let object = try JSONSerialization.jsonObject(with: configuration) as? [String: Any],
         let cacheConfiguration = object["text_config"] as? [String: Any] else {
         throw BoomError.invalid("Missing model cache configuration.")
@@ -149,8 +150,17 @@ actor MLXGemmaRunner {
     self.tokenizerDescription = tokenizerDescription
   }
   private nonisolated func availableContext(batchWidth: Int = 1) throws -> Int {
-    try ProductCore.contextCapacity(configuration: cacheConfiguration,
-      available: ModelResidency.availableBytes(), width: batchWidth)
+    guard let prefill = generationPolicy.prefill else { throw BoomError.invalid("The loaded model has no prefill geometry.") }
+    return try ProductCore.contextCapacity(configuration: cacheConfiguration,
+      available: ModelResidency.availableBytes(), width: batchWidth, prefill: prefill)
+  }
+  private nonisolated func prefillParameters(_ callback: (@Sendable (PrefillProgress) -> Void)?,
+    operationID: UUID) throws -> PrefillParameters {
+    guard let geometry = generationPolicy.prefill else { throw BoomError.invalid("The loaded model has no prefill geometry.") }
+    return PrefillParameters(stepSize: geometry.tokenCeiling, chunking: .balanced,
+      progress: { processed, total in
+        callback?(PrefillProgress(operationID: operationID, processedPositions: processed, totalPositions: total))
+      })
   }
   var contextLength: Int { (try? availableContext()) ?? 0 }
   func contextLength(batchWidth: Int) throws -> Int { try availableContext(batchWidth: batchWidth) }
@@ -371,6 +381,7 @@ actor MLXGemmaRunner {
   ) async throws -> [Output] {
     try flag.check()
     let capacity = try availableContext(batchWidth: seeds.count), policy = generationPolicy
+    let prefill = try prefillParameters(onPrefill, operationID: flag.operationID)
     let controls = Set(policy.controlTokenIDs), ends = Set(policy.eosTokenIDs)
     return try await container.perform { (context: ModelContext) async throws -> [Output] in
       try await InferenceExecutor.shared.perform { _ in
@@ -381,9 +392,7 @@ actor MLXGemmaRunner {
         let digest = Digest.sha256(try JSONEncoder().encode(promptIDs))
         let parameters = GenerateParameters(maxTokens: maxTokens, temperature: settings.temperature,
           topP: settings.topP, topK: settings.topK, minP: settings.minP, repetitionPenalty: nil,
-          prefill: PrefillParameters(progress: { processed, total in
-            onPrefill?(PrefillProgress(operationID: flag.operationID, processedPositions: processed, totalPositions: total))
-          }))
+          prefill: prefill)
         let cache = try context.model.newCache(parameters: parameters)
         let clock = ContinuousClock(), started = clock.now
         let prepared = try context.model.prepare(LMInput(tokens: MLXArray(promptIDs)),
@@ -498,6 +507,7 @@ actor MLXGemmaRunner {
     onText: @escaping @Sendable (String) -> Void) async throws -> Output {
     try flag.check()
     let capacity = try availableContext(), policy = generationPolicy
+    let prefill = try prefillParameters(onPrefill, operationID: flag.operationID)
     let controls = Set(policy.controlTokenIDs), ends = Set(policy.eosTokenIDs)
     return try await container.perform { (context: ModelContext) async throws -> Output in
       try await InferenceExecutor.shared.perform { _ in
@@ -510,9 +520,7 @@ actor MLXGemmaRunner {
         guard promptIDs.count + maxTokens <= capacity else { throw BoomError.budget("The request exceeds available context.") }
         let parameters = GenerateParameters(maxTokens: maxTokens, temperature: settings.temperature,
           topP: settings.topP, topK: settings.topK, minP: settings.minP, repetitionPenalty: nil,
-          prefill: PrefillParameters(progress: { processed, total in
-            onPrefill?(PrefillProgress(operationID: flag.operationID, processedPositions: processed, totalPositions: total))
-          }), seed: seed)
+          prefill: prefill, seed: seed)
         let preparedDigest = Digest.sha256(try JSONEncoder().encode(promptIDs))
         // TokenIterator performs prompt prefill during task construction.
         // Start before it so first-token and elapsed time include that work.

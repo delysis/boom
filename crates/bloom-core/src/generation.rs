@@ -299,6 +299,7 @@ mod tests {
             serde_json::json!({"eos_token_id": 1, "suppress_tokens": [14, 15]}),
             vec![0, 1, 3, 14, 15],
             Some(1),
+            None,
         )?);
         base.progress.token_ids = vec![4, 5];
         for (reason, token) in [("eos", 1), ("model_control", 3), ("cancelled", 1)] {

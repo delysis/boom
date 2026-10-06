@@ -143,10 +143,11 @@ enum ProductCore {
     try call(["op": "sampling", "profile": profile.rawValue])
   }
   static func generationPolicy(vocabularySize: Int, configuration: Data,
-    controls: [Int], tokenizerEOS: Int?) throws -> ModelGenerationPolicy {
+    controls: [Int], tokenizerEOS: Int?, prefillTokens: UInt32? = nil) throws -> ModelGenerationPolicy {
     try call(["op": "model_generation_policy", "vocabularySize": vocabularySize,
       "configuration": JSONSerialization.jsonObject(with: configuration),
-      "controlTokenIds": controls, "tokenizerEos": tokenizerEOS.map { $0 as Any } ?? NSNull()])
+      "controlTokenIds": controls, "tokenizerEos": tokenizerEOS.map { $0 as Any } ?? NSNull(),
+      "prefillTokens": prefillTokens.map { $0 as Any } ?? NSNull()])
   }
   static func admitGenerationPolicy(_ captured: ModelGenerationPolicy?, loaded: ModelGenerationPolicy) throws {
     let _: Bool = try call(["op": "admit_generation_policy",
@@ -178,9 +179,10 @@ enum ProductCore {
     let _: Bool = try call(["op": "residency_cache_probe", "physicalBytes": physical,
       "metalBytes": metal, "cacheBytes": cache])
   }
-  static func contextCapacity(configuration: Data, available: UInt64, width: Int) throws -> Int {
+  static func contextCapacity(configuration: Data, available: UInt64, width: Int,
+    prefill: PrefillGeometry? = nil) throws -> Int {
     try call(["op": "context_capacity", "configuration": JSONSerialization.jsonObject(with: configuration),
-      "availableBytes": available, "width": width])
+      "availableBytes": available, "width": width, "prefill": try prefill.map { try object($0) } ?? NSNull()])
   }
 }
 struct ResidencyLimits: Codable, Sendable {
@@ -284,6 +286,11 @@ struct ModelGenerationPolicy: Codable, Equatable, Sendable {
   let suppressedTokenIDs: [Int]
   let controlTokenIDs: [Int]
   let textDecoding: String?
+  var prefill: PrefillGeometry? = nil
+}
+struct PrefillGeometry: Codable, Equatable, Sendable {
+  let chunking: String
+  let tokenCeiling: Int
 }
 struct CompletionRecipe: Codable, Sendable {
   let document: DocumentSnapshot

@@ -1,4 +1,4 @@
-use crate::{Error, require};
+use crate::{Error, require, sampling_policy::Prefill};
 use serde::{Deserialize, Serialize};
 
 const GIB: u64 = 1 << 30;
@@ -56,13 +56,13 @@ pub struct CacheConfiguration {
 }
 
 impl CacheConfiguration {
-    fn bytes(&self, tokens: u64, width: u64) -> u64 {
+    fn bytes(&self, tokens: u64, width: u64, prefill: Prefill) -> u64 {
         // Float16/bfloat16 K and V, including cache growth rounding, a prefill
         // chunk beside the sliding window, old/new allocation overlap, and
         // the single prefill row during batch expansion. K=V is deliberately
         // counted twice even where the runtime aliases the tensors.
         let positions = tokens.div_ceil(256) * 256;
-        let sliding = positions.min(self.sliding_window + 512);
+        let sliding = positions.min(self.sliding_window + u64::from(prefill.token_ceiling));
         let concrete = self.num_hidden_layers - self.num_kv_shared_layers;
         let per_row = self.layer_types[..concrete as usize]
             .iter()
@@ -105,15 +105,17 @@ pub fn context_capacity(
     config: &CacheConfiguration,
     available: u64,
     width: u64,
+    prefill: Prefill,
 ) -> Result<u64, Error> {
     config.validate()?;
+    prefill.validate()?;
     require((1..=4).contains(&width), "Invalid inference batch width.")?;
     let budget = available.saturating_sub(WORKING_RESERVE);
     let mut low = 0;
     let mut high = 16_384.min(config.max_position_embeddings);
     while low < high {
         let middle = low + (high - low).div_ceil(2);
-        if config.bytes(middle, width) <= budget {
+        if config.bytes(middle, width, prefill) <= budget {
             low = middle;
         } else {
             high = middle - 1;
@@ -168,21 +170,25 @@ mod tests {
     #[test]
     fn full_context_admission_includes_sliding_growth_and_batch_overlap() -> Result<(), Error> {
         let config = gemma();
-        let full = config.bytes(16_384, 3);
+        let prefill = Prefill::default();
+        let full = config.bytes(16_384, 3, prefill);
         assert_eq!(full, (8 * 16_384 * 512 * 4 + 40 * 1536 * 8 * 256 * 4) * 7);
         assert_eq!(
-            context_capacity(&config, full + WORKING_RESERVE, 3)?,
+            context_capacity(&config, full + WORKING_RESERVE, 3, prefill)?,
             16_384
         );
-        assert!(context_capacity(&config, full + WORKING_RESERVE - 1, 3)? < 16_384);
-        assert_eq!(context_capacity(&config, WORKING_RESERVE, 3)?, 0);
+        assert!(context_capacity(&config, full + WORKING_RESERVE - 1, 3, prefill)? < 16_384);
+        assert_eq!(context_capacity(&config, WORKING_RESERVE, 3, prefill)?, 0);
         for width in 1..=4 {
             for available in [0, WORKING_RESERVE, 3 * GIB, 5 * GIB, 8 * GIB, u64::MAX] {
-                let admitted = context_capacity(&config, available, width)?;
-                assert!(config.bytes(admitted, width) <= available.saturating_sub(WORKING_RESERVE));
+                let admitted = context_capacity(&config, available, width, prefill)?;
+                assert!(
+                    config.bytes(admitted, width, prefill)
+                        <= available.saturating_sub(WORKING_RESERVE)
+                );
                 if admitted < 16_384 {
                     assert!(
-                        config.bytes(admitted + 1, width)
+                        config.bytes(admitted + 1, width, prefill)
                             > available.saturating_sub(WORKING_RESERVE)
                     );
                 }
@@ -194,16 +200,44 @@ mod tests {
     #[test]
     fn configuration_and_geometry_fail_closed() {
         let mut config = gemma();
-        assert!(context_capacity(&config, u64::MAX, 0).is_err());
-        assert!(context_capacity(&config, u64::MAX, 5).is_err());
+        assert!(context_capacity(&config, u64::MAX, 0, Prefill::default()).is_err());
+        assert!(context_capacity(&config, u64::MAX, 5, Prefill::default()).is_err());
         config.layer_types[0] = "unknown".into();
-        assert!(context_capacity(&config, u64::MAX, 1).is_err());
+        assert!(context_capacity(&config, u64::MAX, 1, Prefill::default()).is_err());
         config = gemma();
         config.num_hidden_layers = u64::MAX;
-        assert!(context_capacity(&config, u64::MAX, 1).is_err());
+        assert!(context_capacity(&config, u64::MAX, 1, Prefill::default()).is_err());
         config = gemma();
         config.num_kv_shared_layers = 48;
-        assert!(context_capacity(&config, u64::MAX, 1).is_err());
+        assert!(context_capacity(&config, u64::MAX, 1, Prefill::default()).is_err());
+    }
+
+    #[test]
+    fn larger_prefill_is_budgeted_before_admission() -> Result<(), Error> {
+        let config = gemma();
+        let small = Prefill::default();
+        let large = Prefill {
+            token_ceiling: 1024,
+            ..small
+        };
+        let available = config.bytes(16_384, 3, small) + WORKING_RESERVE;
+        assert_eq!(context_capacity(&config, available, 3, small)?, 16_384);
+        assert!(context_capacity(&config, available, 3, large)? < 16_384);
+        assert_eq!(
+            context_capacity(
+                &config,
+                config.bytes(16_384, 3, large) + WORKING_RESERVE,
+                3,
+                large
+            )?,
+            16_384
+        );
+        let invalid = Prefill {
+            token_ceiling: u32::MAX,
+            ..small
+        };
+        assert!(context_capacity(&config, u64::MAX, 1, invalid).is_err());
+        Ok(())
     }
 
     #[test]

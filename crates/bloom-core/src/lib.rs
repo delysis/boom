@@ -662,6 +662,7 @@ pub enum Request {
         configuration: serde_json::Value,
         control_token_ids: Vec<u32>,
         tokenizer_eos: Option<u32>,
+        prefill_tokens: Option<u32>,
     },
     AdmitGenerationPolicy {
         captured: Option<sampling_policy::Policy>,
@@ -828,6 +829,7 @@ pub enum Request {
         configuration: memory::CacheConfiguration,
         available_bytes: u64,
         width: u64,
+        prefill: Option<sampling_policy::Prefill>,
     },
     BackupKey {
         passphrase: String,
@@ -898,11 +900,13 @@ pub fn execute(request: Request) -> Result<Value, Error> {
             configuration,
             control_token_ids,
             tokenizer_eos,
+            prefill_tokens,
         } => serde_json::to_value(sampling_policy::compile(
             vocabulary_size,
             configuration,
             control_token_ids,
             tokenizer_eos,
+            prefill_tokens,
         )?),
         Request::AdmitGenerationPolicy { captured, loaded } => {
             serde_json::to_value(sampling_policy::admit(captured.as_ref(), &loaded)?)
@@ -1020,10 +1024,12 @@ pub fn execute(request: Request) -> Result<Value, Error> {
             configuration,
             available_bytes,
             width,
+            prefill,
         } => serde_json::to_value(memory::context_capacity(
             &configuration,
             available_bytes,
             width,
+            prefill.unwrap_or_default(),
         )?),
         Request::BackupKey { passphrase, salt } => {
             require(
