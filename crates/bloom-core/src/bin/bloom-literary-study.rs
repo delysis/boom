@@ -1005,6 +1005,10 @@ fn main() -> Result<()> {
         Some("run") => run(&args),
         Some("memory") => memory::run(&args),
         Some("demonstration") => demonstration::run(&args),
+        Some("document-authority") => demonstration::documents(&args),
+        Some("document-review") if args.len() == 3 => {
+            demonstration::review_documents(Path::new(&args[2]))
+        }
         Some("memory-review") if args.len() == 3 => memory::review(Path::new(&args[2])),
         Some("fidelity") => fidelity(&args),
         Some("converted-inventory") if args.len() == 6 => converted_inventory(
