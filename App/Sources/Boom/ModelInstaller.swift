@@ -1,11 +1,33 @@
 import BoomCore
 import CryptoKit
+import Darwin
 import Foundation
 
 struct ModelFile: Codable, Equatable, Sendable {
   let path: String
   let bytes: Int64
   let sha256: String
+}
+/// A kernel-owned lock protects resumable files across Author and Chat builds.
+/// A leftover lock file has no authority after its owning descriptor closes.
+final class ModelInstallLease {
+  private var descriptor: Int32
+  init(root: URL, identity: String) throws {
+    let path = root.appendingPathComponent(".bloom-install-" + identity + ".lock")
+    let descriptor = open(path.path, O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0o600)
+    guard descriptor >= 0 else { throw BoomError.invalid("The model installation lock could not be opened safely.") }
+    var info = stat()
+    guard fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG else {
+      close(descriptor); throw BoomError.invalid("The model installation lock is not a regular file.")
+    }
+    guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+      close(descriptor)
+      throw BoomError.unavailable("Another Bloom process is installing this model. Its download was retained.")
+    }
+    self.descriptor = descriptor
+  }
+  func release() { if descriptor >= 0 { _ = flock(descriptor, LOCK_UN); close(descriptor); descriptor = -1 } }
+  deinit { release() }
 }
 enum HuggingFaceCache {
   static func roots(environment: [String: String], home: URL) -> [URL] {

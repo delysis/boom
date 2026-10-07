@@ -156,7 +156,7 @@ import Synchronization
       throw error
     }
   }
-  static func run(writingPack: URL, evidence: URL, cacheProbe: UInt64? = nil,
+  static func run(writingPack: URL, evidence: URL, consultationPackOverride: URL? = nil, cacheProbe: UInt64? = nil,
     prefillTokens: UInt32? = nil) async throws {
     let limits = try ModelResidency.limits()
     let metal = MTLCreateSystemDefaultDevice()?.recommendedMaxWorkingSetSize ?? 0
@@ -186,7 +186,7 @@ import Synchronization
     var model: WorkspaceModel?
     var window: NSWindow?
     do {
-      guard let consultationPack = ModelPacks.cached(.consultation) else {
+      guard let consultationPack = consultationPackOverride ?? ModelPacks.cached(.consultation) else {
         throw BoomError.unavailable("Both cached model packs are required.")
       }
       let store = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("encrypted-workspace"),
@@ -205,7 +205,7 @@ import Synchronization
         receipt[purpose.rawValue + "_load_seconds"] = started.duration(to: clock.now).timeInterval
         receipt[purpose.rawValue + "_model"] = admission.identity
         receipt[purpose.rawValue + "_loaded_footprint_bytes"] = ModelResidency.footprint()
-        try Data(contentsOf: directory.appendingPathComponent(ModelPacks.manifestName))
+        try ModelPacks.evidenceManifest(admission, purpose: purpose)
           .write(to: evidence.appendingPathComponent(purpose.rawValue + "-manifest.json"))
         try write(receipt, "receipt.json", evidence: evidence)
         return runner

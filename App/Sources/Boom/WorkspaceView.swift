@@ -879,11 +879,10 @@ struct ModelSetupView: View {
           else if let installed = ModelPacks.cached(purpose) {
             Button("Open \(purpose.rawValue) model") { model.loadPack(installed, purpose: purpose) }.disabled(model.isBusy)
           } else {
-            Button("Download public \(purpose.rawValue) checkpoint") { model.installModel(purpose) }
+            Button("Download \(purpose.rawValue) model") { model.installModel(purpose) }
               .disabled(model.isBusy)
-            if let entry = try? ModelPacks.entry(purpose) {
-              Text("Checks the Hugging Face cache first. The public checkpoint uses full precision; a local 4-bit pack uses less memory.").font(.caption).foregroundStyle(.secondary)
-              Text("Download \(ByteCountFormatter.string(fromByteCount: entry.manifest.upstreamFiles.reduce(0) { $0 + $1.bytes }, countStyle: .file)); verification precedes loading.")
+            if let checkpoint = try? ModelPacks.published(purpose), let requirements = try? ProductCore.checkpointRequirements(checkpoint) {
+              Text("Download \(ByteCountFormatter.string(fromByteCount: Int64(requirements.downloadBytes), countStyle: .file)) · free disk space \(ByteCountFormatter.string(fromByteCount: Int64(requirements.diskBytes), countStyle: .file))")
                 .font(.caption).foregroundStyle(.secondary)
             }
           }

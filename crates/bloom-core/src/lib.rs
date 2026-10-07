@@ -9,6 +9,7 @@ use uuid::Uuid;
 const TEXT_LIMIT: usize = 2 * 1024 * 1024;
 
 mod batch;
+mod checkpoint;
 mod context;
 mod document;
 mod generation;
@@ -653,6 +654,20 @@ fn sampling(profile: &str) -> Result<Sampling, Error> {
     deny_unknown_fields
 )]
 pub enum Request {
+    CheckpointRequirements {
+        checkpoint: checkpoint::Checkpoint,
+    },
+    CheckpointRange {
+        file_bytes: u64,
+        offset: u64,
+    },
+    CheckpointResponse {
+        file_bytes: u64,
+        offset: u64,
+        status: u16,
+        content_range: Option<String>,
+        content_length: Option<u64>,
+    },
     ValidateMediaDuration {
         seconds: f64,
         automatic_audio: bool,
@@ -853,6 +868,25 @@ pub enum Request {
 
 pub fn execute(request: Request) -> Result<Value, Error> {
     match request {
+        Request::CheckpointRequirements { checkpoint } => {
+            serde_json::to_value(checkpoint::requirements(&checkpoint)?)
+        }
+        Request::CheckpointRange { file_bytes, offset } => {
+            serde_json::to_value(checkpoint::transfer_range(file_bytes, offset)?)
+        }
+        Request::CheckpointResponse {
+            file_bytes,
+            offset,
+            status,
+            content_range,
+            content_length,
+        } => serde_json::to_value(checkpoint::admit_response(
+            file_bytes,
+            offset,
+            status,
+            content_range.as_deref(),
+            content_length,
+        )?),
         Request::ValidateMediaDuration {
             seconds,
             automatic_audio,

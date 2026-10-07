@@ -69,8 +69,14 @@ import SwiftUI
     let evidence = URL(fileURLWithPath: path)
     if action == "verify" { try await verify(evidence); return }
     let fixturePath = try argument("--fixture")
+    let requestedPack: URL?
+    if arguments.contains("--pack") {
+      let packPath = try argument("--pack")
+      guard packPath.hasPrefix("/") else { throw BoomError.invalid("Use an absolute writing model path.") }
+      requestedPack = URL(fileURLWithPath: packPath)
+    } else { requestedPack = nil }
     guard fixturePath.hasPrefix("/"), !FileManager.default.fileExists(atPath: path),
-      let pack = ModelPacks.cached(.writing) else { throw BoomError.invalid("Use a new evidence directory and a cached writing pack.") }
+      let pack = requestedPack ?? ModelPacks.cached(.writing) else { throw BoomError.invalid("Use a new evidence directory and a cached writing pack.") }
     let bytes = try AttachmentProcessor.readGranted(URL(fileURLWithPath: fixturePath))
     guard bytes.count <= 4_194_304 else { throw BoomError.budget("Writing fixture exceeds 4 MiB.") }
     let fixture = try JSONDecoder().decode(WritingEvaluation.Fixture.self, from: bytes)
@@ -99,6 +105,9 @@ import SwiftUI
   }
   private static func capture(_ fixture: WritingEvaluation.Fixture, pack: URL, evidence: URL, record: Bool,
     requireParagraph: Bool) async throws {
+    let admission = try await detachedWork { try ModelPacks.admission(pack, purpose: .writing) }
+    let manifest = try await detachedWork { try ModelPacks.evidenceManifest(admission, purpose: .writing) }
+    try manifest.write(to: evidence.appendingPathComponent("model-manifest.json"), options: .atomic)
     _ = try ProductCore.authoredPrefix(fixture.document, caret: fixture.caretUTF16)
     let store = try store(evidence)
     var state = WorkspaceState(); state.autocomplete = false
@@ -293,8 +302,6 @@ import SwiftUI
     let captured = Capture(fixture: fixture, alternatives: alternatives, replay: replay,
       partialText: partial.text, branch: branch, documents: model.documents, origins: model.state.manuscriptOrigins)
     try write(captured, to: evidence.appendingPathComponent("capture.json"))
-    try Data(contentsOf: pack.appendingPathComponent(ModelPacks.manifestName))
-      .write(to: evidence.appendingPathComponent("model-manifest.json"))
     for dark in [true, false] {
       for width in [1440, 760] { try await render(model, width: width, dark: dark, evidence: evidence) }
     }

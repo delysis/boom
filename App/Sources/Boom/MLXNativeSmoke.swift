@@ -1,6 +1,8 @@
 import BoomCore
+import AppKit
 import CryptoKit
 import Foundation
+import SwiftUI
 
 /// Explicit real-weight diagnostic; every attempt retains its own receipt.
 enum MLXNativeSmoke {
@@ -38,7 +40,13 @@ enum MLXNativeSmoke {
         }
         cache = mib * 1_048_576
       } else { cache = nil }
-      try await ApplicationMemorySmoke.run(writingPack: directory, evidence: evidence, cacheProbe: cache,
+      let consultationPack: URL?
+      if arguments.contains("--consultation-pack") {
+        let path = try argument("--consultation-pack")
+        guard path.hasPrefix("/") else { throw BoomError.invalid("Use an absolute consultation model path.") }
+        consultationPack = URL(fileURLWithPath: path)
+      } else { consultationPack = nil }
+      try await ApplicationMemorySmoke.run(writingPack: directory, evidence: evidence, consultationPackOverride: consultationPack, cacheProbe: cache,
         prefillTokens: prefill)
       return
     }
@@ -69,6 +77,10 @@ enum MLXNativeSmoke {
     try persist()
     do {
       let admission = try await detachedWork { try ModelPacks.admission(directory) }
+      receipt["admitted_identity"] = admission.identity
+      receipt["weight_bytes"] = admission.weightBytes
+      receipt["weight_kind"] = admission.kind.rawValue
+      try persist()
       let runner = try await MLXGemmaRunner.load(admission: admission)
       let output: MLXGemmaRunner.Output
       var editDocument: (DocumentSnapshot, InteractionMode, Bool)?
@@ -140,6 +152,21 @@ enum MLXNativeSmoke {
     state.chats = [chat]; state.selectedDocument = document.id; state.selectedChat = chat.id
     try await store.save(state, documents: [document])
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    var mountedWindow: NSWindow?
+    if model.layout.isAuthor {
+      model.state.showChat = false
+      let host = NSHostingView(rootView: WorkspaceView(model: model))
+      let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 1440, height: 900))
+      window.isReleasedWhenClosed = false; window.contentView = host
+      mountedWindow = window; host.layoutSubtreeIfNeeded()
+      let deadline = ContinuousClock.now + .seconds(2)
+      while model.editor == nil && ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+      guard let editor = model.editor, editor.documentID == document.id, editor.string == document.text,
+        !window.isVisible, window.makeFirstResponder(editor) else {
+        throw BoomError.invalid("The public document diagnostic could not mount its actual native editor.")
+      }
+    }
+    defer { mountedWindow?.close() }
     let pending = ChatMessage(role: .assistant, text: "", state: .pending)
     guard let chatIndex = model.state.chats.firstIndex(where: { $0.id == chat.id }) else {
       throw BoomError.stale("Diagnostic chat is missing.")
@@ -152,6 +179,7 @@ enum MLXNativeSmoke {
       authority: CapturedDocumentAuthority(mode: mode, target: document), documentSources: sources, attachments: [])
     if !expectsEdit {
       guard message.state == .complete, model.selectedDocument == document,
+        model.editor.map({ $0.string == document.text }) ?? true,
         model.state.proposals.isEmpty, !model.undoManager(document.id).canUndo,
         model.status == "No document changes" else {
         throw BoomError.invalid("The no-change response changed document state or reported a proposal.")
@@ -162,7 +190,8 @@ enum MLXNativeSmoke {
       try await model.shutdown()
       return ["mode": mode.rawValue, "status": "No document changes", "expected_text": document.text,
         "persisted_text": persisted?.text ?? "", "no_changes": true, "no_proposal": true,
-        "no_undo_action": true, "keychain_acceptance": false, "interactive_ui_acceptance": false] as [String: Any]
+        "no_undo_action": true, "mounted_editor": mountedWindow != nil,
+        "keychain_acceptance": false, "interactive_ui_acceptance": false] as [String: Any]
     }
     if mode == .propose {
       guard model.selectedDocument == document, let proposal = model.state.proposals.last,
@@ -179,6 +208,7 @@ enum MLXNativeSmoke {
     }
     let expected = "The harbor was bright."
     guard model.selectedDocument?.text == expected, model.state.proposals.last?.status == "applied",
+      model.editor.map({ $0.string == expected && $0.isEditable }) ?? true,
       model.status == "Document edited" else {
       throw BoomError.invalid("Real model did not produce and commit the requested exact edit.")
     }
@@ -186,11 +216,16 @@ enum MLXNativeSmoke {
     let persisted = try await store.load().get().1.first(where: { $0.id == document.id })
     guard persisted?.text == expected else { throw BoomError.invalid("Edited bytes did not persist.") }
     model.undoManager(document.id).undo()
-    guard model.selectedDocument?.text == document.text else { throw BoomError.invalid("Native Undo did not restore the original bytes.") }
+    guard model.selectedDocument?.text == document.text,
+      model.editor.map({ $0.string == document.text }) ?? true else { throw BoomError.invalid("Native Undo did not restore the original bytes.") }
+    try await model.flush()
+    let undone = try await store.load().get().1.first { $0.id == document.id }
+    guard undone == document else { throw BoomError.invalid("Native Undo did not restore persisted document bytes.") }
     try await model.shutdown()
     return ["mode": mode.rawValue, "status": "Document edited", "proposal_required_acceptance": mode == .propose,
       "expected_text": expected, "persisted_text": persisted?.text ?? "", "undone_text": document.text,
       "validated_and_committed": true, "native_undo_restored_original": true,
+      "mounted_editor": mountedWindow != nil, "native_undo_persisted_original": true,
       "keychain_acceptance": false, "interactive_ui_acceptance": false] as [String: Any]
   }
 }

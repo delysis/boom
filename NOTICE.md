@@ -9,6 +9,7 @@ Newly authored product source is provided under the adjacent MIT license. This d
 | `delysis/native-platform` | Commit `637e60b6b044230ed24ed3118615a2e5538cae83`, tree `29f329624d3030a7d3f2e5b33fa3887b1d2beae3` | Five attachment crates in `crates/`; their original notices are retained. |
 | `ml-explore/mlx-swift-lm` | Commit `9afc3b55f75a0d41a3d0c11330b9df6a036d24e4` | Native Swift Gemma 4 runtime, developer conversion, and sampling. |
 | Google Gemma 4 | Base `023679ed352de9bb66cc873c9009ce3482585c08`; instruction/QAT `b6ed86275a6a5735884e208bfed95b445a684ca2` | Separately acquired official checkpoints; converted pack manifests retain upstream and output hashes, settings, runtime identity, and licenses. |
+| MLX Community Gemma 4 | Base `7d7c99c4d1b1d2ec2b52e2c46821cef2fa22ce0c`; instruction/QAT `e70c6b3ba0979b3357dcd2f223ad8bde7787a6b6` | Separately downloaded public artifacts with pinned file hashes and configuration. Exact upstream conversion lineage is not independently established. Model cards and upstream license references accompany the catalog; app distribution does not include these weights. |
 
 Bloom uses MLX for inference. Native-platform reuse is confined to attachment crates. No Cotabby implementation or AGPL source is copied or linked.
 

@@ -45,7 +45,13 @@ import SwiftUI
     }
     let evidence = URL(fileURLWithPath: path)
     if action == "verify" { try await verify(evidence); return }
-    guard !FileManager.default.fileExists(atPath: path), let pack = ModelPacks.cached(.consultation) else {
+    let requestedPack: URL?
+    if arguments.contains("--pack") {
+      let packPath = try argument("--pack")
+      guard packPath.hasPrefix("/") else { throw BoomError.invalid("Use an absolute consultation model path.") }
+      requestedPack = URL(fileURLWithPath: packPath)
+    } else { requestedPack = nil }
+    guard !FileManager.default.fileExists(atPath: path), let pack = requestedPack ?? ModelPacks.cached(.consultation) else {
       throw BoomError.invalid("Use a new evidence directory and a cached consultation pack.")
     }
     try FileManager.default.createDirectory(at: evidence, withIntermediateDirectories: false,
@@ -70,6 +76,9 @@ import SwiftUI
     try WorkspaceStore(rootOverride: evidence.appendingPathComponent("encrypted-workspace"), testKey: key)
   }
   private static func capture(pack: URL, evidence: URL, record: Bool) async throws {
+    let admission = try await detachedWork { try ModelPacks.admission(pack, purpose: .consultation) }
+    let manifest = try await detachedWork { try ModelPacks.evidenceManifest(admission, purpose: .consultation) }
+    try await detachedWork { try manifest.write(to: evidence.appendingPathComponent("model-manifest.json"), options: .atomic) }
     let store = try store(evidence)
     let document = DocumentSnapshot(title: "Public decision notes",
       text: "I have until Friday to choose whether to accept a new project. I feel hurried, although nobody has asked for an answer today. I want to keep my own judgment and identify one small next step.")
@@ -148,8 +157,6 @@ import SwiftUI
       rounds: [separate, discussed], state: loaded.0, documents: loaded.1)
     try await write(captured, to: evidence.appendingPathComponent("capture.json"))
     try await store.exportBackup(passphrase: passphrase, to: evidence.appendingPathComponent("complete.bloombackup"))
-    let manifest = try AttachmentProcessor.readGranted(pack.appendingPathComponent("bloom-model.json"))
-    try await detachedWork { try manifest.write(to: evidence.appendingPathComponent("model-manifest.json"), options: .atomic) }
     print("Named voices, ordinary-chat editing, separate answers and discussion passed with real MLX.")
   }
   private static func createVoice(_ model: WorkspaceModel, name: String, slug: String,

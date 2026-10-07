@@ -383,6 +383,11 @@ import SwiftUI
     return super.resignFirstResponder()
   }
   func replaceDocument(_ value: String, action: String) {
+    // The controller locks user editing while publishing the disk transaction.
+    // NSTextView's insertion/Undo path still needs an editable text view.
+    let editable = isEditable
+    isEditable = true
+    defer { isEditable = editable }
     let selection = selectedRange()
     let manager = undoManager
     clearGhost()

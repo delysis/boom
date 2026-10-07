@@ -32,8 +32,7 @@ enum BatchGenerationSmoke {
     var receipt: [String: Any] = ["schema": 1, "status": "running", "prompt": prompt,
       "runtime_revision": ModelPacks.runtimeRevision, "physical_memory_bytes": ProcessInfo.processInfo.physicalMemory,
       "source_inventory_sha256": Bundle.main.object(forInfoDictionaryKey: "BoomSourceSHA256") ?? "unavailable",
-      "host_performance_qualified_for_32gb": false, "durable_workspace_checkpoint_overhead_included": false,
-      "model_manifest_sha256": try ModelInstaller.hashFile(directory.appendingPathComponent(ModelPacks.manifestName), maxBytes: 4_194_304).sha256]
+      "host_performance_qualified_for_32gb": false, "durable_workspace_checkpoint_overhead_included": false]
     func write(_ value: [String: Any], _ name: String) throws {
       try JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys])
         .write(to: evidence.appendingPathComponent(name), options: .atomic)
@@ -41,10 +40,14 @@ enum BatchGenerationSmoke {
     try write(receipt, "receipt.json")
     do {
       let admission = try ModelPacks.admission(directory, purpose: .writing)
+      let manifest = try ModelPacks.evidenceManifest(admission, purpose: .writing)
+      try manifest.write(to: evidence.appendingPathComponent("model-manifest.json"))
+      receipt["model_manifest_sha256"] = Digest.sha256(manifest)
+      receipt["model_identity"] = admission.identity
+      receipt["weight_kind"] = admission.kind.rawValue
+      try write(receipt, "receipt.json")
       try ModelResidency.admit(weightBytes: admission.weightBytes)
       let runner = try await MLXGemmaRunner.load(admission: admission)
-      try Data(contentsOf: directory.appendingPathComponent(ModelPacks.manifestName))
-        .write(to: evidence.appendingPathComponent("model-manifest.json"))
       let settings = try ProductCore.sampling(.standard)
       receipt["settings"] = try ProductCore.object(settings)
       receipt["model_identity"] = runner.identity

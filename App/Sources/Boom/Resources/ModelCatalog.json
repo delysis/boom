@@ -1,10 +1,6 @@
 {
   "entries": [
     {
-      "purpose": "consultation",
-      "repository": "georgewalker/bloom-gemma4-12b-consultation-mlx-q4",
-      "revision": "",
-      "manifestDigest": "3639bf3342065eb1b2da2bb0ffc786266ee5e5964bdc5727b75e5a410db35cc9",
       "manifest": {
         "bits": 4,
         "calibration": "q4_0",
@@ -153,13 +149,13 @@
         ],
         "upstreamRepository": "google/gemma-4-12B-it-qat-q4_0-unquantized",
         "upstreamRevision": "b6ed86275a6a5735884e208bfed95b445a684ca2"
-      }
+      },
+      "manifestDigest": "3639bf3342065eb1b2da2bb0ffc786266ee5e5964bdc5727b75e5a410db35cc9",
+      "purpose": "consultation",
+      "repository": "georgewalker/bloom-gemma4-12b-consultation-mlx-q4",
+      "revision": ""
     },
     {
-      "purpose": "writing",
-      "repository": "georgewalker/bloom-gemma4-12b-writing-mlx-q4",
-      "revision": "",
-      "manifestDigest": "d23fe3c210a6cdf25db96ca88f43b0a8dd51330b08d8f632a89894345aabb9fd",
       "manifest": {
         "bits": 4,
         "calibration": "standard",
@@ -298,7 +294,132 @@
         ],
         "upstreamRepository": "google/gemma-4-12B",
         "upstreamRevision": "023679ed352de9bb66cc873c9009ce3482585c08"
-      }
+      },
+      "manifestDigest": "d23fe3c210a6cdf25db96ca88f43b0a8dd51330b08d8f632a89894345aabb9fd",
+      "purpose": "writing",
+      "repository": "georgewalker/bloom-gemma4-12b-writing-mlx-q4",
+      "revision": ""
+    }
+  ],
+  "publishedCheckpoints": [
+    {
+      "files": [
+        {
+          "bytes": 355,
+          "path": "README.md",
+          "sha256": "df5eddf0f64cbdd5dc88112a1f772eb88d39c09186120bb8ffc16ea07395fb39"
+        },
+        {
+          "bytes": 17466,
+          "path": "chat_template.jinja",
+          "sha256": "36e3a42e5cf14cd0020e72d92e1fdd9970f59b82170e421f0cbe1bb42bead3f0"
+        },
+        {
+          "bytes": 39882,
+          "path": "config.json",
+          "sha256": "fe091f98e6f7e5e80461bd8ec7ced6d87ac16987586239386ed44b82ecbc2b12"
+        },
+        {
+          "bytes": 260,
+          "path": "generation_config.json",
+          "sha256": "a8349d9bd64cc5841297fcb5002f0fdc4749c473c8f1b10ea337f9ce4ee7014e"
+        },
+        {
+          "bytes": 5343482357,
+          "path": "model-00001-of-00003.safetensors",
+          "sha256": "9fc7406175fdfbca0f941767bfa222ecdaea71ab1d2865cd049eb2a0a1d9f2a1"
+        },
+        {
+          "bytes": 5315166254,
+          "path": "model-00002-of-00003.safetensors",
+          "sha256": "62a2b9715c9bef3a4f0a2769fe2d5022ae55907b631731a24568f3e8f444d9e9"
+        },
+        {
+          "bytes": 329123819,
+          "path": "model-00003-of-00003.safetensors",
+          "sha256": "fd75a04eb5cc73be2760898715472e92626b0a8ba03b19ee57737419885da6c9"
+        },
+        {
+          "bytes": 135330,
+          "path": "model.safetensors.index.json",
+          "sha256": "b87c93774de5d13ca9d0e21b045793e42e5df032fb5e7622212524f56f9695f2"
+        },
+        {
+          "bytes": 868,
+          "path": "processor_config.json",
+          "sha256": "016a1db9c4f41ea0c61919c46855ea5e7c45c6e4ae4bfbedfb5b6bed79a2fe92"
+        },
+        {
+          "bytes": 32169626,
+          "path": "tokenizer.json",
+          "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+        },
+        {
+          "bytes": 2747,
+          "path": "tokenizer_config.json",
+          "sha256": "a4260621db48fa22f2b09ce3ba5ad0ec0cc0e032aa702e3ab743a0bc9d6e1d06"
+        }
+      ],
+      "purpose": "consultation",
+      "repository": "mlx-community/gemma-4-12B-it-qat-4bit",
+      "revision": "e70c6b3ba0979b3357dcd2f223ad8bde7787a6b6"
+    },
+    {
+      "files": [
+        {
+          "bytes": 687,
+          "path": "README.md",
+          "sha256": "62a29099cb4e1fd18bfa6bd44efaa3e2df9f35e3e6266c1c4186dca4276cb389"
+        },
+        {
+          "bytes": 39970,
+          "path": "config.json",
+          "sha256": "c2be62afb1fd8d64fccb813795b1ea852cf42819f39062141f29bfa81ac8b96f"
+        },
+        {
+          "bytes": 233,
+          "path": "generation_config.json",
+          "sha256": "02b56bd11e1cd1e363e701a85a2fd7fbaa2992ec3358c1cd7cc44ead7208f505"
+        },
+        {
+          "bytes": 5343482389,
+          "path": "model-00001-of-00003.safetensors",
+          "sha256": "bbf72072181a7631c561c95fed184c9e754a4645f185a78d3dcf7e82641a92ad"
+        },
+        {
+          "bytes": 5315166368,
+          "path": "model-00002-of-00003.safetensors",
+          "sha256": "c2333eeb88251c545f472bb6dfa4db1579d72617329267455e49096d7e721de5"
+        },
+        {
+          "bytes": 329123819,
+          "path": "model-00003-of-00003.safetensors",
+          "sha256": "1ec1bf698ee8e0b28f694af1f27ca023b42b84249f20d15f4aaa6a08b1f981f8"
+        },
+        {
+          "bytes": 135330,
+          "path": "model.safetensors.index.json",
+          "sha256": "b87c93774de5d13ca9d0e21b045793e42e5df032fb5e7622212524f56f9695f2"
+        },
+        {
+          "bytes": 868,
+          "path": "processor_config.json",
+          "sha256": "016a1db9c4f41ea0c61919c46855ea5e7c45c6e4ae4bfbedfb5b6bed79a2fe92"
+        },
+        {
+          "bytes": 32170070,
+          "path": "tokenizer.json",
+          "sha256": "12bac982b793c44b03d52a250a9f0d0b666813da566b910c24a6da0695fd11e6"
+        },
+        {
+          "bytes": 1533,
+          "path": "tokenizer_config.json",
+          "sha256": "be14c0390e941220070bf5c57589899a9dcd1aef54be6c2c30de0afb226bf2cc"
+        }
+      ],
+      "purpose": "writing",
+      "repository": "mlx-community/gemma-4-12B-4bit",
+      "revision": "7d7c99c4d1b1d2ec2b52e2c46821cef2fa22ce0c"
     }
   ]
 }

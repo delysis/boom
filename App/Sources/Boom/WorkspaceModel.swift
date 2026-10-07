@@ -1918,7 +1918,7 @@ struct CompletionSegment {
       guard let self else { return }
       let directory = try await ModelPacks.install(purpose, flag: flag) { progress in
         Task { @MainActor in
-          guard !flag.isCancelled else { return }
+          guard self.activeFlag === flag, !flag.isCancelled else { return }
           self.status = progress
         }
       }
@@ -1975,19 +1975,21 @@ struct CompletionSegment {
   func importModel() {
     guard !isBusy else { return }
     let panel = NSOpenPanel(); panel.canChooseFiles = false; panel.canChooseDirectories = true
-    panel.message = "Choose a verified Bloom model pack."
+    panel.message = "Choose a Bloom model pack or a supported public Gemma snapshot."
     guard panel.runModal() == .OK, let source = panel.url else { return }
     work("Importing a model pack…") { [weak self] flag in
       guard let self else { return }
       let result = try await detachedWork { try ModelPacks.importPack(source, flag: flag) }
       try flag.check()
       self.status = "\(result.purpose.title) installed"
-      if let directory = ModelPacks.installed(result.purpose) {
+      let directory = result.directory
+      do {
         let admission = try await detachedWork { try ModelPacks.admission(directory, purpose: result.purpose) }
         if result.purpose == .consultation { await self.releaseRunner() }
         else { if let old = self.baseRunner { await old.join() }; self.baseRunner = nil }
         try self.admitModel(admission, purpose: result.purpose)
         let runner = try await MLXGemmaRunner.load(admission: admission)
+        try flag.check()
         if result.purpose == .consultation { self.mlxRunner = runner; self.modelReady = true }
         else { self.baseRunner = runner }
       }

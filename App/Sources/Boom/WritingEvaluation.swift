@@ -125,22 +125,9 @@ enum WritingEvaluation {
       // reference run loads official weights directly; it never converts them.
       let admission = try ModelPacks.admission(directory, purpose: .writing)
       try ModelResidency.admit(weightBytes: admission.weightBytes)
-      let manifest: Data
-      if admission.converted {
-        manifest = try Data(contentsOf: directory.appendingPathComponent(ModelPacks.manifestName))
-      } else {
-        let source = try ModelPacks.entry(.writing).manifest
-        // The catalog also describes the converted pack. Export only the
-        // admitted official files here, never its 4-bit output metadata.
-        manifest = try JSONSerialization.data(withJSONObject: ["schema": 1,
-          "purpose": "writing", "identity": admission.identity,
-          "upstreamRepository": source.upstreamRepository, "upstreamRevision": source.upstreamRevision,
-          "runtimeRevision": source.runtimeRevision, "weightKind": "official_checkpoint",
-          "quantization": NSNull(), "files": ProductCore.object(source.upstreamFiles)],
-          options: [.prettyPrinted, .sortedKeys])
-      }
+      let manifest = try ModelPacks.evidenceManifest(admission, purpose: .writing)
       try manifest.write(to: evidence.appendingPathComponent("model-manifest.json"), options: .atomic)
-      receipt["weight_kind"] = admission.converted ? "converted_pack" : "official_checkpoint"
+      receipt["weight_kind"] = admission.kind.rawValue
       receipt["weight_bytes"] = admission.weightBytes
       receipt["admitted_identity"] = admission.identity
       try persist()

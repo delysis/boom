@@ -15,6 +15,16 @@ import SwiftUI
 
 @main @MainActor enum BoomMain {
   static func main() {
+    if CommandLine.arguments.contains("--model-install-smoke") {
+      let app = NSApplication.shared
+      app.setActivationPolicy(.prohibited)
+      Task {
+        do { try await ModelInstallSmoke.run(arguments: CommandLine.arguments); exit(0) }
+        catch { fputs("Public model installation failed: \(error.localizedDescription)\n", stderr); exit(1) }
+      }
+      app.run()
+      return
+    }
     if CommandLine.arguments.contains("--generation-recovery-smoke") || CommandLine.arguments.contains("--workspace-import-smoke") || CommandLine.arguments.contains("--writing-control-smoke") || CommandLine.arguments.contains("--writing-context-smoke") || CommandLine.arguments.contains("--consultation-control-smoke") || CommandLine.arguments.contains("--explicit-export-smoke") {
       let app = NSApplication.shared
       app.setActivationPolicy(.prohibited)
@@ -76,16 +86,8 @@ import SwiftUI
       dispatchMain()
     }
     if CommandLine.arguments.contains("--mlx-smoke") {
-      if CommandLine.arguments.contains("--memory-budget") {
-        let app = NSApplication.shared
-        app.setActivationPolicy(.prohibited)
-        Task {
-          do { try await MLXNativeSmoke.run(arguments: CommandLine.arguments); exit(0) }
-          catch { fputs("Memory diagnostic failed: \(error.localizedDescription)\n", stderr); exit(1) }
-        }
-        app.run()
-        return
-      }
+      let app = NSApplication.shared
+      app.setActivationPolicy(.prohibited)
       Task {
         do {
           try await MLXNativeSmoke.run(arguments: CommandLine.arguments)
@@ -95,7 +97,8 @@ import SwiftUI
           exit(1)
         }
       }
-      dispatchMain()
+      app.run()
+      return
     }
     let app = NSApplication.shared
     let background = CommandLine.arguments.contains("--native-check-workspace")

@@ -189,6 +189,19 @@ enum ProductCore {
     try call(["op": "residency_load", "physicalBytes": physical, "metalBytes": metal,
       "residentBytes": resident, "weightBytes": weights])
   }
+  static func checkpointRequirements(_ checkpoint: PublishedCheckpoint) throws -> CheckpointRequirements {
+    try call(["op": "checkpoint_requirements", "checkpoint": object(checkpoint)])
+  }
+  static func checkpointRange(fileBytes: UInt64, offset: UInt64) throws -> CheckpointRange {
+    try call(["op": "checkpoint_range", "fileBytes": fileBytes, "offset": offset])
+  }
+  static func checkpointResponse(fileBytes: UInt64, offset: UInt64, response: HTTPURLResponse) throws {
+    let length = response.value(forHTTPHeaderField: "Content-Length")
+    if let length, UInt64(length) == nil { throw BoomError.invalid("Invalid model response length.") }
+    let _: Bool = try call(["op": "checkpoint_response", "fileBytes": fileBytes, "offset": offset,
+      "status": response.statusCode, "contentRange": response.value(forHTTPHeaderField: "Content-Range") as Any? ?? NSNull(),
+      "contentLength": length.flatMap(UInt64.init) as Any? ?? NSNull()])
+  }
   static func contextCapacity(configuration: Data, available: UInt64, width: Int,
     prefill: PrefillGeometry? = nil) throws -> Int {
     try call(["op": "context_capacity", "configuration": JSONSerialization.jsonObject(with: configuration),

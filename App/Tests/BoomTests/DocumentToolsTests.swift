@@ -1,9 +1,50 @@
 import BoomCore
+import AppKit
 import CryptoKit
+import SwiftUI
 import XCTest
 @testable import Boom
 
 final class DocumentToolsTests: XCTestCase {
+  @MainActor func testMountedEditorAppliesResponseAndUndoPreservesModelAndDisk() async throws {
+    _ = NSApplication.shared
+    let policy = NSApp.activationPolicy(); NSApp.setActivationPolicy(.prohibited)
+    defer { NSApp.setActivationPolicy(policy) }
+    let (model, store, root, document, chatID, pending) = try await responseFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    guard model.layout.isAuthor else { throw XCTSkip("The chat edition has no manuscript editor.") }
+    model.state.showChat = false
+    let host = NSHostingView(rootView: WorkspaceView(model: model))
+    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 1440, height: 900))
+    window.isReleasedWhenClosed = false; window.contentView = host
+    defer { window.close() }
+    host.layoutSubtreeIfNeeded()
+    let deadline = ContinuousClock.now + .seconds(2)
+    while model.editor == nil && ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+    let editor = try XCTUnwrap(model.editor)
+    XCTAssertEqual(editor.documentID, document.id); XCTAssertEqual(editor.string, document.text)
+    XCTAssertFalse(window.isVisible)
+    XCTAssertTrue(window.makeFirstResponder(editor))
+    editor.undoManager?.removeAllActions()
+    let response = AssistantEnvelope(reply: "The replacement is included.",
+      edits: [patch(document, [Replacement(old: "quiet", new: "bright")])])
+    _ = try await model.finishConsultationResponse(
+      String(decoding: JSONEncoder().encode(response), as: UTF8.self), pending: pending, chatID: chatID,
+      authority: CapturedDocumentAuthority(mode: .edit, target: document), documentSources: [], attachments: [])
+    let expected = document.text.replacingOccurrences(of: "quiet", with: "bright")
+    XCTAssertEqual(editor.string, expected); XCTAssertEqual(model.selectedDocument?.text, expected)
+    XCTAssertTrue(editor.isEditable); XCTAssertFalse(model.editingLocked)
+    try await model.flush()
+    let persisted = try await store.load().get().1.first { $0.id == document.id }
+    XCTAssertEqual(persisted?.text, expected)
+    XCTAssertTrue(editor.undoManager?.canUndo == true)
+    editor.undoManager?.undo()
+    XCTAssertEqual(editor.string, document.text); XCTAssertEqual(model.selectedDocument, document)
+    try await model.flush()
+    let undone = try await store.load().get().1.first { $0.id == document.id }
+    XCTAssertEqual(undone, document)
+    try await model.shutdown()
+  }
   @MainActor func testEmptyEditResponsePreservesBytesAndReportsNoChanges() async throws {
     for mode in [InteractionMode.propose, .edit] {
       let (model, store, root, document, chatID, pending) = try await responseFixture()
