@@ -15,6 +15,8 @@ use std::{
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const LIMIT: u64 = 4 << 20;
 const SEEDS: [u64; 3] = [42, 2026, 8675309];
+#[path = "bloom-literary-study/demonstration.rs"]
+mod demonstration;
 #[path = "bloom-literary-study/memory.rs"]
 mod memory;
 
@@ -1002,6 +1004,7 @@ fn main() -> Result<()> {
         }
         Some("run") => run(&args),
         Some("memory") => memory::run(&args),
+        Some("demonstration") => demonstration::run(&args),
         Some("memory-review") if args.len() == 3 => memory::review(Path::new(&args[2])),
         Some("fidelity") => fidelity(&args),
         Some("converted-inventory") if args.len() == 6 => converted_inventory(
