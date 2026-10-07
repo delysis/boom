@@ -57,10 +57,11 @@ extension WorkspaceStore {
       expected: identity)
   }
   func consultationCheckpoint(id: UUID, receipt: ConsultationReceipt) throws -> GenerationCheckpoint? {
-    guard vault.exists(.generationJournal, id) else { return nil }
-    let journal = try vault.decode(GenerationCheckpoint.self, kind: .generationJournal, id: id)
+    let attemptID = receipt.attemptID ?? id
+    guard vault.exists(.generationJournal, attemptID) else { return nil }
+    let journal = try vault.decode(GenerationCheckpoint.self, kind: .generationJournal, id: attemptID)
     let expected = GenerationIdentity(kind: journal.identity.kind == .documentResponse ? .documentResponse : .consultation,
-      operationID: receipt.operationID, recordID: id, attemptID: id, model: receipt.model,
+      operationID: receipt.operationID, recordID: receipt.responseID ?? id, attemptID: attemptID, model: receipt.model,
       seed: receipt.seed, requestDigest: Digest.sha256(receipt.plan.rawPrompt), maxTokens: journal.identity.maxTokens,
       generationPolicy: receipt.generationPolicy)
     return try ProductCore.generationCheckpoint(journal, expected: expected)

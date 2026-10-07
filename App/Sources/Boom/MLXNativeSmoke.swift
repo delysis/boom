@@ -108,7 +108,8 @@ enum MLXNativeSmoke {
       return
     }
     if arguments.contains("--batch") {
-      try await BatchGenerationSmoke.run(directory: directory, evidence: evidence)
+      try await BatchGenerationSmoke.run(directory: directory, evidence: evidence,
+        sharedInstructionModel: arguments.contains("--shared-model"))
       return
     }
     var receipt: [String: Any] = ["schema": 1, "status": "running", "seed": seed,
@@ -137,10 +138,11 @@ enum MLXNativeSmoke {
         let mode: InteractionMode = arguments.contains("--edit-smoke") ? .edit : .propose
         let expectsEdit = !arguments.contains("--unchanged-smoke")
         let authority = CapturedDocumentAuthority(mode: mode, target: document)
-        let plan = try ProductCore.prompt(voice: nil, history: [], instructions: "", context: graph.text,
+        let plan = try ProductCore.prompt(voice: nil, history: [], instructions: "",
+          context: DocumentTools.context(graph.documents, authority: authority),
           request: expectsEdit
             ? "In the document, replace quiet with bright. Keep every other character unchanged. Return the actual edit patch."
-            : "Explain the sentence briefly. Do not change any document text. Return edits: [] with your reply.",
+            : "Explain the sentence briefly. Do not change any document text. Reply normally without an edit patch.",
           routing: [], authority: authority)
         receipt["plan"] = try ProductCore.object(plan)
         receipt["authority"] = try ProductCore.object(authority)

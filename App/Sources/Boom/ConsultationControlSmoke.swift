@@ -35,12 +35,12 @@ import SwiftUI
     func argument(_ name: String) throws -> String {
       guard arguments.filter({ $0 == name }).count == 1,
         let index = arguments.firstIndex(of: name), index + 1 < arguments.count else {
-        throw BoomError.invalid("Use --consultation-control-smoke capture|verify --evidence ABSOLUTE_DIRECTORY.")
+        throw BoomError.invalid("Use --consultation-control-smoke capture|verify|followups --evidence ABSOLUTE_DIRECTORY.")
       }
       return arguments[index + 1]
     }
     let action = try argument("--consultation-control-smoke"), path = try argument("--evidence")
-    guard ["capture", "verify"].contains(action), path.hasPrefix("/") else {
+    guard ["capture", "verify", "followups"].contains(action), path.hasPrefix("/") else {
       throw BoomError.invalid("Invalid consultation diagnostic action or path.")
     }
     let evidence = URL(fileURLWithPath: path)
@@ -65,7 +65,8 @@ import SwiftUI
     }
     watchdog.resume(); defer { watchdog.cancel() }
     do {
-      try await capture(pack: pack, evidence: evidence, record: arguments.contains("--record-demonstration"))
+      if action == "followups" { try await followups(pack: pack, evidence: evidence, automatic: arguments.contains("--automatic-setup")) }
+      else { try await capture(pack: pack, evidence: evidence, record: arguments.contains("--record-demonstration")) }
       try await receipt("captured", evidence: evidence)
     } catch {
       try await receipt("failed", evidence: evidence, failure: error.localizedDescription)
@@ -74,6 +75,78 @@ import SwiftUI
   }
   private static func store(_ evidence: URL) throws -> WorkspaceStore {
     try WorkspaceStore(rootOverride: evidence.appendingPathComponent("encrypted-workspace"), testKey: key)
+  }
+  private static func followups(pack: URL, evidence: URL, automatic: Bool) async throws {
+    let store = try store(evidence)
+    let document = DocumentSnapshot(title: "Public follow-up fixture", text: "The harbor was quiet.")
+    let chat = ChatRecord(attachedDocumentID: document.id)
+    var state = WorkspaceState()
+    state.documents = [DocumentIndex(id: document.id, title: document.title)]
+    state.selectedDocument = document.id; state.chats = [chat]; state.selectedChat = chat.id
+    try await store.save(state, documents: [document])
+    let model = try await WorkspaceModel(storeOverride: store, loadModels: automatic)
+    let host = NSHostingView(rootView: WorkspaceView(model: model))
+    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 1440, height: 900))
+    window.isReleasedWhenClosed = false; window.contentView = host
+    defer { window.close() }
+    host.layoutSubtreeIfNeeded()
+    // This unshown diagnostic receives no AppKit user events to close automatic
+    // event groups. Exercise the editor's explicit transaction groups instead.
+    model.undoManager(document.id).groupsByEvent = false
+    if !automatic { model.loadPack(pack, purpose: .consultation) }
+    try await finish(model, evidence: evidence, phase: "loading", recorder: nil)
+    guard model.canInfer, !automatic || !model.layout.isAuthor || model.baseReady else {
+      throw BoomError.invalid("Automatic setup did not prepare the appropriate models.")
+    }
+    guard !window.isVisible else { throw BoomError.invalid("Follow-up fixture became visible.") }
+    model.mode = .edit
+    for (index, replacement) in [("quiet", "bright"), ("bright", "hushed")].enumerated() {
+      guard model.mode == .edit, let before = model.selectedDocument else {
+        throw BoomError.invalid("Edit permission did not survive the preceding send.")
+      }
+      model.draft = "In the attached document, replace \(replacement.0) with \(replacement.1). Keep every other character unchanged. Return the actual edit patch."
+      model.send()
+      let phase = "edit-\(index + 1)"
+      try await finish(model, evidence: evidence, phase: phase, recorder: nil)
+      try await model.flush()
+      let expected = before.text.replacingOccurrences(of: replacement.0, with: replacement.1)
+      let persisted = try await store.load().get().1.first { $0.id == document.id }
+      guard model.mode == .edit, model.selectedDocument?.text == expected, persisted?.text == expected,
+        model.editor.map({ $0.string == expected }) ?? !model.layout.isAuthor,
+        let message = model.selectedChat?.messages.last, message.state == .complete else {
+        throw BoomError.invalid("The real follow-up failed to edit the exact document.")
+      }
+      let vault = store.vault
+      let receipt = try await detachedWork { try vault.decode(ConsultationReceipt.self, kind: .receipt, id: message.id) }
+      guard receipt.state == .complete, !receipt.tokenIDs.isEmpty,
+        let journal = try await store.consultationCheckpoint(id: message.id, receipt: receipt),
+        journal.progress.tokenIDs == receipt.tokenIDs,
+        receipt.sources.contains(where: { $0.id == before.id && $0.digest == before.revision }) else {
+        throw BoomError.invalid("The follow-up lost its captured revision, real token receipt or journal.")
+      }
+      try await write(receipt, to: evidence.appendingPathComponent(phase + "-receipt.json"))
+      try await write(journal, to: evidence.appendingPathComponent(phase + "-journal.json"))
+      try await write(persisted, to: evidence.appendingPathComponent(phase + "-document.json"))
+    }
+    guard model.state.proposals.count == 2, model.state.proposals.allSatisfy({ $0.status == "applied" }) else {
+      throw BoomError.invalid("Expected two individually recorded applied edits.")
+    }
+    for text in ["The harbor was bright.", document.text] {
+      model.undoManager(document.id).undo()
+      try await model.flush()
+      try await write(["expected": text, "observed": model.selectedDocument?.text ?? "", "editor": model.editor?.string ?? ""],
+        to: evidence.appendingPathComponent("undo-" + Digest.sha256(text) + ".json"))
+      guard model.selectedDocument?.text == text,
+        try await store.load().get().1.first(where: { $0.id == document.id })?.text == text else {
+        throw BoomError.invalid("Follow-up Undo did not restore exact document bytes.")
+      }
+    }
+    try model.newChat(about: document.id)
+    guard model.mode == .ask else { throw BoomError.invalid("A new chat inherited editing permission.") }
+    try await model.shutdown()
+    try await write(["status": "passed", "edits": "2", "permission_selected": "once",
+      "undo": "two exact persisted reversals", "scope": "real MLX and mounted offscreen editor; no physical UI or Keychain requests"],
+      to: evidence.appendingPathComponent("followups.json"))
   }
   private static func capture(pack: URL, evidence: URL, record: Bool) async throws {
     let admission = try await detachedWork { try ModelPacks.admission(pack, purpose: .consultation) }
@@ -254,17 +327,26 @@ import SwiftUI
     }
   }
   private static func finish(_ model: WorkspaceModel, evidence: URL, phase: String, recorder: NativeDemoRecorder?) async throws {
-    let started = ContinuousClock().now
-    while model.isBusy {
-      guard started.duration(to: ContinuousClock().now) < .seconds(240) else {
-        throw BoomError.unavailable("Consultation diagnostic timed out during " + phase)
+    do {
+      let started = ContinuousClock().now
+      while model.isBusy {
+        guard started.duration(to: ContinuousClock().now) < .seconds(240) else {
+          throw BoomError.unavailable("Consultation diagnostic timed out during " + phase)
+        }
+        try await write(model.selectedChat, to: evidence.appendingPathComponent(phase + "-latest.json"))
+        try recorder?.frame(phase)
+        try await Task.sleep(for: .milliseconds(100))
       }
       try await write(model.selectedChat, to: evidence.appendingPathComponent(phase + "-latest.json"))
-      try recorder?.frame(phase)
-      try await Task.sleep(for: .milliseconds(100))
+      if let error = model.errorMessage ?? model.composerIssue { throw BoomError.invalid(error) }
+    } catch {
+      let failure = error
+      model.cancel()
+      // A failed qualification must join its live producer before disposing
+      // the window/model or exiting. Retain every failed and cancelled attempt.
+      try? await model.shutdown()
+      throw failure
     }
-    try await write(model.selectedChat, to: evidence.appendingPathComponent(phase + "-latest.json"))
-    if let error = model.errorMessage ?? model.composerIssue { throw BoomError.invalid(error) }
   }
   private static func render(_ model: WorkspaceModel, name: String, evidence: URL) async throws {
     for dark in [false, true] {

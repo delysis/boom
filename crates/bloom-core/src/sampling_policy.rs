@@ -104,6 +104,7 @@ enum EndTokens {
 #[derive(Deserialize)]
 struct Configuration {
     eos_token_id: EndTokens,
+    #[serde(default)]
     suppress_tokens: Vec<u32>,
 }
 
@@ -181,8 +182,16 @@ mod tests {
         assert_eq!(policy.suppressed_token_ids, vec![14, 15]);
         assert_eq!(policy.eos_token_ids, vec![1, 3]);
         assert!(admit(Some(&policy), &policy)?);
-        for config in [
+        let unsuppressed = compile(
+            16,
             json!({"eos_token_id": 1}),
+            vec![0, 1, 3, 14, 15],
+            None,
+            None,
+        )?;
+        assert!(unsuppressed.suppressed_token_ids.is_empty());
+        for config in [
+            json!({"eos_token_id": 1, "suppress_tokens": "invalid"}),
             json!({"eos_token_id": 1, "suppress_tokens": [1]}),
             json!({"eos_token_id": 1, "suppress_tokens": [14, 14]}),
             json!({"eos_token_id": 1, "suppress_tokens": [16]}),

@@ -89,7 +89,8 @@ pub struct CacheConfiguration {
     num_hidden_layers: u64,
     num_kv_shared_layers: u64,
     num_key_value_heads: u64,
-    num_global_key_value_heads: u64,
+    #[serde(default)]
+    num_global_key_value_heads: Option<u64>,
     head_dim: u64,
     global_head_dim: u64,
     attention_k_eq_v: bool,
@@ -113,6 +114,7 @@ impl CacheConfiguration {
                 if kind == "full_attention" {
                     let heads = if self.attention_k_eq_v {
                         self.num_global_key_value_heads
+                            .unwrap_or(self.num_key_value_heads)
                     } else {
                         self.num_key_value_heads
                     };
@@ -129,7 +131,9 @@ impl CacheConfiguration {
             (1..=256).contains(&self.num_hidden_layers)
                 && self.num_kv_shared_layers < self.num_hidden_layers
                 && (1..=128).contains(&self.num_key_value_heads)
-                && (1..=128).contains(&self.num_global_key_value_heads)
+                && self
+                    .num_global_key_value_heads
+                    .is_none_or(|heads| (1..=128).contains(&heads))
                 && (1..=1024).contains(&self.head_dim)
                 && (1..=1024).contains(&self.global_head_dim)
                 && (1..=262_144).contains(&self.sliding_window)
@@ -215,7 +219,7 @@ mod tests {
             num_hidden_layers: 48,
             num_kv_shared_layers: 0,
             num_key_value_heads: 8,
-            num_global_key_value_heads: 1,
+            num_global_key_value_heads: Some(1),
             head_dim: 256,
             global_head_dim: 512,
             attention_k_eq_v: true,
@@ -232,6 +236,35 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn optional_global_heads_match_the_pinned_e_series_runtime() -> Result<(), Error> {
+        let mut config = gemma();
+        config.num_kv_shared_layers = 20;
+        config.attention_k_eq_v = false;
+        config.num_global_key_value_heads = None;
+        config.num_key_value_heads = 2;
+        config.validate()?;
+        let absent = serde_json::json!({
+            "num_hidden_layers":48,"num_kv_shared_layers":20,"num_key_value_heads":2,
+            "num_global_key_value_heads":null,"head_dim":256,"global_head_dim":512,
+            "attention_k_eq_v":false,"sliding_window":1024,"max_position_embeddings":262144,
+            "layer_types":config.layer_types
+        });
+        let decoded: CacheConfiguration =
+            serde_json::from_value(absent).map_err(|e| Error(e.to_string()))?;
+        assert_eq!(
+            decoded.bytes(16384, 3, Prefill::default()),
+            config.bytes(16384, 3, Prefill::default())
+        );
+        config.attention_k_eq_v = true;
+        let fallback = config.bytes(16384, 1, Prefill::default());
+        config.num_global_key_value_heads = Some(2);
+        assert_eq!(fallback, config.bytes(16384, 1, Prefill::default()));
+        config.num_global_key_value_heads = Some(0);
+        assert!(config.validate().is_err());
+        Ok(())
     }
 
     #[test]

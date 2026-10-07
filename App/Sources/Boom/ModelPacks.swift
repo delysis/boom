@@ -93,8 +93,12 @@ enum ModelResidency {
     let limit = try budget()
     return used < limit ? limit - used : 0
   }
-  static func admit(weightBytes: UInt64) throws {
+  static func admit(weightBytes: UInt64, residentWeights: UInt64 = 0) throws {
     try check()
+    guard try ProductCore.admitModelWeights(physical: ProcessInfo.processInfo.physicalMemory,
+      resident: residentWeights, weights: weightBytes) else {
+      throw BoomError.budget("Model weights would use more than half this Mac's memory.")
+    }
     guard let device = MTLCreateSystemDefaultDevice() else { throw BoomError.unavailable("Metal is unavailable.") }
     let used = max(footprint(), UInt64(max(0, Memory.activeMemory + Memory.cacheMemory)))
     guard try ProductCore.admitModelLoad(physical: ProcessInfo.processInfo.physicalMemory,
@@ -114,6 +118,28 @@ enum ModelPacks {
     return try JSONDecoder().decode(ModelCatalog.self, from: Data(contentsOf: url))
   }
   static func entries() throws -> [ModelCatalogEntry] { try catalog().entries }
+  static func publishedCheckpoints(_ purpose: ModelPurpose) throws -> [PublishedCheckpoint] {
+    try catalog().publishedCheckpoints.filter { $0.purpose == purpose }
+  }
+  static func setupChoices(writing: Bool) throws -> [ModelSetupChoice] {
+    var choices: [ModelSetupChoice] = []
+    for purpose in writing ? ModelPurpose.allCases : [.consultation] {
+      if let directory = installed(purpose) {
+        let entry = try entry(purpose)
+        choices.append(ModelSetupChoice(candidate: ModelSetupCandidate(identity: entry.manifestDigest,
+          purpose: purpose, weightBytes: entry.manifest.weightBytes, diskBytes: 0, cached: true, rank: 0),
+          directory: directory, checkpoint: nil))
+      }
+      for (index, checkpoint) in try publishedCheckpoints(purpose).enumerated() {
+        let requirements = try ProductCore.checkpointRequirements(checkpoint)
+        let directory = cachedSnapshot(checkpoint, hubs: HuggingFaceCache.hubs)
+        choices.append(ModelSetupChoice(candidate: ModelSetupCandidate(identity: requirements.identity,
+          purpose: purpose, weightBytes: requirements.weightBytes, diskBytes: directory == nil ? requirements.diskBytes : 0,
+          cached: directory != nil, rank: index + 1), directory: directory, checkpoint: checkpoint))
+      }
+    }
+    return choices
+  }
   static func published(_ purpose: ModelPurpose) throws -> PublishedCheckpoint {
     guard let checkpoint = try catalog().publishedCheckpoints.first(where: { $0.purpose == purpose }) else {
       throw BoomError.unavailable("The public \(purpose.rawValue) model is missing from this build's catalog.")
@@ -172,6 +198,7 @@ enum ModelPacks {
   struct Admission: Sendable {
     enum Kind: String, Sendable { case convertedPack = "converted_pack", officialCheckpoint = "official_checkpoint", publishedCheckpoint = "published_checkpoint" }
     let directory: URL
+    let purpose: ModelPurpose
     let identity: String
     let weightBytes: UInt64
     let kind: Kind
@@ -201,13 +228,14 @@ enum ModelPacks {
     let specification = try entry(purpose)
     if FileManager.default.fileExists(atPath: directory.appendingPathComponent(manifestName).path) {
       let manifest = try verify(directory, purpose: purpose)
-      return Admission(directory: directory, identity: specification.manifestDigest, weightBytes: manifest.weightBytes, kind: .convertedPack)
+      return Admission(directory: directory, purpose: purpose, identity: specification.manifestDigest, weightBytes: manifest.weightBytes, kind: .convertedPack)
     }
-    let checkpoint = try published(purpose)
     let config = try ModelInstaller.hashFile(directory.appendingPathComponent("config.json"), maxBytes: 4_194_304)
-    if checkpoint.files.contains(where: { $0.path == "config.json" && $0.sha256 == config.sha256 }) {
+    if let checkpoint = try publishedCheckpoints(purpose).first(where: {
+      $0.files.contains(where: { $0.path == "config.json" && $0.sha256 == config.sha256 })
+    }) {
       let requirements = try verifyPublished(directory, checkpoint: checkpoint)
-      return Admission(directory: directory, identity: requirements.identity, weightBytes: requirements.weightBytes, kind: .publishedCheckpoint)
+      return Admission(directory: directory, purpose: purpose, identity: requirements.identity, weightBytes: requirements.weightBytes, kind: .publishedCheckpoint)
     }
     guard HuggingFaceCache.hubs.contains(where: {
       snapshot(repository: specification.manifest.upstreamRepository, revision: specification.manifest.upstreamRevision, hub: $0).standardizedFileURL.path == directory.standardizedFileURL.path
@@ -216,7 +244,7 @@ enum ModelPacks {
     }
     try verifyPublicFiles(directory, files: specification.manifest.upstreamFiles)
     let weights = specification.manifest.upstreamFiles.filter { $0.path.hasSuffix(".safetensors") }.reduce(UInt64(0)) { $0 + UInt64($1.bytes) }
-    return Admission(directory: directory, identity: specification.manifest.upstreamRepository + "@" + specification.manifest.upstreamRevision,
+    return Admission(directory: directory, purpose: purpose, identity: specification.manifest.upstreamRepository + "@" + specification.manifest.upstreamRevision,
       weightBytes: weights, kind: .officialCheckpoint)
   }
   static func cached(_ purpose: ModelPurpose) -> URL? { installed(purpose) ?? publishedCached(purpose) }
@@ -226,7 +254,9 @@ enum ModelPacks {
     }
     let repository: String, revision: String, files: [ModelFile]
     if admission.kind == .publishedCheckpoint {
-      let checkpoint = try published(purpose)
+      guard let checkpoint = try catalog().publishedCheckpoints.first(where: {
+        $0.repository + "@" + $0.revision == admission.identity
+      }) else { throw BoomError.invalid("The admitted checkpoint is absent from the catalog.") }
       repository = checkpoint.repository; revision = checkpoint.revision; files = checkpoint.files
     } else {
       let checkpoint = try entry(purpose).manifest
@@ -277,10 +307,10 @@ enum ModelPacks {
     if !FileManager.default.fileExists(atPath: source.appendingPathComponent(manifestName).path) {
       let admission = try admission(source)
       guard admission.kind == .publishedCheckpoint,
-        let purpose = try catalog().publishedCheckpoints.first(where: {
+        let checkpoint = try catalog().publishedCheckpoints.first(where: {
           $0.repository + "@" + $0.revision == admission.identity
-        })?.purpose else { throw BoomError.invalid("Choose a pinned public model snapshot or a Bloom model pack.") }
-      let checkpoint = try published(purpose)
+        }) else { throw BoomError.invalid("Choose a pinned public model snapshot or a Bloom model pack.") }
+      let purpose = checkpoint.purpose
       let target = snapshot(repository: checkpoint.repository, revision: checkpoint.revision, hub: HuggingFaceCache.hub)
       let root = target.deletingLastPathComponent()
       try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -348,11 +378,16 @@ enum ModelPacks {
   static func installPublished(_ purpose: ModelPurpose, flag: CancellationFlag,
     progress: @escaping @Sendable (String) -> Void,
     onStoredRange: @escaping @Sendable (String, UInt64) throws -> Void = { _, _ in }) async throws -> URL {
-    if let cached = publishedCached(purpose) {
-      _ = try await detachedWork { try admission(cached, purpose: purpose) }
+    try await installPublished(published(purpose), flag: flag, progress: progress, onStoredRange: onStoredRange)
+  }
+  static func installPublished(_ specification: PublishedCheckpoint, flag: CancellationFlag,
+    progress: @escaping @Sendable (String) -> Void,
+    onStoredRange: @escaping @Sendable (String, UInt64) throws -> Void = { _, _ in }) async throws -> URL {
+    let purpose = specification.purpose
+    if let cached = cachedSnapshot(specification, hubs: HuggingFaceCache.hubs) {
+      _ = try await detachedWork { try verifyPublished(cached, checkpoint: specification) }
       return cached
     }
-    let specification = try published(purpose)
     let requirements = try ProductCore.checkpointRequirements(specification)
     let target = snapshot(repository: specification.repository, revision: specification.revision, hub: HuggingFaceCache.hub)
     let root = target.deletingLastPathComponent()

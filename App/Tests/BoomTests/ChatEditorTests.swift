@@ -6,6 +6,139 @@ import CryptoKit
 @testable import Boom
 
 final class ChatEditorTests: XCTestCase {
+  @MainActor func testUnsentDocumentComposerDoesNotCreateChatAndFirstSendCapturesDocument() async throws {
+    _ = NSApplication.shared
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-lazy-chat-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    guard model.layout.isAuthor else { throw XCTSkip("The chat edition creates its initial chat at startup.") }
+    let document = try XCTUnwrap(model.selectedDocument)
+    let host = NSHostingView(rootView: ChatPane(model: model))
+    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 480, height: 640))
+    window.isReleasedWhenClosed = false; window.contentView = host
+    defer { window.close() }
+    host.layoutSubtreeIfNeeded()
+    let input = try XCTUnwrap(nativeEditor(in: host))
+    input.setAccessibilityValue("Tell me about this document.")
+    try await Task.sleep(for: .milliseconds(100))
+    XCTAssertEqual(model.draft, "Tell me about this document.")
+    XCTAssertTrue(model.state.chats.isEmpty)
+    model.send()
+    XCTAssertEqual(model.state.chats.count, 1)
+    XCTAssertEqual(model.selectedChat?.attachedDocumentID, document.id)
+    XCTAssertTrue(model.selectedChat?.messages.isEmpty == true)
+    XCTAssertEqual(model.draft, "Tell me about this document.", "Model setup must retain the unsent question.")
+    model.send()
+    XCTAssertEqual(model.state.chats.count, 1)
+    try await model.shutdown()
+  }
+  @MainActor func testPopulatedChatReflowsWithoutOverdrawWhenResized() async throws {
+    _ = NSApplication.shared
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-chat-resize-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    if model.selectedChat == nil { try model.newChat() }
+    let messages = [
+      "It looks like you've entered \"stuff\" as a placeholder or a general query. Since there isn't a specific task or instruction provided, could you please clarify how you would like me to help?",
+      "sure, proofread my memo and see if you can improve it.",
+      "I can assist with analyzing the document, proofreading, drafting new content, or answering questions based on the text. Just let me know what you have in mind!",
+      "# A taller heading\n\n- A long list entry with **bold** and *emphasized* words. " + String(repeating: "The river turns past the old house. ", count: 5),
+      "Unicode: 👩🏽‍💻 café e\u{301} 日本語.\n\n" + String(repeating: "A paragraph that wraps at different pane widths. ", count: 8),
+    ]
+    for (index, text) in messages.enumerated() {
+      model.authorChatMessage(index == 1 ? .user : .assistant); model.draft = text; model.send()
+    }
+    let host = NSHostingView(rootView: ChatPane(model: model))
+    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 740, height: 2400))
+    window.isReleasedWhenClosed = false; window.contentView = host
+    defer { window.close() }
+    func readingViews(_ view: NSView) -> [NSTextView] {
+      if let text = view as? NSTextView, !text.isEditable { return [text] }
+      return view.subviews.flatMap(readingViews)
+    }
+    for appearance in [NSAppearance.Name.darkAqua, .aqua] {
+      window.appearance = NSAppearance(named: appearance)
+      for width in [740.0, 300.0, 510.0, 340.0, 740.0] {
+        window.setContentSize(NSSize(width: width, height: 2400)); settle(window)
+        if width == 300, let chatIndex = model.state.chats.firstIndex(where: { $0.id == model.state.selectedChat }) {
+          model.state.chats[chatIndex].messages[2].state = .pending
+          model.state.chats[chatIndex].messages[2].text += "\n\n" + String(repeating: "An arriving paragraph wraps while the pane is narrow. ", count: 4)
+          settle(window)
+        }
+        let views = readingViews(host)
+        XCTAssertEqual(views.count, messages.count)
+        for view in views {
+          let container = try XCTUnwrap(view.textContainer), layout = try XCTUnwrap(view.layoutManager)
+          layout.ensureLayout(for: container)
+          let glyphs = layout.usedRect(for: container)
+          XCTAssertLessThanOrEqual(glyphs.maxY, view.bounds.height + 1,
+            "Rendered text exceeds its assigned row at width \(width): frame=\(view.frame) container=\(container.size) measured=\((view as? NativeReadingTextView)?.contentHeight(at: view.bounds.width) ?? -1) \(view.string.prefix(30))")
+          XCTAssertLessThanOrEqual(glyphs.maxX, view.bounds.width + 1)
+        }
+        let rects = views.map { $0.convert($0.bounds, to: host) }.sorted { $0.minY < $1.minY }
+        for (first, second) in zip(rects, rects.dropFirst()) {
+          XCTAssertLessThanOrEqual(first.maxY, second.minY + 1, "Message rows overlap at width \(width)")
+        }
+      }
+    }
+    try await model.shutdown()
+  }
+  @MainActor func testSpeculativeTextMeasurementDoesNotChangeDisplayedGeometry() throws {
+    let view = NativeReadingTextView(frame: NSRect(x: 0, y: 0, width: 340, height: 400))
+    view.setSource("# A heading\n\n" + String(repeating: "Native text stays in its assigned container. 👩🏽‍💻 ", count: 8))
+    view.setFrameSize(NSSize(width: 340, height: 400))
+    let container = try XCTUnwrap(view.textContainer), layout = try XCTUnwrap(view.layoutManager)
+    layout.ensureLayout(for: container)
+    let size = container.size, frame = view.frame, before = layout.usedRect(for: container)
+    XCTAssertGreaterThan(view.contentHeight(at: 180), view.contentHeight(at: 740))
+    XCTAssertEqual(container.size, size); XCTAssertEqual(view.frame, frame)
+    layout.ensureLayout(for: container)
+    XCTAssertEqual(layout.usedRect(for: container), before)
+    view.setSource("A short replacement.")
+    XCTAssertLessThan(view.contentHeight(at: 340), before.height)
+    for presentation in [NativeText.Presentation.markdown, .literal, .removed, .added] {
+      view.setSource("# A heading\n\n" + String(repeating: "Literal or styled prose 👩🏽‍💻. ", count: 12),
+        presentation: presentation, pointSize: 12)
+      let height = view.contentHeight(at: 220)
+      view.setFrameSize(NSSize(width: 220, height: height)); layout.ensureLayout(for: container)
+      XCTAssertLessThanOrEqual(layout.usedRect(for: container).maxY, height + 1)
+      XCTAssertLessThanOrEqual(layout.usedRect(for: container).maxX, 221)
+    }
+  }
+  @MainActor func testManuscriptReflowsAndProbesPreserveSelectionUndoAndLiveLayout() async throws {
+    _ = NSApplication.shared
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-document-resize-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    guard model.layout.isAuthor, let document = model.selectedDocument else { throw XCTSkip("No manuscript in the chat edition.") }
+    model.state.autocomplete = false
+    model.updateDocument("# At the harbor\n\n" + String(repeating: "The river turns past the old house. 👩🏽‍💻 café e\u{301} 日本語. ", count: 100), id: document.id, caret: 0)
+    let host = NSHostingView(rootView: ManuscriptPane(model: model))
+    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 840, height: 640))
+    window.isReleasedWhenClosed = false; window.contentView = host
+    defer { window.close() }
+    settle(window)
+    let view = try XCTUnwrap(model.editor), container = try XCTUnwrap(view.textContainer), layout = try XCTUnwrap(view.layoutManager)
+    view.setSelectedRange(NSRange(location: 20, length: 3))
+    let selection = view.selectedRange(), source = view.string, canUndo = view.undoManager?.canUndo
+    for width in [840.0, 330.0, 600.0, 380.0, 840.0] {
+      window.setContentSize(NSSize(width: width, height: 640)); settle(window)
+      layout.ensureLayout(for: container)
+      XCTAssertLessThanOrEqual(layout.usedRect(for: container).maxY + view.textContainerInset.height * 2, view.bounds.height + 1)
+      let size = container.size, frame = view.frame, displayed = layout.usedRect(for: container)
+      _ = view.manuscriptSize(width: 240, minimumHeight: 180)
+      _ = view.manuscriptSize(width: 760, minimumHeight: 180)
+      layout.ensureLayout(for: container)
+      XCTAssertEqual(container.size, size); XCTAssertEqual(view.frame, frame)
+      XCTAssertEqual(layout.usedRect(for: container), displayed)
+      XCTAssertEqual(view.selectedRange(), selection); XCTAssertEqual(view.string, source)
+      XCTAssertEqual(view.undoManager?.canUndo, canUndo)
+    }
+    try await model.shutdown()
+  }
   @MainActor private func nativeEditor(in view: NSView) -> ChatTextView? {
     if let text = view as? ChatTextView { return text }
     return view.subviews.lazy.compactMap { self.nativeEditor(in: $0) }.first

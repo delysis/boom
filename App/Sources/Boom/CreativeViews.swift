@@ -85,8 +85,8 @@ struct WritingAlternatives: View {
                 Text("The manuscript or cursor has changed. You can still branch from this captured continuation.")
                   .font(.caption).foregroundStyle(.secondary)
               }
-              Text(candidate.text.isEmpty ? emptyMessage(candidate) : candidate.text).accessibilityIdentifier("continuation-output")
-                .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+              NativeText(text: candidate.text.isEmpty ? emptyMessage(candidate) : candidate.text).accessibilityIdentifier("continuation-output")
+                .frame(maxWidth: .infinity, alignment: .leading)
               if candidate.state == .cancelled || candidate.state == .failed {
                 Text(candidate.state == .cancelled ? "Generation stopped. This partial continuation has been retained." : "This attempt has been retained. Try another set.")
                   .font(.caption).foregroundStyle(.secondary)
@@ -106,7 +106,7 @@ struct WritingAlternatives: View {
               .font(.headline)
             Text("Text after the captured cursor was not supplied.").font(.caption)
             Text("Seed \(bundle.candidates[bundle.selected].seed) · \(bundle.recipe.profile.title)").font(.caption).foregroundStyle(.secondary)
-            ScrollView { Text(bundle.recipe.prompt).font(.system(.body, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
+            ScrollView { NativeText(text: bundle.recipe.prompt, presentation: .literal, pointSize: 12).frame(maxWidth: .infinity, alignment: .leading) }
           }.padding(18).frame(width: 520, height: 420)
         }
     }
@@ -183,7 +183,8 @@ struct WritingExamplesView: View {
       }
       if adding {
         TextField("Example title", text: $title).accessibilityLabel("Example title")
-        TextEditor(text: $prose).frame(minHeight: 180).border(.secondary.opacity(0.2))
+        ChatComposer(text: $prose, focusRequest: 0, onSend: {}, onCancel: {},
+          placeholder: "Example prose", accessibilityLabel: "Example prose").frame(height: 180)
           .accessibilityLabel("Example prose")
         HStack {
           Text("Paste the passage itself; its title is only for your library.").font(.caption).foregroundStyle(.secondary)
@@ -210,7 +211,8 @@ struct WritingExamplesView: View {
                     Image(systemName: "plus.circle")
                     VStack(alignment: .leading, spacing: 4) {
                       Text(document.title).font(.headline)
-                      Text(String(document.text.prefix(140))).lineLimit(2).foregroundStyle(.secondary)
+                      NativeText(text: String(document.text.prefix(140)), pointSize: 12, selectable: false)
+                        .frame(height: 36, alignment: .top).clipped()
                     }
                     Spacer()
                   }.contentShape(Rectangle())

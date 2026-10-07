@@ -192,6 +192,14 @@ enum ProductCore {
     try call(["op": "residency_load", "physicalBytes": physical, "metalBytes": metal,
       "residentBytes": resident, "weightBytes": weights])
   }
+  static func modelSetup(physical: UInt64, metal: UInt64, resident: UInt64, disk: UInt64,
+    writing: Bool, candidates: [ModelSetupCandidate]) throws -> ModelSetupPlan {
+    try call(["op": "model_setup", "physicalBytes": physical, "metalBytes": metal,
+      "residentBytes": resident, "diskBytes": disk, "writing": writing, "candidates": object(candidates)])
+  }
+  static func admitModelWeights(physical: UInt64, resident: UInt64, weights: UInt64) throws -> Bool {
+    try call(["op": "model_weights", "physicalBytes": physical, "residentBytes": resident, "weightBytes": weights])
+  }
   static func checkpointRequirements(_ checkpoint: PublishedCheckpoint) throws -> CheckpointRequirements {
     try call(["op": "checkpoint_requirements", "checkpoint": object(checkpoint)])
   }
@@ -415,6 +423,9 @@ struct ConsultationReceipt: Codable, Sendable {
   var elapsedSeconds: Double
   let generationPolicy: ModelGenerationPolicy?
   var stopTokenID: Int? = nil
+  var attemptID: UUID? = nil
+  var previousAttemptID: UUID? = nil
+  var responseID: UUID? = nil
 }
 
 struct WritingPrompt: Codable { let prompt: String; let digest: String; let totalCharacters: Int; let omittedCharacters: Int }

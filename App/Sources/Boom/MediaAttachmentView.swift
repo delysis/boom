@@ -83,9 +83,7 @@ struct AttachmentInlineCard: View {
         .foregroundStyle(.secondary)
         .accessibilityValue(showsText ? "Expanded" : "Collapsed")
         if showsText {
-          Text(record.text)
-            .font(.system(size: 12))
-            .textSelection(.enabled)
+          NativeText(text: record.text, pointSize: 12)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.top, 6)
         }

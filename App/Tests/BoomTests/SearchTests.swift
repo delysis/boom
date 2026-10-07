@@ -5,6 +5,29 @@ import XCTest
 @testable import Boom
 
 final class SearchTests: XCTestCase {
+  @MainActor func testToolbarSearchOpensFromIconAndCollapsesOnBlurOrEscape() throws {
+    _ = NSApplication.shared
+    let delegate = ApplicationDelegate()
+    let toolbar = NSToolbar(identifier: "Public search fixture")
+    toolbar.delegate = delegate
+    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 760, height: 500))
+    window.isReleasedWhenClosed = false; window.toolbar = toolbar
+    defer { window.close() }
+    let item = try XCTUnwrap(toolbar.items.first { $0.itemIdentifier.rawValue == "search" })
+    let icon = try XCTUnwrap(item.view as? NSButton)
+    icon.performClick(nil)
+    let field = try XCTUnwrap(item.view as? NSSearchField)
+    field.stringValue = "café"
+    delegate.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: field))
+    delegate.controlTextDidEndEditing(Notification(name: NSControl.textDidEndEditingNotification, object: field))
+    XCTAssertTrue(item.view === icon)
+    icon.performClick(nil)
+    XCTAssertTrue(item.view === field)
+    XCTAssertEqual(field.stringValue, "café")
+    XCTAssertTrue(delegate.control(field, textView: NSTextView(), doCommandBy: #selector(NSResponder.cancelOperation(_:))))
+    XCTAssertTrue(item.view === icon)
+    XCTAssertEqual(field.stringValue, "")
+  }
   @MainActor private final class SearchReceiver: NSObject {
     var query = ""
     @objc func changed(_ sender: NSSearchField) { query = sender.stringValue }

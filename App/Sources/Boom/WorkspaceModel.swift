@@ -3,6 +3,7 @@ import AVFoundation
 import Combine
 import BoomCore
 import MLX
+import Metal
 import SwiftUI
 
 struct StoredProposal: Codable, Identifiable, Sendable {
@@ -14,6 +15,16 @@ struct StoredProposal: Codable, Identifiable, Sendable {
   let documents: [SourceReference]
   let attachments: [SourceReference]
   var status: String
+  var appliedRevision: String? = nil
+}
+
+enum DocumentMergeConflict: Error { case changed }
+
+struct ConsultationReplay {
+  let request: String
+  let voice: Voice?
+  let attachmentIDs: [UUID]
+  let previousAttemptID: UUID?
 }
 
 enum AttachmentDestination {
@@ -76,6 +87,10 @@ struct CompletionSegment {
   private(set) var mlxRunner: MLXGemmaRunner?
   private(set) var baseRunner: MLXGemmaRunner?
   private var modelDirectories: [ModelPurpose: URL] = [:]
+  private var residentModelWeights: [ModelPurpose: UInt64] = [:]
+  @Published private(set) var settingUpModels = false
+  @Published private(set) var modelSetupIssue: String?
+  @Published private(set) var writingUsesConsultation = false
   private var writingModelIdentity: String?
   private var writingGenerationPolicy: ModelGenerationPolicy?
   var selectedMLXRunner: MLXGemmaRunner? { mlxRunner }
@@ -96,7 +111,7 @@ struct CompletionSegment {
     }
     scheduleSave()
     var next = state
-    let chat = ChatRecord()
+    let chat = ChatRecord(attachedDocumentID: layout.isAuthor ? state.selectedDocument : nil)
     next.chats.append(chat)
     next.selectedChat = chat.id
     next.showChat = true
@@ -134,8 +149,8 @@ struct CompletionSegment {
     chooseAttachmentFiles(to: destination)
   }
   var canInfer: Bool { mlxRunner != nil || modelDirectories[.consultation] != nil }
-  var inferenceName: String { canInfer ? "Gemma 4 12B" : "No model" }
-  var baseReady: Bool { baseRunner != nil || modelDirectories[.writing] != nil }
+  var inferenceName: String { canInfer ? "Gemma 4" : "No model" }
+  var baseReady: Bool { baseRunner != nil || modelDirectories[.writing] != nil || (writingUsesConsultation && canInfer) }
   private var foreground: Task<Void, Never>?
   private var activeFlag: CancellationFlag?
   private var activeID: UUID?
@@ -215,13 +230,15 @@ struct CompletionSegment {
     pressureWatch = MemoryPressureWatch { [weak self] critical in
       Task { @MainActor in self?.handleMemoryPressure(critical: critical) }
     }
-    if loadModels { loadInstalledModels() }
+    if loadModels { prepareModels() }
   }
   private func handleMemoryPressure(critical: Bool) {
     if critical { cancel() }
-    if writingFlag != nil { mlxRunner = nil; modelReady = false }
-    else { baseRunner = nil }
-    Task { await reclaimModelCache() }
+    let inactive: ModelPurpose = writingFlag != nil ? .consultation : .writing
+    Task {
+      if critical || !writingUsesConsultation { await releaseRunner(inactive) }
+      await reclaimModelCache()
+    }
     status = "Memory pressure released the inactive model. It will reload when needed."
   }
   func documentMatchesSearch(_ document: DocumentSnapshot) -> Bool {
@@ -348,6 +365,7 @@ struct CompletionSegment {
     dirty.insert(document.id)
     documents.append(document)
     state.selectedDocument = document.id
+    mode = .ask
     resetContinuationView()
     selectedDocumentIDs = [document.id]
     state.showDocument = true
@@ -375,16 +393,10 @@ struct CompletionSegment {
     authoredChatRole = nil; showingChatInstructions = nil; editingChatMessage = nil
     scheduleSave()
   }
-  func ensureChatForDraft() {
+  private func ensureChatForSend() {
     guard !isBusy, !draft.isEmpty, selectedChat == nil else { return }
-      scheduleSave()
-      var next = state
-      let chat = ChatRecord()
-      next.chats.append(chat)
-      next.selectedChat = chat.id
-      scheduleSave()
-      state = next
-      selectedChatIDs = [chat.id]
+    do { _ = try chatAttachmentDestination() }
+    catch { report(error) }
   }
   func attachDocument(_ documentID: UUID?, to chatID: UUID) {
     guard !isBusy else { return }
@@ -464,6 +476,7 @@ struct CompletionSegment {
       resetContinuationView()
       if layout.isAuthor, selectedChat?.attachedDocumentID != id {
         state.selectedChat = state.chats.last(where: { $0.attachedDocumentID == id })?.id
+        mode = .ask
         draft = ""; pendingAttachments = []; showingChatInstructions = nil; editingChatMessage = nil
       }
       if !preservingSelection { selectedDocumentIDs = [id] }
@@ -743,14 +756,14 @@ struct CompletionSegment {
       }
     }
   }
-  func send() {
-    ensureChatForDraft()
-    if authoredChatRole != nil { appendAuthoredChatMessage(); return }
+  func send(replay: ConsultationReplay? = nil) {
+    if replay == nil { ensureChatForSend() }
+    if replay == nil && authoredChatRole != nil { appendAuthoredChatMessage(); return }
     guard !isBusy, let chat = selectedChat, canInfer,
-      !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !pendingAttachments.isEmpty
-    else { if !canInfer { showingModels = true }; return }
-    let request = draft, interaction = mode, document = selectedDocument
-    let selectedIDs = pendingAttachments, style = consultationStyle
+      replay != nil || !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !pendingAttachments.isEmpty
+    else { if !canInfer && !isBusy { prepareModels() }; return }
+    let request = replay?.request ?? draft, interaction: InteractionMode = replay == nil ? mode : .propose, document = selectedDocument
+    let selectedIDs = replay?.attachmentIDs ?? pendingAttachments, style = consultationStyle
     do {
       finishComposition()
       let graph = try ContextGraph.resolveChat(request: request, attachedDocumentID: chat.attachedDocumentID,
@@ -760,10 +773,12 @@ struct CompletionSegment {
       guard interaction != .edit || slugs.count <= 1 else {
         throw BoomError.denied("Edit grants one voice at a time. Use Propose to compare voices.")
       }
-      let voices = try slugs.map { slug -> Voice in
+      let voices: [Voice]
+      if let replay { voices = replay.voice.map { [$0] } ?? [] }
+      else { voices = try slugs.map { slug -> Voice in
         guard let voice = state.voices.first(where: { $0.slug == slug }) else { throw BoomError.invalid("Unknown voice @\(slug).") }
         return voice
-      }
+      } }
       guard interaction == .ask || document != nil else { throw BoomError.denied("Choose a document before requesting edits.") }
       let inherited = graph.documents.flatMap { AttachmentLink.ids(in: $0.text) }
       let attachmentIDs = (selectedIDs + inherited).reduce(into: [UUID]()) { if !$0.contains($1) { $0.append($1) } }
@@ -776,10 +791,11 @@ struct CompletionSegment {
       let attachmentText = attachments.filter { !$0.text.isEmpty }.map {
         "ATTACHMENT \($0.name)\nID \($0.id)\nDIGEST \($0.digest)\nCOVERAGE \($0.coverage)\n\($0.text)"
       }.joined(separator: "\n\n")
-      let context = [graph.text, attachmentText].filter { !$0.isEmpty }.joined(separator: "\n\n")
+      let authority = CapturedDocumentAuthority(mode: interaction, target: interaction == .ask ? nil : document)
+      let documentContext = try DocumentTools.context(graph.documents, authority: authority)
+      let context = [documentContext, attachmentText].filter { !$0.isEmpty }.joined(separator: "\n\n")
       guard context.utf8.count <= 524_288 else { throw BoomError.budget("Combined reference context exceeds 512 KiB.") }
       let instructions = chat.instructions ?? ""
-      let authority = CapturedDocumentAuthority(mode: interaction, target: interaction == .ask ? nil : document)
       let targets: [Voice?] = voices.isEmpty ? [nil] : voices.map(Optional.some)
       let outputLimit = interaction == .ask ? 512 : 4096
       work("Checking consultation context…") { [weak self] flag in
@@ -787,7 +803,7 @@ struct CompletionSegment {
         let runner = try await self.runnerForGeneration(.consultation, flag: flag)
         let provider = runner.identity
         try await self.flush()
-        try await self.revalidateOnDisk(graph.sources, attachments: attachmentSources)
+        try await self.revalidateResponseSources(graph.sources, attachments: attachmentSources, targetID: authority.target?.id)
         var images: [Data] = []
         for attachment in attachments {
           if let image = try await self.imagePayload(for: attachment) { images.append(image) }
@@ -801,20 +817,21 @@ struct CompletionSegment {
           images: images, reserves: reserves, flag: flag, authority: authority)
         let plans = fitted.plans
         try flag.check()
-        try self.revalidate(graph.sources, attachments: attachmentSources)
+        try await self.revalidateResponseSources(graph.sources, attachments: attachmentSources, targetID: authority.target?.id)
         guard let index = self.state.chats.firstIndex(where: { $0.id == chat.id }) else { throw BoomError.stale("Chat was removed.") }
         let replyIDs = targets.map { _ in UUID() }
-        self.state.chats[index].messages.append(ChatMessage(role: .user, text: request,
-          context: context, sources: sources, speaker: Speaker(name: "Human")))
+        if replay == nil {
+          self.state.chats[index].messages.append(ChatMessage(role: .user, text: request,
+            context: context, sources: sources, speaker: Speaker(name: "Human")))
+        }
         for (offset, voice) in targets.enumerated() {
           self.state.chats[index].messages.append(ChatMessage(id: replyIDs[offset], role: .assistant,
             text: "", sources: sources, state: .pending, provider: provider,
             speaker: voice?.speaker ?? Speaker(name: "Bloom")))
         }
         if self.state.chats[index].title == "New chat" { self.state.chats[index].title = try ProductCore.chatTitle(request, routing: slugs) }
-        if self.draft == request { self.draft = "" }
-        if self.pendingAttachments == selectedIDs { self.pendingAttachments = [] }
-        self.mode = .ask
+        if replay == nil && self.draft == request { self.draft = "" }
+        if replay == nil && self.pendingAttachments == selectedIDs { self.pendingAttachments = [] }
         self.streamingChat = chat.id
         var round: [ChatMessage] = []
         do {
@@ -823,73 +840,155 @@ struct CompletionSegment {
             try flag.check()
             self.status = voice.map { "Consulting @\($0.slug)…" } ?? "Generating locally…"
             self.streamingText = ""
-            let plan: ConsultationPlan
+            var plan: ConsultationPlan
             if style == .discuss, !round.isEmpty {
               plan = try ProductCore.prompt(voice: voice, history: fitted.history + round,
                 instructions: instructions, context: context, request: request, routing: slugs, authority: authority)
             } else { plan = plans[offset] }
-            let seed = UInt64.random(in: .min ... .max), vault = self.store.vault
-            var receipt = ConsultationReceipt(operationID: flag.operationID, seed: seed, state: .pending,
-              failure: nil, model: provider, voice: voice, plan: plan, sources: sources,
-              promptDigest: Digest.sha256(plan.rawPrompt), tokenIDs: [], stopReason: "pending",
-              firstTokenSeconds: nil, elapsedSeconds: 0, generationPolicy: runner.generationPolicy)
-            let pendingReceipt = receipt, replyID = replyIDs[offset]
-            try await detachedWork { try vault.encode(pendingReceipt, kind: .receipt, id: replyID) }
-            let checkpointStore = self.store
-            let generation = GenerationIdentity(kind: interaction == .ask ? .consultation : .documentResponse,
-              operationID: flag.operationID, recordID: replyID, attemptID: replyID,
-              model: provider, seed: seed, requestDigest: Digest.sha256(plan.rawPrompt), maxTokens: outputLimit,
-              generationPolicy: runner.generationPolicy)
-            let result = try await runner.run(plan: plan, images: images, maxTokens: outputLimit,
-              seed: seed, flag: flag, onCheckpoint: { progress, stop, token in
-                try await checkpointStore.checkpoint(progress, identity: generation, stopReason: stop, stopTokenID: token)
-              }) { [weak self] text in
-                Task { @MainActor in
-                  guard let self, self.activeFlag === flag, !flag.isCancelled else { return }
-                  if interaction == .ask {
-                    self.streamingText = text
-                    if let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
-                      let m = self.state.chats[c].messages.firstIndex(where: { $0.id == replyIDs[offset] }),
-                      self.state.chats[c].messages[m].state == .pending {
-                      self.state.chats[c].messages[m].text = text
+            var responseAuthority = authority
+            var sourceDocuments = graph.documents
+            var previousAttemptID = replay?.previousAttemptID
+            while true {
+              try flag.check()
+              try await self.revalidateResponseSources(sourceDocuments.map { SourceReference(id: $0.id, title: $0.title, digest: $0.revision, kind: "document") }, attachments: attachmentSources, targetID: responseAuthority.target?.id)
+              guard interaction == .ask || self.state.selectedDocument == document?.id else { throw BoomError.stale("Active document changed.") }
+              let attemptSources = sourceDocuments.map {
+                SourceReference(id: $0.id, title: $0.title, digest: $0.revision, kind: "document")
+              } + attachmentSources
+              let seed = UInt64.random(in: .min ... .max), vault = self.store.vault
+              let attemptID = UUID()
+              var receipt = ConsultationReceipt(operationID: flag.operationID, seed: seed, state: .pending,
+                failure: nil, model: provider, voice: voice, plan: plan, sources: attemptSources,
+                promptDigest: Digest.sha256(plan.rawPrompt), tokenIDs: [], stopReason: "pending",
+                firstTokenSeconds: nil, elapsedSeconds: 0, generationPolicy: runner.generationPolicy)
+              let replyID = replyIDs[offset]
+              receipt.attemptID = attemptID; receipt.previousAttemptID = previousAttemptID; receipt.responseID = replyID
+              let pendingReceipt = receipt
+              try await detachedWork {
+                try vault.encode(pendingReceipt, kind: .receipt, id: attemptID)
+                try vault.encode(pendingReceipt, kind: .receipt, id: replyID)
+              }
+              let checkpointStore = self.store
+              let generation = GenerationIdentity(kind: interaction == .ask ? .consultation : .documentResponse,
+                operationID: flag.operationID, recordID: replyID, attemptID: attemptID,
+                model: provider, seed: seed, requestDigest: Digest.sha256(plan.rawPrompt), maxTokens: outputLimit,
+                generationPolicy: runner.generationPolicy)
+              let result = try await runner.run(plan: plan, images: images, maxTokens: outputLimit,
+                seed: seed, flag: flag, onCheckpoint: { progress, stop, token in
+                  try await checkpointStore.checkpoint(progress, identity: generation, stopReason: stop, stopTokenID: token)
+                }) { [weak self] text in
+                  Task { @MainActor in
+                    guard let self, self.activeFlag === flag, !flag.isCancelled else { return }
+                    if interaction == .ask {
+                      self.streamingText = text
+                      if let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
+                        let m = self.state.chats[c].messages.firstIndex(where: { $0.id == replyIDs[offset] }),
+                        self.state.chats[c].messages[m].state == .pending {
+                        self.state.chats[c].messages[m].text = text
+                      }
                     }
                   }
                 }
+              receipt.promptDigest = result.promptDigest; receipt.tokenIDs = result.tokenIDs
+              receipt.stopReason = result.stopReason; receipt.firstTokenSeconds = result.firstTokenSeconds
+              receipt.stopTokenID = result.stopTokenID
+              receipt.elapsedSeconds = result.elapsedSeconds
+              if result.stopReason == "cancelled" { receipt.state = .cancelled }
+              let emittedReceipt = receipt
+              try await detachedWork {
+                try vault.encode(emittedReceipt, kind: .receipt, id: attemptID)
+                try vault.encode(emittedReceipt, kind: .receipt, id: replyID)
               }
-            receipt.promptDigest = result.promptDigest; receipt.tokenIDs = result.tokenIDs
-            receipt.stopReason = result.stopReason; receipt.firstTokenSeconds = result.firstTokenSeconds
-            receipt.stopTokenID = result.stopTokenID
-            receipt.elapsedSeconds = result.elapsedSeconds
-            if result.stopReason == "cancelled" { receipt.state = .cancelled }
-            let emittedReceipt = receipt
-            try await detachedWork { try vault.encode(emittedReceipt, kind: .receipt, id: replyID) }
-            if interaction == .ask,
-              let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
-              let m = self.state.chats[c].messages.firstIndex(where: { $0.id == replyID }) {
-              self.state.chats[c].messages[m].text = result.text
+              if interaction == .ask,
+                let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
+                let m = self.state.chats[c].messages.firstIndex(where: { $0.id == replyID }) {
+                self.state.chats[c].messages[m].text = result.text
+              }
+              try flag.check()
+              try await self.revalidateResponseSources(sourceDocuments.map { SourceReference(id: $0.id, title: $0.title, digest: $0.revision, kind: "document") }, attachments: attachmentSources, targetID: responseAuthority.target?.id)
+              guard interaction == .ask || self.state.selectedDocument == document?.id else { throw BoomError.stale("Active document changed.") }
+              var issue: String?
+              var refreshContext = false
+              if interaction != .ask {
+                let capturedAuthority = responseAuthority
+                let parsed = try await detachedWork { try DocumentTools.response(result.text, authority: capturedAuthority) }
+                issue = parsed.issue
+                if issue == nil, let patch = parsed.edits.first, let base = responseAuthority.target,
+                  let current = self.selectedDocument {
+                  do { _ = try await detachedWork { try DocumentTools.validate(patch,
+                    grant: DocumentGrant(mode: interaction, snapshot: base), current: current) } }
+                  catch { issue = error.localizedDescription; refreshContext = current.revision != base.revision }
+                }
+              }
+              var message: ChatMessage?
+              if issue == nil {
+                guard !result.text.isEmpty else { throw BoomError.unavailable("The model ended before producing an answer.") }
+                let pending = ChatMessage(id: replyID, role: .assistant, text: "", sources: attemptSources,
+                  state: .pending, provider: provider, speaker: voice?.speaker ?? Speaker(name: "Bloom"))
+                do {
+                  let completed = try await self.finishConsultationResponse(result.text, pending: pending,
+                    chatID: chat.id, authority: responseAuthority, documentSources: sourceDocuments.map {
+                      SourceReference(id: $0.id, title: $0.title, digest: $0.revision, kind: "document")
+                    }, attachments: attachmentSources, recovering: true)
+                  if completed.state == .failed {
+                    issue = completed.failure
+                    refreshContext = self.selectedDocument?.revision != responseAuthority.target?.revision
+                  } else { message = completed }
+                } catch is DocumentMergeConflict {
+                  issue = "Intervening manuscript changes conflict with this attempt."
+                  refreshContext = true
+                }
+              }
+              if let issue {
+                // Fail the joined producer privately. Never add malformed output
+                // to history, or let a retry overwrite an earlier attempt journal.
+                receipt.state = .failed; receipt.failure = issue
+                let failedReceipt = receipt
+                try await detachedWork {
+                  try vault.encode(failedReceipt, kind: .receipt, id: attemptID)
+                  try vault.encode(failedReceipt, kind: .receipt, id: replyID)
+                }
+                previousAttemptID = attemptID
+                self.status = "Preparing document changes…"
+                if refreshContext {
+                  guard let current = self.selectedDocument, current.id == authority.target?.id else {
+                    throw BoomError.stale("The granted document is no longer open.")
+                  }
+                  responseAuthority = CapturedDocumentAuthority(mode: interaction, target: current)
+                  sourceDocuments = try ContextGraph.resolveChat(request: request,
+                    attachedDocumentID: chat.attachedDocumentID, editingDocumentID: current.id,
+                    all: self.documents).documents
+                  let recapturedContext = try DocumentTools.context(sourceDocuments, authority: responseAuthority)
+                  let fullContext = [recapturedContext, attachmentText].filter { !$0.isEmpty }.joined(separator: "\n\n")
+                  let refreshed = try await runner.fittedRound(voices: [voice], history: fitted.history + round,
+                    instructions: instructions, context: fullContext, request: request, routing: slugs,
+                    images: images, reserves: [outputLimit], flag: flag, authority: responseAuthority)
+                  guard let refreshedPlan = refreshed.plans.first else { throw BoomError.invalid("Missing captured response plan.") }
+                  plan = refreshedPlan
+                }
+                continue
+              }
+              guard let message else { throw BoomError.invalid("Missing completed answer.") }
+              round.append(message)
+              receipt.state = message.state
+              receipt.failure = message.failure
+              let completedReceipt = receipt
+              try await detachedWork {
+                try vault.encode(completedReceipt, kind: .receipt, id: attemptID)
+                try vault.encode(completedReceipt, kind: .receipt, id: replyID)
+              }
+              self.streamingText = ""
+              if interaction == .ask { self.status = "Local answer · \(result.promptTokens) prompt tokens" }
+              try await self.flush()
+              break
             }
-            try flag.check()
-            try await self.revalidateOnDisk(graph.sources, attachments: attachmentSources)
-            guard interaction == .ask || self.state.selectedDocument == document?.id else { throw BoomError.stale("Active document changed.") }
-            guard !result.text.isEmpty else { throw BoomError.unavailable("The model ended before producing an answer.") }
-            let pending = ChatMessage(id: replyID, role: .assistant, text: "", sources: sources,
-              state: .pending, provider: provider, speaker: voice?.speaker ?? Speaker(name: "Bloom"))
-            let message = try await self.finishConsultationResponse(result.text, pending: pending,
-              chatID: chat.id, authority: authority, documentSources: graph.sources, attachments: attachmentSources)
-            round.append(message)
-            receipt.state = .complete
-            let completedReceipt = receipt
-            try await detachedWork { try vault.encode(completedReceipt, kind: .receipt, id: replyID) }
-            self.streamingText = ""
-            if interaction == .ask { self.status = "Local answer · \(result.promptTokens) prompt tokens" }
-            try await self.flush()
           }
         } catch {
           if let chatIndex = self.state.chats.firstIndex(where: { $0.id == chat.id }) {
             for message in self.state.chats[chatIndex].messages.indices where replyIDs.contains(self.state.chats[chatIndex].messages[message].id)
               && self.state.chats[chatIndex].messages[message].state == .pending {
               self.state.chats[chatIndex].messages[message].state = flag.isCancelled ? .cancelled : .failed
-              self.state.chats[chatIndex].messages[message].failure = error.localizedDescription
+              self.state.chats[chatIndex].messages[message].failure = flag.isCancelled ? nil : "Bloom couldn't finish this answer. You can try again."
             }
           }
           let vault = self.store.vault, failedIDs = replyIDs, reason = error.localizedDescription
@@ -905,6 +1004,7 @@ struct CompletionSegment {
                     receipt.retain(journal); restored.append((id, journal))
                   }
                   receipt.state = ending; receipt.failure = reason; receipt.stopReason = ending.rawValue
+                  if let attemptID = receipt.attemptID { try vault.encode(receipt, kind: .receipt, id: attemptID) }
                   try vault.encode(receipt, kind: .receipt, id: id)
                 }
               }
@@ -919,42 +1019,57 @@ struct CompletionSegment {
             }
           } catch { self.report(error) }
           self.scheduleSave()
-          throw error
+          self.composerIssue = flag.isCancelled ? nil : "Bloom couldn't finish this answer. You can try again."
+          self.status = flag.isCancelled ? "Cancelled" : "Answer interrupted"
         }
       }
     } catch { report(error) }
   }
   func finishConsultationResponse(_ text: String, pending: ChatMessage, chatID: UUID,
-    authority: CapturedDocumentAuthority, documentSources: [SourceReference], attachments: [SourceReference]
+    authority: CapturedDocumentAuthority, documentSources: [SourceReference], attachments: [SourceReference], recovering: Bool = false
   ) async throws -> ChatMessage {
     guard state.chats.first(where: { $0.id == chatID })?.messages.contains(where: { $0.id == pending.id && $0.state == .pending }) == true else {
       throw BoomError.stale("The pending response disappeared.")
     }
     var answer = text
     var documentStatus: String?
+    var responseIssue: String?
     if authority.mode != .ask {
-      let envelope = try AssistantEnvelope.decode(text)
+      let envelope = try await detachedWork { try DocumentTools.response(text, authority: authority) }
       answer = envelope.reply
-      if let patch = envelope.edits.first {
+      responseIssue = envelope.issue
+      if responseIssue == nil, let patch = envelope.edits.first {
         guard let document = authority.target, let current = selectedDocument else {
           throw BoomError.stale("The captured document is no longer open.")
         }
-        _ = try DocumentTools.validate(patch, grant: DocumentGrant(mode: authority.mode, snapshot: document), current: current)
-        let proposal = StoredProposal(id: UUID(), chatID: chatID, messageID: pending.id,
-          patch: patch, document: document, documents: documentSources, attachments: attachments, status: "pending")
-        state.proposals.append(proposal)
-        try await flush()
-        if authority.mode == .edit { try await commit(proposal) }
+        do { _ = try await detachedWork { try DocumentTools.validate(patch, grant: DocumentGrant(mode: authority.mode, snapshot: document), current: current) } }
+        catch { responseIssue = "No document changes: \(error.localizedDescription)"; answer = text }
+        if responseIssue == nil {
+          let proposal = StoredProposal(id: UUID(), chatID: chatID, messageID: pending.id,
+            patch: patch, document: document, documents: documentSources, attachments: attachments, status: "pending")
+          state.proposals.append(proposal)
+          try await flush()
+          if authority.mode == .edit {
+            do { try await commit(proposal) }
+            catch is DocumentMergeConflict {
+              if let index = state.proposals.firstIndex(where: { $0.id == proposal.id }) { state.proposals[index].status = "superseded" }
+              throw DocumentMergeConflict.changed
+            }
+          }
+        }
       }
-      documentStatus = envelope.edits.isEmpty ? "No document changes"
+      documentStatus = responseIssue ?? (envelope.edits.isEmpty ? "No document changes"
         : authority.mode == .edit ? "Document edited" : "Proposal ready for review"
+      )
     }
     guard let chatIndex = state.chats.firstIndex(where: { $0.id == chatID }),
       let messageIndex = state.chats[chatIndex].messages.firstIndex(where: { $0.id == pending.id }),
       state.chats[chatIndex].messages[messageIndex].state == .pending
     else { throw BoomError.stale("The pending response disappeared.") }
     let message = ChatMessage(id: pending.id, role: .assistant, text: answer, sources: pending.sources,
-      state: .complete, provider: pending.provider, speaker: pending.speaker)
+      state: responseIssue == nil ? .complete : .failed,
+      provider: pending.provider, speaker: pending.speaker, failure: responseIssue)
+    if recovering && responseIssue != nil { return message }
     state.chats[chatIndex].messages[messageIndex] = message
     if let documentStatus { status = documentStatus }
     return message
@@ -964,29 +1079,61 @@ struct CompletionSegment {
     for source in sources { try await store.checkDisk(source.id) }
     try revalidate(sources, attachments: attachments)
   }
-  private func commit(_ proposal: StoredProposal) async throws {
-    try await revalidateOnDisk(proposal.documents, attachments: proposal.attachments)
-    guard state.selectedDocument == proposal.document.id, let current = selectedDocument else {
-      throw BoomError.stale("Choose the original document before accepting this proposal.")
+  private func revalidateResponseSources(_ sources: [SourceReference], attachments: [SourceReference],
+    targetID: UUID?) async throws {
+    // The target's captured revision is checked by the Rust three-way merge.
+    // Other sources, attachments and out-of-process disk writes remain guarded.
+    let independent = sources.filter { $0.id != targetID }
+    try await revalidateOnDisk(independent, attachments: attachments)
+    if let targetID {
+      guard documents.contains(where: { $0.id == targetID }) else { throw BoomError.stale("The granted document was removed.") }
+      try await store.checkDisk(targetID)
     }
-    guard editor?.hasMarkedText() != true else {
-      throw BoomError.denied("Finish the current input-method composition before applying an edit.")
+  }
+  private func commit(_ proposal: StoredProposal) async throws {
+    try await revalidateResponseSources(proposal.documents, attachments: proposal.attachments, targetID: proposal.document.id)
+    let grant = DocumentGrant(mode: .propose, snapshot: proposal.document)
+    var resolution: (DocumentSnapshot, DocumentSnapshot, [ValidatedEdit])?
+    while resolution == nil {
+      try Task.checkCancellation()
+      guard state.selectedDocument == proposal.document.id, let current = selectedDocument else {
+        throw BoomError.stale("Choose the original document before accepting this proposal.")
+      }
+      if editor?.hasMarkedText() == true {
+        try await Task.sleep(for: .milliseconds(50))
+        continue
+      }
+      let planned: (DocumentSnapshot, [ValidatedEdit])
+      do { planned = try await detachedWork { try DocumentTools.plan(proposal.patch, grant: grant, current: current) } }
+      catch {
+        if current.revision != proposal.document.revision { throw DocumentMergeConflict.changed }
+        throw error
+      }
+      guard selectedDocument?.id == current.id, selectedDocument?.revision == current.revision else { continue }
+      resolution = (current, planned.0, planned.1)
+    }
+    guard let (current, updated, nativeEdits) = resolution else { throw BoomError.stale("The document changed.") }
+    if updated.text == current.text {
+      if let index = state.proposals.firstIndex(where: { $0.id == proposal.id }) { state.proposals[index].status = "already present" }
+      status = "The document already contains these changes"
+      return
     }
     editingLocked = true
     let capturedEditor = editor
     capturedEditor?.isEditable = false
     defer { editingLocked = false; capturedEditor?.isEditable = true }
-    let grant = DocumentGrant(mode: .propose, snapshot: proposal.document)
-    let updated = try DocumentTools.apply(proposal.patch, grant: grant, current: current)
+    // Persist the actual pre-merge manuscript before its prepared journal, so
+    // crash recovery and native Undo refer to the user's latest authored text.
+    try await flush()
     let journal = DocumentEditJournal(
       schema: 1, proposalID: proposal.id, documentID: current.id, beforeRevision: current.revision,
-      afterRevision: updated.revision, phase: "prepared")
+      afterRevision: updated.revision, phase: "prepared", capturedRevision: proposal.document.revision)
     let vault = store.vault
     try await detachedWork { try vault.encode(journal, kind: .editJournal, id: proposal.id) }
     try Task.checkCancellation()
     try await store.saveDocument(updated)
     if let editor, editor.documentID == updated.id {
-      editor.replaceDocument(updated.text, action: "Apply proposed edit")
+      editor.replaceDocument(updated.text, action: "Apply proposed edit", edits: nativeEdits)
     } else {
       registerDocumentUndo(current)
       if let index = documents.firstIndex(where: { $0.id == updated.id }) {
@@ -997,6 +1144,7 @@ struct CompletionSegment {
     invalidateGhost()
     if let index = state.proposals.firstIndex(where: { $0.id == proposal.id }) {
       state.proposals[index].status = "applied"
+      state.proposals[index].appliedRevision = updated.revision
     }
     // Updating the UI precedes this second journal write: a disk-full receipt
     // failure must not leave an old buffer poised to overwrite the applied file.
@@ -1004,7 +1152,7 @@ struct CompletionSegment {
     do {
       let finalJournal = DocumentEditJournal(
           schema: 1, proposalID: proposal.id, documentID: current.id,
-          beforeRevision: current.revision, afterRevision: updated.revision, phase: "file_written")
+          beforeRevision: current.revision, afterRevision: updated.revision, phase: "file_written", capturedRevision: proposal.document.revision)
       try await detachedWork { try vault.encode(finalJournal, kind: .editJournal, id: proposal.id) }
       status = "Document edited"
     } catch {
@@ -1015,6 +1163,7 @@ struct CompletionSegment {
   }
   private func registerDocumentUndo(_ previous: DocumentSnapshot) {
     let manager = undoManager(previous.id)
+    manager.beginUndoGrouping()
     manager.registerUndo(withTarget: self) { owner in
       guard !owner.editingLocked, let index = owner.documents.firstIndex(where: { $0.id == previous.id }) else { return }
       let current = owner.documents[index]
@@ -1025,12 +1174,35 @@ struct CompletionSegment {
         owner.scheduleSave()
     }
     manager.setActionName("Document edit")
+    manager.endUndoGrouping()
   }
   func accept(_ id: UUID) {
     guard !isBusy, let proposal = state.proposals.first(where: { $0.id == id }), proposal.status == "pending" else { return }
-    work("Applying the proposed edit…") { [weak self] _ in
+    work("Applying the proposed edit…") { [weak self] flag in
       guard let self else { return }
-      try await self.commit(proposal)
+      do { try await self.commit(proposal) }
+      catch is DocumentMergeConflict {
+        guard let chat = self.state.chats.first(where: { $0.id == proposal.chatID }),
+          let answerIndex = chat.messages.firstIndex(where: { $0.id == proposal.messageID }),
+          let question = chat.messages[..<answerIndex].last(where: { $0.role == .user }) else {
+          self.status = "Your current text is preserved"; return
+        }
+        if let index = self.state.proposals.firstIndex(where: { $0.id == proposal.id }) { self.state.proposals[index].status = "superseded" }
+        let vault = self.store.vault
+        let receipt = try await detachedWork { () throws -> ConsultationReceipt? in
+          vault.exists(.receipt, proposal.messageID) ? try vault.decode(ConsultationReceipt.self, kind: .receipt, id: proposal.messageID) : nil
+        }
+        let replay = ConsultationReplay(request: question.text, voice: receipt?.voice,
+          attachmentIDs: proposal.attachments.map(\.id), previousAttemptID: receipt?.attemptID)
+        self.status = "Preparing a fresh proposal…"
+        let operation = self.foreground
+        Task { @MainActor [weak self] in
+          await operation?.value
+          guard let self, !flag.isCancelled, self.canInfer, !self.isBusy,
+            self.state.selectedChat == proposal.chatID, self.state.selectedDocument == proposal.document.id else { return }
+          self.send(replay: replay)
+        }
+      }
       try await self.flush()
     }
   }
@@ -1041,11 +1213,10 @@ struct CompletionSegment {
   }
   func canUndo(_ proposal: StoredProposal) -> Bool {
     guard !isBusy, proposal.status == "applied", state.selectedDocument == proposal.document.id,
-      let current = selectedDocument, undoManager(current.id).canUndo,
-      let applied = try? DocumentTools.apply(
-        proposal.patch, grant: DocumentGrant(mode: .propose, snapshot: proposal.document),
-        current: proposal.document)
-    else { return false }
+      let current = selectedDocument, undoManager(current.id).canUndo else { return false }
+    if let applied = proposal.appliedRevision { return current.revision == applied }
+    guard let applied = try? DocumentTools.apply(proposal.patch,
+      grant: DocumentGrant(mode: .propose, snapshot: proposal.document), current: proposal.document) else { return false }
     return current.revision == applied.revision
   }
   func undoProposal(_ proposal: StoredProposal) {
@@ -1881,6 +2052,7 @@ struct CompletionSegment {
       if let old = baseRunner { await old.join() }
       baseRunner = nil
     }
+    residentModelWeights.removeValue(forKey: purpose)
   }
   private func reclaimModelCache() async {
     await GenerationCoordinator.shared.enter()
@@ -1897,6 +2069,7 @@ struct CompletionSegment {
   }
   private func pairHasContext() async throws -> Bool {
     guard let writing = baseRunner, let consultation = mlxRunner else { return true }
+    if writing === consultation { return true }
     return try ProductCore.retainResidentPair(writing: await writing.contextLength(batchWidth: 3),
       consultation: await consultation.contextLength)
   }
@@ -1909,27 +2082,102 @@ struct CompletionSegment {
     try flag.check()
     try await retainPairIfUseful(for: purpose)
     if let runner = purpose == .consultation ? mlxRunner : baseRunner { return runner }
+    if writingUsesConsultation {
+      if purpose == .writing {
+        let runner = try await runnerForGeneration(.consultation, flag: flag)
+        useConsultationForWriting(runner)
+        return runner
+      } else if let runner = baseRunner {
+        mlxRunner = runner; modelReady = true
+        residentModelWeights[.consultation] = residentModelWeights[.writing]
+        return runner
+      }
+    }
     guard let directory = modelDirectories[purpose] else {
       throw BoomError.unavailable("Install the \(purpose.title.lowercased()) model first.")
     }
     status = "Reloading \(purpose.title.lowercased()) model to preserve context…"
     return try await openModel(directory, purpose: purpose, flag: flag)
   }
-  func loadInstalledModels() {
-    if let consultation = ModelPacks.cached(.consultation) { loadPack(consultation, purpose: .consultation) }
-    if layout.isAuthor, let writing = ModelPacks.cached(.writing) {
-      Task { [weak self] in
-        guard let self else { return }
-        if let previous = self.foreground { await previous.value }
-        loadPack(writing, purpose: .writing)
+  private func useConsultationForWriting(_ runner: MLXGemmaRunner) {
+    baseRunner = runner
+    residentModelWeights[.writing] = residentModelWeights[.consultation]
+    writingModelIdentity = runner.identity; writingGenerationPolicy = runner.generationPolicy
+  }
+  func prepareModels() {
+    guard !isBusy else { return }
+    modelSetupIssue = nil
+    if canInfer && (!layout.isAuthor || baseReady) { return }
+    work("Preparing Bloom on this Mac…") { [weak self] flag in
+      guard let self else { return }
+      self.settingUpModels = true
+      defer { self.settingUpModels = false }
+      do {
+        // A retry joins and releases a partially loaded setup before planning;
+        // it never admits a replacement on top of unaccounted resident weights.
+        await self.releaseRunner(.writing)
+        await self.releaseRunner(.consultation)
+        await self.reclaimModelCache()
+        try flag.check()
+        guard let device = MTLCreateSystemDefaultDevice() else { throw BoomError.unavailable("Metal is unavailable.") }
+        let writing = self.layout.isAuthor
+        let choices = try await detachedWork { try ModelPacks.setupChoices(writing: writing) }
+        let disk = try await detachedWork { () throws -> UInt64 in
+          var location = HuggingFaceCache.hub
+          while !FileManager.default.fileExists(atPath: location.path), location.path != "/" {
+            location.deleteLastPathComponent()
+          }
+          let values = try location.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey])
+          guard let bytes = values.volumeAvailableCapacityForImportantUsage ?? values.volumeAvailableCapacity.map(Int64.init), bytes >= 0 else {
+            throw BoomError.unavailable("Bloom could not check free disk space.")
+          }
+          return UInt64(bytes)
+        }
+        let plan = try ProductCore.modelSetup(physical: ProcessInfo.processInfo.physicalMemory,
+          metal: device.recommendedMaxWorkingSetSize, resident: ModelResidency.footprint(), disk: disk,
+          writing: writing, candidates: choices.map(\.candidate))
+        self.writingUsesConsultation = plan.reuseConsultation
+        for identity in [plan.consultation, plan.writing].compactMap({ $0 }) {
+          try flag.check()
+          guard let choice = choices.first(where: { $0.candidate.identity == identity }) else {
+            throw BoomError.invalid("The model setup decision is absent from its catalog.")
+          }
+          let directory: URL
+          if let cached = choice.directory {
+            directory = cached
+            self.status = "Opening \(choice.candidate.purpose.rawValue) model…"
+          } else if let checkpoint = choice.checkpoint {
+            self.status = "Downloading a local model…"
+            directory = try await ModelPacks.installPublished(checkpoint, flag: flag) { progress in
+              Task { @MainActor in
+                guard self.activeFlag === flag, !flag.isCancelled else { return }
+                self.status = progress
+              }
+            }
+          } else { throw BoomError.invalid("The selected model has no local files or download.") }
+          _ = try await self.openModel(directory, purpose: choice.candidate.purpose, flag: flag)
+        }
+        if plan.reuseConsultation, let runner = self.mlxRunner { self.useConsultationForWriting(runner) }
+        self.status = "Ready · models stay on this Mac"
+      } catch is CancellationError { throw CancellationError() }
+      catch {
+        try flag.check()
+        self.modelSetupIssue = error.localizedDescription
+        self.status = "Model setup needs attention"
       }
     }
   }
+  private var residentWeightBytes: UInt64 {
+    if let consultation = mlxRunner, let writing = baseRunner, consultation === writing {
+      return residentModelWeights.values.max() ?? 0
+    }
+    return residentModelWeights.values.reduce(0, +)
+  }
   private func admitModel(_ admission: ModelPacks.Admission, purpose: ModelPurpose) async throws {
-    do { try ModelResidency.admit(weightBytes: admission.weightBytes) }
+    do { try ModelResidency.admit(weightBytes: admission.weightBytes, residentWeights: residentWeightBytes) }
     catch BoomError.budget {
       await releaseInactiveModel(for: purpose)
-      try ModelResidency.admit(weightBytes: admission.weightBytes)
+      try ModelResidency.admit(weightBytes: admission.weightBytes, residentWeights: residentWeightBytes)
       status = "The inactive model was released to make room. Reopening it will take a moment."
     }
   }
@@ -1948,6 +2196,8 @@ struct CompletionSegment {
       baseRunner = loaded; writingModelIdentity = loaded.identity
       writingGenerationPolicy = loaded.generationPolicy
     }
+    residentModelWeights[purpose] = admission.weightBytes
+    if purpose == .consultation && writingUsesConsultation { useConsultationForWriting(loaded) }
     try await retainPairIfUseful(for: purpose)
     return loaded
   }

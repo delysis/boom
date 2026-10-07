@@ -97,6 +97,46 @@ final class RecoveryTests: XCTestCase {
     XCTAssertEqual(stopped.state, .cancelled); XCTAssertEqual(stopped.tokenIDs, [3])
     XCTAssertEqual(stopped.stopReason, "interrupted")
   }
+  func testInterruptedRetryKeepsFailedAttemptAndCancelsOnlyTheActiveAttempt() async throws {
+    let store = try WorkspaceStore(rootOverride: root(), testKey: SymmetricKey(size: .bits256))
+    let document = DocumentSnapshot(title: "Public retry fixture", text: "Same.\nSame.")
+    let message = ChatMessage(role: .assistant, text: "", state: .pending)
+    var chat = ChatRecord(attachedDocumentID: document.id); chat.messages = [message]
+    var state = WorkspaceState(); state.documents = [DocumentIndex(id: document.id, title: document.title)]; state.chats = [chat]
+    let plan = try ProductCore.prompt(voice: nil, history: [], instructions: "", context: document.text,
+      request: "Change the second line.", routing: [], authority: CapturedDocumentAuthority(mode: .edit, target: document))
+    let operation = UUID(), firstID = UUID(), activeID = UUID()
+    var first = ConsultationReceipt(operationID: operation, seed: 7, state: .failed, failure: "Malformed fixture",
+      model: "unit-test-model", voice: nil, plan: plan, sources: [], promptDigest: Digest.sha256(plan.rawPrompt),
+      tokenIDs: [1], stopReason: "eos", firstTokenSeconds: 1, elapsedSeconds: 2, generationPolicy: nil)
+    first.attemptID = firstID; first.responseID = message.id
+    try store.vault.encode(first, kind: .receipt, id: firstID)
+    let retainedFirst = try Data(contentsOf: store.vault.recordURL(.receipt, firstID))
+    var active = ConsultationReceipt(operationID: operation, seed: 9, state: .pending, failure: nil,
+      model: "unit-test-model", voice: nil, plan: plan, sources: [], promptDigest: Digest.sha256(plan.rawPrompt),
+      tokenIDs: [], stopReason: "pending", firstTokenSeconds: nil, elapsedSeconds: 0, generationPolicy: nil)
+    active.attemptID = activeID; active.previousAttemptID = firstID; active.responseID = message.id
+    try store.vault.encode(active, kind: .receipt, id: activeID)
+    try store.vault.encode(active, kind: .receipt, id: message.id)
+    let identity = GenerationIdentity(kind: .documentResponse, operationID: operation, recordID: message.id,
+      attemptID: activeID, model: active.model, seed: active.seed, requestDigest: Digest.sha256(plan.rawPrompt),
+      maxTokens: 4096, generationPolicy: nil)
+    try await store.checkpoint(GenerationProgress(text: "Incomplete public fixture", tokenIDs: [2, 3],
+      promptDigest: Digest.sha256(plan.rawPrompt), promptTokens: 100, firstTokenSeconds: 1, elapsedSeconds: 2),
+      identity: identity, stopReason: nil)
+    try await store.save(state, documents: [document])
+    let recovered = try await store.load().get()
+    XCTAssertEqual(recovered.1[0].text, document.text)
+    XCTAssertEqual(recovered.0.chats[0].messages[0].state, .cancelled)
+    let stopped = try store.vault.decode(ConsultationReceipt.self, kind: .receipt, id: message.id)
+    let archived = try store.vault.decode(ConsultationReceipt.self, kind: .receipt, id: activeID)
+    XCTAssertEqual(stopped.state, .cancelled); XCTAssertEqual(archived.state, .cancelled)
+    XCTAssertEqual(stopped.previousAttemptID, firstID); XCTAssertEqual(stopped.tokenIDs, [2, 3])
+    XCTAssertEqual(try Data(contentsOf: store.vault.recordURL(.receipt, firstID)), retainedFirst)
+    let checkpoint = try await store.consultationCheckpoint(id: message.id, receipt: stopped)
+    XCTAssertEqual(checkpoint?.identity.attemptID, activeID)
+  }
+
   func testCorruptCapturedGenerationNeverBecomesEmptyState() async throws {
     let store = try WorkspaceStore(rootOverride: root(), testKey: SymmetricKey(size: .bits256))
     let id = UUID(); var state = WorkspaceState(); state.candidateIDs = [id]

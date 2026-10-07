@@ -6,6 +6,26 @@ import XCTest
 @testable import Boom
 
 final class DocumentToolsTests: XCTestCase {
+  @MainActor func testSuccessiveNativeEditsHaveSeparateUndoAndPreserveCaret() throws {
+    _ = NSApplication.shared
+    let view = MarkdownTextView(frame: NSRect(x: 0, y: 0, width: 600, height: 300))
+    let manager = UndoManager(); manager.groupsByEvent = false
+    view.documentUndo = manager; view.allowsUndo = true
+    let original = "The harbor was quiet. Human addition."
+    view.string = original; view.setSelectedRange(NSRange(location: original.utf16.count, length: 0))
+    let base = DocumentSnapshot(title: "Public fixture", text: original)
+    let first = try DocumentTools.plan(patch(base, [Replacement(old: "quiet", new: "bright")]),
+      grant: DocumentGrant(mode: .edit, snapshot: base), current: base)
+    view.replaceDocument(first.0.text, action: "First edit", edits: first.1)
+    XCTAssertEqual(view.selectedRange().location, first.0.text.utf16.count)
+    let second = try DocumentTools.plan(patch(first.0, [Replacement(old: "bright", new: "hushed")]),
+      grant: DocumentGrant(mode: .edit, snapshot: first.0), current: first.0)
+    view.replaceDocument(second.0.text, action: "Second edit", edits: second.1)
+    XCTAssertEqual(view.string, second.0.text)
+    manager.undo(); XCTAssertEqual(view.string, first.0.text)
+    manager.undo(); XCTAssertEqual(view.string, original)
+    manager.redo(); XCTAssertEqual(view.string, first.0.text)
+  }
   @MainActor func testMountedEditorAppliesResponseAndUndoPreservesModelAndDisk() async throws {
     _ = NSApplication.shared
     let policy = NSApp.activationPolicy(); NSApp.setActivationPolicy(.prohibited)
@@ -91,7 +111,7 @@ final class DocumentToolsTests: XCTestCase {
     XCTAssertEqual(model.state.proposals.last?.status, "undone")
     try await model.shutdown()
   }
-  @MainActor func testStaleProposalCannotOverwriteLaterAuthoredText() async throws {
+  @MainActor func testProposalMergesLaterAuthoredTextWithoutOverwritingIt() async throws {
     let (model, store, root, document, chatID, pending) = try await responseFixture()
     defer { try? FileManager.default.removeItem(at: root) }
     let response = AssistantEnvelope(reply: "A suggested change.",
@@ -105,11 +125,11 @@ final class DocumentToolsTests: XCTestCase {
     try await model.flush()
     model.accept(proposal.id)
     try await waitForResponse(model)
-    XCTAssertNotNil(model.errorMessage)
-    XCTAssertEqual(model.selectedDocument?.text, authored)
-    XCTAssertEqual(model.state.proposals.last?.status, "pending")
+    XCTAssertNil(model.errorMessage)
+    XCTAssertEqual(model.selectedDocument?.text, authored.replacingOccurrences(of: "quiet", with: "bright"))
+    XCTAssertEqual(model.state.proposals.last?.status, "applied")
     let persisted = try await store.load().get().1.first { $0.id == document.id }
-    XCTAssertEqual(persisted?.text, authored)
+    XCTAssertEqual(persisted?.text, authored.replacingOccurrences(of: "quiet", with: "bright"))
     try await model.shutdown()
   }
   @MainActor private func responseFixture() async throws
@@ -144,19 +164,22 @@ final class DocumentToolsTests: XCTestCase {
     model.updateDocument("A quiet beginning.", id: document.id, caret: 0)
     try model.newChat(about: document.id)
     let captured = try XCTUnwrap(model.selectedDocument), chatID = try XCTUnwrap(model.state.selectedChat)
-    let pending = ChatMessage(role: .assistant, text: "", state: .pending)
+    var pending = ChatMessage(role: .assistant, text: "", state: .pending)
     let chatIndex = try XCTUnwrap(model.state.chats.firstIndex { $0.id == chatID })
     model.state.chats[chatIndex].messages.append(pending)
     let authority = CapturedDocumentAuthority(mode: .edit, target: captured)
     let bad = AssistantEnvelope(reply: "Claimed edit.", edits: [patch(captured, [Replacement(old: "missing", new: "Wrong.")])])
-    do {
-      _ = try await model.finishConsultationResponse(String(decoding: JSONEncoder().encode(bad), as: UTF8.self),
-        pending: pending, chatID: chatID, authority: authority, documentSources: [], attachments: [])
-      XCTFail("Invalid edits must fail.")
-    } catch {}
+    let rawBad = String(decoding: try JSONEncoder().encode(bad), as: UTF8.self)
+    let failed = try await model.finishConsultationResponse(rawBad,
+      pending: pending, chatID: chatID, authority: authority, documentSources: [], attachments: [])
+    XCTAssertEqual(failed.state, .failed)
+    XCTAssertEqual(failed.text, rawBad)
+    XCTAssertNotNil(failed.failure)
     XCTAssertEqual(model.selectedDocument?.text, captured.text)
-    XCTAssertEqual(model.selectedChat?.messages.last?.state, .pending)
+    XCTAssertEqual(model.selectedChat?.messages.last?.state, .failed)
     XCTAssertTrue(model.state.proposals.isEmpty)
+    pending = ChatMessage(role: .assistant, text: "", state: .pending)
+    model.state.chats[chatIndex].messages.append(pending)
     let envelope = AssistantEnvelope(reply: "Here is the new beginning.", edits: [patch(captured, [Replacement(old: captured.text, new: "A brighter beginning.")])])
     let result = try await model.finishConsultationResponse(String(decoding: JSONEncoder().encode(envelope), as: UTF8.self),
       pending: pending, chatID: chatID, authority: authority, documentSources: [], attachments: [])
@@ -169,6 +192,49 @@ final class DocumentToolsTests: XCTestCase {
     XCTAssertEqual(model.selectedDocument?.text, captured.text)
     try await model.shutdown()
   }
+  @MainActor func testMalformedResponseRetainsRawTextWithoutProposalUndoOrAlert() async throws {
+    let (model, store, root, document, chatID, pending) = try await responseFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let raw = "{\"reply\":\"Suggested changes\",\"edits\":["
+    let response = try await model.finishConsultationResponse(raw, pending: pending, chatID: chatID,
+      authority: CapturedDocumentAuthority(mode: .propose, target: document), documentSources: [], attachments: [])
+    XCTAssertEqual(response.text, raw)
+    XCTAssertEqual(response.state, .failed)
+    XCTAssertEqual(model.selectedDocument?.text, document.text)
+    XCTAssertTrue(model.state.proposals.isEmpty)
+    XCTAssertFalse(model.undoManager(document.id).canUndo)
+    XCTAssertNil(model.errorMessage)
+    try await model.flush()
+    let persisted = try await store.load().get()
+    XCTAssertEqual(persisted.0.chats.first { $0.id == chatID }?.messages.last?.text, raw)
+    try await model.shutdown()
+  }
+
+  @MainActor func testEditMergesInterveningTypingAndUndoPreservesThatTyping() async throws {
+    let (model, store, root, base, chatID, pending) = try await responseFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let currentText = base.text + " Human addition."
+    model.updateDocument(currentText, id: base.id, caret: currentText.utf16.count)
+    try await model.flush()
+    model.undoManager(base.id).removeAllActions()
+    let envelope = AssistantEnvelope(reply: "A brighter harbor.", edits: [patch(base,
+      [Replacement(old: "The harbor was quiet.", new: "The harbor was bright.")])])
+    let response = try await model.finishConsultationResponse(String(decoding: JSONEncoder().encode(envelope), as: UTF8.self),
+      pending: pending, chatID: chatID, authority: CapturedDocumentAuthority(mode: .edit, target: base),
+      documentSources: [SourceReference(id: base.id, title: base.title, digest: base.revision, kind: "document")], attachments: [])
+    XCTAssertEqual(response.state, .complete)
+    let expected = currentText.replacingOccurrences(of: "quiet", with: "bright")
+    XCTAssertEqual(model.selectedDocument?.text, expected)
+    XCTAssertEqual(model.state.proposals.last?.appliedRevision, Digest.sha256(expected))
+    let persisted = try await store.load().get()
+    XCTAssertEqual(persisted.1.first { $0.id == base.id }?.text, expected)
+    let proposal = try XCTUnwrap(model.state.proposals.last)
+    XCTAssertTrue(model.canUndo(proposal))
+    model.undoProposal(proposal)
+    XCTAssertEqual(model.selectedDocument?.text, currentText)
+    try await model.shutdown()
+  }
+
   func testActualCompiledPromptCarriesReadOnlyOrCapturedToolPermission() throws {
     let document = DocumentSnapshot(title: "Chapter", text: "Original.")
     let ask = try ProductCore.prompt(voice: nil, history: [], instructions: "", context: "",
@@ -177,7 +243,7 @@ final class DocumentToolsTests: XCTestCase {
     let edit = try ProductCore.prompt(voice: nil, history: [], instructions: "", context: document.text,
       request: "Edit my document.", routing: [], authority: CapturedDocumentAuthority(mode: .edit, target: document))
     XCTAssertTrue(edit.rawPrompt.contains(document.id.uuidString.lowercased()))
-    XCTAssertTrue(edit.rawPrompt.contains(document.revision)); XCTAssertTrue(edit.rawPrompt.contains("actual replacement text"))
+    XCTAssertTrue(edit.rawPrompt.contains(document.revision)); XCTAssertTrue(edit.rawPrompt.contains("PUT N.=M:"))
   }
   private func patch(_ d: DocumentSnapshot, _ rs: [Replacement]) -> DocumentPatch {
     DocumentPatch(documentID: d.id, revision: d.revision, replacements: rs)
@@ -192,9 +258,9 @@ final class DocumentToolsTests: XCTestCase {
       try DocumentTools.apply(p, grant: DocumentGrant(mode: .edit, snapshot: d), current: d).text,
       "1 two 3")
   }
-  func testStaleRejected() {
+  func testConflictingInterveningEditIsRejected() {
     let d = DocumentSnapshot(title: "T", text: "old")
-    let changed = DocumentSnapshot(id: d.id, title: "T", text: "old ")
+    let changed = DocumentSnapshot(id: d.id, title: "T", text: "Human replacement")
     XCTAssertThrowsError(
       try DocumentTools.apply(
         patch(d, [Replacement(old: "old", new: "new")]),

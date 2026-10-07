@@ -323,6 +323,7 @@ struct ChatPane: View {
   @StateObject private var voice = VoiceInput()
   @State private var composerFocusRequest = 0
   @State private var voiceChatID: UUID?
+  @State private var voiceDocumentID: UUID?
   @State private var voiceDraft = ""
   @State private var awaitingVoiceReply: UUID?
   @State private var recoveredVoiceText = ""
@@ -578,7 +579,7 @@ struct ChatPane: View {
     } else if message.role == .user {
       HStack(alignment: .bottom, spacing: 4) {
         Spacer(minLength: 36)
-        ChatMarkdown(text: visibleMessageText(message))
+        NativeText(text: visibleMessageText(message))
           .padding(.horizontal, 12).padding(.vertical, 9)
           .background(Color.primary.opacity(0.065), in: RoundedRectangle(cornerRadius: 12))
       }.frame(maxWidth: .infinity, alignment: .trailing)
@@ -600,7 +601,7 @@ struct ChatPane: View {
             }
           }
         }
-        ChatMarkdown(text: visibleMessageText(message))
+        NativeText(text: visibleMessageText(message))
         ForEach(model.state.proposals.filter { $0.messageID == message.id }) { proposal in
           ProposalCard(model: model, proposal: proposal)
         }
@@ -615,6 +616,7 @@ struct ChatPane: View {
         do {
           let text = try await voice.stop()
           guard model.state.selectedChat == voiceChatID, model.draft == voiceDraft,
+            model.state.selectedDocument == voiceDocumentID,
             !model.isBusy else {
             recoveredVoiceText += (recoveredVoiceText.isEmpty ? "" : " ") + text
             model.status = "Voice transcript ready to insert"
@@ -627,9 +629,8 @@ struct ChatPane: View {
               model.showingModels = true
               return
             }
-            model.mode = .ask
-            awaitingVoiceReply = voiceChatID
             model.send()
+            awaitingVoiceReply = model.state.selectedChat
             if !model.isBusy { awaitingVoiceReply = nil }
           } else {
             model.status = "Dictated on device"
@@ -642,6 +643,7 @@ struct ChatPane: View {
       }
     } else {
       voiceChatID = model.state.selectedChat
+      voiceDocumentID = model.state.selectedDocument
       voiceDraft = model.draft
       Task {
         do {
@@ -750,6 +752,16 @@ struct ChatPane: View {
         if let issue = model.composerIssue {
           Text(issue).font(.caption).foregroundStyle(.orange)
         }
+        if model.settingUpModels {
+          HStack(spacing: 8) { ProgressView().controlSize(.small); Text(model.status).font(.caption) }
+            .foregroundStyle(.secondary)
+        } else if let issue = model.modelSetupIssue {
+          HStack(alignment: .top) {
+            Text(issue).font(.caption).foregroundStyle(.orange)
+            Spacer()
+            Button("Retry") { model.prepareModels() }.buttonStyle(.plain).disabled(model.isBusy)
+          }
+        }
         if !model.voiceMatches.isEmpty {
           HStack(spacing: 10) {
             ForEach(model.voiceMatches) { persona in
@@ -758,7 +770,6 @@ struct ChatPane: View {
             }
           }
         }
-        if model.selectedChat != nil || !model.layout.isAuthor {
         ChatComposer(
           text: $model.draft, focusRequest: composerFocusRequest,
           onSend: { model.send() }, onCancel: { model.cancel() },
@@ -766,12 +777,6 @@ struct ChatPane: View {
           onFocus: { model.noteInputFocus(.chat) }
         ).frame(height: CGFloat(50 + 18 * min(3, model.draft.filter { $0 == "\n" }.count)))
         composerControls
-        } else {
-          Button {
-            do { try model.newChat(about: model.state.selectedDocument) } catch { model.report(error) }
-          } label: { Label("New chat about this document", systemImage: "square.and.pencil") }
-            .buttonStyle(.plain).foregroundStyle(.secondary).padding(.vertical, 14)
-        }
       }.padding(10)
         .background(Color(nsColor: BoomChrome.inputBackground), in: RoundedRectangle(cornerRadius: 12))
         .padding(.horizontal, 12).padding(.bottom, 12).padding(.top, 8)
@@ -784,11 +789,10 @@ struct ChatPane: View {
       if message.state == .complete { voice.speak(message.text) }
     }
     .onChange(of: model.state.selectedChat) { _, _ in
-      awaitingVoiceReply = nil
-      voice.stopSpeaking()
-    }
-    .onChange(of: model.draft) { _, text in
-      if !text.isEmpty { model.ensureChatForDraft() }
+      if awaitingVoiceReply != model.state.selectedChat {
+        awaitingVoiceReply = nil
+        voice.stopSpeaking()
+      }
     }
     .onChange(of: model.composerFocusEpoch) { _, _ in
       composerFocusRequest += 1
@@ -800,33 +804,6 @@ struct ChatPane: View {
       }
     }
     .onDisappear { voice.cancel() }
-  }
-}
-/// The same source-preserving styling as every editable native text surface.
-struct ChatMarkdown: NSViewRepresentable {
-  let text: String
-  func makeNSView(context: Context) -> NSTextView {
-    let view = NSTextView()
-    view.isEditable = false; view.isSelectable = true; view.isRichText = false
-    view.drawsBackground = false; view.textContainerInset = .zero
-    view.textContainer?.lineFragmentPadding = 0
-    view.isHorizontallyResizable = false; view.isVerticallyResizable = true
-    view.textContainer?.widthTracksTextView = true
-    view.writingToolsBehavior = .none
-    return view
-  }
-  func updateNSView(_ view: NSTextView, context: Context) {
-    if view.string != text {
-      view.string = text
-      MarkdownStyle.apply(to: view, bodyFont: NSFont.systemFont(ofSize: 14), lineSpacing: 3, reading: true)
-    }
-  }
-  func sizeThatFits(_ proposal: ProposedViewSize, nsView view: NSTextView, context: Context) -> CGSize? {
-    guard let width = proposal.width, width > 0, let container = view.textContainer,
-      let layout = view.layoutManager else { return nil }
-    container.size = NSSize(width: width, height: .greatestFiniteMagnitude)
-    layout.ensureLayout(for: container)
-    return CGSize(width: width, height: max(18, layout.usedRect(for: container).height))
   }
 }
 struct ProposalCard: View {
@@ -845,9 +822,9 @@ struct ProposalCard: View {
         {
           ForEach(Array(proposal.patch.replacements.enumerated()), id: \.offset) { _, r in
             VStack(alignment: .leading, spacing: 4) {
-              Text("− " + r.old).strikethrough().foregroundStyle(.secondary)
-              Text("+ " + r.new)
-            }.font(.system(size: 12, design: .monospaced)).textSelection(.enabled).padding(
+              NativeText(text: "− " + r.old, presentation: .removed, pointSize: 12)
+              NativeText(text: "+ " + r.new, presentation: .added, pointSize: 12)
+            }.padding(
               .vertical, 4)
           }
         }.font(.caption)
@@ -871,22 +848,18 @@ struct ModelSetupView: View {
       Text("Models on this Mac").font(.title2.weight(.semibold))
       Text(model.layout.isAuthor ? "Consult privately with voices, or explore manuscript continuations with a base model." : "Consult privately with voices on this Mac.")
         .foregroundStyle(.secondary)
-      ForEach(model.layout.isAuthor ? ModelPurpose.allCases : [.consultation], id: \.self) { purpose in
-        VStack(alignment: .leading, spacing: 6) {
-          Text(purpose == .consultation ? "Consultation · Gemma 4 12B" : "Writing · Gemma 4 12B base").font(.headline)
-          let ready = purpose == .consultation ? model.canInfer : model.baseReady
-          if ready { Label("Ready on this Mac", systemImage: "checkmark.circle").foregroundStyle(.secondary) }
-          else if let installed = ModelPacks.cached(purpose) {
-            Button("Open \(purpose.rawValue) model") { model.loadPack(installed, purpose: purpose) }.disabled(model.isBusy)
-          } else {
-            Button("Download \(purpose.rawValue) model") { model.installModel(purpose) }
-              .disabled(model.isBusy)
-            if let checkpoint = try? ModelPacks.published(purpose), let requirements = try? ProductCore.checkpointRequirements(checkpoint) {
-              Text("Download \(ByteCountFormatter.string(fromByteCount: Int64(requirements.downloadBytes), countStyle: .file)) · free disk space \(ByteCountFormatter.string(fromByteCount: Int64(requirements.diskBytes), countStyle: .file))")
-                .font(.caption).foregroundStyle(.secondary)
-            }
-          }
+      if model.settingUpModels {
+        HStack { ProgressView().controlSize(.small); Text(model.status) }
+      } else if let issue = model.modelSetupIssue {
+        Text(issue).foregroundStyle(.orange)
+        Button("Try automatic setup again") { model.prepareModels() }.disabled(model.isBusy)
+      } else if model.canInfer {
+        Label("Ready on this Mac", systemImage: "checkmark.circle").foregroundStyle(.secondary)
+        if model.writingUsesConsultation && model.layout.isAuthor {
+          Text("One model serves chat and writing to leave room for your work.").font(.caption).foregroundStyle(.secondary)
         }
+      } else {
+        Button("Prepare Bloom automatically") { model.prepareModels() }.disabled(model.isBusy)
       }
       Button("Import an offline model pack…") { model.importModel() }.disabled(model.isBusy)
       Button("Set up on-device speech…") { model.installSpeechAsset() }.disabled(model.isBusy)

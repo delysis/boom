@@ -37,6 +37,7 @@ struct DocumentEditJournal: Codable, Sendable {
   let beforeRevision: String
   let afterRevision: String
   let phase: String
+  var capturedRevision: String? = nil
 }
 struct VaultInventoryEntry: Encodable, Sendable {
   let name: String
@@ -309,7 +310,7 @@ actor WorkspaceStore {
           DocumentEditJournal.self, kind: .editJournal, id: proposal.id)
         guard journal.schema == 1, journal.proposalID == proposal.id,
           journal.documentID == proposal.document.id,
-          journal.beforeRevision == proposal.document.revision,
+          (journal.capturedRevision ?? journal.beforeRevision) == proposal.document.revision,
           ["prepared", "file_written"].contains(journal.phase)
         else { throw BoomError.invalid("Unknown or inconsistent edit journal; evidence retained.") }
         if let actual = documents.first(where: { $0.id == journal.documentID }),
@@ -399,7 +400,10 @@ actor WorkspaceStore {
       }
     }
     for bundle in bundles { try vault.encode(bundle, kind: .candidate, id: bundle.id) }
-    for (id, receipt) in receipts { try vault.encode(receipt, kind: .receipt, id: id) }
+    for (id, receipt) in receipts {
+      if let attemptID = receipt.attemptID { try vault.encode(receipt, kind: .receipt, id: attemptID) }
+      try vault.encode(receipt, kind: .receipt, id: id)
+    }
     if changed || !bundles.isEmpty || !receipts.isEmpty { try persist(state) }
   }
   func latestCandidate(for documentID: UUID, ids: [UUID]) throws -> CandidateBundle? {

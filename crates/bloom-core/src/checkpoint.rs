@@ -23,7 +23,7 @@ pub struct Checkpoint {
     pub files: Vec<File>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Purpose {
     Consultation,

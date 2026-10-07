@@ -199,3 +199,35 @@ hands the window over without closing it. Check a first click in the editor,
 including its empty page area, then caret placement and typing during generation.
 Offscreen first-responder and persistence checks are component evidence; they
 do not qualify actual focused mouse/keyboard behavior or typing latency.
+
+## Shared text engine and resize transitions
+
+AppKit/TextKit owns prose rendering, selection and editing. SwiftUI owns pane,
+row and command layout. `NativeText.swift` is the only read-only prose bridge;
+`NativeTextMeasurement.swift` supplies isolated proposed-size measurement to
+both reading rows and the manuscript editor. `NativeTextStyle.swift` projects Rust Markdown spans onto native text storage for
+both reading and editing. Keep labels and buttons in SwiftUI. Do not add another
+prose renderer or a per-surface Markdown parser.
+
+A text surface must have exactly one frame owner. Reading rows take their frame
+from SwiftUI and cannot resize themselves. Their proposed-size measurement uses
+an isolated TextKit container with the same attributed source and geometry as
+the display container. Speculative measurement cannot mutate the live renderer.
+Invalidate size when source or styling changes, including the first empty-to-text
+update; synchronize the display container only with the actual assigned width.
+The direct manuscript view also takes its frame from SwiftUI and uses that same
+isolated measurement helper. The chat input owns a native scrolling document;
+AppKit controls that inner document's frame and reports content height through
+its live native layout. Preserve Undo and IME composition in both. These are
+explicit layout contracts over the same engine, not interchangeable controls.
+
+The resize regression first reproduced 18-point rows drawing up to 237 points
+of wrapped text. Before handing off a prose change, run the native populated-chat
+regression and the exact bundle's `--chat-layout-smoke` in a public fixture. Resize
+the same populated conversation wide, narrow, intermediate and wide again in
+both appearances. Include headings, lists, Unicode, state labels, arriving text,
+inline editing and expanded proposal/attachment bodies. Assert actual glyph
+bounds fit assigned rows and consecutive rows do not overlap. Check speculative
+measurements leave displayed glyph geometry unchanged. Inspect the resulting
+native renders as well: geometry assertions do not establish visual quality.
+A fresh screenshot at each width cannot substitute for this transition check.

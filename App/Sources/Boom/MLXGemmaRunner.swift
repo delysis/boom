@@ -121,9 +121,9 @@ actor MLXGemmaRunner {
       let config = try JSONDecoder().decode(Configuration.self,
         from: configuration)
       let text = config.text_config
-      guard config.model_type == "gemma4_unified", text.max_position_embeddings > 0,
+      guard ["gemma4_unified", "gemma4"].contains(config.model_type), text.max_position_embeddings > 0,
         text.num_hidden_layers > 0, text.num_key_value_heads > 0, text.head_dim > 0
-      else { throw BoomError.invalid("This is not the supported Gemma 4 12B model.") }
+      else { throw BoomError.invalid("This is not a supported Gemma 4 model.") }
       let tokenizerDescription = try Data(contentsOf: directory.appendingPathComponent("tokenizer.json"))
       let tokenizer = try JSONDecoder().decode(TokenizerFile.self, from: tokenizerDescription)
       let generationURL = directory.appendingPathComponent("generation_config.json")
@@ -136,6 +136,16 @@ actor MLXGemmaRunner {
         tokenizerConfiguration == (try Data(contentsOf: tokenizerConfigurationURL)),
         generationDescription == (try Data(contentsOf: generationURL)) else {
         throw BoomError.stale("The tokenizer or generation configuration changed while the model was loading.")
+      }
+      if admission.purpose == .consultation {
+        // Admit the actual chat action before advertising consultation as ready.
+        // This catches a missing or incompatible checkpoint template at load,
+        // without a generated response or any network access.
+        _ = try await model.perform { context in
+          let input = try await context.processor.prepare(input: UserInput(chat: [.user("Ready.")],
+            additionalContext: ["enable_thinking": false]))
+          return input.text.tokens.size
+        }
       }
       let tokenizerEnds = await model.perform { ($0.tokenizer.eosTokenId, $0.tokenizer.unknownTokenId) }
       let controls = tokenizer.added_tokens.filter(\.special).map(\.id) + (tokenizerEnds.1.map { [$0] } ?? [])

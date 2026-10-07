@@ -24,7 +24,7 @@ enum BatchGenerationSmoke {
         "cancellation_join_seconds": cancelledAt.map { $0.duration(to: ContinuousClock().now).timeInterval } as Any? ?? NSNull()]
     }
   }
-  static func run(directory: URL, evidence: URL) async throws {
+  static func run(directory: URL, evidence: URL, sharedInstructionModel: Bool = false) async throws {
     let prompt = "<bos>At dusk, Mara reached the harbor with the spool hidden under her coat. "
       + "The old man waited beside the warehouse.\n\n“You are early,” he said.\n\n"
       + "“I was told to come before the boats.”\n\nHe set the spool on the bench. "
@@ -39,8 +39,9 @@ enum BatchGenerationSmoke {
     }
     try write(receipt, "receipt.json")
     do {
-      let admission = try ModelPacks.admission(directory, purpose: .writing)
-      let manifest = try ModelPacks.evidenceManifest(admission, purpose: .writing)
+      let admission = try sharedInstructionModel ? ModelPacks.admission(directory, purpose: .consultation) : ModelPacks.admission(directory, purpose: .writing)
+      let manifest = try ModelPacks.evidenceManifest(admission, purpose: sharedInstructionModel ? .consultation : .writing)
+      receipt["shared_instruction_model_raw_writing"] = sharedInstructionModel
       try manifest.write(to: evidence.appendingPathComponent("model-manifest.json"))
       receipt["model_manifest_sha256"] = Digest.sha256(manifest)
       receipt["model_identity"] = admission.identity
@@ -113,8 +114,15 @@ enum BatchGenerationSmoke {
         throw BoomError.invalid("Fixed batch seed replay changed output; every output retained.")
       }
       let cancelled = try await trial("batch-three-cancelled", seeds: seeds, cancel: true)
-      guard cancelled.count == 3, cancelled.allSatisfy({ $0.stopReason == "cancelled" && !$0.tokenIDs.isEmpty }) else {
-        throw BoomError.invalid("Batch cancellation lost a row or its partial output.")
+      guard cancelled.count == batch.count, cancelled.contains(where: { $0.stopReason == "cancelled" }),
+        zip(cancelled, batch).allSatisfy({ partial, full in
+          if partial.stopReason == "cancelled" {
+            return !partial.tokenIDs.isEmpty && full.tokenIDs.starts(with: partial.tokenIDs)
+          }
+          return partial.tokenIDs == full.tokenIDs && partial.text == full.text
+            && partial.stopReason == full.stopReason && partial.stopTokenID == full.stopTokenID
+        }) else {
+        throw BoomError.invalid("Batch cancellation lost partial output or changed a completed row.")
       }
       // A subsequent lease must work after cancellation and producer joining.
       _ = try await runner.run(rawPrompt: prompt, maxTokens: 8, settings: settings,

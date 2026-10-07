@@ -420,6 +420,204 @@
       "purpose": "writing",
       "repository": "mlx-community/gemma-4-12B-4bit",
       "revision": "7d7c99c4d1b1d2ec2b52e2c46821cef2fa22ce0c"
+    },
+    {
+      "purpose": "writing",
+      "repository": "mlx-community/gemma-4-e4b-4bit",
+      "revision": "1560521ede4c3196854c19b6a77fcc2db8d4e289",
+      "files": [
+        {
+          "path": "README.md",
+          "bytes": 687,
+          "sha256": "30f3f534118ef357163b5420a17b5426c3540688939a5103784b4840bfcd0918"
+        },
+        {
+          "path": "config.json",
+          "bytes": 6188,
+          "sha256": "0fb81cb9ead8f2c8b487c0a1b2b3e91e4e170a58366f1db7fbc9c3082e90090a"
+        },
+        {
+          "path": "generation_config.json",
+          "bytes": 181,
+          "sha256": "de16fa1d777387d5fe6df54a9565d9c0f1213f7b31f2a2cf44805e27686d9c7c"
+        },
+        {
+          "path": "model.safetensors",
+          "bytes": 5217361182,
+          "sha256": "53bf49ec9ab2968a9916123dc60cd6e76ff2b3a06932542f5fd958eb13636504"
+        },
+        {
+          "path": "model.safetensors.index.json",
+          "bytes": 251749,
+          "sha256": "50c54ba1baf793652f8f85fb61cf9bedfafdc2ea7b59f80cf56611c9912fccd0"
+        },
+        {
+          "path": "processor_config.json",
+          "bytes": 902,
+          "sha256": "1bd0d00776284f369c1eff5fb631e865dfcdca861e0b7d60dbef27fcf37436a8"
+        },
+        {
+          "path": "tokenizer.json",
+          "bytes": 32170070,
+          "sha256": "12bac982b793c44b03d52a250a9f0d0b666813da566b910c24a6da0695fd11e6"
+        },
+        {
+          "path": "tokenizer_config.json",
+          "bytes": 1498,
+          "sha256": "e8ca2612e1e9cd7f258aee62c053050019adc92b14a9b3a015c6ec8715b6a2e4"
+        }
+      ]
+    },
+    {
+      "purpose": "writing",
+      "repository": "mlx-community/gemma-4-e2b-4bit",
+      "revision": "a280baf4aece348bd0f561ca43b9d47cc66d8498",
+      "files": [
+        {
+          "path": "README.md",
+          "bytes": 687,
+          "sha256": "656fdb80328b8e7d0d7a1476af8700666aa43159234b5627878bfb29235c888f"
+        },
+        {
+          "path": "config.json",
+          "bytes": 5955,
+          "sha256": "61b3440401f0dc0a1c0c63f9bcf1ef65eb4e564f083a772e3904de5a2b45d1a5"
+        },
+        {
+          "path": "generation_config.json",
+          "bytes": 181,
+          "sha256": "de16fa1d777387d5fe6df54a9565d9c0f1213f7b31f2a2cf44805e27686d9c7c"
+        },
+        {
+          "path": "model.safetensors",
+          "bytes": 3581101896,
+          "sha256": "1b75a001977eeadfe0c82eabde23d470530c311b6a8c279a3c2382aafc2a2d5b"
+        },
+        {
+          "path": "model.safetensors.index.json",
+          "bytes": 230329,
+          "sha256": "a8aa7359c747a0d59368dbff9a1029da86bda139ccc0ae1f1e938db75de7d5ce"
+        },
+        {
+          "path": "processor_config.json",
+          "bytes": 902,
+          "sha256": "1bd0d00776284f369c1eff5fb631e865dfcdca861e0b7d60dbef27fcf37436a8"
+        },
+        {
+          "path": "tokenizer.json",
+          "bytes": 32170070,
+          "sha256": "12bac982b793c44b03d52a250a9f0d0b666813da566b910c24a6da0695fd11e6"
+        },
+        {
+          "path": "tokenizer_config.json",
+          "bytes": 1498,
+          "sha256": "e8ca2612e1e9cd7f258aee62c053050019adc92b14a9b3a015c6ec8715b6a2e4"
+        }
+      ]
+    },
+    {
+      "purpose": "consultation",
+      "repository": "mlx-community/gemma-4-e4b-it-4bit",
+      "revision": "475b9088d29754a3379866cf5aeb6b41acd313c2",
+      "files": [
+        {
+          "path": "README.md",
+          "bytes": 593,
+          "sha256": "8e9717df49219943b8992eeccecd8050535318d34fffbbaeaac924ed01f27155"
+        },
+        {
+          "path": "chat_template.jinja",
+          "bytes": 17336,
+          "sha256": "2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082"
+        },
+        {
+          "path": "config.json",
+          "bytes": 6628,
+          "sha256": "780ccb3a514a5f1ced161d383f948fc22eca9b84b752ca19494f625bd9bad7a6"
+        },
+        {
+          "path": "generation_config.json",
+          "bytes": 208,
+          "sha256": "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de"
+        },
+        {
+          "path": "model.safetensors",
+          "bytes": 5146800534,
+          "sha256": "932b8271fc3fe65adcc78b96c10c6268bbfb13e8f67d1358727c0d6ee97e1eff"
+        },
+        {
+          "path": "model.safetensors.index.json",
+          "bytes": 240961,
+          "sha256": "f8accac59ee7efe87e0c298c854610b262c3cadd477407503147c71209ff0093"
+        },
+        {
+          "path": "processor_config.json",
+          "bytes": 1316,
+          "sha256": "de3e580aebdc98272d4c4547daffe6525fcbae18a83a0e0bcf0d7444d4ee6f37"
+        },
+        {
+          "path": "tokenizer.json",
+          "bytes": 32169626,
+          "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+        },
+        {
+          "path": "tokenizer_config.json",
+          "bytes": 2740,
+          "sha256": "080d9e1aff284e2f6043889cd05367966f7c7b80e025fbc0b06745e218158656"
+        }
+      ]
+    },
+    {
+      "purpose": "consultation",
+      "repository": "mlx-community/gemma-4-e2b-it-4bit",
+      "revision": "238767527555cb75a05732a84dff5d6ba0dd6809",
+      "files": [
+        {
+          "path": "README.md",
+          "bytes": 593,
+          "sha256": "9bd9184deee34e15f680922484005dec022a444239b81cc3fc3b226fc9de7a05"
+        },
+        {
+          "path": "chat_template.jinja",
+          "bytes": 17336,
+          "sha256": "2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082"
+        },
+        {
+          "path": "config.json",
+          "bytes": 6395,
+          "sha256": "6397cb6eca41b911d1dcab74e17941351057bd759284052a2331918ff6f9246c"
+        },
+        {
+          "path": "generation_config.json",
+          "bytes": 208,
+          "sha256": "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de"
+        },
+        {
+          "path": "model.safetensors",
+          "bytes": 3550670554,
+          "sha256": "038e39a37a7667373d2c3991375446b10c96ae1d717a68674870343db376b76e"
+        },
+        {
+          "path": "model.safetensors.index.json",
+          "bytes": 218323,
+          "sha256": "edb157dbf495e23f37377af4a628a9ad13c4ee7937f93ccb36ec9e9a19940f16"
+        },
+        {
+          "path": "processor_config.json",
+          "bytes": 1316,
+          "sha256": "de3e580aebdc98272d4c4547daffe6525fcbae18a83a0e0bcf0d7444d4ee6f37"
+        },
+        {
+          "path": "tokenizer.json",
+          "bytes": 32169626,
+          "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+        },
+        {
+          "path": "tokenizer_config.json",
+          "bytes": 2740,
+          "sha256": "080d9e1aff284e2f6043889cd05367966f7c7b80e025fbc0b06745e218158656"
+        }
+      ]
     }
   ]
 }

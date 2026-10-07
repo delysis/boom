@@ -19,6 +19,7 @@ uuid.workspace = true
 unicode-segmentation.workspace = true
 pulldown-cmark.workspace = true
 regex.workspace = true
+similar.workspace = true
 
 [lints]
 workspace = true

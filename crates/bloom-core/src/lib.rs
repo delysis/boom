@@ -13,15 +13,18 @@ mod checkpoint;
 mod context;
 mod document;
 mod generation;
+mod hashline;
 mod import;
 mod inventory;
 mod layout;
 mod markdown;
 mod media;
 mod memory;
+mod merge;
 mod restore;
 mod sampling_policy;
 mod search;
+mod setup;
 mod writing;
 
 pub use media::{MediaContainer, admit_media};
@@ -737,12 +740,25 @@ pub enum Request {
     DecodeEditResponse {
         text: String,
     },
+    ParseDocumentResponse {
+        text: String,
+        authority: document::Authority,
+    },
+    RenderDocumentContext {
+        documents: Vec<document::Document>,
+        authority: document::Authority,
+    },
     ValidateDocumentPatch {
         patch: document::Patch,
         authority: document::Authority,
         current: document::Document,
     },
     ApplyDocumentPatch {
+        patch: document::Patch,
+        authority: document::Authority,
+        current: document::Document,
+    },
+    PlanDocumentPatch {
         patch: document::Patch,
         authority: document::Authority,
         current: document::Document,
@@ -858,6 +874,19 @@ pub enum Request {
         resident_bytes: u64,
         weight_bytes: u64,
     },
+    ModelSetup {
+        physical_bytes: u64,
+        metal_bytes: u64,
+        resident_bytes: u64,
+        disk_bytes: u64,
+        writing: bool,
+        candidates: Vec<setup::Candidate>,
+    },
+    ModelWeights {
+        physical_bytes: u64,
+        resident_bytes: u64,
+        weight_bytes: u64,
+    },
     ContextCapacity {
         configuration: memory::CacheConfiguration,
         available_bytes: u64,
@@ -968,6 +997,18 @@ pub fn execute(request: Request) -> Result<Value, Error> {
             serde_json::to_value(sampling_policy::admit(captured.as_ref(), &loaded)?)
         }
         Request::DecodeEditResponse { text } => serde_json::to_value(document::decode(&text)?),
+        Request::ParseDocumentResponse { text, authority } => {
+            serde_json::to_value(hashline::response(&text, &authority))
+        }
+        Request::RenderDocumentContext {
+            documents,
+            authority,
+        } => serde_json::to_value(hashline::context(&documents, &authority)?),
+        Request::PlanDocumentPatch {
+            patch,
+            authority,
+            current,
+        } => serde_json::to_value(document::plan(&patch, &authority, &current)?),
         Request::ValidateDocumentPatch {
             patch,
             authority,
@@ -1095,6 +1136,30 @@ pub fn execute(request: Request) -> Result<Value, Error> {
             resident_bytes,
             weight_bytes,
         )?),
+        Request::ModelSetup {
+            physical_bytes,
+            metal_bytes,
+            resident_bytes,
+            disk_bytes,
+            writing,
+            candidates,
+        } => serde_json::to_value(setup::plan(
+            physical_bytes,
+            metal_bytes,
+            resident_bytes,
+            disk_bytes,
+            writing,
+            candidates,
+        )?),
+        Request::ModelWeights {
+            physical_bytes,
+            resident_bytes,
+            weight_bytes,
+        } => serde_json::to_value(setup::admit_weights(
+            physical_bytes,
+            resident_bytes,
+            weight_bytes,
+        )),
         Request::ContextCapacity {
             configuration,
             available_bytes,

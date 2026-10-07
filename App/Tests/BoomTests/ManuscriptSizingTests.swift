@@ -70,7 +70,8 @@ final class ManuscriptSizingTests: XCTestCase {
     XCTAssertEqual(view.manuscriptSize(width: 480, minimumHeight: first.height + 100)?.height, first.height + 100)
     XCTAssertEqual(layout.geometryChanges, firstGeometry, "A minimum page-height change needs no geometry invalidation.")
     _ = view.manuscriptSize(width: 320, minimumHeight: 100)
-    XCTAssertGreaterThan(layout.geometryChanges, firstGeometry)
+    XCTAssertEqual(layout.geometryChanges, firstGeometry,
+      "A proposed width must not change the displayed text container.")
     storage.replaceCharacters(in: NSRange(location: 0, length: 0), with: "🙂 added prose\n")
     let changed = try XCTUnwrap(view.manuscriptSize(width: 320, minimumHeight: 100))
     MarkdownStyle.apply(to: view, bodyFont: NSFont.systemFont(ofSize: 24), lineSpacing: 12)

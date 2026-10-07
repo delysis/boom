@@ -7,7 +7,7 @@ final class ModelLoadTests: XCTestCase {
     let coordinator = GenerationCoordinator.shared
     await coordinator.enter()
     let source = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-cancelled-load-" + UUID().uuidString)
-    let admission = ModelPacks.Admission(directory: source, identity: "cancelled-public-fixture", weightBytes: 1, kind: .convertedPack)
+    let admission = ModelPacks.Admission(directory: source, purpose: .consultation, identity: "cancelled-public-fixture", weightBytes: 1, kind: .convertedPack)
     let queued = Task { try await MLXGemmaRunner.load(admission: admission) }
     let deadline = Date().addingTimeInterval(2)
     while await coordinator.queuedOperations != 1 {

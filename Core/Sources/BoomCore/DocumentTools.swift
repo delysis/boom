@@ -1,11 +1,18 @@
 import Foundation
 
 public struct Replacement: Codable, Equatable, Sendable {
+  public struct ByteRange: Codable, Equatable, Sendable {
+    public let start: Int
+    public let end: Int
+    public init(start: Int, end: Int) { self.start = start; self.end = end }
+  }
   public let old: String
   public let new: String
-  public init(old: String, new: String) {
+  public let range: ByteRange?
+  public init(old: String, new: String, range: ByteRange? = nil) {
     self.old = old
     self.new = new
+    self.range = range
   }
 }
 public struct DocumentPatch: Codable, Equatable, Sendable, Identifiable {

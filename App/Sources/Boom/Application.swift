@@ -43,12 +43,14 @@ import SwiftUI
       app.run()
       return
     }
-    if CommandLine.arguments.contains("--generation-recovery-smoke") || CommandLine.arguments.contains("--workspace-import-smoke") || CommandLine.arguments.contains("--writing-control-smoke") || CommandLine.arguments.contains("--writing-context-smoke") || CommandLine.arguments.contains("--consultation-control-smoke") || CommandLine.arguments.contains("--explicit-export-smoke") {
+    if CommandLine.arguments.contains("--chat-layout-smoke") || CommandLine.arguments.contains("--generation-recovery-smoke") || CommandLine.arguments.contains("--workspace-import-smoke") || CommandLine.arguments.contains("--writing-control-smoke") || CommandLine.arguments.contains("--writing-context-smoke") || CommandLine.arguments.contains("--consultation-control-smoke") || CommandLine.arguments.contains("--explicit-export-smoke") {
       let app = NSApplication.shared
       app.setActivationPolicy(.prohibited)
       Task {
         do {
-          if CommandLine.arguments.contains("--explicit-export-smoke") {
+          if CommandLine.arguments.contains("--chat-layout-smoke") {
+            try await ChatLayoutSmoke.run(arguments: CommandLine.arguments)
+          } else if CommandLine.arguments.contains("--explicit-export-smoke") {
             try await ExplicitExportSmoke.run(arguments: CommandLine.arguments)
           } else if CommandLine.arguments.contains("--consultation-control-smoke") {
             try await ConsultationControlSmoke.run(arguments: CommandLine.arguments)
@@ -119,8 +121,11 @@ import SwiftUI
       return
     }
     let app = NSApplication.shared
-    let background = CommandLine.arguments.contains("--native-check-workspace")
-      && CommandLine.arguments.contains("--native-check-background")
+    let launchArguments: [String]
+    do { launchArguments = try QualificationLaunch.current() }
+    catch { fputs("Qualification startup refused: \(error.localizedDescription)\n", stderr); exit(1) }
+    let background = launchArguments.contains("--native-check-workspace")
+      && launchArguments.contains("--native-check-background")
     app.setActivationPolicy(background ? .accessory : .regular)
     let delegate = ApplicationDelegate()
     app.delegate = delegate
@@ -137,10 +142,13 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
   private var writingGuideWindow: NSWindow?
   private var observer: AnyCancellable?
   private var buttons: [String: NSButton] = [:]
-  private var searchItem: NSSearchToolbarItem?
+  private var searchItem: NSToolbarItem?
   private var searchField: NSSearchField?
+  private var searchButton: NSButton?
+  private weak var searchReturnResponder: NSResponder?
   private var terminating = false
   private var isNativeCheck = false
+  private var nativeEvidence: NativeCheckEvidence?
   static func workspaceWindow(frame: NSRect) -> NSWindow {
     let window = NSWindow(contentRect: frame, styleMask: [.titled, .closable, .miniaturizable, .resizable],
       backing: .buffered, defer: false)
@@ -154,7 +162,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
   }
   private func openWorkspace() async {
     do {
-      let arguments = CommandLine.arguments
+      let arguments = try QualificationLaunch.current()
       let override: WorkspaceStore?
       if let index = arguments.firstIndex(of: "--native-check-workspace") {
         guard arguments.filter({ $0 == "--native-check-workspace" }).count == 1,
@@ -162,7 +170,24 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
           throw BoomError.invalid("Native checks require an explicit absolute encrypted workspace path.")
         }
         let root = URL(fileURLWithPath: arguments[index + 1]).standardizedFileURL
-        override = try await detachedWork { try WorkspaceStore(rootOverride: root) }
+        let session: VaultSession
+        if let scopeIndex = arguments.firstIndex(of: "--native-check-qualification-id") {
+          guard arguments.filter({ $0 == "--native-check-qualification-id" }).count == 1,
+            scopeIndex + 1 < arguments.count, let id = UUID(uuidString: arguments[scopeIndex + 1]) else {
+            throw BoomError.invalid("Native qualification requires one UUID scope.")
+          }
+          session = VaultSession(qualificationID: id)
+        } else { session = .shared }
+        override = try await detachedWork { try WorkspaceStore(rootOverride: root, session: session) }
+        if arguments.contains("--native-check-evidence") {
+          guard arguments.contains("--native-check-qualification-id"),
+            arguments.filter({ $0 == "--native-check-evidence" }).count == 1,
+            let evidenceIndex = arguments.firstIndex(of: "--native-check-evidence"),
+            evidenceIndex + 1 < arguments.count, arguments[evidenceIndex + 1].hasPrefix("/") else {
+            throw BoomError.invalid("Visible qualification evidence requires an explicit UUID and fresh absolute directory.")
+          }
+          nativeEvidence = try await NativeCheckEvidence(directory: URL(fileURLWithPath: arguments[evidenceIndex + 1]), session: session)
+        }
         isNativeCheck = true
       } else { override = nil }
       let backgroundCheck = isNativeCheck && arguments.contains("--native-check-background")
@@ -213,6 +238,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
         window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
       }
       refreshToolbar()
+      nativeEvidence?.observe(window: window, model: model)
     } catch {
       let alert = NSAlert()
       alert.messageText = "Bloom could not open its local workspace"
@@ -244,24 +270,32 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
     toolbarDefaultItemIdentifiers(toolbar)
   }
   func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-    let controls = (model?.layout.paneControls ?? []).map { NSToolbarItem.Identifier($0) }
-    return [NSToolbarItem.Identifier.flexibleSpace] + controls + [NSToolbarItem.Identifier("search")]
+    let controls = model?.layout.paneControls ?? []
+    let leading = controls.filter { $0 != "chat" }.map { NSToolbarItem.Identifier($0) }
+    let trailing = controls.filter { $0 == "chat" }.map { NSToolbarItem.Identifier($0) }
+    return leading + [.flexibleSpace, NSToolbarItem.Identifier("search")] + trailing
   }
   func toolbar(
     _ toolbar: NSToolbar, itemForItemIdentifier identifier: NSToolbarItem.Identifier,
     willBeInsertedIntoToolbar flag: Bool
   ) -> NSToolbarItem? {
     if identifier.rawValue == "search" {
-      let item = NSSearchToolbarItem(itemIdentifier: identifier)
+      let item = NSToolbarItem(itemIdentifier: identifier)
       let field = LibrarySearchField()
       field.placeholderString = "Search"
       field.setAccessibilityLabel("Search library")
       field.target = self; field.action = #selector(searchLibrary(_:)); field.delegate = self
       field.sendsSearchStringImmediately = true; field.sendsWholeSearchString = false
       field.recentsAutosaveName = nil; field.maximumRecents = 0
-      item.searchField = field
-      item.preferredWidthForSearchField = 240
-      field.widthAnchor.constraint(lessThanOrEqualToConstant: 280).isActive = true
+      field.widthAnchor.constraint(equalToConstant: 240).isActive = true
+      guard let image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: "Search (⌘F)") else { return nil }
+      let button = NSButton(image: image, target: self, action: #selector(focusSearch))
+      button.bezelStyle = .texturedRounded
+      button.toolTip = "Search (⌘F)"
+      button.setAccessibilityLabel("Search (⌘F)")
+      item.label = "Search"
+      item.view = button
+      searchButton = button
       searchItem = item; searchField = field
       return item
     }
@@ -284,6 +318,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
       button.setButtonType(.toggle)
     }
     let item = NSToolbarItem(itemIdentifier: identifier)
+    item.isNavigational = identifier.rawValue == "library"
     item.label = label
     item.paletteLabel = label
     item.toolTip = label
@@ -352,9 +387,6 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
       ("Cut", "cut:", "x"), ("Copy", "copy:", "c"), ("Paste", "paste:", "v"),
       ("Select All", "selectAll:", "a"),
     ] { edit.addItem(item(name, NSSelectorFromString(selector), key)) }
-    let find = item("Find…", #selector(NSTextView.performFindPanelAction(_:)), "f")
-    find.tag = 1
-    edit.addItem(find)
     let format = NSMenu(title: "Format")
     let formatItem = NSMenuItem(title: "Format", action: nil, keyEquivalent: "")
     formatItem.submenu = format
@@ -395,7 +427,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
     if model?.layout.paneControls.contains("chat") == true {
       view.addItem(item("Chat", #selector(toggleChat), "3", target: self))
     }
-    view.addItem(item("Search Library…", #selector(focusSearch), "f", [.command, .shift], target: self))
+    view.addItem(item("Search Library…", #selector(focusSearch), "f", target: self))
     view.addItem(.separator())
 
     let theme = NSMenu(title: "Appearance")
@@ -479,9 +511,35 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
   @objc private func importVoice() { model?.importVoice() }
   @objc private func searchLibrary(_ field: NSSearchField) {
     model?.librarySearch = field.stringValue
+    searchButton?.contentTintColor = field.stringValue.isEmpty ? nil : .controlAccentColor
     if !field.stringValue.isEmpty, model?.showsLibrary == false { model?.toggle("library") }
   }
-  @objc private func focusSearch() { searchItem?.beginSearchInteraction() }
+  @objc private func focusSearch() {
+    guard let item = searchItem, let field = searchField else { return }
+    let owner = searchButton?.window ?? window
+    if item.view !== field { searchReturnResponder = owner?.firstResponder }
+    item.view = field
+    owner?.makeFirstResponder(field)
+    field.selectText(nil)
+  }
+  private func hideSearch() {
+    guard let item = searchItem, let button = searchButton, item.view !== button else { return }
+    item.view = button
+  }
+  func control(_ control: NSControl, textView: NSTextView, doCommandBy command: Selector) -> Bool {
+    guard control === searchField, command == #selector(NSResponder.cancelOperation(_:)),
+      searchItem != nil else { return false }
+    searchField?.stringValue = ""
+    model?.librarySearch = ""
+    searchButton?.contentTintColor = nil
+    (searchField?.window ?? window)?.makeFirstResponder(searchReturnResponder)
+    hideSearch()
+    return true
+  }
+  func controlTextDidEndEditing(_ notification: Notification) {
+    guard let field = notification.object as? NSSearchField, field === searchField else { return }
+    hideSearch()
+  }
   func controlTextDidChange(_ notification: Notification) {
     guard let field = notification.object as? NSSearchField, field === searchField else { return }
     searchLibrary(field)

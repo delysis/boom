@@ -27,9 +27,16 @@ enum ModelInstallSmoke {
     guard path.hasPrefix("/"), !FileManager.default.fileExists(atPath: path) else { throw BoomError.invalid("Use a fresh absolute evidence directory.") }
     let evidence = URL(fileURLWithPath: path)
     try FileManager.default.createDirectory(at: evidence, withIntermediateDirectories: false)
-    let checkpoint = try ModelPacks.published(purpose)
+    let checkpoint: PublishedCheckpoint
+    if arguments.contains("--repository") {
+      let repository = try argument("--repository")
+      guard let selected = try ModelPacks.publishedCheckpoints(purpose).first(where: { $0.repository == repository }) else {
+        throw BoomError.invalid("The requested public repository is not pinned in this bundle.")
+      }
+      checkpoint = selected
+    } else { checkpoint = try ModelPacks.published(purpose) }
     let requirements = try ProductCore.checkpointRequirements(checkpoint)
-    let cachedBefore = ModelPacks.publishedCached(purpose)
+    let cachedBefore = ModelPacks.cachedSnapshot(checkpoint, hubs: HuggingFaceCache.hubs)
     let interrupt = arguments.contains("--interrupt-download")
     let importSource: URL?
     if arguments.contains("--import-snapshot") {
@@ -75,7 +82,7 @@ enum ModelInstallSmoke {
         guard result.purpose == purpose else { throw BoomError.invalid("The imported model has the wrong purpose.") }
         directory = result.directory
       } else {
-        directory = try await ModelPacks.installPublished(purpose, flag: flag, progress: { _ in }, onStoredRange: { file, offset in
+        directory = try await ModelPacks.installPublished(checkpoint, flag: flag, progress: { _ in }, onStoredRange: { file, offset in
           try ledger.stored(file, offset: offset)
           if interrupt, file.hasSuffix(".safetensors"), offset >= 67_108_864 { flag.cancel() }
         })
