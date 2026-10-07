@@ -75,6 +75,9 @@ struct CompletionSegment {
   let store: WorkspaceStore
   private(set) var mlxRunner: MLXGemmaRunner?
   private(set) var baseRunner: MLXGemmaRunner?
+  private var modelDirectories: [ModelPurpose: URL] = [:]
+  private var writingModelIdentity: String?
+  private var writingGenerationPolicy: ModelGenerationPolicy?
   var selectedMLXRunner: MLXGemmaRunner? { mlxRunner }
   var completionRunner: MLXGemmaRunner? { baseRunner }
   func documentAttachments(_ document: DocumentSnapshot) -> [AttachmentRecord] {
@@ -130,9 +133,9 @@ struct CompletionSegment {
     guard let destination = documentAttachmentDestination(id: document.id, range: range) else { return }
     chooseAttachmentFiles(to: destination)
   }
-  var canInfer: Bool { mlxRunner != nil }
-  var inferenceName: String { mlxRunner == nil ? "No model" : "Gemma 4 12B" }
-  var baseReady: Bool { baseRunner != nil }
+  var canInfer: Bool { mlxRunner != nil || modelDirectories[.consultation] != nil }
+  var inferenceName: String { canInfer ? "Gemma 4 12B" : "No model" }
+  var baseReady: Bool { baseRunner != nil || modelDirectories[.writing] != nil }
   private var foreground: Task<Void, Never>?
   private var activeFlag: CancellationFlag?
   private var activeID: UUID?
@@ -223,7 +226,7 @@ struct CompletionSegment {
       MLX.Memory.clearCache()
       await GenerationCoordinator.shared.leave()
     }
-    status = "Memory pressure released the inactive model. It can be reopened from model setup."
+    status = "Memory pressure released the inactive model. It will reload when needed."
   }
   func documentMatchesSearch(_ document: DocumentSnapshot) -> Bool {
     librarySearch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || searchedQuery != librarySearch || documentSearch[document.id] != nil
@@ -747,11 +750,11 @@ struct CompletionSegment {
   func send() {
     ensureChatForDraft()
     if authoredChatRole != nil { appendAuthoredChatMessage(); return }
-    guard !isBusy, let chat = selectedChat, let runner = mlxRunner,
+    guard !isBusy, let chat = selectedChat, canInfer,
       !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !pendingAttachments.isEmpty
-    else { if mlxRunner == nil { showingModels = true }; return }
+    else { if !canInfer { showingModels = true }; return }
     let request = draft, interaction = mode, document = selectedDocument
-    let selectedIDs = pendingAttachments, style = consultationStyle, provider = runner.identity
+    let selectedIDs = pendingAttachments, style = consultationStyle
     do {
       finishComposition()
       let graph = try ContextGraph.resolveChat(request: request, attachedDocumentID: chat.attachedDocumentID,
@@ -785,6 +788,8 @@ struct CompletionSegment {
       let outputLimit = interaction == .ask ? 512 : 4096
       work("Checking consultation context…") { [weak self] flag in
         guard let self else { return }
+        let runner = try await self.runnerForGeneration(.consultation, flag: flag)
+        let provider = runner.identity
         try await self.flush()
         try await self.revalidateOnDisk(graph.sources, attachments: attachmentSources)
         var images: [Data] = []
@@ -1289,14 +1294,14 @@ struct CompletionSegment {
   private func generateCandidates(document: DocumentSnapshot, offset: Int, profile: SamplingProfile,
     count: Int, maxTokens: Int, flag: CancellationFlag, previous: CandidateBundle? = nil,
     replay: WritingCandidate? = nil) async throws {
-    guard let runner = baseRunner else { throw BoomError.unavailable("Install the writing model first.") }
+    let capturedEpoch = epoch
+    let runner = try await runnerForGeneration(.writing, flag: flag)
     if let execution = replay?.batch, let seed = replay?.seed {
       try ProductCore.validateWritingBatch(execution, seed: seed)
     }
     let seeds = replay.map { $0.batch?.seeds ?? [$0.seed] }
       ?? (0..<count).map { _ in UInt64.random(in: .min ... .max) }
     try ProductCore.admitWritingBatch(width: seeds.count, prompt: 1, output: maxTokens, capacity: 16_384)
-    let capturedEpoch = epoch
     try await flush()
     let recipe: CompletionRecipe
     if let previous { recipe = previous.recipe }
@@ -1502,9 +1507,10 @@ struct CompletionSegment {
   }
   func canReplayCandidate(_ index: Int) -> Bool {
     guard !isBusy, let bundle = candidates, bundle.candidates.indices.contains(index),
-      bundle.candidates[index].state == .complete, let runner = baseRunner,
-      bundle.recipe.model == runner.identity else { return false }
-    do { try ProductCore.admitGenerationPolicy(bundle.recipe.generationPolicy, loaded: runner.generationPolicy); return true }
+      bundle.candidates[index].state == .complete,
+      bundle.recipe.model == (baseRunner?.identity ?? writingModelIdentity),
+      let policy = baseRunner?.generationPolicy ?? writingGenerationPolicy else { return false }
+    do { try ProductCore.admitGenerationPolicy(bundle.recipe.generationPolicy, loaded: policy); return true }
     catch { return false }
   }
   func acceptCandidateWord(_ index: Int) {
@@ -1829,15 +1835,11 @@ struct CompletionSegment {
       text = extracted
       note = coverage
     case .image(let image):
-      guard let runner = mlxRunner else {
-        throw BoomError.unavailable("No local image description model is ready.")
-      }
+      let runner = try await runnerForGeneration(.consultation, flag: flag)
       text = try await describeImage(image, runner: runner, flag: flag)
       note = "Local model description of the first image, resized to at most 1600 pixels. Machine-generated, not verified OCR or full image coverage."
     case .video(let frames, let coverage):
-      guard let runner = mlxRunner else {
-        throw BoomError.unavailable("No local video-frame description model is ready.")
-      }
+      let runner = try await runnerForGeneration(.consultation, flag: flag)
       var descriptions: [String] = []
       for frame in frames {
         try flag.check()
@@ -1874,9 +1876,45 @@ struct CompletionSegment {
       self.status = "Attachment ready"
     }
   }
-  private func releaseRunner() async {
-    if let old = mlxRunner { await old.join() }
-    mlxRunner = nil; modelReady = false
+  private func releaseRunner(_ purpose: ModelPurpose) async {
+    if purpose == .consultation {
+      if let old = mlxRunner { await old.join() }
+      mlxRunner = nil; modelReady = false
+    } else {
+      if let old = baseRunner { await old.join() }
+      baseRunner = nil
+    }
+  }
+  private func reclaimModelCache() async {
+    await GenerationCoordinator.shared.enter()
+    MLX.Memory.clearCache()
+    await GenerationCoordinator.shared.leave()
+  }
+  private func releaseInactiveModel(for purpose: ModelPurpose) async {
+    // Return from releaseRunner before clearing the allocator: its local strong
+    // reference must be gone so discarded model weights can actually reclaim.
+    await releaseRunner(purpose == .consultation ? .writing : .consultation)
+    await reclaimModelCache()
+  }
+  private func pairHasContext() async throws -> Bool {
+    guard let writing = baseRunner, let consultation = mlxRunner else { return true }
+    return try ProductCore.retainResidentPair(writing: await writing.contextLength(batchWidth: 3),
+      consultation: await consultation.contextLength)
+  }
+  private func retainPairIfUseful(for purpose: ModelPurpose) async throws {
+    guard try await !pairHasContext() else { return }
+    await releaseInactiveModel(for: purpose)
+    status = "The inactive model was released to preserve context. It will reload when needed."
+  }
+  func runnerForGeneration(_ purpose: ModelPurpose, flag: CancellationFlag) async throws -> MLXGemmaRunner {
+    try flag.check()
+    try await retainPairIfUseful(for: purpose)
+    if let runner = purpose == .consultation ? mlxRunner : baseRunner { return runner }
+    guard let directory = modelDirectories[purpose] else {
+      throw BoomError.unavailable("Install the \(purpose.title.lowercased()) model first.")
+    }
+    status = "Reloading \(purpose.title.lowercased()) model to preserve context…"
+    return try await openModel(directory, purpose: purpose, flag: flag)
   }
   func loadInstalledModels() {
     if let consultation = ModelPacks.cached(.consultation) { loadPack(consultation, purpose: .consultation) }
@@ -1888,27 +1926,36 @@ struct CompletionSegment {
       }
     }
   }
-  private func admitModel(_ admission: ModelPacks.Admission, purpose: ModelPurpose) throws {
+  private func admitModel(_ admission: ModelPacks.Admission, purpose: ModelPurpose) async throws {
     do { try ModelResidency.admit(weightBytes: admission.weightBytes) }
     catch BoomError.budget {
-      if purpose == .consultation { baseRunner = nil }
-      else { mlxRunner = nil; modelReady = false }
+      await releaseInactiveModel(for: purpose)
       try ModelResidency.admit(weightBytes: admission.weightBytes)
       status = "The inactive model was released to make room. Reopening it will take a moment."
     }
   }
+  func openModel(_ url: URL, purpose: ModelPurpose, flag: CancellationFlag,
+    prefillTokens: UInt32? = nil) async throws -> MLXGemmaRunner {
+    let admission = try await detachedWork { try ModelPacks.admission(url, purpose: purpose) }
+    try flag.check()
+    await releaseRunner(purpose)
+    await reclaimModelCache()
+    try await admitModel(admission, purpose: purpose)
+    let loaded = try await MLXGemmaRunner.load(admission: admission, prefillTokens: prefillTokens)
+    try flag.check()
+    modelDirectories[purpose] = url
+    if purpose == .consultation { mlxRunner = loaded; modelReady = true }
+    else {
+      baseRunner = loaded; writingModelIdentity = loaded.identity
+      writingGenerationPolicy = loaded.generationPolicy
+    }
+    try await retainPairIfUseful(for: purpose)
+    return loaded
+  }
   func loadPack(_ url: URL, purpose: ModelPurpose) {
     work("Opening \(purpose.title.lowercased()) model…") { [weak self] flag in
       guard let self else { return }
-      let admission = try await detachedWork { try ModelPacks.admission(url, purpose: purpose) }
-      try flag.check()
-      if purpose == .consultation { await self.releaseRunner() }
-      else { if let old = self.baseRunner { await old.join() }; self.baseRunner = nil }
-      try self.admitModel(admission, purpose: purpose)
-      let loaded = try await MLXGemmaRunner.load(admission: admission)
-      try flag.check()
-      if purpose == .consultation { self.mlxRunner = loaded; self.modelReady = true }
-      else { self.baseRunner = loaded }
+      _ = try await self.openModel(url, purpose: purpose, flag: flag)
       self.showingModels = false
       self.status = "\(purpose.title) ready · on this Mac"
     }
@@ -1923,14 +1970,7 @@ struct CompletionSegment {
         }
       }
       try flag.check()
-      let admission = try await detachedWork { try ModelPacks.admission(directory, purpose: purpose) }
-      if purpose == .consultation { await self.releaseRunner() }
-      else { if let old = self.baseRunner { await old.join() }; self.baseRunner = nil }
-      try self.admitModel(admission, purpose: purpose)
-      let loaded = try await MLXGemmaRunner.load(admission: admission)
-      try flag.check()
-      if purpose == .consultation { self.mlxRunner = loaded; self.modelReady = true }
-      else { self.baseRunner = loaded }
+      _ = try await self.openModel(directory, purpose: purpose, flag: flag)
       self.status = "\(purpose.title) ready · on this Mac"
     }
   }
@@ -1984,14 +2024,7 @@ struct CompletionSegment {
       self.status = "\(result.purpose.title) installed"
       let directory = result.directory
       do {
-        let admission = try await detachedWork { try ModelPacks.admission(directory, purpose: result.purpose) }
-        if result.purpose == .consultation { await self.releaseRunner() }
-        else { if let old = self.baseRunner { await old.join() }; self.baseRunner = nil }
-        try self.admitModel(admission, purpose: result.purpose)
-        let runner = try await MLXGemmaRunner.load(admission: admission)
-        try flag.check()
-        if result.purpose == .consultation { self.mlxRunner = runner; self.modelReady = true }
-        else { self.baseRunner = runner }
+        _ = try await self.openModel(directory, purpose: result.purpose, flag: flag)
       }
     }
   }

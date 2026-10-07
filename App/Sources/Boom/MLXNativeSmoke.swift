@@ -25,6 +25,16 @@ enum MLXNativeSmoke {
     else { throw BoomError.invalid("Use absolute paths and a fresh evidence directory.") }
     try FileManager.default.createDirectory(at: evidence, withIntermediateDirectories: false,
       attributes: [.posixPermissions: 0o700])
+    if arguments.contains("--residency-fallback") {
+      let consultation = try argument("--consultation-pack"), fixture = try argument("--fixture")
+      guard consultation.hasPrefix("/"), fixture.hasPrefix("/") else {
+        throw BoomError.invalid("Use absolute consultation and fixture paths.")
+      }
+      try await ModelResidencySmoke.run(writingPack: directory,
+        consultationPack: URL(fileURLWithPath: consultation),
+        fixtureURL: URL(fileURLWithPath: fixture), evidence: evidence)
+      return
+    }
     if arguments.contains("--memory-budget") {
       let prefill: UInt32?
       if arguments.contains("--benchmark-prefill-tokens") {

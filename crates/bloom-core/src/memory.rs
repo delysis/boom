@@ -39,6 +39,16 @@ pub fn qualification_context(writing: u64, consultation: u64) -> Result<FullCont
     })
 }
 
+/// Keeping weights resident is useful only while both ordinary experiences
+/// retain their context ceiling. Otherwise the inactive model must make room.
+pub fn retain_pair(writing: u64, consultation: u64) -> Result<bool, Error> {
+    require(
+        writing <= CONTEXT_CEILING && consultation <= CONTEXT_CEILING,
+        "Resident context capacity exceeds the configured ceiling.",
+    )?;
+    Ok(writing == CONTEXT_CEILING && consultation == CONTEXT_CEILING)
+}
+
 pub fn limits(physical: u64, metal: u64) -> Limits {
     let os_reserve = (8 * GIB).max(physical / 4);
     let metal_budget = (u128::from(metal) * 85 / 100) as u64;
@@ -160,6 +170,22 @@ pub fn context_capacity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paired_weights_cannot_take_the_active_context_budget() -> Result<(), Error> {
+        let config = gemma();
+        let prefill = Prefill::default();
+        let writing = context_capacity(&config, 3 * GIB, 3, prefill)?;
+        let consultation = context_capacity(&config, 3 * GIB, 1, prefill)?;
+        assert!(writing < CONTEXT_CEILING);
+        assert!(!retain_pair(writing, consultation)?);
+        assert!(retain_pair(
+            context_capacity(&config, 10 * GIB, 3, prefill)?,
+            context_capacity(&config, 10 * GIB, 1, prefill)?,
+        )?);
+        assert!(retain_pair(CONTEXT_CEILING + 1, CONTEXT_CEILING).is_err());
+        Ok(())
+    }
 
     #[test]
     fn qualification_keeps_both_full_context_inputs_and_output_reservations() -> Result<(), Error> {

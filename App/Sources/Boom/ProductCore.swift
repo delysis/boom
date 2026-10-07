@@ -181,6 +181,9 @@ enum ProductCore {
   static func qualificationContext(writing: Int, consultation: Int) throws -> FullContextInputs {
     try call(["op": "qualification_context", "writing": writing, "consultation": consultation])
   }
+  static func retainResidentPair(writing: Int, consultation: Int) throws -> Bool {
+    try call(["op": "residency_pair", "writing": writing, "consultation": consultation])
+  }
   static func admitCacheProbe(physical: UInt64, metal: UInt64, cache: UInt64) throws {
     let _: Bool = try call(["op": "residency_cache_probe", "physicalBytes": physical,
       "metalBytes": metal, "cacheBytes": cache])

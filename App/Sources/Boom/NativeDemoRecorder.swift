@@ -52,6 +52,15 @@ import Foundation
     guard !ended, seconds <= 300, frames.count < 1800,
       NSApp.activationPolicy() == .prohibited, view.window?.isVisible == false,
       view.window?.isRestorable == false, view.window?.restorationClass == nil else {
+      let failure: [String: Any] = ["ended": ended, "seconds": seconds,
+        "frame_count": frames.count, "phase": phase,
+        "activation_policy": NSApp.activationPolicy().rawValue,
+        "window_attached": view.window != nil,
+        "window_visible": view.window?.isVisible as Any? ?? NSNull(),
+        "window_restorable": view.window?.isRestorable as Any? ?? NSNull(),
+        "has_restoration_class": view.window?.restorationClass != nil]
+      try JSONSerialization.data(withJSONObject: failure, options: [.prettyPrinted, .sortedKeys])
+        .write(to: evidence.appendingPathComponent("demonstration-guard-failure.json"), options: .atomic)
       throw BoomError.invalid("The public recording exceeded its scope or deadline.")
     }
     if let last = frames.last, last.phase == phase, seconds - last.seconds < 0.2 { return }

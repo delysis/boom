@@ -11,7 +11,7 @@ import Synchronization
 /// Explicit public fixtures, actual paired MLX allocations and production
 /// encrypted checkpoints. No shown window, user workspace, Keychain or network.
 @MainActor enum ApplicationMemorySmoke {
-  private final class Probe: @unchecked Sendable {
+  final class Probe: @unchecked Sendable {
     private let lock = NSLock()
     private let queue = DispatchQueue(label: "com.delysis.Bloom.memory-sampler", qos: .utility)
     private let source: DispatchSourceTimer
@@ -191,51 +191,72 @@ import Synchronization
       }
       let store = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("encrypted-workspace"),
         testKey: SymmetricKey(data: Data(repeating: 0x6a, count: 32)))
+      let initialDocument = DocumentSnapshot(title: "Public memory and typing fixture", text: "Public fixture")
+      var state = WorkspaceState(); state.autocomplete = false; state.showChat = false
+      state.documents = [DocumentIndex(id: initialDocument.id, title: initialDocument.title)]
+      state.selectedDocument = initialDocument.id
+      try await store.save(state, documents: [initialDocument])
+      let workspace = try await WorkspaceModel(storeOverride: store, loadModels: false); model = workspace
+      guard workspace.layout.isAuthor else { throw BoomError.unavailable("Use the author edition for this diagnostic.") }
+      receipt["residency_scope"] = "production controller; keep both when context fits, otherwise release inactive weights and reload the same snapshot"
       let clock = ContinuousClock()
       var writingAdmission: ModelPacks.Admission?
-      func load(_ directory: URL, _ purpose: ModelPurpose) async throws -> MLXGemmaRunner {
+      var loads: [[String: Any]] = []
+      func load(_ directory: URL, _ purpose: ModelPurpose) async throws {
         probe.mark("verify-" + purpose.rawValue)
         let admission = try await detachedWork { try ModelPacks.admission(directory, purpose: purpose) }
         if purpose == .writing { writingAdmission = admission }
-        try ModelResidency.admit(weightBytes: admission.weightBytes)
         probe.mark("load-" + purpose.rawValue)
         let started = clock.now
-        let runner = try await MLXGemmaRunner.load(admission: admission, prefillTokens: prefillTokens)
+        let runner = try await workspace.openModel(directory, purpose: purpose,
+          flag: CancellationFlag(), prefillTokens: prefillTokens)
+        if let cacheProbe { Memory.cacheLimit = Int(clamping: cacheProbe); Memory.clearCache() }
         receipt[purpose.rawValue + "_generation_policy"] = try ProductCore.object(runner.generationPolicy)
         receipt[purpose.rawValue + "_load_seconds"] = started.duration(to: clock.now).timeInterval
         receipt[purpose.rawValue + "_model"] = admission.identity
         receipt[purpose.rawValue + "_loaded_footprint_bytes"] = ModelResidency.footprint()
+        loads.append(["purpose": purpose.rawValue, "model": admission.identity,
+          "elapsed_seconds": started.duration(to: clock.now).timeInterval,
+          "process_footprint_bytes": ModelResidency.footprint()])
+        receipt["model_loads_in_order"] = loads
         try ModelPacks.evidenceManifest(admission, purpose: purpose)
           .write(to: evidence.appendingPathComponent(purpose.rawValue + "-manifest.json"))
         try write(receipt, "receipt.json", evidence: evidence)
+      }
+      func activate(_ purpose: ModelPurpose) async throws -> MLXGemmaRunner {
+        if let runner = purpose == .writing ? workspace.completionRunner : workspace.selectedMLXRunner {
+          return runner
+        }
+        try await load(purpose == .writing ? writingPack : consultationPack, purpose)
+        guard let runner = purpose == .writing ? workspace.completionRunner : workspace.selectedMLXRunner else {
+          throw BoomError.invalid("The production controller did not retain its active model.")
+        }
         return runner
+      }
+      func writingPrefix(_ tokens: Int) async throws -> String {
+        let runner = try await activate(.writing)
+        return try await runner.diagnosticPrefix(tokens: tokens)
       }
       // A fresh process does not guarantee a cold OS filesystem cache.
       receipt["loading_scope"] = "fresh process; OS filesystem cache was not flushed"
-      let consultation = try await load(consultationPack, .consultation)
-      let writing = try await load(writingPack, .writing)
-      probe.mark("reject-resident-overlap")
-      guard let duplicate = writingAdmission else { throw BoomError.invalid("The writing admission was not captured.") }
-      receipt["overlap_load_admission_probe"] = try await overlapProbe(duplicate, prefillTokens: prefillTokens)
-      try write(receipt, "receipt.json", evidence: evidence)
-      if let cacheProbe { Memory.cacheLimit = Int(clamping: cacheProbe); Memory.clearCache() }
+      try await load(consultationPack, .consultation)
+      let initialConsultationCapacity = await workspace.selectedMLXRunner?.contextLength ?? 0
+      try await load(writingPack, .writing)
       receipt["effective_allocator_cache_limit_bytes"] = Memory.cacheLimit
-      probe.mark("pair-resident")
-      let writingCapacity = try await writing.contextLength(batchWidth: 3)
-      let consultationCapacity = await consultation.contextLength
+      probe.mark("runtime-residency")
+      let writingCapacity = try await workspace.completionRunner?.contextLength(batchWidth: 3) ?? 0
+      let consultationCapacity = await workspace.selectedMLXRunner?.contextLength
+      receipt["both_models_retained_after_pair_load"] = workspace.completionRunner != nil && workspace.selectedMLXRunner != nil
       receipt["writing_three_row_context_capacity_after_pair_load"] = writingCapacity
-      receipt["consultation_context_capacity_after_pair_load"] = consultationCapacity
-      guard writingCapacity >= 4096 + 256, consultationCapacity >= 4096 + 256 else {
-        throw BoomError.budget("The pair leaves insufficient context for the registered 4K trial.")
+      receipt["consultation_context_capacity_after_pair_load"] = consultationCapacity as Any? ?? NSNull()
+      receipt["consultation_context_capacity_before_pair_load"] = initialConsultationCapacity
+      guard writingCapacity >= 4096 + 256, initialConsultationCapacity >= 4096 + 256 else {
+        throw BoomError.budget("The runtime leaves insufficient context for the registered 4K trial.")
       }
-      let short = try await writing.diagnosticPrefix(tokens: 512)
-      let document = DocumentSnapshot(title: "Public memory and typing fixture", text:
-        try await writing.diagnosticPrefix(tokens: 16_128))
-      var state = WorkspaceState(); state.autocomplete = false; state.showChat = false
-      state.documents = [DocumentIndex(id: document.id, title: document.title)]; state.selectedDocument = document.id
-      try await store.save(state, documents: [document])
-      let workspace = try await WorkspaceModel(storeOverride: store, loadModels: false); model = workspace
-      guard workspace.layout.isAuthor else { throw BoomError.unavailable("Use the author edition for this diagnostic.") }
+      let short = try await writingPrefix(512)
+      workspace.updateDocument(try await writingPrefix(16_128), id: initialDocument.id, caret: 0)
+      try await workspace.flush()
+      guard let document = workspace.selectedDocument else { throw BoomError.invalid("Public document disappeared.") }
       let host = NSHostingView(rootView: WorkspaceView(model: workspace))
       let testWindow = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 1190, height: 846))
       window = testWindow; testWindow.isReleasedWhenClosed = false; testWindow.contentView = host
@@ -277,6 +298,7 @@ import Synchronization
         return delays
       }
       func consultationPlan(tokens: Int) async throws -> ConsultationPlan {
+        let consultation = try await activate(.consultation)
         var length = tokens - 64
         for _ in 0..<8 {
           let prefix = try await consultation.diagnosticPrefix(tokens: length)
@@ -358,30 +380,40 @@ import Synchronization
           try write(record, name + ".json", evidence: evidence); throw error
         }
       }
-      _ = try await trial("warmup-writing", runner: writing, prompt: short, plan: nil, seeds: [99], maxTokens: 16)
-      _ = try await trial("warmup-consultation", runner: consultation, prompt: nil,
-        plan: consultationPlan(tokens: 512), seeds: [99], maxTokens: 16)
-      let warmWriting = try await trial("warm-writing-4k", runner: writing,
-        prompt: writing.diagnosticPrefix(tokens: 4096), plan: nil, seeds: [42], maxTokens: 256)
-      let warmConsultation = try await trial("warm-consultation-4k", runner: consultation,
-        prompt: nil, plan: consultationPlan(tokens: 4096), seeds: [42], maxTokens: 256)
-      // Recompute admission after warming both models and exercising the UI.
-      let fullWritingCapacity = try await writing.contextLength(batchWidth: 3)
-      let fullConsultationCapacity = await consultation.contextLength
+      // Group trials by model so each 4K measurement follows a warmup of that
+      // resident instance. Scoped runner arguments do not pin inactive weights.
+      _ = try await trial("warmup-writing", runner: activate(.writing), prompt: short, plan: nil, seeds: [99], maxTokens: 16)
+      let warmWriting = try await trial("warm-writing-4k", runner: activate(.writing),
+        prompt: writingPrefix(4096), plan: nil, seeds: [42], maxTokens: 256)
+      let fullWritingCapacity = try await workspace.completionRunner?.contextLength(batchWidth: 3) ?? 0
       receipt["full_writing_admitted_context"] = fullWritingCapacity
-      receipt["full_consultation_admitted_context"] = fullConsultationCapacity
       try write(receipt, "receipt.json", evidence: evidence)
-      let fullContext = try ProductCore.qualificationContext(writing: fullWritingCapacity, consultation: fullConsultationCapacity)
+      let fullContext = try ProductCore.qualificationContext(writing: fullWritingCapacity, consultation: initialConsultationCapacity)
       receipt["registered_full_context_workload"] = try ProductCore.object(fullContext)
-      _ = try await trial("full-context-writing-three", runner: writing,
-        prompt: writing.diagnosticPrefix(tokens: fullContext.inputTokens[0]), plan: nil,
+      _ = try await trial("full-context-writing-three", runner: activate(.writing),
+        prompt: writingPrefix(fullContext.inputTokens[0]), plan: nil,
         seeds: [42, 2026, 8675309], maxTokens: fullContext.outputTokens)
-      _ = try await trial("full-context-consultation", runner: consultation,
-        prompt: nil, plan: consultationPlan(tokens: fullContext.inputTokens[1]), seeds: [42], maxTokens: fullContext.outputTokens)
-      let cancelled = try await trial("decode-cancellation-three", runner: writing,
+      let cancelled = try await trial("decode-cancellation-three", runner: activate(.writing),
         prompt: short, plan: nil, seeds: [17, 42, 314], maxTokens: 256, cancellation: true)
-      _ = try await trial("after-cancellation", runner: writing, prompt: short, plan: nil, seeds: [17], maxTokens: 16)
-      await writing.join(); await consultation.join()
+      _ = try await trial("after-cancellation", runner: activate(.writing), prompt: short, plan: nil, seeds: [17], maxTokens: 16)
+      let shortConsultation = try await consultationPlan(tokens: 512)
+      _ = try await trial("warmup-consultation", runner: activate(.consultation), prompt: nil,
+        plan: shortConsultation, seeds: [99], maxTokens: 16)
+      let warmConsultation = try await trial("warm-consultation-4k", runner: activate(.consultation),
+        prompt: nil, plan: consultationPlan(tokens: 4096), seeds: [42], maxTokens: 256)
+      let fullConsultationCapacity = await workspace.selectedMLXRunner?.contextLength ?? 0
+      receipt["full_consultation_admitted_context"] = fullConsultationCapacity
+      let finalContext = try ProductCore.qualificationContext(writing: fullWritingCapacity, consultation: fullConsultationCapacity)
+      try write(receipt, "receipt.json", evidence: evidence)
+      _ = try await trial("full-context-consultation", runner: activate(.consultation),
+        prompt: nil, plan: consultationPlan(tokens: finalContext.inputTokens[1]), seeds: [42], maxTokens: finalContext.outputTokens)
+      // The adversarial overlap probe deliberately retains a 1 GiB allocation.
+      // Run it after context admission and generation: allocator retention of
+      // that fixture must not reduce the ordinary workload's context capacity.
+      probe.mark("reject-resident-overlap")
+      guard let duplicate = writingAdmission else { throw BoomError.invalid("The writing admission was not captured.") }
+      receipt["overlap_load_admission_probe"] = try await overlapProbe(duplicate, prefillTokens: prefillTokens)
+      try write(receipt, "receipt.json", evidence: evidence)
       typing?.cancel()
       let typingDelays = try await typing!.value; typing = nil
       workspace.isBusy = false; try await workspace.shutdown()

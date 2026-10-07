@@ -843,6 +843,10 @@ pub enum Request {
         writing: u64,
         consultation: u64,
     },
+    ResidencyPair {
+        writing: u64,
+        consultation: u64,
+    },
     ResidencyCacheProbe {
         physical_bytes: u64,
         metal_bytes: u64,
@@ -1067,6 +1071,10 @@ pub fn execute(request: Request) -> Result<Value, Error> {
             writing,
             consultation,
         } => serde_json::to_value(memory::qualification_context(writing, consultation)?),
+        Request::ResidencyPair {
+            writing,
+            consultation,
+        } => serde_json::to_value(memory::retain_pair(writing, consultation)?),
         Request::ResidencyCacheProbe {
             physical_bytes,
             metal_bytes,
