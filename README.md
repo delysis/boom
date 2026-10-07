@@ -38,6 +38,8 @@ Explore prefills its captured prose once, expands that cache to three rows, and 
 
 Automatic suggestions reload an evicted writing model when the manuscript owns input focus and typing requests a continuation. Chat focus cannot start that reload. An open alternatives tray retains its captured choices; a dismissed or invalidated suggestion cannot prevent resumption after Undo. Native edits cancel obsolete suggestions, and foreground consultation joins the cancelled producer before acquiring the model coordinator.
 
+Model-cache reclamation retains the generation coordinator's lease and releases native allocations on the dedicated inference queue. Memory-pressure cleanup uses the same path, allowing the main actor to continue handling manuscript input.
+
 ## Build and checks
 
 Use an Apple Silicon Mac, macOS 15 or later, Xcode with Swift 6, and Rust.

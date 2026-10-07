@@ -221,11 +221,7 @@ struct CompletionSegment {
     if critical { cancel() }
     if writingFlag != nil { mlxRunner = nil; modelReady = false }
     else { baseRunner = nil }
-    Task {
-      await GenerationCoordinator.shared.enter()
-      MLX.Memory.clearCache()
-      await GenerationCoordinator.shared.leave()
-    }
+    Task { await reclaimModelCache() }
     status = "Memory pressure released the inactive model. It will reload when needed."
   }
   func documentMatchesSearch(_ document: DocumentSnapshot) -> Bool {
@@ -1888,7 +1884,9 @@ struct CompletionSegment {
   }
   private func reclaimModelCache() async {
     await GenerationCoordinator.shared.enter()
-    MLX.Memory.clearCache()
+    // Releasing native Metal allocations may block. Retain the GPU lease,
+    // but let the main actor continue handling manuscript input.
+    await InferenceExecutor.shared.perform { _ in MLX.Memory.clearCache() }
     await GenerationCoordinator.shared.leave()
   }
   private func releaseInactiveModel(for purpose: ModelPurpose) async {
