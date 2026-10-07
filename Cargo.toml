@@ -3,6 +3,7 @@ members = [
   "RustBridge",
   "crates/bloom-core",
   "crates/bloom-tokenizer-reference",
+  "crates/bloom-vault-reference",
   "crates/attachment-native-document",
   "crates/attachment-native-host",
   "crates/attachment-native-inspect",
