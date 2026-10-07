@@ -4,6 +4,19 @@ import XCTest
 @testable import Boom
 
 final class VaultTests: XCTestCase {
+  func testInjectedSessionIsSharedByStoresAndCannotSelectProductionNamespace() async throws {
+    let id = UUID()
+    XCTAssertEqual(VaultSession.qualificationService(id), "com.delysis.Bloom.qualification." + id.uuidString)
+    let session = VaultSession(loader: { _ in SymmetricKey(size: .bits256) })
+    let first = try WorkspaceStore(rootOverride: root(), session: session)
+    let second = try WorkspaceStore(rootOverride: root(), session: session)
+    let document = DocumentSnapshot(title: "Session fixture", text: "Public shared session")
+    try first.vault.put(Data(document.text.utf8), kind: .document, id: document.id)
+    let sibling = try first.vault.sibling(at: second.vault.root)
+    try FileManager.default.copyItem(at: first.vault.recordURL(.document, document.id), to: sibling.recordURL(.document, document.id))
+    XCTAssertEqual(try second.vault.get(.document, id: document.id), Data(document.text.utf8))
+    XCTAssertEqual(session.lookupCount, 1)
+  }
   private func root() throws -> URL {
     let url = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-test-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)

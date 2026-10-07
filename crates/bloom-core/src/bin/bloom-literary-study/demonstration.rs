@@ -137,7 +137,12 @@ pub(super) fn run(args: &[String]) -> Result<()> {
 }
 
 /// Commands are configured by the caller; this owns their common bounded lifetime.
-fn finish_case(mut command: Command, study: &Path, label: &str, deadline: u64) -> Result<bool> {
+pub(super) fn finish_case(
+    mut command: Command,
+    study: &Path,
+    label: &str,
+    deadline: u64,
+) -> Result<bool> {
     command
         .env_remove("MLX_METAL_GPU_ARCH")
         .env_remove("MLX_METAL_MAX_OPS")

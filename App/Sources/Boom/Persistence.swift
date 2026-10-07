@@ -73,7 +73,7 @@ final class Vault: @unchecked Sendable {
   let root: URL
   private let key: SymmetricKey
   private let lock = NSLock()
-  init(root: URL, testKey: SymmetricKey? = nil) throws {
+  init(root: URL, testKey: SymmetricKey? = nil, session: VaultSession = .shared) throws {
     self.root = root
     try FileManager.default.createDirectory(
       at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -82,7 +82,7 @@ final class Vault: @unchecked Sendable {
       key = testKey
       return
     }
-    key = try VaultSession.shared.unlock(existingRecords: !FileManager.default.contentsOfDirectory(
+    key = try session.unlock(existingRecords: !FileManager.default.contentsOfDirectory(
       at: root, includingPropertiesForKeys: nil).isEmpty)
   }
   private static func requireDirectory(_ url: URL) throws {
@@ -170,7 +170,16 @@ final class VaultSession: @unchecked Sendable {
   private var result: Result<SymmetricKey, Error>?
   private var lookups = 0
   private let loader: (@Sendable (Bool) throws -> SymmetricKey)?
-  init(loader: (@Sendable (Bool) throws -> SymmetricKey)? = nil) { self.loader = loader }
+  private let service: String
+  init(loader: (@Sendable (Bool) throws -> SymmetricKey)? = nil, qualificationID: UUID? = nil) {
+    self.loader = loader
+    service = qualificationID.map(Self.qualificationService) ?? "com.delysis.Bloom"
+  }
+  // A diagnostic can address only its disposable UUID namespace. Ordinary
+  // launches retain the same production item and process-owned session.
+  static func qualificationService(_ id: UUID) -> String {
+    "com.delysis.Bloom.qualification." + id.uuidString
+  }
   var lookupCount: Int { lock.lock(); defer { lock.unlock() }; return lookups }
   func unlock(existingRecords: Bool) throws -> SymmetricKey {
     lock.lock(); defer { lock.unlock() }
@@ -183,7 +192,7 @@ final class VaultSession: @unchecked Sendable {
   private func readOrCreate(existingRecords: Bool) throws -> SymmetricKey {
     let query: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
-      kSecAttrService as String: "com.delysis.Bloom",
+      kSecAttrService as String: service,
       kSecAttrAccount as String: "workspace-master-key", kSecReturnData as String: true,
       kSecMatchLimit as String: kSecMatchLimitOne,
     ]
@@ -208,7 +217,7 @@ final class VaultSession: @unchecked Sendable {
     let data = newKey.withUnsafeBytes { Data($0) }
     let add: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
-      kSecAttrService as String: "com.delysis.Bloom",
+      kSecAttrService as String: service,
       kSecAttrAccount as String: "workspace-master-key",
       kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
       kSecValueData as String: data,
@@ -225,7 +234,7 @@ actor WorkspaceStore {
   nonisolated let root: URL
   nonisolated let vault: Vault
   private var diskRevisions: [UUID: String] = [:]
-  init(rootOverride: URL? = nil, testKey: SymmetricKey? = nil) throws {
+  init(rootOverride: URL? = nil, testKey: SymmetricKey? = nil, session: VaultSession = .shared) throws {
     #if BOOM_UI_TEST
     let path = ProcessInfo.processInfo.environment["BOOM_UI_TEST_ROOT"]
       ?? "/tmp/boom-ui-test-root"
@@ -249,7 +258,7 @@ actor WorkspaceStore {
       root: root.appendingPathComponent("Private", isDirectory: true),
       testKey: SymmetricKey(data: Data(repeating: 0x42, count: 32)))
     #else
-    vault = try Vault(root: root.appendingPathComponent("Private", isDirectory: true), testKey: testKey)
+    vault = try Vault(root: root.appendingPathComponent("Private", isDirectory: true), testKey: testKey, session: session)
     #endif
   }
   func load() -> Result<(WorkspaceState, [DocumentSnapshot]), Error> {

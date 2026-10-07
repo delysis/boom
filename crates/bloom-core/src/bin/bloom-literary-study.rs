@@ -1,5 +1,6 @@
 //! Developer-only, source-bound literary comparison through the native app.
-//! This binary never opens a user workspace, requests a key or modifies prose.
+//! This binary never opens a user workspace or modifies prose. Only the explicit
+//! Keychain diagnostic accesses disposable UUID-named qualification items.
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -17,6 +18,8 @@ const LIMIT: u64 = 4 << 20;
 const SEEDS: [u64; 3] = [42, 2026, 8675309];
 #[path = "bloom-literary-study/demonstration.rs"]
 mod demonstration;
+#[path = "bloom-literary-study/keychain.rs"]
+mod keychain;
 #[path = "bloom-literary-study/memory.rs"]
 mod memory;
 
@@ -1006,6 +1009,7 @@ fn main() -> Result<()> {
         Some("memory") => memory::run(&args),
         Some("demonstration") => demonstration::run(&args),
         Some("document-authority") => demonstration::documents(&args),
+        Some("keychain") => keychain::run(&args),
         Some("document-review") if args.len() == 3 => {
             demonstration::review_documents(Path::new(&args[2]))
         }

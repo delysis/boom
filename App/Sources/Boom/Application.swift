@@ -15,6 +15,15 @@ import SwiftUI
 
 @main @MainActor enum BoomMain {
   static func main() {
+    if CommandLine.arguments.contains("--keychain-smoke") {
+      let app = NSApplication.shared
+      app.setActivationPolicy(.prohibited)
+      Task {
+        do { try await KeychainSmoke.run(arguments: CommandLine.arguments); exit(0) }
+        catch { fputs("Isolated Keychain diagnostic failed: \(error.localizedDescription)\n", stderr); exit(1) }
+      }
+      app.run(); return
+    }
     if CommandLine.arguments.contains("--writing-guide-smoke") {
       let app = NSApplication.shared
       app.setActivationPolicy(.prohibited)
