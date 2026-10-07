@@ -2,15 +2,48 @@ import BoomCore
 import AppKit
 import CryptoKit
 import Foundation
+import Metal
+import MLX
 import SwiftUI
 
 /// Explicit real-weight diagnostic; every attempt retains its own receipt.
 enum MLXNativeSmoke {
+  struct ConsultationFixture: Decodable {
+    let model: String
+    let plan: ConsultationPlan
+    let generation_policy: ModelGenerationPolicy
+    let seeds: [UInt64]
+    let max_tokens_per_row: Int
+    let outputs: [Expected]
+    struct Expected: Decodable { let prompt_digest: String; let prompt_tokens: Int }
+    static func decode(_ data: Data, model: String, seed: UInt64,
+      promptTokens: Int, outputTokens: Int) throws -> Self {
+      guard data.count <= 1_048_576 else { throw BoomError.invalid("Oversized consultation fixture.") }
+      let fixture = try JSONDecoder().decode(Self.self, from: data)
+      guard fixture.model == model, fixture.seeds == [seed], fixture.outputs.count == 1,
+        fixture.max_tokens_per_row == outputTokens, fixture.outputs[0].prompt_tokens == promptTokens else {
+        throw BoomError.invalid("Require the captured model, seed and complete consultation workload.")
+      }
+      return fixture
+    }
+  }
+  static func validateConsultationArguments(_ arguments: [String]) throws {
+    let captured = arguments.contains("--consultation-fixture")
+    guard captured == arguments.contains("--consultation-warmup") else {
+      throw BoomError.invalid("Supply both the captured consultation and its captured warmup.")
+    }
+    let otherModes = ["--base", "--edit-smoke", "--propose-smoke", "--unchanged-smoke",
+      "--memory-budget", "--residency-fallback", "--preempt", "--writing-fixtures", "--batch"]
+    guard !captured || !otherModes.contains(where: arguments.contains) else {
+      throw BoomError.invalid("Choose only the captured consultation diagnostic.")
+    }
+  }
   static func run(arguments: [String]) async throws {
+    try validateConsultationArguments(arguments)
     func argument(_ name: String) throws -> String {
       guard arguments.filter({ $0 == name }).count == 1,
         let index = arguments.firstIndex(of: name), index + 1 < arguments.count
-      else { throw BoomError.invalid("Use --mlx-smoke --pack ABSOLUTE_DIRECTORY --evidence NEW_DIRECTORY [--base] [--seed INTEGER] [--writing-fixtures ABSOLUTE_JSON] [--preempt].") }
+      else { throw BoomError.invalid("Use --mlx-smoke --pack ABSOLUTE_DIRECTORY --evidence NEW_DIRECTORY [--base] [--seed INTEGER] [--writing-fixtures ABSOLUTE_JSON] [--preempt] [--consultation-fixture ABSOLUTE_JSON --consultation-warmup ABSOLUTE_JSON].") }
       return arguments[index + 1]
     }
     let directory = URL(fileURLWithPath: try argument("--pack"))
@@ -115,6 +148,47 @@ enum MLXNativeSmoke {
         output = try await runner.run(plan: plan, images: [], maxTokens: 1024,
           seed: seed, flag: CancellationFlag(), onText: { _ in })
         editDocument = (document, mode, expectsEdit)
+      } else if arguments.contains("--consultation-fixture") {
+        func captured(_ name: String, seed: UInt64, promptTokens: Int, outputTokens: Int) throws -> (ConsultationFixture, String) {
+          let path = try argument(name)
+          guard path.hasPrefix("/") else { throw BoomError.invalid("Use an absolute consultation fixture path.") }
+          let url = URL(fileURLWithPath: path)
+          let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+          guard values.isRegularFile == true, values.isSymbolicLink != true,
+            let size = values.fileSize, size <= 1_048_576 else { throw BoomError.invalid("Unsafe consultation fixture type or size.") }
+          let data = try Data(contentsOf: url)
+          let fixture = try ConsultationFixture.decode(data, model: runner.identity, seed: seed,
+            promptTokens: promptTokens, outputTokens: outputTokens)
+          try ProductCore.admitGenerationPolicy(fixture.generation_policy, loaded: runner.generationPolicy)
+          return (fixture, Digest.sha256(data))
+        }
+        let (fixture, fixtureHash) = try captured("--consultation-fixture", seed: seed, promptTokens: 4096, outputTokens: 256)
+        let (warmFixture, warmHash) = try captured("--consultation-warmup", seed: 99, promptTokens: 512, outputTokens: 16)
+        receipt["fixture_sha256"] = fixtureHash
+        receipt["warmup_fixture_sha256"] = warmHash
+        receipt["plan"] = try ProductCore.object(fixture.plan)
+        receipt["generation_policy"] = try ProductCore.object(runner.generationPolicy)
+        let device = MTLCreateSystemDefaultDevice()
+        receipt["backend"] = ["device_name": device?.name ?? "unavailable",
+          "architecture": device?.architecture.name ?? "unavailable",
+          "max_ops_override": ProcessInfo.processInfo.environment["MLX_MAX_OPS_PER_BUFFER"] ?? "unset",
+          "max_mb_override": ProcessInfo.processInfo.environment["MLX_MAX_MB_PER_BUFFER"] ?? "unset",
+          "cache_limit_bytes": Memory.cacheLimit, "memory_limit_bytes": Memory.memoryLimit] as [String: Any]
+        receipt["scope"] = "application runner, GPU lease, preflight, executor, production token stream and completed response; no UI or encrypted checkpoint workload"
+        try persist()
+        let warmup = try await runner.run(plan: warmFixture.plan, images: [], maxTokens: 16, seed: 99,
+          flag: CancellationFlag(), onText: { _ in })
+        receipt["warmup"] = ["prompt_tokens": warmup.promptTokens, "prompt_digest": warmup.promptDigest,
+          "text": warmup.text, "token_ids": warmup.tokenIDs, "elapsed_seconds": warmup.elapsedSeconds] as [String: Any]
+        try persist()
+        guard warmup.promptDigest == warmFixture.outputs[0].prompt_digest,
+          warmup.promptTokens == warmFixture.outputs[0].prompt_tokens else {
+          throw BoomError.invalid("The application runner supplied a different captured warmup.")
+        }
+        output = try await runner.run(plan: fixture.plan, images: [], maxTokens: fixture.max_tokens_per_row,
+          seed: seed, flag: CancellationFlag(), onText: { _ in })
+        receipt["captured_prompt_matches"] = output.promptDigest == fixture.outputs[0].prompt_digest
+          && output.promptTokens == fixture.outputs[0].prompt_tokens
       } else if arguments.contains("--base") {
         let text = "The harbor lighthouse was built from"
         output = try await runner.run(rawPrompt: "<bos>" + text, maxTokens: 64,
@@ -135,7 +209,12 @@ enum MLXNativeSmoke {
       receipt["stop_token_id"] = output.stopTokenID
       receipt["first_token_seconds"] = output.firstTokenSeconds
       receipt["elapsed_seconds"] = output.elapsedSeconds
+      receipt["native_setup_metrics"] = try output.setupMetrics.map { try ProductCore.object($0) } ?? NSNull()
+      receipt["execution_task_priority"] = output.executionPriority
       try persist() // Retain raw output even if tool decoding or the real commit fails.
+      if arguments.contains("--consultation-fixture"), receipt["captured_prompt_matches"] as? Bool != true {
+        throw BoomError.invalid("The application runner supplied a different captured prompt.")
+      }
       guard !output.text.isEmpty else { throw BoomError.invalid("The real model returned no text.") }
       await runner.join()
       if let (document, mode, expectsEdit) = editDocument {
