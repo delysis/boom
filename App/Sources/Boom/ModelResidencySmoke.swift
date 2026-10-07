@@ -11,7 +11,7 @@ import SwiftUI
     var receipt: [String: Any] = ["status": "running", "schema": 1,
       "source_inventory_sha256": Bundle.main.infoDictionary?["BoomSourceSHA256"] ?? "unavailable",
       "application_budget_bytes": try ModelResidency.budget(),
-      "scope": "public fixtures, real model eviction/reload and production consultation/Explore; full-context generation, physical input and Keychain remain unqualified",
+      "scope": "public fixtures, real model eviction/reload, focused automatic suggestions, stale editing, consultation preemption and Explore; full-context generation, physical input and Keychain remain unqualified",
       "full_context_generation_qualified": false, "keychain_dialogs_qualified": false,
       "physical_input_qualified": false, "window_shown": false]
     func persist() throws {
@@ -89,6 +89,77 @@ import SwiftUI
       receipt["consultation_reply"] = try ProductCore.object(chat)
       receipt["send_reloaded_same_snapshot"] = true; try persist()
       host.layoutSubtreeIfNeeded()
+      editor.setSelectedRange(NSRange(location: fixture.caretUTF16, length: 0))
+      workspace.movedCaret(fixture.caretUTF16, hasMarkedText: false)
+      func suggestion(_ ready: (CandidateBundle) -> Bool) async throws -> CandidateBundle {
+        let deadline = ContinuousClock().now.advanced(by: .seconds(180))
+        while ContinuousClock().now < deadline {
+          if let candidate = workspace.candidates, ready(candidate) { return candidate }
+          try await Task.sleep(for: .milliseconds(25))
+        }
+        workspace.cancel()
+        throw BoomError.unavailable("Automatic suggestion did not reach its registered state: " + workspace.status)
+      }
+      func composer(_ view: NSView) -> NSTextView? {
+        if let text = view as? NSTextView, text !== editor, text.isEditable { return text }
+        for child in view.subviews { if let text = composer(child) { return text } }
+        return nil
+      }
+      guard let chatComposer = composer(host), testWindow.makeFirstResponder(chatComposer) else {
+        throw BoomError.invalid("The mounted chat composer did not accept input focus.")
+      }
+      probe.mark("chat-focus-does-not-reload-writing")
+      workspace.setAutocomplete(true)
+      try await Task.sleep(for: .milliseconds(800))
+      guard workspace.completionRunner == nil, workspace.candidates == nil else {
+        throw BoomError.invalid("Chat focus started an unsolicited writing-model reload.")
+      }
+      receipt["chat_focus_did_not_reload_writing"] = true; try persist()
+      probe.mark("typing-reloads-writing-for-short-suggestion")
+      guard testWindow.makeFirstResponder(editor) else { throw BoomError.invalid("Manuscript focus was lost.") }
+      editor.insertText("x", replacementRange: NSRange(location: fixture.caretUTF16, length: 0))
+      editor.insertText("", replacementRange: NSRange(location: fixture.caretUTF16, length: 1))
+      let automatic = try await suggestion { $0.candidates.count == 1 && $0.candidates[0].state == .complete }
+      guard automatic.recipe.maxTokens == 64, automatic.recipe.model == receipt["writing_model"] as? String,
+        automatic.candidates[0].outputTokens <= 64, !automatic.candidates[0].text.isEmpty,
+        !workspace.showingCandidates, !workspace.ghostText.isEmpty,
+        workspace.selectedDocument == fixture.document, editor.string == fixture.document.text,
+        editor.isEditable, workspace.selectedMLXRunner == nil else {
+        throw BoomError.invalid("Typing failed to resume a short suggestion after writing-model eviction.")
+      }
+      receipt["automatic_suggestion"] = try ProductCore.object(automatic)
+      receipt["typing_reloaded_same_snapshot"] = true; try persist()
+      workspace.setAutocomplete(true)
+      let interruptedByEdit = try await suggestion { $0.id != automatic.id && $0.candidates.count == 1
+        && $0.candidates[0].state == .pending && $0.candidates[0].outputTokens > 0 }
+      probe.mark("native-edit-invalidates-short-suggestion")
+      editor.breakUndoCoalescing()
+      editor.insertText("x", replacementRange: NSRange(location: fixture.caretUTF16, length: 0))
+      workspace.setAutocomplete(false)
+      editor.undoManager?.undo()
+      let cancelledByEdit = try await suggestion { $0.id == interruptedByEdit.id && $0.candidates[0].state == .cancelled }
+      guard editor.string == fixture.document.text, workspace.selectedDocument == fixture.document,
+        workspace.ghostText.isEmpty else { throw BoomError.invalid("Obsolete automatic text survived native editing/Undo.") }
+      receipt["cancelled_by_edit"] = try ProductCore.object(cancelledByEdit); try persist()
+      workspace.setAutocomplete(true)
+      let interruptedByConsultation = try await suggestion { $0.id != cancelledByEdit.id && $0.candidates.count == 1
+        && $0.candidates[0].state == .pending && $0.candidates[0].outputTokens > 0 }
+      probe.mark("consultation-preempts-automatic-suggestion")
+      guard testWindow.makeFirstResponder(chatComposer) else { throw BoomError.invalid("Chat focus was lost.") }
+      workspace.draft = question; workspace.send(); try await finish(workspace)
+      guard let cancelledByConsultation = workspace.candidates,
+        cancelledByConsultation.id == interruptedByConsultation.id,
+        cancelledByConsultation.candidates[0].state == .cancelled,
+        workspace.selectedChat?.messages.count == 4,
+        workspace.selectedChat?.messages.last?.state == .complete,
+        workspace.selectedMLXRunner != nil, workspace.completionRunner == nil,
+        workspace.ghostText.isEmpty, editor.string == fixture.document.text else {
+        throw BoomError.invalid("Foreground consultation failed to join/preempt the automatic suggestion.")
+      }
+      receipt["cancelled_by_consultation"] = try ProductCore.object(cancelledByConsultation)
+      receipt["consultation_preempted_automatic_suggestion"] = true; try persist()
+      workspace.setAutocomplete(false); workspace.dismissCandidates()
+      guard testWindow.makeFirstResponder(editor) else { throw BoomError.invalid("Manuscript focus was lost after consultation.") }
       editor.setSelectedRange(NSRange(location: fixture.caretUTF16, length: 0))
       workspace.movedCaret(fixture.caretUTF16, hasMarkedText: false)
       guard workspace.canExploreWriting else { throw BoomError.invalid("Released writing model disabled Explore.") }

@@ -36,6 +36,8 @@ The pair shares an application budget capped at 24 GiB on every host, reduced fu
 
 Explore prefills its captured prose once, expands that cache to three rows, and decodes the alternatives in one MLX tensor batch. Rows use independent seeded samplers and stop independently; completed rows keep their positions until the batch finishes. Replay repeats the recorded batch width and ordered seeds, retaining all replayed alternatives and selecting the requested row. A short suggestion uses one row; requesting its other two alternatives uses a two-row batch. Context admission accounts for every row and the cache expansion overlap. `--mlx-smoke --batch --pack ABSOLUTE_DIRECTORY --evidence NEW_DIRECTORY` retains public-prose serial/batch measurements, raw outputs, exact replay, cache dimensions, cancellation and subsequent-operation results. This short single-model comparison does not establish paired full-context memory usage.
 
+Automatic suggestions reload an evicted writing model when the manuscript owns input focus and typing requests a continuation. Chat focus cannot start that reload. An open alternatives tray retains its captured choices; a dismissed or invalidated suggestion cannot prevent resumption after Undo. Native edits cancel obsolete suggestions, and foreground consultation joins the cancelled producer before acquiring the model coordinator.
+
 ## Build and checks
 
 Use an Apple Silicon Mac, macOS 15 or later, Xcode with Swift 6, and Rust.

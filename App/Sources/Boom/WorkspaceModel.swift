@@ -1209,9 +1209,10 @@ struct CompletionSegment {
   func scheduleCompletion() {
     // An open tray retains its captured choices for branching after edits.
     // Background suggestions must not replace the visible bundle.
-    guard !showingCandidates, librarySearch.isEmpty, state.autocomplete, showsDocument, !isBusy, baseRunner != nil, caret > 0,
+    guard !showingCandidates, librarySearch.isEmpty, state.autocomplete, showsDocument, !isBusy, baseReady, caret > 0,
       let document = selectedDocument, let editor, editor.selectedRange().length == 0,
-      !editor.hasMarkedText(), !candidateIsCurrent else { return }
+      editor.window?.firstResponder === editor,
+      !editor.hasMarkedText(), !candidateIsCurrent || ghostText.isEmpty else { return }
     let previous = ghostTask
     ghostFlag?.cancel(); previous?.cancel()
     let capturedEpoch = epoch, offset = caret, profile = samplingProfile
