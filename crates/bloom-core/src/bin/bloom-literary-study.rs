@@ -134,6 +134,38 @@ fn prepare(corpus: &Path, destination: &Path) -> Result<()> {
     }
     write_json(destination, &json!({"fixtures":fixtures,"seeds":SEEDS}))
 }
+fn caret_fixtures(original: &Path, destination: &Path) -> Result<()> {
+    let mut value = json_file(original)?;
+    require(
+        array(&value["fixtures"])?.len() == 4 && value["seeds"] == json!(SEEDS),
+        "Require the paired original corpus",
+    )?;
+    let original_fixtures = array(&value["fixtures"])?.to_vec();
+    for (index, fixture) in original_fixtures.iter().enumerate() {
+        let document = text(&fixture["document"]["text"])?;
+        let old_caret = fixture["caretUTF16"].as_u64().ok_or("Missing caret")? as usize;
+        let prefix = bloom_core::authored_prefix(document, old_caret)?;
+        let marker = if index < 2 {
+            "She held out her hand for"
+        } else {
+            "Éva folded the map once, along the crease"
+        };
+        let end = prefix
+            .rfind(marker)
+            .ok_or("Missing captured final sentence")?
+            + marker.len();
+        let caret = prefix[..end].encode_utf16().count();
+        require(
+            caret < old_caret,
+            "The new caret must precede the original paragraph end",
+        )?;
+        value["fixtures"][index]["caretUTF16"] = json!(caret);
+    }
+    value["caretComparison"] = json!({"original_fixture_sha256":digest_file(original)?,
+        "scope":"Only the captured caret changes; complete manuscript bytes, identities, examples and seeds remain unchanged",
+        "markers":["She held out her hand for","Éva folded the map once, along the crease"]});
+    write_json(destination, &value)
+}
 fn verify_model(directory: &Path, manifest: &Value) -> Result<()> {
     let mut names = std::collections::BTreeSet::new();
     for file in array(&manifest["files"])? {
@@ -507,10 +539,13 @@ fn booklet(study: &Path, destination: &Path) -> Result<()> {
             for name in array(&group["names"])? {
                 let name = text(name)?.to_owned();
                 rows.push((
-                    // A different model must not reuse a previously revealed label key.
+                    // Changed models or caret fixtures must not reuse a revealed label key.
                     bloom_core::digest(
-                        format!("bloom-literary-blind-v2:{}:{name}", registration["model"])
-                            .as_bytes(),
+                        format!(
+                            "bloom-literary-blind-v3:{}:{}:{name}",
+                            registration["model"], registration["fixture_sha256"]
+                        )
+                        .as_bytes(),
                     ),
                     name,
                 ));
@@ -962,6 +997,9 @@ fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("prepare") if args.len() == 4 => prepare(Path::new(&args[2]), Path::new(&args[3])),
+        Some("caret-fixtures") if args.len() == 4 => {
+            caret_fixtures(Path::new(&args[2]), Path::new(&args[3]))
+        }
         Some("run") => run(&args),
         Some("memory") => memory::run(&args),
         Some("memory-review") if args.len() == 3 => memory::review(Path::new(&args[2])),

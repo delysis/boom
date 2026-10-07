@@ -15,6 +15,15 @@ import SwiftUI
 
 @main @MainActor enum BoomMain {
   static func main() {
+    if CommandLine.arguments.contains("--writing-guide-smoke") {
+      let app = NSApplication.shared
+      app.setActivationPolicy(.prohibited)
+      Task {
+        do { try await WritingGuide.capture(arguments: CommandLine.arguments); exit(0) }
+        catch { fputs("Guide capture failed: \(error.localizedDescription)\n",stderr); exit(1) }
+      }
+      app.run(); return
+    }
     if CommandLine.arguments.contains("--model-install-smoke") {
       let app = NSApplication.shared
       app.setActivationPolicy(.prohibited)
@@ -116,6 +125,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
 {
   private var model: WorkspaceModel?
   private var window: NSWindow?
+  private var writingGuideWindow: NSWindow?
   private var observer: AnyCancellable?
   private var buttons: [String: NSButton] = [:]
   private var searchItem: NSSearchToolbarItem?
@@ -392,6 +402,11 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
     window.addItem(item("Minimize", #selector(NSWindow.performMiniaturize(_:)), "m"))
     window.addItem(item("Zoom", #selector(NSWindow.performZoom(_:))))
     NSApp.windowsMenu = window
+    if model?.layout.isAuthor == true {
+      let help = submenu("Help")
+      help.addItem(item("Writing with Bloom", #selector(showWritingGuide), target: self))
+      NSApp.helpMenu = help
+    }
     return bar
   }
   func menuWillOpen(_ menu: NSMenu) {
@@ -427,6 +442,18 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
     return true
   }
   @objc private func toggleLibrary() { model?.toggle("library") }
+  @objc private func showWritingGuide() {
+    if let writingGuideWindow { writingGuideWindow.makeKeyAndOrderFront(nil); return }
+    Task { @MainActor in
+      do {
+        let text = try await WritingGuide.load()
+        if let writingGuideWindow { writingGuideWindow.makeKeyAndOrderFront(nil); return }
+        let guide = WritingGuide.makeWindow(text: text)
+        writingGuideWindow = guide
+        guide.center(); guide.makeKeyAndOrderFront(nil)
+      } catch { model?.report(error) }
+    }
+  }
   @objc private func toggleDocument() { model?.toggle("document") }
   @objc private func toggleChat() { model?.toggle("chat") }
   @objc private func newDocument() {
