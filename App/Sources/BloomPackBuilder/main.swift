@@ -40,6 +40,9 @@ import MLXVLM
   }
   static func main() async throws {
     let args = CommandLine.arguments
+    if args.count > 1, args[1] == "--base-fidelity" {
+      try await BaseFidelityProbe.run(args); return
+    }
     if args.count > 1, args[1] == "--input-packaging-probe" {
       try await InputPackagingProbe.run(args); return
     }

@@ -84,6 +84,28 @@ fn group_matches(a: &Value, b: &Value) -> bool {
         })
     }) && FIELDS.iter().all(|key| a[*key] == b[*key])
 }
+fn model_identity(manifest: &Value, manifest_hash: &str) -> Result<String> {
+    if let Some(identity) = manifest["identity"].as_str() {
+        return Ok(identity.to_owned());
+    }
+    require(
+        manifest["schema"] == 1
+            && manifest["purpose"] == "writing"
+            && manifest["bits"] == 4
+            && manifest["groupSize"] == 32
+            && manifest["runtimeRevision"] == "9afc3b55f75a0d41a3d0c11330b9df6a036d24e4"
+            && manifest["upstreamRepository"] == "google/gemma-4-12B",
+        "Unsupported converted model manifest",
+    )?;
+    Ok(manifest_hash.to_owned())
+}
+fn native_manifest_matches(native: &Value, registered: &Value) -> bool {
+    if registered["identity"].is_string() {
+        native["identity"] == registered["identity"] && native["files"] == registered["files"]
+    } else {
+        native == registered
+    }
+}
 fn prepare(corpus: &Path, destination: &Path) -> Result<()> {
     let mut fixtures = Vec::new();
     for (index, (name, title)) in [
@@ -180,6 +202,8 @@ fn run(args: &[String]) -> Result<()> {
         "Require a writing manifest",
     )?;
     verify_model(pack, &manifest)?;
+    let manifest_hash = digest_file(Path::new(&args[5]))?;
+    let model = model_identity(&manifest, &manifest_hash)?;
     fs::create_dir(study)?;
     fs::copy(fixtures, study.join("fixtures.json"))?;
     fs::copy(&inventory, study.join("source-files.sha256"))?;
@@ -191,7 +215,7 @@ fn run(args: &[String]) -> Result<()> {
     )?;
     let registration = json!({"schema":1,"executable":executable,"executable_sha256":executable_hash,
         "source_inventory_sha256":source_hash,"fixture_sha256":digest_file(fixtures)?,
-        "manifest_sha256":digest_file(Path::new(&args[5]))?,"model":manifest["identity"],
+        "manifest_sha256":manifest_hash,"model":model,
         "execution_plan":plan,"unique_conditions":36,"replay_conditions":36,
         "profiles":["steady","standard","open"],"seeds":SEEDS,"batch_width":3,"max_tokens_per_row":256,
         "deadline_seconds":900,"automatic_retries":false,"outbound_network_denied":true,
@@ -298,8 +322,7 @@ fn review(study: &Path) -> Result<()> {
     let registered_model = json_file(&study.join("registered-model.json"))?;
     let native_model = json_file(&root.join("model-manifest.json"))?;
     require(
-        native_model["identity"] == registered_model["identity"]
-            && native_model["files"] == registered_model["files"],
+        native_manifest_matches(&native_model, &registered_model),
         "Native model manifest differs",
     )?;
     require(
@@ -482,7 +505,11 @@ fn booklet(study: &Path, destination: &Path) -> Result<()> {
             for name in array(&group["names"])? {
                 let name = text(name)?.to_owned();
                 rows.push((
-                    bloom_core::digest(format!("bloom-literary-blind-v1:{name}").as_bytes()),
+                    // A different model must not reuse a previously revealed label key.
+                    bloom_core::digest(
+                        format!("bloom-literary-blind-v2:{}:{name}", registration["model"])
+                            .as_bytes(),
+                    ),
                     name,
                 ));
             }
@@ -634,11 +661,319 @@ fn reference_call(
     )?;
     json_file(&stdout)
 }
+
+fn snapshot_inventory(pack: &Path, upstream: &Path, destination: &Path) -> Result<()> {
+    let metadata = json_file(upstream)?;
+    let id = text(&metadata["id"])?;
+    let revision = text(&metadata["sha"])?;
+    require(
+        id == "google/gemma-4-12B" && revision.len() == 40,
+        "Require official base metadata",
+    )?;
+    let mut files = Vec::new();
+    for entry in array(&metadata["siblings"])? {
+        let name = text(&entry["rfilename"])?;
+        require(
+            Path::new(name)
+                .components()
+                .all(|c| matches!(c, Component::Normal(_))),
+            "Unsafe upstream file",
+        )?;
+        if name == ".gitattributes" {
+            continue;
+        }
+        let path = pack.join(name);
+        let bytes = fs::metadata(&path)?.len();
+        let digest = digest_file(&path)?;
+        require(
+            entry["size"].as_u64() == Some(bytes),
+            "Cached upstream file size differs",
+        )?;
+        if let Some(lfs) = entry.get("lfs") {
+            require(
+                lfs["sha256"] == digest && lfs["size"].as_u64() == Some(bytes),
+                "Cached LFS file differs from official pinned metadata",
+            )?;
+        } else {
+            let blob = Command::new("git")
+                .args(["hash-object", "--no-filters"])
+                .arg(&path)
+                .output()?;
+            require(
+                blob.status.success()
+                    && String::from_utf8(blob.stdout)?.trim() == text(&entry["blobId"])?,
+                "Cached Git blob differs from official pinned metadata",
+            )?;
+        }
+        files.push(
+            json!({"path":name,"bytes":bytes,"sha256":digest,"upstream_blob_id":entry["blobId"]}),
+        );
+    }
+    require(
+        files.iter().any(|f| f["path"] == "model.safetensors"),
+        "Missing official weights",
+    )?;
+    write_json(
+        destination,
+        &json!({"identity":format!("{id}@{revision}"),"purpose":"writing",
+        "upstream_metadata_sha256":digest_file(upstream)?,"files":files,
+        "conversionProvenance":"Official BF16 checkpoint; upstream LFS SHA256 verified, no conversion."}),
+    )
+}
+
+fn fidelity(args: &[String]) -> Result<()> {
+    require(
+        args.len() == 9,
+        "fidelity BUILDER FIXTURE PACK MANIFEST PROTECTED_ROOT NEW_STUDY MODEL_IDENTITY",
+    )?;
+    require(
+        args[2..8].iter().all(|p| Path::new(p).is_absolute()),
+        "Use absolute paths",
+    )?;
+    let executable = Path::new(&args[2]);
+    let fixture = Path::new(&args[3]);
+    let pack = Path::new(&args[4]);
+    let manifest_path = Path::new(&args[5]);
+    let study = Path::new(&args[7]);
+    let captured = json_file(fixture)?;
+    require(
+        captured["promptTokens"] == 659
+            && captured["tokenIDs"] == json!([236913, 3771, 625, 5889, 236789])
+            && captured["stopTokenID"] == 1,
+        "Require the captured malformed contraction",
+    )?;
+    let manifest = json_file(manifest_path)?;
+    require(
+        manifest["identity"] == args[8] && manifest["purpose"] == "writing",
+        "Wrong model identity",
+    )?;
+    verify_model(pack, &manifest)?;
+    fs::create_dir(study)?;
+    fs::copy(fixture, study.join("fixture.json"))?;
+    fs::copy(manifest_path, study.join("registered-model.json"))?;
+    fs::copy(std::env::current_exe()?, study.join("owner"))?;
+    write_new(
+        &study.join("owner.rs"),
+        include_bytes!("bloom-literary-study.rs"),
+    )?;
+    let plan = json!({"pack":pack,"model":args[8],"fixture":study.join("fixture.json"),
+        "fixtureSHA256":digest_file(fixture)?,"output":study.join("native")});
+    write_json(&study.join("plan.json"), &plan)?;
+    let registration = json!({"schema":1,"executable":executable,"executable_sha256":digest_file(executable)?,
+        "fixture_sha256":digest_file(fixture)?,"manifest_sha256":digest_file(manifest_path)?,
+        "plan_sha256":digest_file(&study.join("plan.json"))?,"model":args[8],"process_budget_bytes":24_u64<<30,
+        "deadline_seconds":300,"automatic_retries":false,"outbound_network_denied":true,
+        "human_workspace_access_denied":true,"keychain_access":false,"foreground_activation":false,
+        "scope":"Same Swift architecture, teacher-forced raw logits; not independent architecture or product admission qualification"});
+    write_json(&study.join("registration.json"), &registration)?;
+    let registration_hash = digest_file(&study.join("registration.json"))?;
+    let protected = serde_json::to_string(&args[6])?;
+    let normal = serde_json::to_string(&format!(
+        "{}/Library/Application Support/Bloom",
+        std::env::var("HOME")?
+    ))?;
+    let profile = format!(
+        "(version 1) (allow default) (deny network-outbound) (deny file-read* file-write* (subpath {protected})) (deny file-read* file-write* (subpath {normal}))"
+    );
+    let mut command = Command::new("/usr/bin/sandbox-exec");
+    command
+        .args(["-p", &profile])
+        .arg(executable)
+        .arg("--base-fidelity")
+        .arg(study.join("plan.json"))
+        .env_remove("MLX_METAL_GPU_ARCH")
+        .env_remove("MLX_METAL_MAX_OPS")
+        .env_remove("MLX_METAL_MAX_MB")
+        .env_remove("MTL_CAPTURE_ENABLED")
+        .env("MLX_MAX_OPS_PER_BUFFER", "50")
+        .env("MLX_MAX_MB_PER_BUFFER", "50")
+        .stdin(Stdio::null())
+        .stdout(fs::File::create(study.join("execution.stdout"))?)
+        .stderr(fs::File::create(study.join("execution.stderr"))?)
+        .process_group(0);
+    let started = Instant::now();
+    let mut child = OwnedChild(command.spawn()?);
+    write_json(
+        &study.join("started.json"),
+        &json!({"pid":child.0.id(),"process_group":child.0.id()}),
+    )?;
+    println!("Owned precision screen started: {}", child.0.id());
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.0.try_wait()? {
+            break status;
+        }
+        if started.elapsed() >= Duration::from_secs(300) {
+            timed_out = true;
+            child.terminate();
+            break child.0.wait()?;
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+    write_json(
+        &study.join("owner-result.json"),
+        &json!({"pid":child.0.id(),"child_joined":true,
+        "exit_code":status.code(),"timed_out":timed_out,"elapsed_seconds":started.elapsed().as_secs_f64(),"automatic_retries":false}),
+    )?;
+    require(
+        digest_file(executable)? == registration["executable_sha256"]
+            && digest_file(&study.join("fixture.json"))? == registration["fixture_sha256"]
+            && digest_file(&study.join("registered-model.json"))?
+                == registration["manifest_sha256"]
+            && digest_file(&study.join("plan.json"))? == registration["plan_sha256"]
+            && digest_file(&study.join("registration.json"))? == registration_hash,
+        "Registered inputs changed",
+    )?;
+    verify_model(pack, &manifest)?;
+    write_json(
+        &study.join("inputs-after.json"),
+        &json!({"registered_inputs_unchanged":true,"model_inventory_verified":true}),
+    )?;
+    require(
+        status.success() && !timed_out,
+        "Precision screen failed; retain this attempt",
+    )
+}
+
+fn converted_inventory(
+    pack: &Path,
+    expected: &str,
+    upstream: &Path,
+    destination: &Path,
+) -> Result<()> {
+    let path = pack.join("bloom-model.json");
+    require(
+        digest_file(&path)? == expected,
+        "Converted manifest differs from the signed catalog",
+    )?;
+    let manifest = json_file(&path)?;
+    let official = json_file(upstream)?;
+    require(
+        manifest["purpose"] == "writing"
+            && manifest["bits"] == 4
+            && manifest["groupSize"] == 32
+            && manifest["runtimeRevision"] == "9afc3b55f75a0d41a3d0c11330b9df6a036d24e4"
+            && official["identity"]
+                == format!(
+                    "{}@{}",
+                    text(&manifest["upstreamRepository"])?,
+                    text(&manifest["upstreamRevision"])?
+                ),
+        "Wrong converted checkpoint lineage",
+    )?;
+    let originals = array(&official["files"])?;
+    for file in array(&manifest["upstreamFiles"])? {
+        require(
+            originals.iter().any(|f| {
+                f["path"] == file["path"]
+                    && f["bytes"] == file["bytes"]
+                    && f["sha256"] == file["sha256"]
+            }),
+            "Converted pack declares different upstream bytes",
+        )?;
+    }
+    verify_model(pack, &manifest)?;
+    let mut files = array(&manifest["files"])?.to_vec();
+    files.push(
+        json!({"path":"bloom-model.json","bytes":fs::metadata(&path)?.len(),"sha256":expected}),
+    );
+    write_json(
+        destination,
+        &json!({"identity":format!("bloom/writing@{expected}"),"purpose":"writing","files":files,
+        "upstream":official["identity"],"upstream_metadata_sha256":digest_file(upstream)?,
+        "conversionProvenance":"Existing catalog-pinned local affine 4-bit/group-32 conversion; declared upstream bytes matched to verified official snapshot."}),
+    )
+}
+
+fn logit_metrics(bytes: &[u8]) -> Result<Value> {
+    require(bytes.len() == 262_144 * 4, "Wrong vocabulary-vector length")?;
+    let values: Vec<_> = bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    require(
+        values.iter().all(|x| x.is_finite()),
+        "Nonfinite vocabulary logits",
+    )?;
+    let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let total: f64 = values
+        .iter()
+        .map(|&x| (f64::from(x) - f64::from(maximum)).exp())
+        .sum();
+    let mut tokens = Vec::new();
+    for (id, label) in [(1, "EOS"), (236745, "literal t")] {
+        let logit = values[id];
+        tokens.push(json!({"id":id,"label":label,"logit":logit,
+            "rank":1+values.iter().filter(|&&x| x > logit).count(),
+            "unfiltered_probability":(f64::from(logit)-f64::from(maximum)).exp()/total}));
+    }
+    Ok(
+        json!({"vocabulary":values.len(),"tokens":tokens,"probability_scope":"Unfiltered softmax, not Standard's filtered sampling probability"}),
+    )
+}
+
+fn fidelity_review(study: &Path) -> Result<()> {
+    let registration = json_file(&study.join("registration.json"))?;
+    let owner = json_file(&study.join("owner-result.json"))?;
+    require(
+        owner["child_joined"] == true && owner["exit_code"] == 0 && owner["timed_out"] == false,
+        "Screen did not complete",
+    )?;
+    require(
+        json_file(&study.join("inputs-after.json"))?["model_inventory_verified"] == true
+            && digest_file(&study.join("fixture.json"))? == registration["fixture_sha256"]
+            && digest_file(&study.join("registered-model.json"))?
+                == registration["manifest_sha256"]
+            && digest_file(&study.join("plan.json"))? == registration["plan_sha256"],
+        "Input binding differs",
+    )?;
+    let report = json_file(&study.join("native/report.json"))?;
+    require(
+        report["status"] == "complete" && report["model"] == registration["model"],
+        "Native screen incomplete",
+    )?;
+    let mut observations = Vec::new();
+    for (name, count) in [("prefix", 659), ("after-apostrophe", 664)] {
+        let path = study.join("native").join(format!("{name}.f32"));
+        let metadata = json_file(&study.join("native").join(format!("{name}.json")))?;
+        require(
+            digest_file(&path)? == metadata["logits_sha256"] && metadata["input_tokens"] == count,
+            "Logit identity differs",
+        )?;
+        for field in ["current_footprint_bytes", "kernel_peak_footprint_bytes"] {
+            require(
+                metadata["memory"][field]
+                    .as_u64()
+                    .is_some_and(|x| x <= 24_u64 << 30),
+                "Process budget exceeded",
+            )?;
+        }
+        observations.push(json!({"name":name,"metrics":logit_metrics(&read(&path)?)?,"memory":metadata["memory"]}));
+    }
+    write_json(
+        &study.join("logit-review.json"),
+        &json!({"status":"verified","model":registration["model"],
+        "observations":observations,"independent_architecture_qualified":false,"literary_quality_qualified":false}),
+    )
+}
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("prepare") if args.len() == 4 => prepare(Path::new(&args[2]), Path::new(&args[3])),
         Some("run") => run(&args),
+        Some("fidelity") => fidelity(&args),
+        Some("converted-inventory") if args.len() == 6 => converted_inventory(
+            Path::new(&args[2]),
+            &args[3],
+            Path::new(&args[4]),
+            Path::new(&args[5]),
+        ),
+        Some("fidelity-review") if args.len() == 3 => fidelity_review(Path::new(&args[2])),
+        Some("snapshot-inventory") if args.len() == 5 => snapshot_inventory(
+            Path::new(&args[2]),
+            Path::new(&args[3]),
+            Path::new(&args[4]),
+        ),
         Some("review") if args.len() == 3 => review(Path::new(&args[2])),
         Some("booklet") if args.len() == 4 => booklet(Path::new(&args[2]), Path::new(&args[3])),
         Some("reference")
@@ -660,6 +995,33 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn converted_manifest_requires_full_match_and_uses_its_digest_as_identity() {
+        let manifest = json!({"schema":1,"purpose":"writing","bits":4,"groupSize":32,
+            "runtimeRevision":"9afc3b55f75a0d41a3d0c11330b9df6a036d24e4","upstreamRepository":"google/gemma-4-12B"});
+        assert_eq!(
+            model_identity(&manifest, "captured-digest").expect("converted identity"),
+            "captured-digest"
+        );
+        let mut changed = manifest.clone();
+        changed["groupSize"] = json!(64);
+        assert!(!native_manifest_matches(&changed, &manifest));
+        assert!(model_identity(&changed, "captured-digest").is_err());
+        assert!(model_identity(&json!({}), "captured-digest").is_err());
+    }
+    #[test]
+    fn logit_reader_rejects_truncation_and_nonfinite_values() {
+        assert!(logit_metrics(&[0; 4]).is_err());
+        let mut bytes = vec![0; 262_144 * 4];
+        let metrics = logit_metrics(&bytes).expect("finite logits");
+        assert_eq!(metrics["tokens"][0]["rank"], 1);
+        assert_eq!(
+            metrics["tokens"][0]["unfiltered_probability"],
+            1.0 / 262_144.0
+        );
+        bytes[..4].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert!(logit_metrics(&bytes).is_err());
+    }
     #[test]
     fn absent_optional_lineage_matches_null_but_required_identity_never_does() {
         let a = json!({"id":"g","fixture":0,"profile":"standard","seeds":[42],"names":["a"],"replayOf":null});
