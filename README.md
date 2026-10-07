@@ -10,6 +10,8 @@ Generation applies the pinned checkpoint's control-token suppression before samp
 
 Writing supplies the chosen examples as prose, followed by the manuscript before the caret. When the full prefix exceeds the budget, Rust excludes impossible suffixes using validated vocabulary bounds and asks the loaded tokenizer to check the remaining suffixes in order. The first fit retains the most recent contiguous text possible, without splitting a grapheme. Token counts can decrease when text is added; a binary search cannot establish this result. Text after the caret is excluded.
 
+The Rust writing-prompt builder includes the model's beginning-of-text marker. The native encoder disables automatic insertion so the model receives one boundary token. Counting, suffix selection and both generation shapes use that same compiled prompt. Authored prose has no chat turn template or inserted source headers.
+
 ## Privacy and ownership
 
 The fresh workspace is `~/Library/Application Support/Bloom/Private`. Documents, conversations, voice revisions, attachment originals, continuations, receipts and recovery journals are authenticated encrypted records. There is no migration, old-store reader, or plaintext workspace mode. Existing Boom stores are left alone.
@@ -53,6 +55,8 @@ open "$PWD/out/fresh-build/Bloom.app"
 ```
 
 Cargo has one workspace and lock. Swift dependencies are resolved once, with MLX Swift LM pinned to `9afc3b55f75a0d41a3d0c11330b9df6a036d24e4`. Builds use locked dependencies, run Rust and native tests, record actual static linker requirements, and reject source changes during the build. The signed bundle contains source/lock inventories, notices and the model catalog. Development signing uses a stable Apple Development identity; Developer ID distribution is a separate gate.
+
+`bloom-tokenizer-reference` is an offline developer executable in that same Rust workspace. It uses the pinned Hugging Face Rust tokenizer to encode explicit UTF-8 files or decode explicit token-ID arrays, retaining counts and hashes. It is not linked into Bloom. For compiled prompts that already include the beginning-of-text marker, compare its encoding without additional special tokens against native receipts. The tool also compares those tokens with standard checkpoint post-processing of the authored text after removing the compiler's leading marker. Default features and network support are disabled.
 
 The safe Rust `bloom-delivery` developer tool owns signing admission and command receipts. The third build argument selects `development` (default) or `distribution`; distribution requires an explicitly configured Developer ID Application identity and secure timestamp. Inspection and archive preparation do not submit to Apple or launch the app. See [DISTRIBUTION.md](DISTRIBUTION.md) for the exact preparation, notarization, stapling and installation sequence.
 

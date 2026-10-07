@@ -2,6 +2,7 @@
 members = [
   "RustBridge",
   "crates/bloom-core",
+  "crates/bloom-tokenizer-reference",
   "crates/attachment-native-document",
   "crates/attachment-native-host",
   "crates/attachment-native-inspect",
