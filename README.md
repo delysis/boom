@@ -105,6 +105,16 @@ The native MLX backend compares fused group-32 quantized multiplication with BF1
 
 It verifies the captured model and prompt identities, then compares native processor input with flat tokens in a fixed native/flat/flat/native order, using fresh KV caches and balanced 512-token prefill. It retains every full-vocabulary logit vector and observation, including partial evidence on failure. This one-model component check measures prefill and cache/logit settlement; it does not sample, qualify application performance, or change application behavior or defaults. Use an owning offline driver with a deadline, and compare complete vectors independently. The retained first comparison found identical logits and no supported speed benefit from flattening; the app keeps its native input path.
 
+`bloom-prefill-profile` owns a developer-only operation profile of the pinned public consultation checkpoint. Supply its existing HF snapshot, a captured public 4K consultation fixture, the corresponding model inventory, the built `BloomPackBuilder`, and fresh evidence, using absolute paths:
+
+```sh
+cargo build --release -p bloom-core --bin bloom-prefill-profile --locked
+target/release/bloom-prefill-profile run /absolute/public-snapshot /absolute/fixture.json /absolute/model-manifest.json /absolute/BloomPackBuilder /absolute/new-evidence
+target/release/bloom-prefill-profile review /absolute/new-evidence
+```
+
+The Rust owner verifies every inventoried model file before and after execution, registers a baseline/profile/profile/baseline order, denies outbound networking and access to the active author fixture workspace, and joins its child process group with a 300-second native execution deadline. Native instrumentation delegates to the loaded model's unchanged linear projections, settling their inputs and outputs separately. Each output projection's input settlement includes the preceding attention, rotary and cache work. These synchronized groups perturb scheduling and are not individual GPU kernel timings. The independent reader requires exact equality of all four complete float32 logit vectors and retains every operation observation. This one-model probe changes no app runtime, weights, sampling settings, context budget or product qualification gate.
+
 The application memory diagnostic exercises the production residency controller and requires a complete 16,384-token context for each purpose before its registered 16,128-input/256-output trial. Writing includes three batched rows. Rust rejects reduced admission rather than letting the diagnostic silently shorten its workload. The diagnostic retains all initial loads and reloads separately; it warms each resident instance before measuring its 4K first response. The 24 GiB application cap and separate latency, decoding, cancellation and typing targets remain unchanged.
 
 The explicit memory diagnostic accepts `--benchmark-prefill-tokens 256`, `512`, or `1024`. Ordinary generation remains balanced 512-token prefill. Each diagnostic captures its geometry in receipts and encrypted journals; replay under another geometry is refused. Register comparisons before execution and retain every failed target. A smaller chunk is an experimental measurement option, not a qualified latency improvement.
