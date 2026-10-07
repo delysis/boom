@@ -111,7 +111,7 @@ impl Drop for Owner {
 fn run(args: &[String]) -> Result<()> {
     require(
         cfg!(target_os = "macos") && args.len() == 7,
-        "run ABS_PACK ABS_FIXTURE ABS_MANIFEST ABS_BUILDER NEW_ABS_EVIDENCE",
+        "run|entry|priority|executor ABS_PACK ABS_FIXTURE ABS_MANIFEST ABS_BUILDER NEW_ABS_EVIDENCE",
     )?;
     require(
         args[2..]
@@ -135,19 +135,47 @@ fn run(args: &[String]) -> Result<()> {
         "Require a captured public 4K consultation",
     )?;
     verify_pack(pack, &manifest)?;
+    let policy = &fixture["generation_policy"];
+    let compiled = bloom_core::execute(serde_json::from_value(json!({
+        "op":"model_generation_policy","vocabularySize":policy["vocabularySize"],
+        "configuration":read(&pack.join("generation_config.json"))?,
+        "controlTokenIds":policy["controlTokenIDs"],"tokenizerEos":null,"prefillTokens":512
+    }))?)?;
+    require(
+        &compiled == policy,
+        "Captured policy differs from checkpoint",
+    )?;
+    let sampling = bloom_core::execute(serde_json::from_value(
+        json!({"op":"sampling","profile":"standard"}),
+    )?)?;
+    let seed = fixture["seeds"][0]
+        .as_u64()
+        .ok_or_else(|| io::Error::other("Missing captured seed"))?;
+    let mode = if args[1] == "run" {
+        "profile"
+    } else {
+        args[1].as_str()
+    };
+    let entry = mode != "profile";
+    let order = if entry {
+        ["direct", "iterator", "iterator", "direct"]
+    } else {
+        ["baseline", "profile", "profile", "baseline"]
+    };
     fs::create_dir(root)?;
     fs::copy(fixture_path, root.join("fixture.json"))?;
     fs::copy(manifest_path, root.join("model-manifest.json"))?;
     let plan_path = root.join("plan.json");
     let plan = json!({"pack":pack,"fixture":root.join("fixture.json"),"fixtureSHA256":hash(fixture_path)?,
-        "model":MODEL,"output":root.join("native")});
+        "model":MODEL,"output":root.join("native"),"mode":mode,
+        "sampling":sampling,"seed":seed,"suppressedTokenIDs":policy["suppressedTokenIDs"]});
     write(&plan_path, &plan)?;
     let registration = json!({"model":MODEL,"builder":builder,"builder_sha256":hash(builder)?,
         "plan_sha256":hash(&plan_path)?,"fixture_sha256":hash(fixture_path)?,"manifest_sha256":hash(manifest_path)?,
-        "order":["baseline","profile","profile","baseline"],"input_tokens":4096,"prefill_tokens":512,
-        "environment":{"MLX_METAL_MAX_OPS":"50","MLX_METAL_MAX_MB":"50","HF_HUB_OFFLINE":"1","MLX_METAL_GPU_ARCH":"removed","MTL_CAPTURE_ENABLED":"removed"},
+        "order":order,"input_tokens":4096,"prefill_tokens":512,"sampling":sampling,"seed":seed,"mode":plan["mode"],
+        "environment":{"MLX_MAX_OPS_PER_BUFFER":"50","MLX_MAX_MB_PER_BUFFER":"50","HF_HUB_OFFLINE":"1","MLX_METAL_GPU_ARCH":"removed","MTL_CAPTURE_ENABLED":"removed"},
         "deadline_seconds":300,"network_outbound_denied":true,"protected_workspace_denied":true,
-        "scope":"owned public-fixture synchronized operation-group attribution; no product gate"});
+        "scope":if entry { "matched direct prefill and production TokenIterator component comparison; no product gate" } else { "owned public-fixture synchronized operation-group attribution; no product gate" }});
     write(&root.join("registration.json"), &registration)?;
     let profile = format!(
         "(version 1) (allow default) (deny network-outbound) (deny file-read* file-write* (subpath \"{PROTECTED}\"))"
@@ -158,8 +186,10 @@ fn run(args: &[String]) -> Result<()> {
         .arg(builder)
         .arg("--prefill-profile")
         .arg(&plan_path)
-        .env("MLX_METAL_MAX_OPS", "50")
-        .env("MLX_METAL_MAX_MB", "50")
+        .env("MLX_MAX_OPS_PER_BUFFER", "50")
+        .env("MLX_MAX_MB_PER_BUFFER", "50")
+        .env_remove("MLX_METAL_MAX_OPS")
+        .env_remove("MLX_METAL_MAX_MB")
         .env("HF_HUB_OFFLINE", "1")
         .env_remove("MLX_METAL_GPU_ARCH")
         .env_remove("MTL_CAPTURE_ENABLED")
@@ -239,6 +269,15 @@ fn review(root: &Path) -> Result<()> {
             && native["prefill_tokens"] == 512,
         "Incomplete native observations",
     )?;
+    require(
+        native["backend"]["max_ops_override"] == "50"
+            && native["backend"]["max_mb_override"] == "50"
+            && native["backend"]["max_ops_override"]
+                == registration["environment"]["MLX_MAX_OPS_PER_BUFFER"]
+            && native["backend"]["max_mb_override"]
+                == registration["environment"]["MLX_MAX_MB_PER_BUFFER"],
+        "Effective backend overrides were not verified",
+    )?;
     let fixture = read(&root.join("fixture.json"))?;
     let ids = read(&root.join("native/input-token-ids.json"))?;
     require(
@@ -251,6 +290,7 @@ fn review(root: &Path) -> Result<()> {
         .ok_or_else(|| io::Error::other("Missing trials"))?;
     require(trials.len() == 4, "Missing scheduled trials")?;
     let mut reference: Option<Vec<u8>> = None;
+    let mut first_sample: Option<u64> = None;
     let mut summaries = Vec::new();
     for (index, trial) in trials.iter().enumerate() {
         let arm = text(&registration["order"][index])?;
@@ -284,6 +324,28 @@ fn review(root: &Path) -> Result<()> {
             reference = Some(bytes);
         }
         let total = positive(&trial["seconds"], false)?;
+        if ["entry", "priority", "executor"]
+            .iter()
+            .any(|m| registration["mode"] == *m)
+        {
+            let token = trial["selected_token_id"]
+                .as_u64()
+                .ok_or_else(|| io::Error::other("Missing sampled token"))?;
+            require(
+                token < 262144
+                    && positive(&trial["constructor_seconds"], false)? <= total
+                    && trial["thread_qos"].as_u64().is_some(),
+                "Invalid first-sample observation",
+            )?;
+            if let Some(expected) = first_sample {
+                require(
+                    expected == token,
+                    "First sampled token changed between paths",
+                )?;
+            } else {
+                first_sample = Some(token);
+            }
+        }
         let rows = trial["observations"]
             .as_array()
             .ok_or_else(|| io::Error::other("Missing operation observations"))?;
@@ -321,12 +383,20 @@ fn review(root: &Path) -> Result<()> {
         )?;
         summaries.push(
             json!({"trial":index,"arm":arm,"seconds":total,"groups":groups,
-            "unattributed_seconds":total-attributed,"operation_observations":rows.len()}),
+            "unattributed_seconds":total-attributed,"operation_observations":rows.len(),
+            "constructor_seconds":trial["constructor_seconds"],"selected_token_id":trial["selected_token_id"],"thread_qos":trial["thread_qos"]}),
         );
+    }
+    if first_sample.is_some() {
+        require(
+            first_sample == fixture["outputs"][0]["token_ids"][0].as_u64(),
+            "First sample differs from the captured application token",
+        )?;
     }
     write(
         &root.join("independent-review.json"),
-        &json!({"status":"passed","complete_logit_vectors_verified":4,
+        &json!({"status":"passed","complete_logit_vectors_verified":4,"effective_backend_overrides_verified":true,
+        "first_sample_matches_captured":first_sample == fixture["outputs"][0]["token_ids"][0].as_u64(),
         "exact_instrumented_logits":true,"trials":summaries,
         "scope":"full saved output equality and synchronized operation-group attribution; not kernel or app performance"}),
     )?;
@@ -336,8 +406,8 @@ fn review(root: &Path) -> Result<()> {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
-        Some("run") => run(&args),
+        Some("run" | "entry" | "priority" | "executor") => run(&args),
         Some("review") if args.len() == 3 && Path::new(&args[2]).is_absolute() => review(&PathBuf::from(&args[2])),
-        _ => Err(io::Error::other("Use run ABS_PACK ABS_FIXTURE ABS_MANIFEST ABS_BUILDER NEW_ABS_EVIDENCE or review ABS_EVIDENCE").into()),
+        _ => Err(io::Error::other("Use run|entry|priority|executor ABS_PACK ABS_FIXTURE ABS_MANIFEST ABS_BUILDER NEW_ABS_EVIDENCE or review ABS_EVIDENCE").into()),
     }
 }

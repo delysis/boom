@@ -229,7 +229,7 @@ fn main() -> Result<()> {
     let registration = json!({"executable":executable,"executable_sha256":hash(&executable)?,
         "plan_sha256":hash(&plan_path)?,"pack_identity":identity,"shard_sha256":expected["sha256"],
         "manifest_sha256":manifest_hash,"source_bindings":source_bindings,
-        "environment":{"MLX_METAL_MAX_OPS":"50","MLX_METAL_MAX_MB":"50","MLX_METAL_GPU_ARCH":"removed","MTL_CAPTURE_ENABLED":"removed"},
+        "environment":{"MLX_MAX_OPS_PER_BUFFER":"50","MLX_MAX_MB_PER_BUFFER":"50","MLX_METAL_GPU_ARCH":"removed","MTL_CAPTURE_ENABLED":"removed"},
         "operation_budget_bytes":budget,"protected_workspace_denied":true,
         "network_outbound_denied":true,"scope":"owned developer arithmetic screen; no product qualification",
         "deadline_seconds":120,"registered_observations":cases.len()*16,"registered_distinct_outputs":cases.len()*4});
@@ -249,8 +249,10 @@ fn main() -> Result<()> {
         .arg(&executable)
         .arg("--prefill-kernel-probe")
         .arg(&plan_path)
-        .env("MLX_METAL_MAX_OPS", "50")
-        .env("MLX_METAL_MAX_MB", "50")
+        .env("MLX_MAX_OPS_PER_BUFFER", "50")
+        .env("MLX_MAX_MB_PER_BUFFER", "50")
+        .env_remove("MLX_METAL_MAX_OPS")
+        .env_remove("MLX_METAL_MAX_MB")
         .env_remove("MLX_METAL_GPU_ARCH")
         .env_remove("MTL_CAPTURE_ENABLED")
         .stdin(Stdio::null())
