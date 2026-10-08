@@ -3,7 +3,7 @@ use crate::{Error, checkpoint::Purpose, memory, require};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Candidate {
     pub identity: String,
@@ -32,20 +32,13 @@ pub fn admit_weights(physical: u64, resident: u64, additional: u64) -> bool {
             .is_some_and(|total| total <= physical / 2)
 }
 
-pub fn plan(
-    physical: u64,
-    metal: u64,
-    resident: u64,
-    disk: u64,
-    writing: bool,
-    mut candidates: Vec<Candidate>,
-) -> Result<Plan, Error> {
+fn validate(candidates: &[Candidate]) -> Result<(), Error> {
     require(
         (1..=32).contains(&candidates.len()),
         "Automatic setup requires a bounded model catalog.",
     )?;
     let mut identities = BTreeSet::new();
-    for candidate in &candidates {
+    for candidate in candidates {
         require(
             !candidate.identity.is_empty()
                 && candidate.identity.len() <= 256
@@ -56,6 +49,9 @@ pub fn plan(
             "Invalid or repeated automatic model candidate.",
         )?;
     }
+    Ok(())
+}
+fn order(candidates: &mut [Candidate]) {
     candidates.sort_by(|a, b| {
         (!a.cached, a.rank, a.weight_bytes, &a.identity).cmp(&(
             !b.cached,
@@ -64,13 +60,57 @@ pub fn plan(
             &b.identity,
         ))
     });
-    let fits = |weights, required_disk| {
-        Ok::<_, Error>(
-            admit_weights(physical, 0, weights)
-                && required_disk <= disk
-                && memory::admit_load(physical, metal, resident, weights)?,
-        )
-    };
+}
+fn fits(
+    physical: u64,
+    metal: u64,
+    resident: u64,
+    disk: u64,
+    weights: u64,
+    required_disk: u64,
+) -> Result<bool, Error> {
+    Ok(admit_weights(physical, 0, weights)
+        && required_disk <= disk
+        && memory::admit_load(physical, metal, resident, weights)?)
+}
+/// The picker and automatic plan share validation, ordering and admission.
+pub fn eligible(
+    physical: u64,
+    metal: u64,
+    resident: u64,
+    disk: u64,
+    mut candidates: Vec<Candidate>,
+) -> Result<Vec<String>, Error> {
+    validate(&candidates)?;
+    order(&mut candidates);
+    let mut identities = Vec::new();
+    for candidate in candidates {
+        if fits(
+            physical,
+            metal,
+            resident,
+            disk,
+            candidate.weight_bytes,
+            candidate.disk_bytes,
+        )? {
+            identities.push(candidate.identity);
+        }
+    }
+    Ok(identities)
+}
+
+pub fn plan(
+    physical: u64,
+    metal: u64,
+    resident: u64,
+    disk: u64,
+    writing: bool,
+    mut candidates: Vec<Candidate>,
+) -> Result<Plan, Error> {
+    validate(&candidates)?;
+    order(&mut candidates);
+    let fits =
+        |weights, required_disk| fits(physical, metal, resident, disk, weights, required_disk);
     let mut consultation = None;
     for candidate in &candidates {
         if candidate.purpose == Purpose::Consultation
@@ -127,6 +167,39 @@ mod tests {
             cached: disk == 0,
             rank,
         }
+    }
+    #[test]
+    fn picker_uses_the_same_memory_disk_and_cache_ordering() -> Result<(), Error> {
+        let candidates = vec![
+            candidate("remote", Purpose::Consultation, 4 * GIB, 8 * GIB, 0),
+            candidate("cached", Purpose::Writing, 8 * GIB, 0, 2),
+            candidate("too-big", Purpose::Consultation, 17 * GIB, 0, 0),
+        ];
+        assert_eq!(
+            eligible(32 * GIB, 24 * GIB, GIB, 0, candidates.clone())?,
+            vec!["cached"]
+        );
+        assert_eq!(
+            eligible(32 * GIB, 24 * GIB, GIB, 16 * GIB, candidates)?,
+            vec!["cached", "remote"]
+        );
+        assert!(
+            eligible(
+                32 * GIB,
+                4 * GIB,
+                GIB,
+                0,
+                vec![candidate(
+                    "metal-limited",
+                    Purpose::Consultation,
+                    8 * GIB,
+                    0,
+                    0
+                )]
+            )?
+            .is_empty()
+        );
+        Ok(())
     }
     #[test]
     fn cached_pair_fits_but_public_pair_reuses_chat_with_half_ram_limit() -> Result<(), Error> {

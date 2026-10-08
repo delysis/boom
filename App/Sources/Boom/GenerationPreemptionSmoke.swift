@@ -67,7 +67,7 @@ enum GenerationPreemptionSmoke {
           settings: ProductCore.sampling(.standard), seeds: batch ? [42, 17, 314] : [42],
           flag: backgroundFlag, background: true, onPrefill: { progress in
             trace.prefill(progress); events.continuation.yield(progress)
-          }, onCheckpoint: { _, progress, _, _ in if !progress.text.isEmpty { trace.text() } })
+          }, onCheckpoint: { updates in if updates.contains(where: { !$0.progress.text.isEmpty }) { trace.text() } })
       }
       backgroundTask = background
       let watchdog = DispatchSource.makeTimerSource(queue: .global())

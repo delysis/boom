@@ -25,6 +25,7 @@ struct AttachmentRecord: Codable, Identifiable, Equatable, Sendable {
   var coverage: String
   var transform: String?
   var isImage: Bool? = nil
+  var awaitingTranscription: Bool? = nil
   var digest: String { Digest.sha256(rootDigest + "\n" + text + "\n" + (transform ?? "original")) }
   var reference: SourceReference {
     SourceReference(id: id, title: name, digest: digest, kind: "attachment")
@@ -63,6 +64,8 @@ struct WorkspaceState: Codable, Sendable {
   var showDocument = true
   var showChat = true
   var autocomplete = true
+  var preferredModels: [String: String]? = nil
+  var recordingDrafts: [UUID: [UUID]]? = nil
   var theme = "system"
 }
 
@@ -353,21 +356,7 @@ actor WorkspaceStore {
         }
         let journal = try writingCheckpoint(bundle: bundle, candidate: bundle.candidates[index])
         guard bundle.candidates[index].state == .pending else { continue }
-        if let journal {
-          bundle.candidates[index].retain(journal)
-          if let stop = journal.stopReason, stop != "cancelled" {
-            // A row may have finished while the other rows were still decoding.
-            // Its terminal journal is durable even before the bundle's final save.
-            bundle.candidates[index].state = journal.progress.text.isEmpty ? .failed : .complete
-            bundle.candidates[index].stopReason = stop
-          } else {
-            bundle.candidates[index].state = .cancelled
-            bundle.candidates[index].stopReason = "interrupted"
-          }
-        } else {
-          bundle.candidates[index].state = .cancelled
-          bundle.candidates[index].stopReason = "interrupted"
-        }
+        bundle.candidates[index].finishInterrupted(journal)
         interrupted = true
       }
       if interrupted { bundles.append(bundle) }

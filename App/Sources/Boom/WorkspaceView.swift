@@ -42,7 +42,7 @@ struct WorkspaceView: View {
     }
     .background(Color(nsColor: BoomChrome.sidebarBackground))
     .environment(\.openURL, OpenURLAction { _ in .discarded })
-    .sheet(isPresented: $model.showingModels) { ModelSetupView(model: model) }
+    .sheet(isPresented: $model.showingModels) { ModelPickerView(model: model) }
     .sheet(item: $model.backupRequest) { BackupPassphraseView(model: model, request: $0) }
     .sheet(item: $model.editingWritingExamples) { WritingExamplesView(model: model, request: $0) }
     .alert("Bloom", isPresented: Binding(
@@ -325,8 +325,9 @@ struct ChatPane: View {
   @State private var voiceChatID: UUID?
   @State private var voiceDocumentID: UUID?
   @State private var voiceDraft = ""
-  @State private var awaitingVoiceReply: UUID?
   @State private var recoveredVoiceText = ""
+  @State private var recoveredRecording: Data?
+  @State private var acceptingCapture = false
   @State private var restoreComposerAfterAlert = false
   private func authorityMenu(compact: Bool) -> some View {
     Menu {
@@ -371,36 +372,34 @@ struct ChatPane: View {
       .accessibilityLabel("Attach files or paste an image")
   }
   private func modelMenu(compact: Bool) -> some View {
-    Menu {
-      Button("Manage models…") { model.showingModels = true }
-    } label: {
+    Button { model.openModels() } label: {
       HStack(spacing: 4) {
         Image(systemName: "cpu")
         if !compact {
           Text(model.canInfer ? "Gemma" : "No model")
         }
       }.font(.system(size: 11, weight: .medium)).lineLimit(1)
-    }.menuStyle(.borderlessButton).fixedSize().disabled(model.isBusy)
+    }.buttonStyle(.plain).fixedSize().disabled(model.isBusy)
       .accessibilityLabel("Current model: \(model.inferenceName)")
       .help("Current local model: \(model.inferenceName). Select a model")
   }
-  private var dictationButton: some View {
-    Button { toggleVoice(.dictation) } label: {
-      Image(systemName: voice.purpose == .dictation ? "stop.circle.fill" : "waveform")
+  private var recordingButton: some View {
+    Button { toggleVoice(.recording) } label: {
+      Image(systemName: voice.purpose == .recording ? "stop.circle.fill" : "waveform")
         .frame(width: 22, height: 22)
-    }.buttonStyle(.plain).disabled((model.isBusy && !voice.isRecording) ||
-      voice.starting || voice.transcribing ||
-      (voice.isRecording && voice.purpose != .dictation))
-      .accessibilityLabel(voice.purpose == .dictation ? "Stop dictation" : "Dictate into message")
+    }.buttonStyle(.plain).disabled((model.isBusy && !model.settingUpModels && !voice.isRecording) ||
+      voice.starting || voice.transcribing || acceptingCapture ||
+      (voice.isRecording && voice.purpose != .recording))
+      .accessibilityLabel(voice.purpose == .recording ? "Stop audio recording" : "Record audio")
   }
-  private var conversationButton: some View {
-    Button { toggleVoice(.conversation) } label: {
-      Image(systemName: voice.purpose == .conversation ? "stop.circle.fill" : "mic")
+  private var transcriptionButton: some View {
+    Button { toggleVoice(.transcription) } label: {
+      Image(systemName: voice.purpose == .transcription ? "stop.circle.fill" : "mic")
         .frame(width: 22, height: 22)
-    }.buttonStyle(.plain).disabled((model.isBusy && !voice.isRecording) ||
-      voice.starting || voice.transcribing ||
-      (voice.isRecording && voice.purpose != .conversation))
-      .accessibilityLabel(voice.purpose == .conversation ? "Stop voice recording" : "Start voice conversation")
+    }.buttonStyle(.plain).disabled((model.isBusy && !model.settingUpModels && !voice.isRecording) ||
+      voice.starting || voice.transcribing || acceptingCapture ||
+      (voice.isRecording && voice.purpose != .transcription))
+      .accessibilityLabel(voice.purpose == .transcription ? "Stop transcription" : "Transcribe speech")
   }
   private var sendButton: some View {
     Group {
@@ -412,13 +411,13 @@ struct ChatPane: View {
         Button { model.send() } label: {
           Image(systemName: "arrow.up.circle.fill").font(.system(size: 24))
         }.buttonStyle(.plain).disabled(
-          model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+          model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && model.pendingAttachments.isEmpty
         ).keyboardShortcut(.return, modifiers: .command).accessibilityLabel(model.authoredChatRole == nil ? "Send message" : "Add message")
       }
     }
   }
   private enum ComposerControl: Hashable {
-    case newChat, authority, attachment, model, dictation, conversation
+    case newChat, authority, attachment, model, recording, transcription
   }
   private var newChatMenu: some View {
     Menu {
@@ -474,20 +473,20 @@ struct ChatPane: View {
       }
       if hidden.contains(.model) {
         Menu("Model · \(model.inferenceName)") {
-          Button("Manage models…") { model.showingModels = true }
+          Button("Manage models…") { model.openModels() }
         }.disabled(model.isBusy)
       }
-      if hidden.contains(.dictation) {
-        Button(voice.purpose == .dictation ? "Stop dictation" : "Dictate into message") {
-          toggleVoice(.dictation)
-        }.disabled((model.isBusy && !voice.isRecording) || voice.starting || voice.transcribing ||
-          (voice.isRecording && voice.purpose != .dictation))
+      if hidden.contains(.recording) {
+        Button(voice.purpose == .recording ? "Stop audio recording" : "Record audio") {
+          toggleVoice(.recording)
+        }.disabled((model.isBusy && !model.settingUpModels && !voice.isRecording) || voice.starting || voice.transcribing || acceptingCapture ||
+          (voice.isRecording && voice.purpose != .recording))
       }
-      if hidden.contains(.conversation) {
-        Button(voice.purpose == .conversation ? "Stop voice recording" : "Start voice conversation") {
-          toggleVoice(.conversation)
-        }.disabled((model.isBusy && !voice.isRecording) || voice.starting || voice.transcribing ||
-          (voice.isRecording && voice.purpose != .conversation))
+      if hidden.contains(.transcription) {
+        Button(voice.purpose == .transcription ? "Stop transcription" : "Transcribe speech") {
+          toggleVoice(.transcription)
+        }.disabled((model.isBusy && !model.settingUpModels && !voice.isRecording) || voice.starting || voice.transcribing || acceptingCapture ||
+          (voice.isRecording && voice.purpose != .transcription))
       }
     } label: {
       Image(systemName: "ellipsis").frame(width: 22, height: 22)
@@ -506,8 +505,8 @@ struct ChatPane: View {
       Spacer(minLength: 0)
       HStack(spacing: 6) {
         if !hidden.contains(.model) { modelMenu(compact: compactLabels) }
-        if !hidden.contains(.dictation) { dictationButton }
-        if !hidden.contains(.conversation) { conversationButton }
+        if !hidden.contains(.recording) { recordingButton }
+        if !hidden.contains(.transcription) { transcriptionButton }
         if !hidden.isEmpty { overflowMenu(hidden) }
         sendButton
       }.fixedSize()
@@ -519,10 +518,10 @@ struct ChatPane: View {
       controlRow(compactLabels: true)
       controlRow(hidden: [.newChat], compactLabels: true)
       controlRow(hidden: [.newChat, .attachment], compactLabels: true)
-      controlRow(hidden: [.newChat, .attachment, .dictation], compactLabels: true)
-      controlRow(hidden: [.newChat, .attachment, .dictation, .conversation], compactLabels: true)
-      controlRow(hidden: [.newChat, .attachment, .dictation, .conversation], compactLabels: true)
-      controlRow(hidden: [.newChat, .attachment, .dictation, .conversation, .model], compactLabels: true)
+      controlRow(hidden: [.newChat, .attachment, .recording], compactLabels: true)
+      controlRow(hidden: [.newChat, .attachment, .recording, .transcription], compactLabels: true)
+      controlRow(hidden: [.newChat, .attachment, .recording, .transcription], compactLabels: true)
+      controlRow(hidden: [.newChat, .attachment, .recording, .transcription, .model], compactLabels: true)
     }.frame(height: 28)
   }
   private func assistantName(_ message: ChatMessage) -> String {
@@ -543,6 +542,8 @@ struct ChatPane: View {
           Text(assistantName(message)).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
         }
         ChatTextEditor(label: "Edit message", text: message.text,
+          completionModel: model, completionTarget: TextInputTarget(chatID: chat.id,
+            documentID: nil, messageID: message.id),
           save: { try model.replaceChatMessage($0, id: message.id, chatID: chat.id) },
           cancel: { model.editingChatMessage = nil })
       }
@@ -574,30 +575,25 @@ struct ChatPane: View {
     }
   }
   private func toggleVoice(_ purpose: VoiceInput.Purpose) {
+    guard !acceptingCapture else { return }
     if voice.isRecording {
       guard voice.purpose == purpose else { return }
+      let chatID = voiceChatID, documentID = voiceDocumentID, draft = voiceDraft
+      acceptingCapture = true
       Task {
+        defer { acceptingCapture = false }
         do {
-          let text = try await voice.stop()
-          guard model.state.selectedChat == voiceChatID, model.draft == voiceDraft,
-            model.state.selectedDocument == voiceDocumentID,
-            !model.isBusy else {
-            recoveredVoiceText += (recoveredVoiceText.isEmpty ? "" : " ") + text
-            model.status = "Voice transcript ready to insert"
-            return
-          }
-          model.draft += (model.draft.isEmpty ? "" : " ") + text
-          if purpose == .conversation {
-            guard model.canInfer else {
-              model.status = "Voice transcript ready · choose a local model to send"
-              model.showingModels = true
+          switch try await voice.stop() {
+          case .audio(let bytes):
+            do { try await model.attachRecordedAudio(bytes, chatID: chatID, documentID: documentID) }
+            catch { recoveredRecording = bytes }
+          case .transcript(let text):
+            guard model.state.selectedChat == chatID, model.draft == draft,
+              model.state.selectedDocument == documentID else {
+              recoveredVoiceText += (recoveredVoiceText.isEmpty ? "" : " ") + text
               return
             }
-            model.send()
-            awaitingVoiceReply = model.state.selectedChat
-            if !model.isBusy { awaitingVoiceReply = nil }
-          } else {
-            model.status = "Dictated on device"
+            model.draft += (model.draft.isEmpty ? "" : " ") + text
             composerFocusRequest += 1
           }
         } catch is CancellationError {} catch {
@@ -612,7 +608,7 @@ struct ChatPane: View {
       Task {
         do {
           try await voice.start(purpose)
-          model.status = purpose == .conversation ? "Voice conversation · recording" : "Dictation · recording"
+          model.status = purpose == .transcription ? "Transcribing" : "Recording"
         } catch is CancellationError {} catch { model.report(error) }
       }
     }
@@ -673,15 +669,34 @@ struct ChatPane: View {
               .buttonStyle(.plain).accessibilityLabel("Detach document from chat")
           }.font(.system(size: 11)).foregroundStyle(.secondary)
         }
+        if let recording = recoveredRecording {
+          HStack {
+            Image(systemName: "waveform")
+            Button {
+              Task {
+                do {
+                  try await model.attachRecordedAudio(recording, chatID: model.state.selectedChat,
+                    documentID: model.state.selectedDocument)
+                  recoveredRecording = nil
+                } catch { model.composerIssue = "The recording couldn't be attached yet." }
+              }
+            } label: { Image(systemName: "plus") }
+              .buttonStyle(.plain).accessibilityLabel("Attach retained recording")
+            Button { recoveredRecording = nil } label: { Image(systemName: "xmark") }
+              .buttonStyle(.plain).accessibilityLabel("Discard retained recording")
+          }
+        }
         if !recoveredVoiceText.isEmpty {
           HStack {
-            Text("Voice transcript saved").font(.caption).foregroundStyle(.secondary)
+            Image(systemName: "mic").foregroundStyle(.secondary)
             Spacer()
-            Button("Insert") {
+            Button {
               model.draft += (model.draft.isEmpty ? "" : " ") + recoveredVoiceText
               recoveredVoiceText = ""
-            }.font(.caption)
-            Button("Discard") { recoveredVoiceText = "" }.font(.caption).buttonStyle(.plain)
+            } label: { Image(systemName: "plus") }
+              .buttonStyle(.plain).accessibilityLabel("Insert retained transcript")
+            Button { recoveredVoiceText = "" } label: { Image(systemName: "xmark") }
+              .buttonStyle(.plain).accessibilityLabel("Discard retained transcript")
           }
         }
         if !model.pendingAttachments.isEmpty {
@@ -719,13 +734,14 @@ struct ChatPane: View {
           Text(issue).font(.caption).foregroundStyle(.orange)
         }
         if model.settingUpModels {
-          HStack(spacing: 8) { ProgressView().controlSize(.small); Text(model.status).font(.caption) }
+          HStack(spacing: 8) { ProgressView().controlSize(.small).help(model.status); Spacer() }
             .foregroundStyle(.secondary)
         } else if let issue = model.modelSetupIssue {
           HStack(alignment: .top) {
-            Text(issue).font(.caption).foregroundStyle(.orange)
+            Image(systemName: "exclamationmark.circle").foregroundStyle(.orange).help(issue)
             Spacer()
-            Button("Retry") { model.prepareModels() }.buttonStyle(.plain).disabled(model.isBusy)
+            Button { model.prepareModels() } label: { Image(systemName: "arrow.clockwise") }
+              .buttonStyle(.plain).disabled(model.isBusy).accessibilityLabel("Retry model preparation")
           }
         }
         if !model.voiceMatches.isEmpty {
@@ -740,7 +756,9 @@ struct ChatPane: View {
           text: $model.draft, focusRequest: composerFocusRequest,
           onSend: { model.send() }, onCancel: { model.cancel() },
           onAttachments: { model.attachToCurrentChat($0) },
-          onFocus: { model.noteInputFocus(.chat) }
+          onFocus: { model.noteInputFocus(.chat) },
+          completionModel: model, completionTarget: TextInputTarget(chatID: model.state.selectedChat,
+            documentID: model.state.selectedDocument)
         ).frame(height: CGFloat(50 + 18 * min(3, model.draft.filter { $0 == "\n" }.count)))
         composerControls
       }.padding(10)
@@ -748,18 +766,7 @@ struct ChatPane: View {
         .padding(.horizontal, 12).padding(.bottom, 12).padding(.top, 8)
     }
     .background(Color(nsColor: BoomChrome.sidebarBackground))
-    .onChange(of: model.selectedChat?.messages.count) { _, _ in
-      guard let chat = model.selectedChat, chat.id == awaitingVoiceReply,
-        let message = chat.messages.last, message.role == .assistant else { return }
-      awaitingVoiceReply = nil
-      if message.state == .complete { voice.speak(message.text) }
-    }
-    .onChange(of: model.state.selectedChat) { _, _ in
-      if awaitingVoiceReply != model.state.selectedChat {
-        awaitingVoiceReply = nil
-        voice.stopSpeaking()
-      }
-    }
+    .onChange(of: model.state.selectedChat) { _, _ in voice.stopSpeaking() }
     .onChange(of: model.composerFocusEpoch) { _, _ in
       composerFocusRequest += 1
     }
@@ -807,33 +814,70 @@ struct ProposalCard: View {
   }
 }
 
-struct ModelSetupView: View {
+struct ModelPickerView: View {
   @ObservedObject var model: WorkspaceModel
+  @State private var search = ""
+  private var choices: [ModelSetupChoice] {
+    model.modelChoices.filter { search.isEmpty || ($0.title + " " + $0.purposeLabel + " " + ($0.checkpoint?.repository ?? "Bloom")).localizedCaseInsensitiveContains(search) }
+  }
   var body: some View {
-    VStack(alignment: .leading, spacing: 16) {
-      Text("Models on this Mac").font(.title2.weight(.semibold))
-      Text(model.layout.isAuthor ? "Consult privately with voices, or explore manuscript continuations with a base model." : "Consult privately with voices on this Mac.")
-        .foregroundStyle(.secondary)
-      if model.settingUpModels {
-        HStack { ProgressView().controlSize(.small); Text(model.status) }
-      } else if let issue = model.modelSetupIssue {
-        Text(issue).foregroundStyle(.orange)
-        Button("Try automatic setup again") { model.prepareModels() }.disabled(model.isBusy)
-      } else if model.canInfer {
-        Label("Ready on this Mac", systemImage: "checkmark.circle").foregroundStyle(.secondary)
-        if model.writingUsesConsultation && model.layout.isAuthor {
-          Text("One model serves chat and writing to leave room for your work.").font(.caption).foregroundStyle(.secondary)
-        }
-      } else {
-        Button("Prepare Bloom automatically") { model.prepareModels() }.disabled(model.isBusy)
-      }
-      Button("Import an offline model pack…") { model.importModel() }.disabled(model.isBusy)
-      Button("Set up on-device speech…") { model.installSpeechAsset() }.disabled(model.isBusy)
-      Text(model.status).font(.caption).foregroundStyle(.secondary)
+    VStack(alignment: .leading, spacing: 12) {
       HStack {
-        if model.isBusy { ProgressView().controlSize(.small); Button("Stop") { model.cancel() } }
-        Spacer(); Button("Done") { model.showingModels = false }.keyboardShortcut(.cancelAction)
+        Text("Models").font(.headline)
+        Spacer()
+        Menu {
+          Button("Import…") { model.importModel() }.disabled(model.isBusy)
+          Button("Refresh") { model.refreshModelChoices() }
+        } label: { Image(systemName: "ellipsis") }
+          .menuStyle(.borderlessButton).fixedSize().accessibilityLabel("Model actions")
+        Button { model.showingModels = false } label: { Image(systemName: "xmark") }
+          .buttonStyle(.plain).keyboardShortcut(.cancelAction).accessibilityLabel("Close model picker")
       }
-    }.padding(24).frame(width: 470)
+      HStack(spacing: 6) {
+        Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+        TextField("Search", text: $search).textFieldStyle(.plain)
+          .accessibilityLabel("Search curated models")
+      }.padding(7).background(.quaternary, in: RoundedRectangle(cornerRadius: 7))
+      ScrollView {
+        VStack(alignment: .leading, spacing: 3) {
+          ForEach([true, false], id: \.self) { local in
+            let group = choices.filter { $0.candidate.cached == local }
+            if !group.isEmpty {
+              Text(local ? "Local" : "Hugging Face").font(.caption.weight(.medium)).foregroundStyle(.secondary).padding(.top, 8)
+              ForEach(group) { choice in
+                Button { model.chooseModel(choice) } label: {
+                  HStack(spacing: 8) {
+                    Image(systemName: choice.candidate.purpose == .consultation ? "bubble.left" : "pencil")
+                      .frame(width: 18)
+                    VStack(alignment: .leading, spacing: 2) {
+                      Text(choice.title)
+                      Text(choice.purposeLabel + " · " + ByteCountFormatter.string(fromByteCount: Int64(choice.candidate.weightBytes), countStyle: .memory))
+                        .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Image(systemName: model.modelIsSelected(choice) ? "checkmark" : local ? "arrow.right" : "arrow.down.circle")
+                      .foregroundStyle(.secondary)
+                  }.padding(.vertical, 7).padding(.horizontal, 8).contentShape(Rectangle())
+                }.buttonStyle(.plain).disabled(model.isBusy)
+                  .help((choice.checkpoint?.repository ?? "Bloom") + " · " + choice.purposeLabel + (local ? " · Local" : " · Download"))
+              }
+            }
+          }
+        }.frame(maxWidth: .infinity, alignment: .leading)
+      }.frame(maxHeight: 360)
+      if model.settingUpModels {
+        HStack { ProgressView().controlSize(.small); Text("Preparing").font(.caption) }
+          .help(model.status)
+      }
+      if let issue = model.modelSetupIssue ?? model.modelPickerIssue {
+        HStack {
+          Image(systemName: "exclamationmark.circle").foregroundStyle(.orange).help(issue)
+          Spacer()
+          Button { model.prepareModels() } label: { Image(systemName: "arrow.clockwise") }
+            .buttonStyle(.plain).disabled(model.isBusy).accessibilityLabel("Retry model preparation")
+        }
+      }
+    }.padding(16).frame(width: 350)
+      .onAppear { model.refreshModelChoices() }
   }
 }

@@ -50,6 +50,24 @@ final class GenerationJournalTests: XCTestCase {
     GenerationProgress(text: text, tokenIDs: tokens, promptDigest: Digest.sha256("prepared tokens"),
       promptTokens: 12, firstTokenSeconds: 0.2, elapsedSeconds: elapsed)
   }
+  func testLiveInterruptionPreservesDurableCompletionAndPartialRows() async throws {
+    let f = try await fixture(); defer { try? FileManager.default.removeItem(at: f.root) }
+    try await f.store.checkpoint(progress("Finished 👩🏽‍💻"), identity: f.writing, stopReason: "output_limit")
+    let journal = try await f.store.writingCheckpoint(bundle: f.bundle, candidate: f.bundle.candidates[0])
+    var candidate = f.bundle.candidates[0]
+    candidate.finishInterrupted(journal, reason: "cancelled")
+    XCTAssertEqual(candidate.state, .complete); XCTAssertEqual(candidate.stopReason, "output_limit")
+    XCTAssertEqual(candidate.text, "Finished 👩🏽‍💻"); XCTAssertEqual(candidate.tokenIDs, [1, 2])
+    let finished = candidate
+    candidate.finishInterrupted(nil, failed: true, reason: "failed")
+    XCTAssertEqual(candidate.state, finished.state); XCTAssertEqual(candidate.text, finished.text)
+    XCTAssertEqual(candidate.tokenIDs, finished.tokenIDs); XCTAssertEqual(candidate.stopReason, finished.stopReason)
+    var partial = f.bundle.candidates[0]
+    let checkpoint = GenerationCheckpoint(schema: 1, identity: f.writing, progress: progress(), stopReason: nil)
+    partial.finishInterrupted(checkpoint, reason: "cancelled")
+    XCTAssertEqual(partial.state, .cancelled); XCTAssertEqual(partial.text, checkpoint.progress.text)
+    XCTAssertEqual(partial.tokenIDs, checkpoint.progress.tokenIDs)
+  }
   func testBatchRowsRecoverIndependentlyAndRejectChangedGeometryWithoutOverwriting() async throws {
     let f = try await fixture(); defer { try? FileManager.default.removeItem(at: f.root) }
     var bundle = f.bundle

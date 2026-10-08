@@ -171,8 +171,12 @@ tests must construct the actual framework input with microphone, stereo and
 compressed-file shapes. Format tests need no installed speech asset; signed
 transcription and physical microphone checks do.
 
-After speech changes, exercise both microphone controls through start, stop,
-transcription, and another recording in a fresh public fixture. Check cancellation
+After speech changes, exercise both controls through start, stop, and another
+recording in a fresh public fixture. The waveform attaches playable raw audio;
+the microphone inserts editable transcript text. Neither sends automatically or
+opens model setup. Preparation is automatic; the intentional model picker lists
+eligible local weights before downloadable Hugging Face checkpoints, with offline
+import in its overflow menu. Check cancellation
 followed by reuse and silence followed by reuse. Recognition owns its result
 consumer and cancellation watcher; finish or cancel and join both before the
 operation returns. Retain failed attempts. Never test a new diagnostic identity
@@ -189,6 +193,16 @@ Generate actual alternatives with MLX before checking Option-Up/Down. Record eac
 captured prompt, seed, model identity, token output, and failure. Requesting
 alternatives from a single short suggestion must use that same captured prompt.
 After partial acceptance, new generation must use the accepted manuscript prefix.
+
+`NativeCompletionTextView` owns ghost projection and reversible word navigation
+for every prose input. Manuscripts and chat inputs provide captured-state clients,
+not separate key handlers or suggestion overlays. Exercise the composer and inline
+editing of both speakers with real weights, context after the caret excluded,
+speaker attribution retained, repeated word acceptance/reversal, typing, Undo,
+marked text, focus loss and stale callbacks. Save is always explicit. Retain input
+recipes, seeds, token journals and cancelled attempts in encrypted storage.
+Branching from a user message rerolls in a new conversation. Branching from an
+assistant reply preserves that reply without generation. Keep the parent intact.
 
 Exercise consultation with an explicit long attachment and writing with a long
 manuscript and selected prose examples. Consultation must preserve the captured

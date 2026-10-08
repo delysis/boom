@@ -4,6 +4,11 @@ import Foundation
 
 /// Swift projections of Rust-owned policy. No duplicate validation rules.
 enum ProductCore {
+  static func inputContext(instructions: String, history: [PromptTurn], speaker: String,
+    text: String, caret: Int) throws -> String {
+    try call(["op": "input_context", "instructions": instructions, "history": object(history),
+      "speaker": speaker, "text": text, "caretUtf16": caret])
+  }
   static func mediaDuration(_ seconds: Double, automaticAudio: Bool = false) throws {
     let _: Bool = try call(["op": "validate_media_duration", "seconds": seconds, "automaticAudio": automaticAudio])
   }
@@ -197,6 +202,11 @@ enum ProductCore {
     try call(["op": "model_setup", "physicalBytes": physical, "metalBytes": metal,
       "residentBytes": resident, "diskBytes": disk, "writing": writing, "candidates": object(candidates)])
   }
+  static func modelChoices(physical: UInt64, metal: UInt64, resident: UInt64, disk: UInt64,
+    candidates: [ModelSetupCandidate]) throws -> [String] {
+    try call(["op": "model_choices", "physicalBytes": physical, "metalBytes": metal,
+      "residentBytes": resident, "diskBytes": disk, "candidates": object(candidates)])
+  }
   static func admitModelWeights(physical: UInt64, resident: UInt64, weights: UInt64) throws -> Bool {
     try call(["op": "model_weights", "physicalBytes": physical, "residentBytes": resident, "weightBytes": weights])
   }
@@ -293,7 +303,7 @@ struct Voice: Codable, Identifiable, Equatable, Sendable {
   }
   var speaker: Speaker { Speaker(name: name, voiceID: id, voiceRevision: revision) }
 }
-private struct PromptTurn: Codable {
+struct PromptTurn: Codable, Sendable {
   let role: String
   let text: String
   let speaker: Speaker
@@ -375,6 +385,7 @@ struct CandidateBundle: Codable, Identifiable, Sendable {
   let origin: ManuscriptOrigin?
   var candidates: [WritingCandidate]
   var selected: Int
+  var input: TextInputCapture? = nil
 }
 struct WritingHistoryEntry: Codable, Sendable {
   let id: UUID

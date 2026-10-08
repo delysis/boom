@@ -50,6 +50,17 @@ enum HuggingFaceCache {
 
   static var bloomModels: URL { hub.appendingPathComponent("bloom", isDirectory: true) }
 }
+enum LocalModelDirectories {
+  static func roots(home: URL) -> [URL] {
+    [home.appendingPathComponent(".lmstudio/models"), home.appendingPathComponent(".cache/lm-studio/models")]
+  }
+  static var roots: [URL] { roots(home: FileManager.default.homeDirectoryForCurrentUser) }
+  static func cached(_ checkpoint: PublishedCheckpoint, roots: [URL]) -> URL? {
+    roots.map { $0.appendingPathComponent(checkpoint.repository) }.first { directory in
+      checkpoint.files.allSatisfy { FileManager.default.fileExists(atPath: directory.appendingPathComponent($0.path).path) }
+    }
+  }
+}
 enum ModelInstaller {
   static func hashFile(_ url: URL, maxBytes: Int64) throws -> (sha256: String, bytes: Int64) {
     let info = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])

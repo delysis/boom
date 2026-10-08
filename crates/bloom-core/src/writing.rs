@@ -6,6 +6,79 @@ use serde::{Deserialize, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
+/// Continue authored chat text as prose, without an assistant turn template.
+/// In-place editing supplies only turns preceding the edited message.
+pub fn input_context(
+    instructions: &str,
+    history: &[crate::PromptTurn],
+    speaker: &str,
+    text: &str,
+    caret: usize,
+) -> Result<String, Error> {
+    require(
+        instructions.len() <= TEXT_LIMIT && history.len() <= 4096,
+        "The captured input context exceeds its limit.",
+    )?;
+    let valid_name =
+        |name: &str| !name.is_empty() && name.len() <= 256 && !name.contains(['\r', '\n']);
+    require(valid_name(speaker), "Invalid input speaker.")?;
+    let prefix = authored_prefix(text, caret)?;
+    let mut context = String::new();
+    if !instructions.is_empty() {
+        context.push_str(instructions);
+        context.push_str("\n\n");
+    }
+    for turn in history {
+        require(
+            ["user", "assistant"].contains(&turn.role.as_str())
+                && valid_name(&turn.speaker.name)
+                && turn.text.len() <= TEXT_LIMIT,
+            "Invalid input history.",
+        )?;
+        context.push_str(&turn.speaker.name);
+        context.push_str(": ");
+        context.push_str(&turn.text);
+        context.push_str("\n\n");
+        require(
+            context.len() <= TEXT_LIMIT,
+            "Input history exceeds its limit.",
+        )?;
+    }
+    context.push_str(speaker);
+    context.push_str(": ");
+    context.push_str(prefix);
+    require(
+        context.len() <= TEXT_LIMIT,
+        "Input context exceeds its limit.",
+    )?;
+    Ok(context)
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+    #[test]
+    fn attributed_input_is_raw_prose_and_caret_bound() {
+        let history = [crate::PromptTurn {
+            role: "assistant".into(),
+            text: "The harbor was quiet.".into(),
+            speaker: crate::Speaker {
+                name: "Mara".into(),
+                voice_id: None,
+                voice_revision: None,
+            },
+        }];
+        let text = "Café 👩🏽‍💻. AFTER";
+        let caret = "Café 👩🏽‍💻.".encode_utf16().count();
+        assert_eq!(
+            input_context("A story", &history, "You", text, caret).expect("valid attributed input"),
+            "A story\n\nMara: The harbor was quiet.\n\nYou: Café 👩🏽‍💻."
+        );
+        assert!(input_context("", &history, "You", text, 6).is_err());
+        assert!(input_context("", &history, "Spoof\nSpeaker", text, caret).is_err());
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HistoryEntry {

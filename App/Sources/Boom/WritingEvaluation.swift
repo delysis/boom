@@ -215,8 +215,10 @@ enum WritingEvaluation {
         try await recorder.prepared(recipe)
         let outputs = try await runner.runBatch(rawPrompt: recipe.prompt, maxTokens: recipe.maxTokens,
           settings: recipe.settings, seeds: group.seeds, flag: CancellationFlag(),
-          onCheckpoint: { lane, progress, stop, token in
-            try await recorder.checkpoint(lane, progress: progress, stop: stop, token: token)
+          onCheckpoint: { updates in
+            for update in updates {
+              try await recorder.checkpoint(update.lane, progress: update.progress, stop: update.stopReason, token: update.stopTokenID)
+            }
           }, onMetrics: { metrics in await recorder.measured(metrics) })
         try await recorder.finished(outputs)
       } catch { try await recorder.failed(error.localizedDescription) }

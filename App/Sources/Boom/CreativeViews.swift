@@ -6,17 +6,23 @@ struct ChatTextEditor: View {
   let label: String
   let save: (String) throws -> Void
   let cancel: () -> Void
+  var completionModel: WorkspaceModel? = nil
+  var completionTarget: TextInputTarget? = nil
   @State private var text: String
   @State private var failure: String?
   @State private var contentHeight: CGFloat = 22
-  init(label: String, text: String, save: @escaping (String) throws -> Void, cancel: @escaping () -> Void) {
+  init(label: String, text: String, completionModel: WorkspaceModel? = nil,
+    completionTarget: TextInputTarget? = nil,
+    save: @escaping (String) throws -> Void, cancel: @escaping () -> Void) {
     self.label = label; self.save = save; self.cancel = cancel; _text = State(initialValue: text)
+    self.completionModel = completionModel; self.completionTarget = completionTarget
   }
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
       ChatComposer(text: $text, focusRequest: 1, onSend: commit, onCancel: cancel,
         placeholder: "", accessibilityLabel: label, lineSpacing: 3,
-        onContentHeight: { contentHeight = $0 }, showsEditingActions: true)
+        onContentHeight: { contentHeight = $0 }, showsEditingActions: true,
+        completionModel: completionModel, completionTarget: completionTarget)
         .frame(height: min(240, max(22, contentHeight)) + 32)
       if let failure { Text(failure).font(.caption).foregroundStyle(.red) }
     }.padding(8)
@@ -47,6 +53,8 @@ struct ChatInstructions: View {
         }
       }
       ChatTextEditor(label: "Chat instructions", text: chat.instructions ?? "",
+        completionModel: model, completionTarget: TextInputTarget(chatID: chat.id,
+          documentID: nil, instructions: true),
         save: { try model.setChatInstructions($0, mention: mention, chatID: chat.id) },
         cancel: { model.showingChatInstructions = nil })
     }

@@ -15,6 +15,14 @@ import SwiftUI
 
 @main @MainActor enum BoomMain {
   static func main() {
+    if CommandLine.arguments.contains("--input-completion-smoke") {
+      let app = NSApplication.shared; app.setActivationPolicy(.prohibited)
+      Task {
+        do { try await InputCompletionSmoke.run(arguments: CommandLine.arguments); exit(0) }
+        catch { fputs("Public input diagnostic failed: \(error.localizedDescription)\n", stderr); exit(1) }
+      }
+      app.run(); return
+    }
     if CommandLine.arguments.contains("--speech-recovery-smoke") {
       let app = NSApplication.shared
       app.setActivationPolicy(.prohibited)
@@ -560,7 +568,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
   @objc private func attachChat() { model?.chooseChatAttachmentFiles() }
   @objc private func exportBackup() { model?.backupWorkspace(restoring: false) }
   @objc private func restoreBackup() { model?.backupWorkspace(restoring: true) }
-  @objc private func models() { model?.showingModels = true }
+  @objc private func models() { model?.openModels() }
   @objc private func showContinuations() { model?.showContinuations() }
   @objc private func writingExamples() { model?.openWritingExamples() }
   @objc private func exploreWriting() { model?.exploreWriting() }

@@ -88,6 +88,12 @@ actor MLXGemmaRunner {
     let decodeForwardPasses: Int
     let cacheBatchDimensions: [Int]
   }
+  struct BatchCheckpoint: Sendable {
+    let lane: Int
+    let progress: GenerationProgress
+    let stopReason: String?
+    let stopTokenID: Int?
+  }
   nonisolated let source: URL
   nonisolated let identity: String
   nonisolated let generationPolicy: ModelGenerationPolicy
@@ -386,14 +392,16 @@ actor MLXGemmaRunner {
   func runBatch(rawPrompt: String, maxTokens: Int, settings: SamplingSettings, seeds: [UInt64],
     flag: CancellationFlag, background: Bool = false,
     onPrefill: (@Sendable (PrefillProgress) -> Void)? = nil,
-    onCheckpoint: (@Sendable (Int, GenerationProgress, String?, Int?) async throws -> Void)? = nil,
+    onCheckpoint: (@Sendable ([BatchCheckpoint]) async throws -> Void)? = nil,
     onMetrics: (@Sendable (BatchMetrics) async -> Void)? = nil
   ) async throws -> [Output] {
     try ProductCore.admitWritingBatch(width: seeds.count, prompt: 1, output: maxTokens, capacity: 16_384)
     if seeds.count == 1 {
       return [try await run(rawPrompt: rawPrompt, maxTokens: maxTokens, settings: settings,
         seed: seeds[0], flag: flag, background: background, onPrefill: onPrefill,
-        onCheckpoint: { progress, stop, token in try await onCheckpoint?(0, progress, stop, token) },
+        onCheckpoint: { progress, stop, token in
+          try await onCheckpoint?([BatchCheckpoint(lane: 0, progress: progress, stopReason: stop, stopTokenID: token)])
+        },
         onText: { _ in })]
     }
     return try await ownedOperation(flag: flag, background: background) {
@@ -404,7 +412,7 @@ actor MLXGemmaRunner {
   private func generateBatchOwned(raw: String, maxTokens: Int, settings: SamplingSettings,
     seeds: [UInt64], flag: CancellationFlag,
     onPrefill: (@Sendable (PrefillProgress) -> Void)?,
-    onCheckpoint: (@Sendable (Int, GenerationProgress, String?, Int?) async throws -> Void)?,
+    onCheckpoint: (@Sendable ([BatchCheckpoint]) async throws -> Void)?,
     onMetrics: (@Sendable (BatchMetrics) async -> Void)?
   ) async throws -> [Output] {
     try flag.check()
@@ -480,6 +488,7 @@ actor MLXGemmaRunner {
             return joined.asArray(Int.self)
           }
           if firstDeliveryQoS == nil { firstDeliveryQoS = qos_class_self().rawValue }
+          var updates: [BatchCheckpoint] = []
           for lane in seeds.indices where reasons[lane] == nil {
             let token = sampled[lane]
             guard !policy.suppressedTokenIDs.contains(token) else {
@@ -495,12 +504,13 @@ actor MLXGemmaRunner {
             let decoded = context.tokenizer.decode(tokenIds: tokens[lane])
             elapsed[lane] = started.duration(to: clock.now).timeInterval
             if reasons[lane] != nil || (!decoded.hasSuffix("\u{FFFD}") && decoded != texts[lane]) {
-              try await onCheckpoint?(lane, GenerationProgress(text: decoded, tokenIDs: tokens[lane],
+              updates.append(BatchCheckpoint(lane: lane, progress: GenerationProgress(text: decoded, tokenIDs: tokens[lane],
                 promptDigest: digest, promptTokens: promptIDs.count, firstTokenSeconds: first[lane],
-                elapsedSeconds: elapsed[lane]), reasons[lane], stops[lane])
+                elapsedSeconds: elapsed[lane]), stopReason: reasons[lane], stopTokenID: stops[lane]))
               texts[lane] = decoded
             }
           }
+          if !updates.isEmpty { try await onCheckpoint?(updates) }
           if reasons.contains(nil), !flag.isCancelled, !Task.isCancelled {
             logits = try autoreleasepool {
               let output = context.model(LMInput.Text(tokens: MLXArray(sampled).reshaped([seeds.count, 1])),
@@ -514,14 +524,16 @@ actor MLXGemmaRunner {
             decodePasses += 1
           }
         }
+        var cancelled: [BatchCheckpoint] = []
         for lane in seeds.indices where reasons[lane] == nil {
           reasons[lane] = "cancelled"
           elapsed[lane] = started.duration(to: clock.now).timeInterval
           texts[lane] = context.tokenizer.decode(tokenIds: tokens[lane])
-          try await onCheckpoint?(lane, GenerationProgress(text: texts[lane], tokenIDs: tokens[lane],
+          cancelled.append(BatchCheckpoint(lane: lane, progress: GenerationProgress(text: texts[lane], tokenIDs: tokens[lane],
             promptDigest: digest, promptTokens: promptIDs.count, firstTokenSeconds: first[lane],
-            elapsedSeconds: elapsed[lane]), reasons[lane], nil)
+            elapsedSeconds: elapsed[lane]), stopReason: reasons[lane], stopTokenID: nil))
         }
+        if !cancelled.isEmpty { try await onCheckpoint?(cancelled) }
         await onMetrics?(BatchMetrics(width: seeds.count, sharedPromptPrefills: 1,
           decodeForwardPasses: decodePasses,
           cacheBatchDimensions: cache.flatMap { $0.state.map { $0.dim(0) } }))

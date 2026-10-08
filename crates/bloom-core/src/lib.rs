@@ -838,6 +838,13 @@ pub enum Request {
         text: String,
         caret_utf16: usize,
     },
+    InputContext {
+        instructions: String,
+        history: Vec<PromptTurn>,
+        speaker: String,
+        text: String,
+        caret_utf16: usize,
+    },
     Sampling {
         profile: String,
     },
@@ -880,6 +887,13 @@ pub enum Request {
         resident_bytes: u64,
         disk_bytes: u64,
         writing: bool,
+        candidates: Vec<setup::Candidate>,
+    },
+    ModelChoices {
+        physical_bytes: u64,
+        metal_bytes: u64,
+        resident_bytes: u64,
+        disk_bytes: u64,
         candidates: Vec<setup::Candidate>,
     },
     ModelWeights {
@@ -1088,6 +1102,19 @@ pub fn execute(request: Request) -> Result<Value, Error> {
         Request::AuthoredPrefix { text, caret_utf16 } => {
             serde_json::to_value(authored_prefix(&text, caret_utf16)?)
         }
+        Request::InputContext {
+            instructions,
+            history,
+            speaker,
+            text,
+            caret_utf16,
+        } => serde_json::to_value(writing::input_context(
+            &instructions,
+            &history,
+            &speaker,
+            &text,
+            caret_utf16,
+        )?),
         Request::WritingPrompt {
             text,
             caret_utf16,
@@ -1135,6 +1162,19 @@ pub fn execute(request: Request) -> Result<Value, Error> {
             metal_bytes,
             resident_bytes,
             weight_bytes,
+        )?),
+        Request::ModelChoices {
+            physical_bytes,
+            metal_bytes,
+            resident_bytes,
+            disk_bytes,
+            candidates,
+        } => serde_json::to_value(setup::eligible(
+            physical_bytes,
+            metal_bytes,
+            resident_bytes,
+            disk_bytes,
+            candidates,
         )?),
         Request::ModelSetup {
             physical_bytes,

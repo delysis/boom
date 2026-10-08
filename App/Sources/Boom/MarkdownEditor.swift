@@ -2,18 +2,14 @@ import AppKit
 import BoomCore
 import SwiftUI
 
-@MainActor final class MarkdownTextView: NSTextView, NSMenuDelegate, NativeTextStylingGuard {
-  weak var owner: WorkspaceModel?
-  var documentID = UUID()
+@MainActor final class MarkdownTextView: NativeCompletionTextView, NSMenuDelegate, NativeTextStylingGuard {
+  weak var owner: WorkspaceModel? { didSet { completionClient = owner } }
   var documentUndo: UndoManager?
   var applyingExternal = false
   override func setAccessibilityValue(_ value: Any?) {
     guard isEditable, !hasMarkedText(), let value = value as? String, value != string else { return }
     insertText(value, replacementRange: NSRange(location: 0, length: string.utf16.count))
   }
-  private var displayStorage: NSTextStorage?
-  private var displayLayout: NSLayoutManager?
-  private var displayContainer: NSTextContainer?
   private var searchRanges: [NSRange] = []
   private var searchIdentity: String?
   private let measurement = NativeTextMeasurement()
@@ -44,8 +40,6 @@ import SwiftUI
     if identity == nil || !searchRanges.isEmpty { searchIdentity = identity }
     needsDisplay = true
   }
-  private var visibleStamp: GhostStamp?
-  private var displayGhostLength = 0
   private let placeholderStorage = NSTextStorage()
   private let placeholderLayout = NSLayoutManager()
   private let placeholderContainer = NSTextContainer(size: .zero)
@@ -53,6 +47,10 @@ import SwiftUI
     placeholderStorage.addLayoutManager(placeholderLayout)
     placeholderLayout.addTextContainer(placeholderContainer)
     setAccessibilityPlaceholderValue("Begin writing…")
+  }
+  override func draw(_ dirtyRect: NSRect) {
+    super.draw(dirtyRect)
+    if !hasVisibleGhost { drawPlaceholder() }
   }
   private func drawPlaceholder() {
     guard string.isEmpty, !hasMarkedText(), let textContainer else { return }
@@ -64,15 +62,6 @@ import SwiftUI
     placeholderContainer.lineFragmentPadding = textContainer.lineFragmentPadding
     placeholderLayout.drawGlyphs(forGlyphRange: placeholderLayout.glyphRange(for: placeholderContainer), at: textContainerOrigin)
   }
-  private struct AcceptedStep {
-    let documentID: UUID
-    let revision: String
-    let caret: Int
-    let accepted: String
-    let previous: String
-    let sources: [SourceReference]
-  }
-  private var acceptedSteps: [AcceptedStep] = []
   override var undoManager: UndoManager? { documentUndo }
   override var acceptsFirstResponder: Bool { true }
   override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -82,90 +71,6 @@ import SwiftUI
     return accepted
   }
 
-  func clearGhost() {
-    guard displayStorage != nil || visibleStamp != nil || displayGhostLength != 0 else { return }
-    displayStorage = nil
-    displayLayout = nil
-    displayContainer = nil
-    visibleStamp = nil
-    displayGhostLength = 0
-    needsDisplay = true
-  }
-  func showGhost(_ completion: String, stamp: GhostStamp) {
-    guard selectedRange().length == 0, !hasMarkedText(), stamp.documentID == documentID,
-      window?.isKeyWindow == true, window?.firstResponder === self, NSApp.isActive,
-      let storage = textStorage
-    else {
-      clearGhost()
-      return
-    }
-    let location = selectedRange().location
-    guard location >= 0, location <= storage.length else {
-      clearGhost()
-      return
-    }
-    if visibleStamp == stamp, let displayStorage {
-      displayStorage.beginEditing()
-      displayStorage.replaceCharacters(
-        in: NSRange(location: location, length: displayGhostLength), with: completion)
-      displayStorage.setAttributes(
-        ghostAttributes(),
-        range: NSRange(location: location, length: (completion as NSString).length))
-      displayStorage.endEditing()
-      displayGhostLength = (completion as NSString).length
-      needsDisplay = true
-      return
-    }
-    // A separate DISPLAY layout contains the ghost. Canonical textStorage,
-    // accessibility value, clipboard, autosave and undo never contain it.
-    let copy = NSMutableAttributedString(attributedString: storage)
-    let attributes = ghostAttributes()
-    copy.insert(NSAttributedString(string: completion, attributes: attributes), at: location)
-    let display = NSTextStorage(attributedString: copy)
-    let layout = NSLayoutManager()
-    let container = NSTextContainer(
-      size: textContainer?.size ?? NSSize(width: bounds.width, height: .greatestFiniteMagnitude))
-    container.lineFragmentPadding = textContainer?.lineFragmentPadding ?? 5
-    layout.allowsNonContiguousLayout = true
-    display.addLayoutManager(layout)
-    layout.addTextContainer(container)
-    displayStorage = display
-    displayLayout = layout
-    displayContainer = container
-    visibleStamp = stamp
-    displayGhostLength = (completion as NSString).length
-    needsDisplay = true
-  }
-  private func ghostAttributes() -> [NSAttributedString.Key: Any] {
-    var attributes = typingAttributes
-    attributes[.font] = font ?? MarkdownStyle.body
-    attributes[.foregroundColor] = NSColor.tertiaryLabelColor
-    return attributes
-  }
-  override func draw(_ dirtyRect: NSRect) {
-    guard let layout = displayLayout, let container = displayContainer, let stamp = visibleStamp,
-      stamp.documentID == documentID, selectedRange().length == 0,
-      stamp.caretUTF16 == selectedRange().location, !hasMarkedText()
-    else {
-      super.draw(dirtyRect)
-      drawPlaceholder()
-      return
-    }
-    BoomChrome.paperBackground.setFill()
-    dirtyRect.fill()
-    container.size = textContainer?.size ?? container.size
-    let origin = textContainerOrigin
-    let glyphs = layout.glyphRange(
-      forBoundingRect: dirtyRect.offsetBy(dx: -origin.x, dy: -origin.y), in: container)
-    layout.drawBackground(forGlyphRange: glyphs, at: origin)
-    layout.drawGlyphs(forGlyphRange: glyphs, at: origin)
-    if let window, window.isKeyWindow {
-      let screen = firstRect(forCharacterRange: selectedRange(), actualRange: nil)
-      let local = convert(window.convertFromScreen(screen), from: nil)
-      NSColor.labelColor.setFill()
-      NSRect(x: local.minX, y: local.minY, width: 1, height: local.height).fill()
-    }
-  }
   override func mouseDown(with event: NSEvent) {
     let previousSelection = selectedRange()
     super.mouseDown(with: event)
@@ -174,67 +79,7 @@ import SwiftUI
     if window?.firstResponder !== self { window?.makeFirstResponder(self) }
     // The selection/text delegates invalidate changed captures. Refocusing at
     // the same caret leaves the captured manuscript and continuation valid.
-    if selectedRange() != previousSelection { acceptedSteps.removeAll() }
-  }
-  @discardableResult func acceptNextGhostWord() -> Bool {
-    guard !hasMarkedText(), selectedRange().length == 0 else { return false }
-    let position = selectedRange().location
-    guard let segment = owner?.takeGhostChunk(documentID: documentID, caret: position), !segment.accepted.isEmpty else { return false }
-    insertText(segment.accepted, replacementRange: selectedRange())
-    if let document = owner?.selectedDocument {
-      acceptedSteps.append(AcceptedStep(documentID: documentID, revision: document.revision,
-        caret: selectedRange().location, accepted: segment.accepted, previous: segment.whole, sources: segment.sources))
-    }
-    owner?.resumeGhost(segment.remaining, documentID: documentID, caret: selectedRange().location, sources: segment.sources)
-    return true
-  }
-  override func keyDown(with event: NSEvent) {
-    let modifiers = event.modifierFlags.intersection([.shift, .control, .command, .option])
-    if modifiers == [.option], !hasMarkedText(), selectedRange().length == 0 {
-      switch event.keyCode {
-      case 124: // Option-Right: accept the next word of the visible completion.
-        if acceptNextGhostWord() { return }
-      case 123: // Option-Left: reverse only the last completion acceptance.
-        if let step = acceptedSteps.last, step.documentID == documentID,
-          owner?.selectedDocument?.revision == step.revision,
-          selectedRange().location == step.caret {
-          let length = (step.accepted as NSString).length
-          let range = NSRange(location: step.caret - length, length: length)
-          let source = string as NSString
-          if range.location >= 0, NSMaxRange(range) <= source.length,
-            source.substring(with: range) == step.accepted {
-            acceptedSteps.removeLast()
-            insertText("", replacementRange: range)
-            owner?.resumeGhost(step.previous, documentID: documentID,
-              caret: selectedRange().location, sources: step.sources)
-            return
-          }
-        }
-        if owner?.ghostStamp != nil { return }
-      case 125, 126: // Option-Down/Up: completion candidates, never caret movement.
-        owner?.navigateGhost(event.keyCode == 125 ? 1 : -1)
-        return
-      default: break
-      }
-    }
-    acceptedSteps.removeAll()
-    if event.keyCode == 48, selectedRange().length == 0, !hasMarkedText(),
-      event.modifierFlags.intersection([.shift, .control, .command, .option]).isEmpty,
-      let completion = owner?.takeGhost(documentID: documentID, caret: selectedRange().location)
-    {
-      let manager = undoManager
-      manager?.beginUndoGrouping()
-      insertText(completion, replacementRange: selectedRange())
-      manager?.setActionName("Accept completion")
-      manager?.endUndoGrouping()
-      return
-    }
-    if event.keyCode == 53, modifiers.isEmpty, !hasMarkedText(),
-      owner?.ghostStamp != nil || owner?.showingCandidates == true {
-      owner?.invalidateGhost()
-      return
-    }
-    super.keyDown(with: event)
+    if selectedRange() != previousSelection { endGhostBoundary() }
   }
   private func wrapSelection(_ marker: String, placeholder: String = "") {
     finishComposition()
@@ -364,10 +209,6 @@ import SwiftUI
     for item in menu.items where ["Writing Tools", "AutoFill", "Services"].contains(item.title) {
       menu.removeItem(item)
     }
-  }
-  override func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
-    owner?.invalidateGhost()
-    super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
   }
   func finishComposition() {
     guard hasMarkedText() else { return }
@@ -508,6 +349,7 @@ struct MarkdownEditor: NSViewRepresentable {
       defer { text.applyingExternal = false }
       let changedDocument = text.documentID != document.id
       text.clearGhost()
+      text.endGhostBoundary()
       text.documentID = document.id
       text.documentUndo = model.undoManager(document.id)
       let selection = changedDocument ? NSRange(location: 0, length: 0) : text.selectedRange()
@@ -536,6 +378,7 @@ struct MarkdownEditor: NSViewRepresentable {
     }
     func textDidChange(_ notification: Notification) {
       guard let view, !view.applyingExternal else { return }
+      if !view.movingGhostBoundary { view.endGhostBoundary() }
       guard !view.hasMarkedText() else {
         model.invalidateGhost()
         return
@@ -546,6 +389,7 @@ struct MarkdownEditor: NSViewRepresentable {
     }
     func textViewDidChangeSelection(_ notification: Notification) {
       guard let view, !view.applyingExternal else { return }
+      if !view.movingGhostBoundary { view.selectionChangedDuringGhost() }
       if view.selectedRange().length > 0 { model.invalidateGhost() }
       model.movedCaret(view.selectedRange().location, hasMarkedText: view.hasMarkedText())
     }

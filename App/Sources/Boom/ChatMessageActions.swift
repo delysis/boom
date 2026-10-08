@@ -19,7 +19,13 @@ import SwiftUI
     guard canEdit, model.state.selectedChat == chatID else { return }
     model.editingChatMessage = message.id
   }
-  func branch() { if canBranch { model.branch(message.id, from: chatID) } }
+  var branchLabel: String { message.role == .user ? "Reroll in new branch" : "Branch from this reply" }
+  var branchSymbol: String { message.role == .user ? "arrow.clockwise" : "arrow.triangle.branch" }
+  func branch() {
+    guard canBranch else { return }
+    if message.role == .user { model.reroll(message.id, from: chatID) }
+    else { model.branch(message.id, from: chatID) }
+  }
   func continueEditing() { if canEdit { model.branch(message.id, from: chatID, editing: true) } }
   func regenerate() { if canEdit { model.regenerate(message.id, from: chatID) } }
   func rate(_ feedback: MessageFeedback) { if canRate { model.rate(message.id, in: chatID, as: feedback) } }
@@ -27,10 +33,11 @@ import SwiftUI
   @ViewBuilder var menu: some View {
     Button("Copy", systemImage: "square.on.square", action: copy)
     Button("Edit", systemImage: "pencil", action: edit).disabled(!canEdit)
-    Button("Branch", systemImage: "arrow.triangle.branch", action: branch).disabled(!canBranch)
+    Button(branchLabel, systemImage: branchSymbol, action: branch).disabled(!canBranch)
     if message.role == .user {
       Button("Edit & Continue", action: continueEditing).disabled(!canEdit)
     } else {
+      Button("Speak", systemImage: "speaker.wave.2") { model.speak(message) }.disabled(message.state != .complete)
       Button("Regenerate in new branch", action: regenerate).disabled(!canEdit)
       Divider()
       Button(message.feedback == .helpful ? "Remove thumbs up" : "Thumbs up", systemImage: "hand.thumbsup") { rate(.helpful) }
@@ -59,8 +66,12 @@ struct ChatMessageRow<Content: View>: View {
 }
 
 private struct ChatMessageActions: NSViewRepresentable {
+  @ObservedObject var model: WorkspaceModel
   let commands: ChatMessageCommands
   let hovered: Bool
+  init(commands: ChatMessageCommands, hovered: Bool) {
+    self.model = commands.model; self.commands = commands; self.hovered = hovered
+  }
   func makeNSView(context: Context) -> ChatMessageActionView { ChatMessageActionView(commands: commands) }
   func updateNSView(_ view: ChatMessageActionView, context: Context) {
     view.update(commands: commands)
@@ -89,7 +100,7 @@ private struct ChatMessageActions: NSViewRepresentable {
     super.init(frame: .zero)
     configure(copyButton, symbol: "square.on.square", label: "Copy message", action: #selector(copyMessage))
     configure(editButton, symbol: "pencil", label: "Edit message", action: #selector(editMessage))
-    configure(branchButton, symbol: "arrow.triangle.branch", label: "Branch from this message", action: #selector(branchMessage))
+    configure(branchButton, symbol: commands.branchSymbol, label: commands.branchLabel, action: #selector(branchMessage))
     if let feedbackButton { configure(feedbackButton, symbol: "hand.thumbsup", label: "Feedback", action: #selector(showFeedback)) }
     timestamp.font = .systemFont(ofSize: 11)
     timestamp.textColor = .secondaryLabelColor

@@ -334,9 +334,11 @@ import Synchronization
             outputs = try await runner.runBatch(rawPrompt: prompt, maxTokens: maxTokens,
               settings: ProductCore.sampling(.standard), seeds: seeds, flag: flag,
               onPrefill: { prefillTrace.record($0) },
-              onCheckpoint: { lane, progress, stop, token in
-                try await store.checkpoint(progress, identity: identities[lane], stopReason: stop, stopTokenID: token)
-                if cancellation, lane == 0, progress.tokenIDs.count >= 8 { await trace.cancel(flag) }
+              onCheckpoint: { updates in
+                for update in updates {
+                  try await store.checkpoint(update.progress, identity: identities[update.lane], stopReason: update.stopReason, stopTokenID: update.stopTokenID)
+                }
+                if cancellation, updates.contains(where: { $0.lane == 0 && $0.progress.tokenIDs.count >= 8 }) { await trace.cancel(flag) }
               }, onMetrics: { await trace.measured($0) })
           } else {
             guard let plan, seeds.count == 1 else { throw BoomError.invalid("Missing diagnostic input.") }

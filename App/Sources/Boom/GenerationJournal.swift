@@ -87,6 +87,22 @@ extension ConsultationReceipt {
   }
 }
 extension WritingCandidate {
+  /// Live interruption and relaunch use the same durable terminal state.
+  /// A cancelled sibling cannot rewrite a row that already completed.
+  mutating func finishInterrupted(_ journal: GenerationCheckpoint?, failed: Bool = false,
+    reason: String = "interrupted") {
+    guard state == .pending else { return }
+    if let journal {
+      retain(journal)
+      if let stop = journal.stopReason, stop != "cancelled" {
+        state = journal.progress.text.isEmpty ? .failed : .complete
+        stopReason = stop
+        return
+      }
+    }
+    state = failed ? .failed : .cancelled
+    stopReason = reason
+  }
   mutating func retain(_ journal: GenerationCheckpoint) {
     retain(journal.progress); stopTokenID = journal.stopTokenID
   }

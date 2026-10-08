@@ -76,9 +76,9 @@ enum BatchGenerationSmoke {
           } else {
             outputs = try await runner.runBatch(rawPrompt: prompt, maxTokens: 128,
               settings: settings, seeds: seeds, flag: flag,
-              onCheckpoint: { lane, progress, stop, _ in
-                await probe.checkpoint(lane, progress, stop)
-                if cancel, lane == 0, progress.tokenIDs.count >= 8 {
+              onCheckpoint: { updates in
+                for update in updates { await probe.checkpoint(update.lane, update.progress, update.stopReason) }
+                if cancel, updates.contains(where: { $0.lane == 0 && $0.progress.tokenIDs.count >= 8 }) {
                   await probe.cancelling(); flag.cancel()
                 }
               }, onMetrics: { await probe.measured($0) })

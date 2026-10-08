@@ -7,7 +7,7 @@ func nativeEditEvent(_ event: String) {
   }
 }
 
-@MainActor final class ChatTextView: NSTextView {
+@MainActor final class ChatTextView: NativeCompletionTextView {
   var onSend: (() -> Void)?
   var onCancel: (() -> Void)?
   var onAttachments: (([AttachmentInput]) -> Void)?
@@ -32,12 +32,15 @@ func nativeEditEvent(_ event: String) {
     reportContentHeight()
   }
   func reportContentHeight() {
-    guard let onContentHeight, let layoutManager, let textContainer else { return }
+    guard let layoutManager, let textContainer else { return }
     layoutManager.ensureLayout(for: textContainer)
     let used = layoutManager.usedRect(for: textContainer)
     let lastLine = layoutManager.extraLineFragmentRect
-    onContentHeight(ceil(max(used.maxY, lastLine.maxY) + textContainerInset.height * 2))
+    let height = ceil(max(minSize.height, max(max(used.maxY, lastLine.maxY) + textContainerInset.height * 2, completionDisplayHeight)))
+    if abs(frame.height - height) > 0.5 { setFrameSize(NSSize(width: frame.width, height: height)) }
+    onContentHeight?(height)
   }
+  override func completionDisplayDidChange() { reportContentHeight() }
 
   override func draw(_ dirtyRect: NSRect) {
     super.draw(dirtyRect)
@@ -57,7 +60,12 @@ func nativeEditEvent(_ event: String) {
   override func becomeFirstResponder() -> Bool {
     let accepted = super.becomeFirstResponder()
     if accepted { onFocus?() }
+    if accepted { (completionClient as? TextInputCompletion)?.refresh() }
     return accepted
+  }
+  override func resignFirstResponder() -> Bool {
+    completionClient?.invalidateGhost(); endGhostBoundary()
+    return super.resignFirstResponder()
   }
 
   override func keyDown(with event: NSEvent) {
@@ -66,6 +74,7 @@ func nativeEditEvent(_ event: String) {
       return
     }
     if event.keyCode == 53, !hasMarkedText() {
+      if hasVisibleGhost { completionClient?.invalidateGhost(); endGhostBoundary(); return }
       onCancel?()
       return
     }
@@ -176,6 +185,8 @@ struct ChatComposer: NSViewRepresentable {
   var lineSpacing: CGFloat = 0
   var onContentHeight: ((CGFloat) -> Void)? = nil
   var showsEditingActions = false
+  var completionModel: WorkspaceModel? = nil
+  var completionTarget: TextInputTarget? = nil
 
   func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
 
@@ -228,6 +239,7 @@ struct ChatComposer: NSViewRepresentable {
     MarkdownStyle.apply(to: view, bodyFont: NSFont.systemFont(ofSize: 14), lineSpacing: lineSpacing)
     context.coordinator.lineSpacing = lineSpacing
     context.coordinator.view = view
+    configureCompletion(view, coordinator: context.coordinator)
 
     let scroll = NSScrollView()
     scroll.drawsBackground = false
@@ -248,12 +260,16 @@ struct ChatComposer: NSViewRepresentable {
     view.onAttachments = onAttachments
     view.onFocus = onFocus
     if view.string != text, !view.hasMarkedText() {
+      view.endGhostBoundary(); context.coordinator.completion?.invalidateGhost()
       view.string = text
       MarkdownStyle.apply(to: view, bodyFont: NSFont.systemFont(ofSize: 14), lineSpacing: lineSpacing)
       view.setSelectedRange(NSRange(location: (text as NSString).length, length: 0))
       view.needsDisplay = true
     }
     view.reportContentHeight()
+    configureCompletion(view, coordinator: context.coordinator)
+    context.coordinator.updateCompletion()
+    context.coordinator.completion?.refresh()
     if focusRequest != context.coordinator.appliedFocusRequest {
       context.coordinator.appliedFocusRequest = focusRequest
       DispatchQueue.main.async { [weak view] in
@@ -263,20 +279,54 @@ struct ChatComposer: NSViewRepresentable {
     }
   }
 
+  private func configureCompletion(_ view: ChatTextView, coordinator: Coordinator) {
+    if let completionModel, let completionTarget {
+      if coordinator.completion?.model !== completionModel {
+        coordinator.completion?.invalidateGhost()
+        coordinator.completion = TextInputCompletion(model: completionModel, target: completionTarget)
+      }
+      coordinator.completionTarget = completionTarget
+      coordinator.completion?.view = view
+      view.completionClient = coordinator.completion
+      if let completion = coordinator.completion { view.documentID = completion.id }
+      coordinator.updateCompletion()
+    } else {
+      coordinator.completion?.invalidateGhost(); coordinator.completion = nil
+      view.completionClient = nil
+    }
+  }
+  static func dismantleNSView(_ input: ChatInputView, coordinator: Coordinator) {
+    coordinator.completion?.invalidateGhost()
+  }
+
   @MainActor final class Coordinator: NSObject, NSTextViewDelegate {
     var text: Binding<String>
     weak var view: ChatTextView?
     var appliedFocusRequest = 0
     var lineSpacing: CGFloat = 0
     var onContentHeight: ((CGFloat) -> Void)?
+    var completion: TextInputCompletion?
+    var completionTarget: TextInputTarget?
     private var measuredHeight: CGFloat = -1
     init(text: Binding<String>) { self.text = text }
     func textDidChange(_ notification: Notification) {
       guard let view else { return }
+      if !view.movingGhostBoundary { view.endGhostBoundary() }
       if !view.hasMarkedText() { MarkdownStyle.apply(to: view, bodyFont: NSFont.systemFont(ofSize: 14), lineSpacing: lineSpacing) }
       text.wrappedValue = view.string
       view.needsDisplay = true
       view.reportContentHeight()
+      updateCompletion()
+    }
+    func textViewDidChangeSelection(_ notification: Notification) {
+      guard let view else { return }
+      if !view.movingGhostBoundary { view.selectionChangedDuringGhost() }
+      updateCompletion()
+    }
+    func updateCompletion() {
+      guard let view, let completionTarget else { return }
+      completion?.update(text: view.string, selection: view.selectedRange(),
+        marked: view.hasMarkedText(), target: completionTarget)
     }
     func measure(_ height: CGFloat) {
       guard height != measuredHeight else { return }

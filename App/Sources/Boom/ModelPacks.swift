@@ -140,6 +140,15 @@ enum ModelPacks {
     }
     return choices
   }
+  static func availableDiskBytes() throws -> UInt64 {
+    var location = HuggingFaceCache.hub
+    while !FileManager.default.fileExists(atPath: location.path), location.path != "/" { location.deleteLastPathComponent() }
+    let values = try location.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey])
+    guard let bytes = values.volumeAvailableCapacityForImportantUsage ?? values.volumeAvailableCapacity.map(Int64.init), bytes >= 0 else {
+      throw BoomError.unavailable("Bloom could not check free disk space.")
+    }
+    return UInt64(bytes)
+  }
   static func published(_ purpose: ModelPurpose) throws -> PublishedCheckpoint {
     guard let checkpoint = try catalog().publishedCheckpoints.first(where: { $0.purpose == purpose }) else {
       throw BoomError.unavailable("The public \(purpose.rawValue) model is missing from this build's catalog.")
@@ -161,7 +170,7 @@ enum ModelPacks {
     guard (try? ProductCore.checkpointRequirements(checkpoint)) != nil else { return nil }
     return hubs.map { snapshot(repository: checkpoint.repository, revision: checkpoint.revision, hub: $0) }.first { snapshot in
       checkpoint.files.allSatisfy { FileManager.default.fileExists(atPath: snapshot.appendingPathComponent($0.path).path) }
-    }
+    } ?? LocalModelDirectories.cached(checkpoint, roots: LocalModelDirectories.roots)
   }
   static func publishedCached(_ purpose: ModelPurpose) -> URL? {
     guard let checkpoint = try? published(purpose) else { return nil }

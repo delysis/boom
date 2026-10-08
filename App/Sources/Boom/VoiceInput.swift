@@ -4,7 +4,7 @@ import BoomCore
 import Speech
 
 @MainActor final class VoiceInput: ObservableObject {
-  enum Purpose { case conversation, dictation }
+  enum Purpose { case recording, transcription }
   @Published private(set) var purpose: Purpose?
   @Published private(set) var starting = false
   @Published private(set) var transcribing = false
@@ -14,6 +14,15 @@ import Speech
   private var transcriptionFlag: CancellationFlag?
   private var generation = 0
   private let speaker = AVSpeechSynthesizer()
+  private static var speechPreparation: Task<Void, Error>?
+
+  static func prepareOnDeviceSpeech() async throws {
+    if let preparation = speechPreparation { try await preparation.value; return }
+    let preparation = Task { try await VoiceInput().installSpeechAsset() }
+    speechPreparation = preparation
+    defer { speechPreparation = nil }
+    try await preparation.value
+  }
 
   var isRecording: Bool { engine != nil }
 
@@ -22,10 +31,9 @@ import Speech
     starting = true
     let capturedGeneration = generation
     defer { starting = false }
-    if #available(macOS 26.0, *) {
-      _ = try await readyDictationModule()
-    } else {
-      try await authorizeLegacySpeech()
+    if purpose == .transcription {
+      if #available(macOS 26.0, *) { try await Self.prepareOnDeviceSpeech() }
+      else { try await authorizeLegacySpeech() }
     }
     guard generation == capturedGeneration else { throw CancellationError() }
     guard await AVCaptureDevice.requestAccess(for: .audio) else {
@@ -45,19 +53,25 @@ import Speech
     }
   }
 
-  func stop() async throws -> String {
-    guard let engine, let recording else { return "" }
+  func stop() async throws -> VoiceCapture {
+    guard let engine, let recording, let purpose else { throw BoomError.unavailable("No recording is active.") }
     let capturedGeneration = generation
     engine.stop(); engine.inputNode.removeTap(onBus: 0)
     deadline?.cancel(); deadline = nil
-    self.engine = nil; self.recording = nil; purpose = nil
+    self.engine = nil; self.recording = nil; self.purpose = nil
     let flag = CancellationFlag(); transcriptionFlag = flag
     transcribing = true
     defer { transcribing = false; if transcriptionFlag === flag { transcriptionFlag = nil } }
+    if purpose == .recording {
+      let bytes = try await detachedWork { try RecordedClip.wav(recording.snapshot()) }
+      try flag.check()
+      guard generation == capturedGeneration else { throw CancellationError() }
+      return .audio(bytes)
+    }
     let buffer = try recording.snapshot()
     let text = try await recognize(buffer, flag: flag)
     guard generation == capturedGeneration else { throw CancellationError() }
-    return text
+    return .transcript(text)
   }
 
   func cancel() {
@@ -122,7 +136,7 @@ import Speech
     let media = try MemoryMedia(bytes: data)
     let reader = try await media.audioReader(automaticAudio: automaticAudio)
     try flag.check()
-    if #available(macOS 26.0, *) { _ = try await readyDictationModule() }
+    if #available(macOS 26.0, *) { try await Self.prepareOnDeviceSpeech() }
     else { try await authorizeLegacySpeech() }
     try flag.check()
     let count = max(1, Int(ceil(reader.duration / 50)))
