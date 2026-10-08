@@ -147,22 +147,21 @@ import Speech
   }
   @available(macOS 26.0, *)
   private func transcribeModern(
-    _ buffer: AVAudioPCMBuffer, with transcriber: DictationTranscriber, flag: CancellationFlag? = nil
+    _ buffer: AVAudioPCMBuffer, with transcriber: DictationTranscriber, flag: CancellationFlag
   ) async throws -> String {
+    let input = try await SpeechAudioInput.prepare(buffer, for: transcriber, flag: flag)
     let analyzer = SpeechAnalyzer(modules: [transcriber])
-    try await analyzer.prepareToAnalyze(in: buffer.format)
-    let watchdog = flag.map { flag in
-      Task {
-        while !Task.isCancelled {
-          if flag.isCancelled {
-            await analyzer.cancelAndFinishNow()
-            return
-          }
-          try? await Task.sleep(nanoseconds: 200_000_000)
+    try await analyzer.prepareToAnalyze(in: input.format)
+    try flag.check()
+    let watchdog = Task {
+      while !Task.isCancelled {
+        if flag.isCancelled {
+          await analyzer.cancelAndFinishNow()
+          return
         }
+        try? await Task.sleep(nanoseconds: 200_000_000)
       }
     }
-    defer { watchdog?.cancel() }
     let results = Task { () throws -> String in
       var words = ""
       for try await result in transcriber.results {
@@ -173,16 +172,20 @@ import Speech
     }
     do {
       let inputs = AsyncStream<AnalyzerInput> { continuation in
-        continuation.yield(AnalyzerInput(buffer: buffer)); continuation.finish()
+        continuation.yield(input.element); continuation.finish()
       }
       _ = try await analyzer.analyzeSequence(inputs)
       try await analyzer.finalizeAndFinishThroughEndOfInput()
-      try flag?.check()
+      try flag.check()
       let text = try await results.value.trimmingCharacters(in: .whitespacesAndNewlines)
+      watchdog.cancel(); await watchdog.value
       guard !text.isEmpty else { throw BoomError.unavailable("No words were recognized.") }
       return text
     } catch {
+      await analyzer.cancelAndFinishNow()
       results.cancel()
+      _ = try? await results.value
+      watchdog.cancel(); await watchdog.value
       throw error
     }
   }

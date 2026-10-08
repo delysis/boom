@@ -161,6 +161,23 @@ and installed; no legacy recognition fallback is permitted. On older systems,
 verify both the on-device capability check and the required on-device request
 flag. Check the microphone flow separately from file audio.
 
+Treat every decoder-to-framework handoff as a consumer contract. Valid decoded
+PCM is not necessarily valid Speech input: negotiate the installed module's
+format and use `SpeechAudioInput` as the sole `AnalyzerInput` construction site.
+Check sample representation, rate, channels, frame counts and cancellation
+before entering nonthrowing native initializers. Do not rely on catching a
+framework precondition trap. A conversion-only test is insufficient: regression
+tests must construct the actual framework input with microphone, stereo and
+compressed-file shapes. Format tests need no installed speech asset; signed
+transcription and physical microphone checks do.
+
+After speech changes, exercise both microphone controls through start, stop,
+transcription, and another recording in a fresh public fixture. Check cancellation
+followed by reuse and silence followed by reuse. Recognition owns its result
+consumer and cancellation watcher; finish or cancel and join both before the
+operation returns. Retain failed attempts. Never test a new diagnostic identity
+against a human workspace; bind each visible fixture to a unique launch identity.
+
 ## Completion navigation and context review
 
 With a real model loaded, create a visible ghost suggestion. Option-Right must

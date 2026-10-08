@@ -15,6 +15,15 @@ import SwiftUI
 
 @main @MainActor enum BoomMain {
   static func main() {
+    if CommandLine.arguments.contains("--speech-recovery-smoke") {
+      let app = NSApplication.shared
+      app.setActivationPolicy(.prohibited)
+      Task {
+        do { try await SpeechRecognitionSmoke.run(arguments: CommandLine.arguments); exit(0) }
+        catch { fputs("Public speech lifecycle check failed: \(error.localizedDescription)\n", stderr); exit(1) }
+      }
+      app.run(); return
+    }
     if CommandLine.arguments.contains("--keychain-smoke") {
       let app = NSApplication.shared
       app.setActivationPolicy(.prohibited)
