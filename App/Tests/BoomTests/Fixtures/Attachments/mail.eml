@@ -1,0 +1,6 @@
+From: a@example.invalid
+To: b@example.invalid
+Subject: Public fixture
+Content-Type: text/plain; charset=utf-8
+
+ATTACHMENT_CANARY

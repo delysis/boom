@@ -149,6 +149,9 @@ pub struct MediaReference {
     pub name: String,
     pub root_digest: String,
     pub kind: String,
+    pub text: Option<String>,
+    pub source_digest: Option<String>,
+    pub frame_digests: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -171,7 +174,30 @@ pub fn compile_media_prompt(text: &str, media: &[MediaReference]) -> Result<Medi
                     .root_digest
                     .bytes()
                     .all(|byte| byte.is_ascii_hexdigit())
-                && ["image", "audio"].contains(&reference.kind.as_str()),
+                && ["image", "audio", "pdf", "video", "text"].contains(&reference.kind.as_str())
+                && if ["pdf", "video"].contains(&reference.kind.as_str()) {
+                    reference.frame_digests.as_ref().is_some_and(|frames| {
+                        (1..=8).contains(&frames.len())
+                            && frames.iter().all(|digest| {
+                                digest.len() == 64
+                                    && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            })
+                    })
+                } else {
+                    reference.frame_digests.is_none()
+                }
+                && if reference.kind == "text" {
+                    reference
+                        .text
+                        .as_ref()
+                        .is_some_and(|text| !text.is_empty() && text.len() <= 262_144)
+                        && reference.source_digest.as_ref().is_some_and(|digest| {
+                            digest.len() == 64
+                                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        })
+                } else {
+                    reference.text.is_none() && reference.source_digest.is_none()
+                },
             "Invalid writing media identity.",
         )?;
         require(
@@ -204,11 +230,7 @@ pub fn compile_media_prompt(text: &str, media: &[MediaReference]) -> Result<Medi
         let start = byte_offsets[span.location];
         let end = byte_offsets[span.location + span.length];
         prompt.push_str(&text[cursor..start]);
-        prompt.push_str(if reference.kind == "image" {
-            "<|image|>"
-        } else {
-            "<|audio|>"
-        });
+        prompt.push_str(&reference.prompt_content());
         ordered.push(reference.clone());
         cursor = end;
     }
@@ -221,6 +243,19 @@ pub fn compile_media_prompt(text: &str, media: &[MediaReference]) -> Result<Medi
         prompt,
         media: ordered,
     })
+}
+
+impl MediaReference {
+    pub fn prompt_content(&self) -> std::borrow::Cow<'_, str> {
+        match self.kind.as_str() {
+            "image" => "<|image|>".into(),
+            "audio" => "<|audio|>".into(),
+            "pdf" | "video" => "<|image|>\n"
+                .repeat(self.frame_digests.as_ref().map_or(0, Vec::len))
+                .into(),
+            _ => self.text.as_deref().unwrap_or("").into(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -264,8 +299,13 @@ pub fn validate(recipe: &Recipe) -> Result<bool, Error> {
         recipe.media.as_deref().unwrap_or(&[]).iter().all(|media| {
             recipe.sources.iter().any(|source| {
                 source.id == media.id
-                    && source.kind == "media"
-                    && source.digest == media.root_digest
+                    && source.kind
+                        == if media.kind == "text" {
+                            "attachment"
+                        } else {
+                            "media"
+                        }
+                    && source.digest == *media.source_digest.as_ref().unwrap_or(&media.root_digest)
             })
         }),
         "Writing media is missing its original source identity.",
@@ -296,7 +336,8 @@ pub fn validate(recipe: &Recipe) -> Result<bool, Error> {
                     && source.title.len() <= TEXT_LIMIT
                     && source.digest.len() == 64
                     && source.digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-                    && ["document", "writing-example", "media"].contains(&source.kind.as_str())
+                    && ["document", "writing-example", "media", "attachment"]
+                        .contains(&source.kind.as_str())
             }),
         "The captured writing sources are invalid.",
     )?;
@@ -327,18 +368,59 @@ mod tests {
     use super::*;
     use serde_json::json;
     #[test]
+    fn text_and_sampled_frames_compile_with_captured_content_and_identities() -> Result<(), Error> {
+        let text = MediaReference {
+            id: Uuid::from_u128(3),
+            name: "prose.docx".into(),
+            root_digest: "a".repeat(64),
+            kind: "text".into(),
+            text: Some("The café was quiet. 👩‍💻".into()),
+            source_digest: Some("b".repeat(64)),
+            frame_digests: None,
+        };
+        let video = MediaReference {
+            id: Uuid::from_u128(4),
+            name: "scene.mp4".into(),
+            root_digest: "c".repeat(64),
+            kind: "video".into(),
+            text: None,
+            source_digest: None,
+            frame_digests: Some(vec!["d".repeat(64), "e".repeat(64)]),
+        };
+        let source = format!(
+            "<bos>[Attachment: text](boom-attachment:{})\n[Attachment: video](boom-attachment:{})\nContinue:",
+            text.id, video.id
+        );
+        let compiled = compile_media_prompt(&source, &[text.clone(), video.clone()])?;
+        assert_eq!(
+            compiled.prompt,
+            "<bos>The café was quiet. 👩‍💻\n<|image|>\n<|image|>\n\nContinue:"
+        );
+        assert_eq!(compiled.media, [text, video]);
+        let mut changed = compiled.media;
+        changed[1].frame_digests = Some(vec!["wrong".into()]);
+        assert!(compile_media_prompt(&source, &changed).is_err());
+        Ok(())
+    }
+    #[test]
     fn compiled_media_preserves_order_and_literal_code_and_authored_suffix() -> Result<(), Error> {
         let a = MediaReference {
             id: Uuid::from_u128(1),
             name: "café.png".into(),
             root_digest: "a".repeat(64),
             kind: "image".into(),
+            text: None,
+            source_digest: None,
+            frame_digests: None,
         };
         let b = MediaReference {
             id: Uuid::from_u128(2),
             name: "recording.wav".into(),
             root_digest: "b".repeat(64),
             kind: "audio".into(),
+            text: None,
+            source_digest: None,
+            frame_digests: None,
         };
         let image = format!("[Attachment: café](boom-attachment:{})", a.id);
         let audio = format!("[Attachment: audio](boom-attachment:{})", b.id);

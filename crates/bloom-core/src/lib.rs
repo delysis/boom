@@ -27,7 +27,7 @@ mod search;
 mod setup;
 mod writing;
 
-pub use media::{MediaContainer, admit_media};
+pub use media::{MediaContainer, admit_media, caf_wave};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]

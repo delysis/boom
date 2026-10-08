@@ -27,6 +27,8 @@ struct AttachmentRecord: Codable, Identifiable, Equatable, Sendable {
   var isImage: Bool? = nil
   var awaitingTranscription: Bool? = nil
   var awaitingPreparation: Bool? = nil
+  var presentation: AttachmentKind? = nil
+  var kind: AttachmentKind { presentation ?? (isImage == true ? .image : !text.isEmpty ? .document : AttachmentKind(name: name)) }
   var needsPreparation: Bool { awaitingTranscription == true || awaitingPreparation == true }
   var digest: String { Digest.sha256(rootDigest + "\n" + text + "\n" + (transform ?? "original")) }
   var reference: SourceReference {

@@ -2,7 +2,7 @@
 //! Unsafe code is confined to borrowed C slices and returning/freeing one Box<[u8]>.
 //! No filesystem paths, network handles, model handles or subprocess APIs exist here.
 use attachment_native_host::{AttachmentHost, AttachmentHostConfig, ProvidedAttachment};
-use attachment_native_types::{PreparedPart, TargetCapabilities};
+use attachment_native_types::{DetectedFormat, MediaFamily, PreparedPart, TargetCapabilities};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -36,8 +36,8 @@ fn process(name: &str, bytes: &[u8]) -> Value {
         Ok(host) => host,
         Err(e) => return error(&e.code, &e.safe_message),
     };
-    // Text is the ONLY automatically admitted modality. Native image/audio/video
-    // descriptions are a separate explicit user action, with lossy-source receipts.
+    // The authority-free host admits canonical text. Native media adapters
+    // consume validated original bytes separately, never a filename's claim.
     let target = TargetCapabilities {
         target_id: "boom-gemma4-text-context".into(),
         fingerprint: "boom-gemma4-text-context:v1".into(),
@@ -64,8 +64,31 @@ fn process(name: &str, bytes: &[u8]) -> Value {
                     _ => None,
                 })
                 .collect();
+            let format = prepared
+                .bundle
+                .graph
+                .objects
+                .iter()
+                .find(|object| object.id == prepared.bundle.graph.root)
+                .and_then(|object| object.detection.selected);
+            let presentation = match format {
+                Some(DetectedFormat::Pdf) => "pdf",
+                Some(DetectedFormat::Svg) => "document",
+                Some(format) => match format.media_family() {
+                    Some(MediaFamily::Image) => "image",
+                    Some(MediaFamily::Audio) => "audio",
+                    Some(MediaFamily::Video) => "video",
+                    _ if !texts.is_empty() => "document",
+                    _ => match bloom_core::admit_media(bytes) {
+                        Ok(bloom_core::MediaContainer::Mp4) => "video",
+                        Ok(_) => "audio",
+                        Err(_) => "unavailable",
+                    },
+                },
+                None => "unavailable",
+            };
             json!({"schema":1,"ok":true,"root":prepared.bundle.graph.root.0,"input_sha256":format!("{:x}", Sha256::digest(bytes)),
-                "texts":texts,"receipt":prepared.receipt,"plan":prepared.plan,
+                "texts":texts,"presentation":presentation,"receipt":prepared.receipt,"plan":prepared.plan,
                 "graph":prepared.bundle.graph,"error":null})
         }
         Err(e) => error(&e.code, &e.safe_message),
@@ -115,6 +138,29 @@ pub unsafe extern "C" fn bloom_core_request(
 /// For nonzero lengths, pointers must address readable immutable buffers of the
 /// supplied lengths for this call. The embedding Swift Data.withUnsafeBytes owns them.
 /// The returned buffer must be released exactly once with boom_attachment_free.
+#[no_mangle]
+pub unsafe extern "C" fn bloom_caf_wave(data: *const u8, length: usize) -> BoomAttachmentBuffer {
+    if data.is_null() || length == 0 || length > MAX_INPUT {
+        return owned(error("caf_input", "Invalid CAF input."));
+    }
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: caller owns the immutable input for the duration of this call.
+        bloom_core::caf_wave(unsafe { slice::from_raw_parts(data, length) })
+    }));
+    match result {
+        Ok(Ok(bytes)) => {
+            let length = bytes.len();
+            BoomAttachmentBuffer {
+                data: Box::into_raw(bytes.into_boxed_slice()) as *mut u8,
+                length,
+            }
+        }
+        _ => owned(error("caf_invalid", "CAF cannot be decoded locally.")),
+    }
+}
+
+/// # Safety
+/// The input buffer is borrowed for this call; free the result exactly once.
 #[no_mangle]
 pub unsafe extern "C" fn bloom_media_admit(data: *const u8, length: usize) -> BoomAttachmentBuffer {
     if data.is_null() || length == 0 || length > MAX_INPUT {
@@ -211,6 +257,17 @@ mod tests {
     #[test]
     fn empty_input_rejected() {
         assert_eq!(process("a", b"")["ok"], false);
+    }
+    #[test]
+    fn presentation_uses_detected_bytes_instead_of_name_hints() {
+        assert_eq!(
+            process("misleading.jpg", b"Readable plain text")["presentation"],
+            "document"
+        );
+        let image = include_bytes!("../../App/Tests/BoomTests/Fixtures/Attachments/picture.png");
+        assert_eq!(process("misleading.txt", image)["presentation"], "image");
+        let audio = include_bytes!("../../App/Tests/BoomTests/Fixtures/Attachments/tone.wav");
+        assert_eq!(process("misleading.bin", audio)["presentation"], "audio");
     }
     #[test]
     fn null_ffi_is_typed_error_and_frees() {

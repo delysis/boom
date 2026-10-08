@@ -710,7 +710,13 @@ struct ChatPane: View {
             }
           }.frame(height: model.pendingAttachments.compactMap { id in
             model.state.attachments.first(where: { $0.id == id }).map { record -> CGFloat in
-              switch AttachmentKind(name: record.name) { case .audio: 44; case .image: 180; case .video, .pdf: 220; case .document: 24 }
+              switch record.kind {
+              case .audio: 44
+              case .image: 180
+              case .video, .pdf: 220
+              case .document: NativeScrollableText.height(of: record.text, width: 300)
+              case .unavailable: 24
+              }
             }
           }.max() ?? 44)
         }

@@ -7,14 +7,14 @@ import Foundation
 import PDFKit
 import SwiftUI
 
-enum AttachmentKind: Equatable {
-  case image, audio, video, pdf, document
+enum AttachmentKind: String, Codable, Sendable {
+  case image, audio, video, pdf, document, unavailable
 
   init(name: String) {
     switch (name as NSString).pathExtension.lowercased() {
-    case "png", "jpg", "jpeg", "heic", "tif", "tiff", "gif", "webp": self = .image
-    case "mp3", "m4a", "aac", "wav", "aiff", "aif", "flac", "ogg": self = .audio
-    case "mov", "mp4", "m4v": self = .video
+    case "png", "jpg", "jpeg", "heic", "heif", "tif", "tiff", "gif", "webp", "bmp", "avif": self = .image
+    case "mp3", "m4a", "m4b", "aac", "wav", "aiff", "aif", "flac", "ogg", "opus", "caf": self = .audio
+    case "mov", "mp4", "m4v", "webm", "mkv", "avi": self = .video
     case "pdf": self = .pdf
     default: self = .document
     }
@@ -27,6 +27,7 @@ enum AttachmentKind: Equatable {
     case .video: "play.rectangle"
     case .pdf: "doc.richtext"
     case .document: "doc.text"
+    case .unavailable: "exclamationmark.triangle"
     }
   }
 }
@@ -34,7 +35,10 @@ enum AttachmentKind: Equatable {
 struct AttachmentMediaView: View {
   let name: String
   let bytes: Data
-  private var kind: AttachmentKind { AttachmentKind(name: name) }
+  var presentation: AttachmentKind? = nil
+  var text: String = ""
+  var maximumTextHeight: CGFloat = 220
+  private var kind: AttachmentKind { presentation ?? AttachmentKind(name: name) }
 
   var body: some View {
     Group {
@@ -52,10 +56,11 @@ struct AttachmentMediaView: View {
         VideoAttachmentPlayer(name: name, bytes: bytes)
       case .pdf:
         if let pdf = PDFDocument(data: bytes) {
-          PDFAttachmentView(document: pdf)
+          PDFAttachmentView(bytes: bytes, pageCount: pdf.pageCount)
         } else { unavailable }
       case .document:
-        EmptyView()
+        NativeScrollableText(text: text, maximumHeight: maximumTextHeight)
+      case .unavailable: unavailable
       }
     }
   }
@@ -66,17 +71,44 @@ struct AttachmentMediaView: View {
   }
 }
 
-private struct PDFAttachmentView: NSViewRepresentable {
-  let document: PDFDocument
-  func makeNSView(context: Context) -> PDFView {
-    let view = PDFView()
-    view.autoScales = true
-    view.displayMode = .singlePageContinuous
-    view.document = document
-    return view
+private struct PDFAttachmentView: View {
+  let bytes: Data
+  let pageCount: Int
+  var body: some View {
+    ScrollView {
+      LazyVStack(spacing: 8) {
+        ForEach(0..<pageCount, id: \.self) { index in
+          PDFPagePreview(bytes: bytes, index: index)
+        }
+      }
+    }
   }
-  func updateNSView(_ view: PDFView, context: Context) {
-    if view.document !== document { view.document = document }
+}
+
+private struct PDFPagePreview: View {
+  let bytes: Data
+  let index: Int
+  @State private var image: NSImage?
+  @State private var failed = false
+  var body: some View {
+    Group {
+      if let image { Image(nsImage: image).resizable().aspectRatio(contentMode: .fit) }
+      else if failed { Image(systemName: "exclamationmark.triangle").foregroundStyle(.secondary) }
+      else { ProgressView().controlSize(.small) }
+    }
+    .task {
+      do {
+        let png = try await detachedWork {
+          guard let page = PDFDocument(data: bytes)?.page(at: index),
+            let tiff = page.thumbnail(of: NSSize(width: 1200, height: 1200), for: .mediaBox).tiffRepresentation,
+            let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else {
+            throw BoomError.invalid("PDF preview unavailable.")
+          }
+          return png
+        }
+        try Task.checkCancellation(); image = NSImage(data: png)
+      } catch is CancellationError {} catch { failed = true }
+    }
   }
 }
 
@@ -99,9 +131,13 @@ private struct MediaPlaybackTime: View {
 
 private struct AudioAttachmentPlayer: View {
   let bytes: Data
-  @State private var player: AVAudioPlayer?
+  @State private var player: AVPlayer?
+  @State private var media: MemoryMedia?
+  @State private var preparation: Task<Void, Never>?
   @State private var playing = false
   @State private var seconds = 0.0
+  @State private var duration = 0.0
+  @State private var scrubbing = false
   @State private var failure: String?
   private let ticker = Timer.publish(every: 0.2, on: .main, in: .common).autoconnect()
 
@@ -109,28 +145,39 @@ private struct AudioAttachmentPlayer: View {
     HStack(spacing: 8) {
       Button {
         guard let player else { return }
-        if player.isPlaying { player.pause() } else { player.play() }
-        playing = player.isPlaying
+        if player.rate > 0 { player.pause() }
+        else { if seconds >= duration { player.seek(to: .zero) }; player.play() }
+        playing = player.rate > 0
       } label: {
         Image(systemName: playing ? "pause.fill" : "play.fill")
           .font(.system(size: 18)).frame(width: 28, height: 36)
       }.buttonStyle(.plain).disabled(player == nil)
       .accessibilityLabel(playing ? "Pause audio" : "Play audio")
-      Slider(value: $seconds, in: 0...max(player?.duration ?? 0, 0.1), onEditingChanged: { editing in
-        if !editing { player?.currentTime = seconds }
+      Slider(value: $seconds, in: 0...max(duration, 0.1), onEditingChanged: { editing in
+        scrubbing = editing
+        if !editing { player?.seek(to: CMTime(seconds: seconds, preferredTimescale: 600)) }
       }).frame(minWidth: 32).disabled(player == nil)
-      MediaPlaybackTime(seconds: seconds, duration: player?.duration ?? 0)
+      MediaPlaybackTime(seconds: seconds, duration: duration)
         .foregroundStyle(.secondary)
     }
     .padding(.horizontal, 4)
     .onAppear {
-      do { player = try MemoryMedia.audioPlayer(bytes: bytes); player?.prepareToPlay() }
-      catch { failure = error.localizedDescription }
+      guard preparation == nil else { return }
+      preparation = Task {
+        do {
+          let source = try MemoryMedia(bytes: bytes)
+          let ready = try await source.readyPlayer(flag: CancellationFlag())
+          let length = try await source.asset.load(.duration).seconds
+          try Task.checkCancellation()
+          media = source; player = ready; duration = length.isFinite ? max(0, length) : 0
+        } catch is CancellationError {} catch { failure = error.localizedDescription }
+      }
     }
-    .onDisappear { player?.stop(); player = nil }
+    .onDisappear { preparation?.cancel(); preparation = nil; player?.pause(); player = nil; media = nil }
     .onReceive(ticker) { _ in
-      seconds = player?.currentTime ?? 0
-      playing = player?.isPlaying == true
+      let time = player?.currentTime().seconds ?? 0
+      if !scrubbing, time.isFinite { seconds = time }
+      playing = (player?.rate ?? 0) > 0
     }
     .overlay(alignment: .bottomLeading) {
       if let failure {
@@ -218,10 +265,10 @@ private struct VideoAttachmentPlayer: View {
     do {
       let source = try MemoryMedia(bytes: bytes)
       guard source.container == .mp4 else { throw BoomError.invalid("This attachment is not self-contained MP4 video.") }
-      media = source
-      player = AVPlayer(playerItem: AVPlayerItem(asset: source.asset))
       posterTask = Task {
         do {
+          let ready = try await source.readyPlayer(flag: CancellationFlag())
+          try Task.checkCancellation(); media = source; player = ready
           let generator = AVAssetImageGenerator(asset: source.asset)
           generator.appliesPreferredTrackTransform = true; generator.maximumSize = NSSize(width: 1600, height: 1600)
           let frame = try await generator.image(at: .zero)
@@ -256,21 +303,20 @@ struct InlineAttachmentView: View {
   var remove: (() -> Void)? = nil
   @State private var bytes: Data?
   @State private var failure: String?
-  private var kind: AttachmentKind { AttachmentKind(name: record.name) }
+  private var kind: AttachmentKind { record.kind }
   var body: some View {
     Group {
-      if let bytes, kind != .document {
-        AttachmentMediaView(name: record.name, bytes: bytes)
-          .frame(width: kind == .audio ? 260 : kind == .image ? 240 : 300)
-          .frame(height: kind == .audio ? 44 : kind == .image ? 180 : 220)
+      if let bytes {
+        AttachmentMediaView(name: record.name, bytes: bytes, presentation: kind, text: record.text)
+          .frame(minWidth: 0, idealWidth: kind == .unavailable ? 24 : kind == .audio ? 260 : kind == .image ? 240 : 300,
+            maxWidth: kind == .unavailable ? 24 : kind == .audio ? 260 : kind == .image ? 240 : 300)
+          .frame(height: kind == .document ? nil : kind == .unavailable ? 24 : kind == .audio ? 44 : kind == .image ? 180 : 220)
       } else if let failure {
         Image(systemName: "exclamationmark.triangle").foregroundStyle(.secondary).help(failure)
-      } else if kind == .document {
-        Label(record.name, systemImage: "doc.text").font(.caption)
       } else { ProgressView().controlSize(.small) }
     }
     .accessibilityLabel(record.name)
-    .help(record.name)
+    .help(kind == .unavailable ? record.coverage : record.name)
     .contextMenu {
       if let remove { Button("Remove", action: remove) }
       Button("Export original…") {

@@ -1,4 +1,5 @@
 import AVFoundation
+import CAttachment
 import BoomCore
 import Foundation
 import UniformTypeIdentifiers
@@ -12,16 +13,38 @@ final class MemoryMedia: NSObject, AVAssetResourceLoaderDelegate, @unchecked Sen
   private let contentType: String
   private let queue = DispatchQueue(label: "com.delysis.Bloom.media")
   init(bytes: Data) throws {
-    container = try ProductCore.admitMedia(bytes)
-    self.bytes = bytes
+    let original = try ProductCore.admitMedia(bytes)
+    let admitted = original == .caf ? try Self.cafWave(bytes) : bytes
+    container = original == .caf ? .wav : original
+    self.bytes = admitted
     contentType = UTType(filenameExtension: container.rawValue)?.identifier ?? UTType.data.identifier
     asset = AVURLAsset(url: URL(string: "bloom-media://local/\(UUID().uuidString)")!)
     super.init()
     asset.resourceLoader.setDelegate(self, queue: queue)
   }
-  static func audioPlayer(bytes: Data) throws -> AVAudioPlayer {
-    _ = try ProductCore.admitMedia(bytes)
-    return try AVAudioPlayer(data: bytes)
+  /// Decoder admission is not playback readiness. Both media controls use the
+  /// actual AVPlayer consumer, retain this memory owner, and expose playback
+  /// only after the item has negotiated its codec and reached readyToPlay.
+  @MainActor func readyPlayer(flag: CancellationFlag) async throws -> AVPlayer {
+    try flag.check(); try Task.checkCancellation()
+    let item = AVPlayerItem(asset: asset), player = AVPlayer(playerItem: item)
+    for _ in 0..<500 where item.status == .unknown {
+      try flag.check(); try await Task.sleep(for: .milliseconds(10))
+    }
+    try flag.check(); try Task.checkCancellation()
+    guard item.status == .readyToPlay else {
+      player.pause()
+      throw item.error ?? BoomError.unavailable("This media cannot be played locally.")
+    }
+    return player
+  }
+  private static func cafWave(_ bytes: Data) throws -> Data {
+    let buffer = bytes.withUnsafeBytes { pointer in bloom_caf_wave(pointer.bindMemory(to: UInt8.self).baseAddress, bytes.count) }
+    defer { boom_attachment_free(buffer) }
+    guard let pointer = buffer.data, buffer.length >= 44, buffer.length <= 67_108_910 else { throw BoomError.invalid("CAF cannot be decoded locally.") }
+    let wave = Data(bytes: pointer, count: buffer.length)
+    guard wave.starts(with: Data("RIFF".utf8)), try ProductCore.admitMedia(wave) == .wav else { throw BoomError.invalid("CAF cannot be decoded locally.") }
+    return wave
   }
   func resourceLoader(_ resourceLoader: AVAssetResourceLoader,
     shouldWaitForLoadingOfRequestedResource request: AVAssetResourceLoadingRequest) -> Bool {

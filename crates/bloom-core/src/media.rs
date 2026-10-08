@@ -14,6 +14,7 @@ pub enum MediaContainer {
     Mp3,
     Aac,
     Ogg,
+    Caf,
 }
 
 fn u32(bytes: &[u8]) -> Result<u32, Error> {
@@ -130,12 +131,154 @@ fn mp3(bytes: &[u8]) -> bool {
     bytes.get(10 + size + footer..).is_some_and(mpeg_audio)
 }
 
+fn caf_sections(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    if !bytes.starts_with(b"caff\x00\x01\x00\x00") {
+        return None;
+    }
+    let mut cursor = 8_usize;
+    let mut description = None;
+    let mut data = None;
+    let mut chunks = 0;
+    while cursor < bytes.len() {
+        chunks += 1;
+        let header = bytes.get(cursor..cursor + 12)?;
+        if chunks > 4096 {
+            return None;
+        }
+        let Ok(size) = <[u8; 8]>::try_from(&header[4..12]) else {
+            return None;
+        };
+        let size = i64::from_be_bytes(size);
+        let count = if size == -1 && &header[..4] == b"data" {
+            bytes.len() - cursor - 12
+        } else if let Ok(count) = usize::try_from(size) {
+            count
+        } else {
+            return None;
+        };
+        let end = cursor
+            .checked_add(12)
+            .and_then(|start| start.checked_add(count))?;
+        let payload = bytes.get(cursor + 12..end)?;
+        match &header[..4] {
+            b"desc" => {
+                if payload.len() != 32 || description.is_some() {
+                    return None;
+                }
+                let Ok(rate) = <[u8; 8]>::try_from(&payload[..8]) else {
+                    return None;
+                };
+                let rate = f64::from_be_bytes(rate);
+                if !rate.is_finite() || !(8000.0..=384000.0).contains(&rate) {
+                    return None;
+                }
+                description = Some(payload);
+            }
+            b"data" => {
+                if payload.len() <= 4 || data.is_some() {
+                    return None;
+                }
+                data = Some(&payload[4..]);
+            }
+            _ => {}
+        }
+        cursor = end;
+    }
+    description.zip(data)
+}
+
+/// Repackage signed/float LPCM without decoding or changing sample values.
+/// CAF has its own flags: bit 0 is float and bit 1 is little endian, unlike
+/// AudioStreamBasicDescription. No file or resolver is involved.
+/// https://developer.apple.com/library/archive/documentation/MusicAudio/Reference/CAFSpec/CAF_spec/CAF_spec.html
+pub fn caf_wave(bytes: &[u8]) -> Result<Vec<u8>, Error> {
+    require(bytes.len() <= MAX_BYTES, "CAF exceeds its input bound.")?;
+    let (description, samples) =
+        caf_sections(bytes).ok_or_else(|| Error("Invalid CAF structure.".into()))?;
+    require(
+        &description[8..12] == b"lpcm",
+        "Only local linear PCM CAF is supported.",
+    )?;
+    let flags = u32(&description[12..])?;
+    let packet_bytes = u32(&description[16..])?;
+    let packet_frames = u32(&description[20..])?;
+    let channels = u32(&description[24..])?;
+    let bits = u32(&description[28..])?;
+    require(
+        flags & !3 == 0 && (1..=8).contains(&channels) && packet_frames == 1,
+        "Unsupported CAF sample geometry.",
+    )?;
+    let float = flags & 1 != 0;
+    require(
+        if float {
+            [32, 64].contains(&bits)
+        } else {
+            [16, 24, 32].contains(&bits)
+        },
+        "Unsupported CAF sample width.",
+    )?;
+    let width = bits as usize / 8;
+    let block = channels * bits / 8;
+    require(
+        packet_bytes == block && samples.len() % block as usize == 0,
+        "CAF samples are not complete frames.",
+    )?;
+    let rate = f64::from_be_bytes(
+        description[..8]
+            .try_into()
+            .map_err(|_| Error("Invalid CAF rate.".into()))?,
+    );
+    require(rate.fract() == 0.0, "CAF rate is not integral.")?;
+    let rate = rate as u32;
+    let mut pcm = samples.to_vec();
+    if flags & 2 == 0 {
+        for sample in pcm.chunks_exact_mut(width) {
+            sample.reverse();
+        }
+    }
+    if float {
+        require(
+            pcm.chunks_exact(width).all(|sample| {
+                if bits == 32 {
+                    <[u8; 4]>::try_from(sample)
+                        .is_ok_and(|value| f32::from_le_bytes(value).is_finite())
+                } else {
+                    <[u8; 8]>::try_from(sample)
+                        .is_ok_and(|value| f64::from_le_bytes(value).is_finite())
+                }
+            }),
+            "CAF contains nonfinite samples.",
+        )?;
+    }
+    let padded = pcm.len() + pcm.len() % 2;
+    let mut wav = Vec::with_capacity(44 + padded);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36_u32 + padded as u32).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&(if float { 3_u16 } else { 1_u16 }).to_le_bytes());
+    wav.extend_from_slice(&(channels as u16).to_le_bytes());
+    wav.extend_from_slice(&rate.to_le_bytes());
+    wav.extend_from_slice(&(rate * block).to_le_bytes());
+    wav.extend_from_slice(&(block as u16).to_le_bytes());
+    wav.extend_from_slice(&(bits as u16).to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+    wav.extend_from_slice(&pcm);
+    if padded != pcm.len() {
+        wav.push(0);
+    }
+    Ok(wav)
+}
+
 pub fn admit_media(bytes: &[u8]) -> Result<MediaContainer, Error> {
     require(
         !bytes.is_empty() && bytes.len() <= MAX_BYTES,
         "Native media must be nonempty and at most 64 MiB.",
     )?;
-    let kind = if bytes.get(4..8) == Some(b"ftyp") {
+    let kind = if caf_sections(bytes).is_some() {
+        MediaContainer::Caf
+    } else if bytes.get(4..8) == Some(b"ftyp") {
         let mut movie = Movie::default();
         movie.scan(bytes, 0)?;
         require(
@@ -221,6 +364,20 @@ mod tests {
             admit_media(&prefixed[1..]).expect("borrowed movie"),
             MediaContainer::Mp4
         );
+    }
+    #[test]
+    fn caf_repack_preserves_pcm_and_rejects_truncated_or_false_geometry() {
+        let original = include_bytes!("../../../App/Tests/BoomTests/Fixtures/Attachments/tone.caf");
+        let (_, samples) = caf_sections(original).expect("CAF sections");
+        let wave = caf_wave(original).expect("wave");
+        assert_eq!(&wave[44..], samples);
+        assert_eq!(admit_media(&wave).expect("admitted"), MediaContainer::Wav);
+        for end in [0, 7, 19, original.len() - 1] {
+            assert!(caf_wave(&original[..end]).is_err());
+        }
+        let mut false_geometry = original.to_vec();
+        false_geometry[44..48].copy_from_slice(&0_u32.to_be_bytes());
+        assert!(caf_wave(&false_geometry).is_err());
     }
     #[test]
     fn external_urls_aliases_and_urns_are_rejected() {

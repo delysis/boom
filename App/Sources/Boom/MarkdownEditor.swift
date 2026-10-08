@@ -41,27 +41,13 @@ import SwiftUI
     if identity == nil || !searchRanges.isEmpty { searchIdentity = identity }
     needsDisplay = true
   }
-  private let placeholderStorage = NSTextStorage()
-  private let placeholderLayout = NSLayoutManager()
-  private let placeholderContainer = NSTextContainer(size: .zero)
+  private let placeholder = NativeTextPlaceholder("Begin writing…")
   func preparePlaceholder() {
-    placeholderStorage.addLayoutManager(placeholderLayout)
-    placeholderLayout.addTextContainer(placeholderContainer)
     setAccessibilityPlaceholderValue("Begin writing…")
   }
   override func draw(_ dirtyRect: NSRect) {
     super.draw(dirtyRect)
-    if !hasVisibleGhost { drawPlaceholder() }
-  }
-  private func drawPlaceholder() {
-    guard string.isEmpty, !hasMarkedText(), let textContainer else { return }
-    var attributes = typingAttributes
-    attributes[.font] = font ?? MarkdownStyle.body
-    attributes[.foregroundColor] = NSColor.placeholderTextColor
-    placeholderStorage.setAttributedString(NSAttributedString(string: "Begin writing…", attributes: attributes))
-    placeholderContainer.size = textContainer.size
-    placeholderContainer.lineFragmentPadding = textContainer.lineFragmentPadding
-    placeholderLayout.drawGlyphs(forGlyphRange: placeholderLayout.glyphRange(for: placeholderContainer), at: textContainerOrigin)
+    if !hasVisibleGhost { placeholder.draw(in: self) }
   }
   override var undoManager: UndoManager? { documentUndo }
   override var acceptsFirstResponder: Bool { true }
@@ -315,7 +301,7 @@ struct MarkdownEditor: NSViewRepresentable {
     text.isContinuousSpellCheckingEnabled = true
     text.usesFindBar = false
     text.usesFindPanel = false
-    text.registerForDraggedTypes([.fileURL, .png, .tiff, .string])
+    text.registerForDraggedTypes(AttachmentInput.draggingTypes + [.string])
     text.setAccessibilityLabel("Manuscript")
     text.preparePlaceholder()
     MarkdownStyle.apply(to: text)

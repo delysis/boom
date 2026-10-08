@@ -1,0 +1,6 @@
+From a@example.invalid Sat Jan 01 00:00:00 2022
+From: a@example.invalid
+Subject: Public fixture
+Content-Type: text/plain; charset=utf-8
+
+ATTACHMENT_CANARY

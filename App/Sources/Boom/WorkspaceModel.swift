@@ -789,7 +789,8 @@ struct CompletionSegment {
   }
   private func revalidate(_ sources: [SourceReference], attachments: [SourceReference]) throws {
     for source in sources {
-      let digest = source.kind == "media" ? state.attachments.first(where: { $0.id == source.id })?.rootDigest
+      let attachment = state.attachments.first(where: { $0.id == source.id })
+      let digest = source.kind == "media" ? attachment?.rootDigest : source.kind == "attachment" ? attachment?.digest
         : documents.first(where: { $0.id == source.id })?.revision
       guard digest == source.digest else {
         throw BoomError.stale(source.title)
@@ -832,6 +833,10 @@ struct CompletionSegment {
         guard let record = state.attachments.first(where: { $0.id == id }) else { throw BoomError.stale("An attachment was removed.") }
         return record
       }
+      if attachments.contains(where: { $0.kind == .unavailable }) {
+        composerIssue = "An attachment can't be read locally. Its original has been kept."
+        return
+      }
       if attachments.contains(where: { $0.needsPreparation }) {
         prepareMediaForSend(attachments, chat: chat.id, request: request, interaction: interaction,
           selectedIDs: selectedIDs, documentID: state.selectedDocument)
@@ -854,17 +859,14 @@ struct CompletionSegment {
         let provider = runner.identity
         try await self.flush()
         try await self.revalidateResponseSources(graph.sources, attachments: attachmentSources, targetID: authority.target?.id)
-        var images: [Data] = []
-        for attachment in attachments {
-          if let image = try await self.imagePayload(for: attachment) { images.append(image) }
-          else if attachment.text.isEmpty { throw BoomError.unavailable("\(attachment.name) has no readable local content. Prepare it locally or remove it.") }
-        }
+        let media = try await self.consultationMedia(attachments, rawAudio: runner.supportsRawAudio, flag: flag)
+        let images = media.images
         let reserves = targets.indices.map { index in
           style == .discuss ? outputLimit * (index + 1) + 256 * index : outputLimit
         }
         let fitted = try await runner.fittedRound(voices: targets, history: chat.messages,
           instructions: instructions, context: context, request: request, routing: slugs,
-          images: images, reserves: reserves, flag: flag, authority: authority)
+          images: images, audio: media.audio, reserves: reserves, flag: flag, authority: authority)
         let plans = fitted.plans
         try flag.check()
         try await self.revalidateResponseSources(graph.sources, attachments: attachmentSources, targetID: authority.target?.id)
@@ -926,7 +928,7 @@ struct CompletionSegment {
                 operationID: flag.operationID, recordID: replyID, attemptID: attemptID,
                 model: provider, seed: seed, requestDigest: Digest.sha256(plan.rawPrompt), maxTokens: outputLimit,
                 generationPolicy: runner.generationPolicy)
-              let result = try await runner.run(plan: plan, images: images, maxTokens: outputLimit,
+              let result = try await runner.run(plan: plan, images: images, audio: media.audio, maxTokens: outputLimit,
                 seed: seed, flag: flag, onCheckpoint: { progress, stop, token in
                   try await checkpointStore.checkpoint(progress, identity: generation, stopReason: stop, stopTokenID: token)
                 }) { [weak self] text in
@@ -1130,7 +1132,7 @@ struct CompletionSegment {
   }
   private func revalidateOnDisk(_ sources: [SourceReference], attachments: [SourceReference]) async throws {
     try revalidate(sources, attachments: attachments)
-    for source in sources where source.kind != "media" { try await store.checkDisk(source.id) }
+    for source in sources where !["media", "attachment"].contains(source.kind) { try await store.checkDisk(source.id) }
     try revalidate(sources, attachments: attachments)
   }
   private func revalidateResponseSources(_ sources: [SourceReference], attachments: [SourceReference],
@@ -2003,13 +2005,30 @@ struct CompletionSegment {
         var record = imported.record
         record.isImage = LocalImage.canDecode(imported.original)
         if record.isImage == true {
+          record.presentation = .image
           record.coverage = "Original image available locally"
-        } else if [.audio, .video].contains(AttachmentKind(name: record.name)), record.text.isEmpty {
+        } else if record.kind == .image {
+          record.presentation = .unavailable
+          record.coverage = "Image cannot be decoded locally; original retained"
+        } else if record.kind == .pdf {
+          record.text = ""
+          do { record = try await self.preparedRecord(record, data: imported.original, automaticAudio: false, flag: flag) }
+          catch is CancellationError { throw CancellationError() }
+          catch { record.coverage = "Original PDF available locally; " + error.localizedDescription }
+        } else if [.audio, .video].contains(record.kind), record.text.isEmpty {
           do {
             _ = try ProductCore.admitMedia(imported.original)
+            if record.kind == .audio {
+              try await detachedWork {
+                let reader = try await MemoryMedia(bytes: imported.original).audioReader()
+                guard try reader.next(flag: flag, seconds: 1) != nil else { throw BoomError.invalid("Audio contains no decodable samples.") }
+              }
+            } else {
+              _ = try await detachedWork { [name = record.name] in try await NativeMedia.prepare(data: imported.original, name: name, audioSeconds: 0, flag: flag) }
+            }
             record.awaitingPreparation = true
             record.coverage = "Original media available locally"
-          } catch { record.coverage = "Unreadable locally: " + error.localizedDescription }
+          } catch { record.presentation = .unavailable; record.coverage = "Unreadable locally: " + error.localizedDescription }
         } else if record.text.isEmpty {
           do {
             record = try await self.preparedRecord(
@@ -2089,11 +2108,22 @@ struct CompletionSegment {
       self.send()
     }) { [weak self] flag in
       guard let self else { return }
+      let runner = try await self.runnerForGeneration(.consultation, flag: flag)
       for original in records where original.needsPreparation {
         let vault = self.store.vault
         let bytes = try await detachedWork { try vault.get(.attachment, id: original.id, limit: 67_108_864) }
         guard Digest.sha256(bytes) == original.rootDigest else { throw BoomError.invalid("The recorded audio changed.") }
-        var prepared = try await self.preparedRecord(original, data: bytes, automaticAudio: false, flag: flag)
+        var prepared: AttachmentRecord
+        if original.kind == .video || original.kind == .audio && runner.supportsRawAudio {
+          prepared = original
+          if original.kind == .audio {
+            _ = try await MemoryMedia(bytes: bytes).audioReader()
+            prepared.coverage = "Original audio waveform available locally"
+          } else {
+            _ = try await detachedWork { try await NativeMedia.prepare(data: bytes, name: original.name, audioSeconds: 0, flag: flag) }
+            prepared.coverage = "Four sampled video frames; sound is not represented"
+          }
+        } else { prepared = try await self.preparedRecord(original, data: bytes, automaticAudio: false, flag: flag) }
         prepared.awaitingTranscription = false; prepared.awaitingPreparation = false
         try flag.check()
         guard let index = self.state.attachments.firstIndex(where: { $0.id == original.id }),
@@ -2103,31 +2133,25 @@ struct CompletionSegment {
       self.status = "Audio ready"; self.scheduleSave()
     }
   }
-  private func imagePayload(for attachment: AttachmentRecord) async throws -> Data? {
-    guard attachment.isImage == true || attachment.text.isEmpty else { return nil }
-    let vault = store.vault
-    let data = try await detachedWork { try vault.get(.attachment, id: attachment.id, limit: 67_108_864) }
-    guard Digest.sha256(data) == attachment.rootDigest else {
-      throw BoomError.invalid("Stored image bytes changed.")
+  func consultationMedia(_ records: [AttachmentRecord], rawAudio: Bool, flag: CancellationFlag) async throws -> (images: [Data], audio: [WritingMediaData]) {
+    let readable = records.filter { !($0.kind == .audio && !rawAudio) }
+    let links = readable.map { "[Attachment: media](boom-attachment:\($0.id))" }.joined(separator: "\n")
+    let payloads = try await writingMedia(in: links, flag: flag)
+    let images = payloads.flatMap { $0.reference.kind == "image" ? [$0.bytes] : $0.images }
+    let audio = payloads.filter { $0.reference.kind == "audio" }
+    for record in records {
+      try flag.check()
+      if record.text.isEmpty && ![.image, .audio, .pdf, .video].contains(record.kind) {
+        throw BoomError.unavailable("This attachment has no readable local content.")
+      }
     }
-    if LocalImage.canDecode(data) { return data }
-    if attachment.isImage == true {
-      throw BoomError.invalid("The stored image cannot be decoded locally.")
-    }
-    return nil
-  }
-  private func describeImage(_ image: CGImage, runner: MLXGemmaRunner, flag: CancellationFlag) async throws -> String {
-    let bitmap = NSBitmapImageRep(cgImage: image)
-    guard let bytes = bitmap.representation(using: .png, properties: [:]) else { throw BoomError.invalid("Could not encode image.") }
-    let plan = try ProductCore.prompt(voice: nil, history: [], instructions: "", context: "",
-      request: "Describe this image carefully. Transcribe legible text and distinguish uncertainty.", routing: [])
-    return try await runner.run(plan: plan, images: [bytes], maxTokens: 512, flag: flag, onText: { _ in }).text
+    return (images, audio)
   }
   private func preparedRecord(
     _ attachment: AttachmentRecord, data: Data, automaticAudio: Bool, flag: CancellationFlag
   ) async throws -> AttachmentRecord {
     var updated = attachment
-    if AttachmentKind(name: attachment.name) == .audio {
+    if attachment.kind == .audio {
       let result = try await VoiceInput().transcribeAttachment(
         data: data, automaticAudio: automaticAudio, flag: flag
       ) { [weak self] current, total in
@@ -2150,26 +2174,15 @@ struct CompletionSegment {
     case .text(let extracted, let coverage):
       text = extracted
       note = coverage
-    case .image(let image):
-      let runner = try await runnerForGeneration(.consultation, flag: flag)
-      text = try await describeImage(image, runner: runner, flag: flag)
-      note = "Local model description of the first image, resized to at most 1600 pixels. Machine-generated, not verified OCR or full image coverage."
-    case .video(let frames, let coverage):
-      let runner = try await runnerForGeneration(.consultation, flag: flag)
-      var descriptions: [String] = []
-      for frame in frames {
-        try flag.check()
-        let result = try await describeImage(frame.image, runner: runner, flag: flag)
-        descriptions.append("[Frame at \(String(format: "%.2f", frame.seconds)) seconds]\n" + result)
-      }
-      text = descriptions.joined(separator: "\n\n")
-      note = coverage
+    case .image, .video:
+      throw BoomError.invalid("Media must use its original input adapter.")
     }
     try flag.check()
     guard !text.isEmpty, text.utf8.count <= 262_144 else {
       throw BoomError.invalid("Native transform returned no bounded text.")
     }
     updated.text = text
+    if updated.kind != .pdf { updated.presentation = .document }
     updated.transform = note
     updated.coverage = "Partial native transform"
     return updated

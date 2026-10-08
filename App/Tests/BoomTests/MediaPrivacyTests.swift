@@ -21,12 +21,9 @@ final class MediaPrivacyTests: XCTestCase {
     let url = try XCTUnwrap(Bundle.module.url(forResource: name, withExtension: nil, subdirectory: "Fixtures"))
     return try Data(contentsOf: url)
   }
-  func testBothNativeDecoderEntrypointsRejectReferencesBeforeCreatingPlayers() {
+  func testNativeDecoderRejectsReferencesBeforeCreatingPlayers() {
     for bytes in [referenceMovie(), Data("#EXTM3U\nhttps://example.invalid/video".utf8)] {
       XCTAssertThrowsError(try MemoryMedia(bytes: bytes)) { error in
-        XCTAssertTrue(error.localizedDescription.contains("forbidden"), "\(error)")
-      }
-      XCTAssertThrowsError(try MemoryMedia.audioPlayer(bytes: bytes)) { error in
         XCTAssertTrue(error.localizedDescription.contains("forbidden"), "\(error)")
       }
     }
@@ -88,12 +85,12 @@ final class MediaPrivacyTests: XCTestCase {
     }
     withExtendedLifetime(owner) {}
   }
-  func testRealM4AAudioPlayerAndPCMReaderUseAdmittedMemoryBytes() async throws {
+  @MainActor func testRealM4AAudioPlayerAndPCMReaderUseAdmittedMemoryBytes() async throws {
     let bytes = try fixture("local-audio.m4a")
-    let player = try MemoryMedia.audioPlayer(bytes: bytes)
-    XCTAssertTrue(player.prepareToPlay()) // No sound is played.
-    XCTAssertEqual(player.duration, 1.25, accuracy: 0.1)
     let owner = try MemoryMedia(bytes: bytes)
+    let player = try await owner.readyPlayer(flag: CancellationFlag())
+    XCTAssertEqual(player.currentItem?.status, .readyToPlay) // No sound is played.
+    XCTAssertEqual(player.currentItem?.duration.seconds ?? 0, 1.25, accuracy: 0.1)
     let reader = try await owner.audioReader()
     var samples: [Float] = []
     while let buffer = try reader.next(flag: CancellationFlag(), seconds: 1) {
@@ -107,6 +104,6 @@ final class MediaPrivacyTests: XCTestCase {
     let crossings = zip(samples, samples.dropFirst()).filter { $0.0 <= 0 && $0.1 > 0 }.count
     let frequency = Double(crossings) / (Double(samples.count) / 16_000)
     XCTAssertEqual(frequency, 523, accuracy: 20)
-    player.stop()
+    player.pause()
   }
 }

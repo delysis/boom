@@ -1,0 +1,6 @@
+# Attachment fixtures are literal byte inputs, including deliberately malformed
+# files. Never normalize their line endings or lint binary/PDF payload as prose.
+App/Tests/BoomTests/Fixtures/Attachments/* -text
+App/Tests/BoomTests/Fixtures/Attachments/*.png binary
+App/Tests/BoomTests/Fixtures/Attachments/*.pdf binary
+App/Tests/BoomTests/Fixtures/Attachments/*.bin binary

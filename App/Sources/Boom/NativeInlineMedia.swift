@@ -21,9 +21,13 @@ struct InlineMediaSpan: Decodable {
   let bytes: Data?
   let image: CGImage?
   let failure: String?
-  var kind: AttachmentKind { AttachmentKind(name: record.name) }
+  private let prose = NativeReadingTextView(frame: .zero)
+  private let measurement = NativeTextMeasurement()
+  var kind: AttachmentKind { record.kind }
   init(_ record: AttachmentRecord, bytes: Data? = nil, image: CGImage? = nil, failure: String? = nil) {
     self.record = record; self.bytes = bytes; self.image = image; self.failure = failure
+    super.init()
+    if kind == .document { prose.setSource(record.text) }
   }
   func size(available: CGFloat) -> NSSize {
     let width = max(1, available)
@@ -35,7 +39,10 @@ struct InlineMediaSpan: Decodable {
     case .audio: return NSSize(width: min(width, 560), height: 44)
     case .video: return NSSize(width: min(width, 680), height: min(width, 680) * 9 / 16)
     case .pdf: return NSSize(width: width, height: 360)
-    case .document: return .zero
+    case .document:
+      let height = prose.textStorage.map { measurement.height(of: $0, width: width, insets: .zero, fragmentPadding: 0) } ?? 24
+      return NSSize(width: width, height: min(480, max(24, height)))
+    case .unavailable: return NSSize(width: 24, height: 24)
     }
   }
 }
@@ -170,8 +177,8 @@ struct InlineMediaSpan: Decodable {
     let records = model?.state.attachments ?? []
     let ids = Set(spans.map(\.id))
     for id in Array(items.keys) where !ids.contains(id) { tasks.removeValue(forKey: id)?.cancel(); items.removeValue(forKey: id) }
-    for record in records where ids.contains(record.id) && AttachmentKind(name: record.name) != .document {
-      if items[record.id]?.record.rootDigest != record.rootDigest {
+    for record in records where ids.contains(record.id) {
+      if items[record.id]?.record != record {
         tasks.removeValue(forKey: record.id)?.cancel(); items[record.id] = InlineMediaItem(record)
       }
       if items[record.id]?.bytes == nil && items[record.id]?.failure == nil && tasks[record.id] == nil, let vault = model?.store.vault {
@@ -180,7 +187,7 @@ struct InlineMediaSpan: Decodable {
             let loaded = try await detachedWork {
               let data = try vault.get(.attachment, id: record.id, limit: 67_108_864)
               guard Digest.sha256(data) == record.rootDigest else { throw BoomError.invalid("Attachment original changed.") }
-              return (data, NativeMedia.thumbnail(data, maximum: 1600))
+              return (data, record.kind == .image ? NativeMedia.thumbnail(data, maximum: 1600) : nil)
             }
             guard let self, !Task.isCancelled, self.items[record.id]?.record.rootDigest == record.rootDigest else { return }
             self.items[record.id] = InlineMediaItem(record, bytes: loaded.0, image: loaded.1)
@@ -284,7 +291,8 @@ struct InlineMediaSpan: Decodable {
       let imageView = NSImageView(); imageView.image = NSImage(cgImage: image, size: .zero)
       imageView.imageScaling = .scaleProportionallyUpOrDown; content = imageView
     } else if let bytes = item.bytes {
-      content = NSHostingView(rootView: AttachmentMediaView(name: item.record.name, bytes: bytes))
+      content = NSHostingView(rootView: AttachmentMediaView(name: item.record.name, bytes: bytes,
+        presentation: item.kind, text: item.record.text, maximumTextHeight: 480))
     } else {
       let symbol = NSImageView(); symbol.image = NSImage(systemSymbolName: item.failure == nil ? item.kind.symbol : "exclamationmark.triangle", accessibilityDescription: item.record.name)
       content = symbol

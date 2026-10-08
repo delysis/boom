@@ -241,7 +241,7 @@ struct ResidencyLimits: Codable, Sendable {
   let workingReserveBytes: UInt64
 }
 enum MediaContainer: String, Decodable {
-  case mp4, wav, aiff, flac, mp3, aac, ogg
+  case mp4, wav, aiff, flac, mp3, aac, ogg, caf
 }
 final class ContextVocabulary: Sendable {
   let id: UUID

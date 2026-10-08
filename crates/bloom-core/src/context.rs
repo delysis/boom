@@ -316,11 +316,9 @@ impl Search {
                             .iter()
                             .find(|reference| reference.id == span.id)
                             .expect("filtered media");
-                        normalized_offset += if reference.kind == "image" {
-                            "<|image|>".len()
-                        } else {
-                            "<|audio|>".len()
-                        };
+                        let content = reference.prompt_content();
+                        normalized_offset +=
+                            content.len() + content.bytes().filter(|b| *b == b' ').count() * 2;
                     }
                 } else {
                     normalized_offset +=
@@ -563,6 +561,9 @@ mod tests {
             name: "clip.wav".into(),
             root_digest: "a".repeat(64),
             kind: "audio".into(),
+            text: None,
+            source_digest: None,
+            frame_digests: None,
         };
         let link = format!("[Attachment: clip](boom-attachment:{})", media.id);
         let text = format!("{link}z");

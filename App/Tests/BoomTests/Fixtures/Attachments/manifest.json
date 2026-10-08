@@ -1,0 +1,377 @@
+[
+  {
+    "kind": "document",
+    "name": "plain.txt",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "source.rs",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "manuscript.md",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "rich.rtf",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "data.json",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "data.csv",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "data.tsv",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "page.html",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "data.xml",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "drawing.svg",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "notebook.ipynb",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "captions.vtt",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "captions.srt",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "mail.eml",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "mailbox.mbox",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "word.docx",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "slides.pptx",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "sheet.xlsx",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "open.odt",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "open.ods",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "open.odp",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "book.epub",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "archive.zip",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "archive.tar",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "archive.tar.gz",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "public.txt.gz",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "archive.tar.bz2",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "public.txt.bz2",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "archive.tar.xz",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "document",
+    "name": "public.txt.xz",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "image",
+    "name": "picture.png",
+    "needle": null
+  },
+  {
+    "kind": "image",
+    "name": "picture.jpg",
+    "needle": null
+  },
+  {
+    "kind": "image",
+    "name": "picture.tiff",
+    "needle": null
+  },
+  {
+    "kind": "image",
+    "name": "picture.gif",
+    "needle": null
+  },
+  {
+    "kind": "image",
+    "name": "picture.bmp",
+    "needle": null
+  },
+  {
+    "kind": "image",
+    "name": "picture.webp",
+    "needle": null
+  },
+  {
+    "kind": "image",
+    "name": "picture.avif",
+    "needle": null
+  },
+  {
+    "kind": "audio",
+    "name": "tone.wav",
+    "needle": null
+  },
+  {
+    "kind": "audio",
+    "name": "tone.aiff",
+    "needle": null
+  },
+  {
+    "kind": "audio",
+    "name": "tone.flac",
+    "needle": null
+  },
+  {
+    "kind": "audio",
+    "name": "tone.mp3",
+    "needle": null
+  },
+  {
+    "kind": "audio",
+    "name": "tone.m4a",
+    "needle": null
+  },
+  {
+    "kind": "audio",
+    "name": "tone.aac",
+    "needle": null
+  },
+  {
+    "kind": "audio",
+    "name": "tone.ogg",
+    "needle": null
+  },
+  {
+    "kind": "audio",
+    "name": "tone.opus",
+    "needle": null
+  },
+  {
+    "kind": "audio",
+    "name": "tone.caf",
+    "needle": null
+  },
+  {
+    "kind": "video",
+    "name": "video.mp4",
+    "needle": null
+  },
+  {
+    "kind": "video",
+    "name": "video.mov",
+    "needle": null
+  },
+  {
+    "kind": "video",
+    "name": "video.mkv",
+    "needle": null
+  },
+  {
+    "kind": "video",
+    "name": "video.webm",
+    "needle": null
+  },
+  {
+    "kind": "video",
+    "name": "video.avi",
+    "needle": null
+  },
+  {
+    "kind": "image",
+    "name": "misnamed-image.txt",
+    "needle": null
+  },
+  {
+    "kind": "document",
+    "name": "misnamed-text.jpg",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "audio",
+    "name": "misnamed-audio.bin",
+    "needle": null
+  },
+  {
+    "kind": "video",
+    "name": "misnamed-video.dat",
+    "needle": null
+  },
+  {
+    "kind": "unavailable",
+    "name": "invalid.png",
+    "needle": null
+  },
+  {
+    "kind": "unavailable",
+    "name": "invalid.mp4",
+    "needle": null
+  },
+  {
+    "kind": "unavailable",
+    "name": "unknown.bin",
+    "needle": null
+  },
+  {
+    "kind": "unavailable",
+    "name": "program.exe",
+    "needle": null
+  },
+  {
+    "kind": "document",
+    "name": "legacy.doc",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "pdf",
+    "name": "text.pdf",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "kind": "pdf",
+    "name": "scanned.pdf",
+    "needle": null
+  },
+  {
+    "kind": "image",
+    "name": "picture.heic",
+    "needle": null
+  },
+  {
+    "name": "picture.heif",
+    "kind": "image",
+    "needle": null
+  },
+  {
+    "name": "odd ] caf\u00e9 \ud83e\udeb6.txt",
+    "kind": "document",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "name": "plain.txt.zst",
+    "kind": "document",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "name": "archive.7z",
+    "kind": "document",
+    "needle": "ATTACHMENT_CANARY"
+  },
+  {
+    "name": "invalid.rar",
+    "kind": "unavailable",
+    "needle": null
+  },
+  {
+    "name": "reference.mov",
+    "kind": "unavailable",
+    "needle": null
+  },
+  {
+    "name": "opaque.pages",
+    "kind": "unavailable",
+    "needle": null
+  },
+  {
+    "name": "opaque.numbers",
+    "kind": "unavailable",
+    "needle": null
+  },
+  {
+    "name": "opaque.key",
+    "kind": "unavailable",
+    "needle": null
+  },
+  {
+    "name": "opaque.xls",
+    "kind": "unavailable",
+    "needle": null
+  },
+  {
+    "name": "opaque.ppt",
+    "kind": "unavailable",
+    "needle": null
+  },
+  {
+    "name": "opaque.msg",
+    "kind": "unavailable",
+    "needle": null
+  }
+]

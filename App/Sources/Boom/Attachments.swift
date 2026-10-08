@@ -37,26 +37,36 @@ private struct ClipboardMedia: Codable { let name: String; let data: Data }
 enum AttachmentInput {
   case file(URL)
   case bytes(name: String, data: Data)
+  static let draggingTypes: [NSPasteboard.PasteboardType] = [.fileURL, .bloomMedia, .png, .tiff,
+    .init(UTType.image.identifier), .init(UTType.audio.identifier), .init(UTType.movie.identifier), .init(UTType.pdf.identifier)]
+  private static func mediaType(_ type: NSPasteboard.PasteboardType) -> UTType? {
+    guard let uniform = UTType(type.rawValue), [.image, .audio, .movie, .pdf].contains(where: { uniform.conforms(to: $0) }) else { return nil }
+    return uniform
+  }
 
   static func read(_ pasteboard: NSPasteboard) -> [AttachmentInput]? {
-    if let urls = pasteboard.readObjects(
-      forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL],
-      !urls.isEmpty {
-      return urls.map(AttachmentInput.file)
-    }
-    if let data = pasteboard.data(forType: .bloomMedia), data.count <= 67_120_000,
-      let media = try? PropertyListDecoder().decode(ClipboardMedia.self, from: data),
-      !media.name.isEmpty, media.name.utf8.count <= 4096, !media.data.isEmpty, media.data.count <= 67_108_864 {
-      return [.bytes(name: media.name, data: media.data)]
-    }
-    if let image = readImage(pasteboard) { return [image] }
-    for type in pasteboard.types ?? [] {
-      if let uniform = UTType(type.rawValue), uniform.conforms(to: .audio) || uniform.conforms(to: .movie),
-        let data = pasteboard.data(forType: type), !data.isEmpty, data.count <= 67_108_864 {
-        return [.bytes(name: "Pasted media." + (uniform.preferredFilenameExtension ?? "bin"), data: data)]
+    guard let items = pasteboard.pasteboardItems else { return nil }
+    let files = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+    var result: [AttachmentInput] = []
+    for item in items {
+      if let value = item.string(forType: .fileURL), let url = URL(string: value), url.isFileURL {
+        result.append(.file(files.first(where: { $0 == url }) ?? url)); continue
+      }
+      if let data = item.data(forType: .bloomMedia), data.count <= 67_120_000,
+        let media = try? PropertyListDecoder().decode(ClipboardMedia.self, from: data),
+        !media.name.isEmpty, media.name.utf8.count <= 4096, !media.data.isEmpty, media.data.count <= 67_108_864 {
+        result.append(.bytes(name: media.name, data: media.data)); continue
+      }
+      // Aggregate board types include synthesized TIFF previews. Item types
+      // identify original representations and keep mixed/multiple drops intact.
+      for type in item.types {
+        if let uniform = mediaType(type), let data = item.data(forType: type),
+          !data.isEmpty, data.count <= 67_108_864 {
+          result.append(.bytes(name: "Pasted media." + (uniform.preferredFilenameExtension ?? "bin"), data: data)); break
+        }
       }
     }
-    return nil
+    return result.isEmpty ? nil : result
   }
 
   static func write(_ input: AttachmentInput, to pasteboard: NSPasteboard) {
@@ -67,10 +77,13 @@ enum AttachmentInput {
     else if let type = UTType(filenameExtension: (name as NSString).pathExtension) { pasteboard.setData(data, forType: NSPasteboard.PasteboardType(type.identifier)) }
   }
   static func readImage(_ pasteboard: NSPasteboard) -> AttachmentInput? {
-    if let data = pasteboard.data(forType: .png) {
+    // AppKit can synthesize TIFF when asked for it on a JPEG/HEIC board.
+    // Prefer advertised bytes so import receipts bind the actual original.
+    let originals = pasteboard.pasteboardItems?.flatMap(\.types) ?? pasteboard.types ?? []
+    if originals.contains(.png), let data = pasteboard.data(forType: .png) {
       return .bytes(name: "Pasted image.png", data: data)
     }
-    if let data = pasteboard.data(forType: .tiff) {
+    if originals.contains(.tiff), let data = pasteboard.data(forType: .tiff) {
       return .bytes(name: "Pasted image.tiff", data: data)
     }
     return nil
@@ -79,8 +92,7 @@ enum AttachmentInput {
   static func canRead(_ pasteboard: NSPasteboard) -> Bool {
     pasteboard.availableType(from: [.fileURL, .png, .tiff, .bloomMedia]) != nil
       || (pasteboard.types ?? []).contains { type in
-        guard let uniform = UTType(type.rawValue) else { return false }
-        return uniform.conforms(to: .audio) || uniform.conforms(to: .movie)
+        mediaType(type) != nil
       }
   }
 }
@@ -136,7 +148,7 @@ enum AttachmentProcessor {
       AttachmentImport(
         record: AttachmentRecord(
           id: UUID(), name: name, rootDigest: digest, text: "", coverage: "Blocked: " + reason,
-          transform: nil), receipt: response, original: data)
+          transform: nil, presentation: .unavailable), receipt: response, original: data)
     }
     guard let object = (try? JSONSerialization.jsonObject(with: response)) as? [String: Any],
       object["schema"] as? Int == 1
@@ -150,6 +162,7 @@ enum AttachmentProcessor {
     }
     guard let root = object["root"] as? String, !root.isEmpty,
       let texts = object["texts"] as? [String], let receipt = object["receipt"] as? [String: Any],
+      let kind = (object["presentation"] as? String).flatMap(AttachmentKind.init(rawValue:)),
       object["input_sha256"] as? String == digest
     else {
       return blocked("Bridge input identity or receipt is invalid; no context admitted.")
@@ -170,7 +183,7 @@ enum AttachmentProcessor {
       : "Partial or blocked coverage; see processing receipt"
     return AttachmentImport(
       record: AttachmentRecord(
-        id: UUID(), name: name, rootDigest: digest, text: text, coverage: coverage, transform: nil),
+        id: UUID(), name: name, rootDigest: digest, text: text, coverage: coverage, transform: nil, presentation: kind),
       receipt: response, original: data)
   }
   static func readGranted(_ url: URL, limit: Int = 67_108_864, allowEmpty: Bool = false) throws -> Data {
@@ -208,7 +221,7 @@ enum NativeMedia {
       let type = CGImageSourceGetType(source) as String?,
       [
         "public.jpeg", "public.png", "public.heic", "public.heif", "public.tiff",
-        "com.compuserve.gif", "org.webmproject.webp",
+        "com.compuserve.gif", "org.webmproject.webp", "com.microsoft.bmp", "public.avif",
       ].contains(type),
       let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
       let width = props[kCGImagePropertyPixelWidth] as? Int,
@@ -276,6 +289,7 @@ enum NativeMedia {
         parts.append("[Page \(i+1)]\n" + text)
       }
       guard !parts.isEmpty else { throw BoomError.invalid("PDF has no pages.") }
+      guard empty < pdf.pageCount else { throw BoomError.unavailable("PDF pages contain no readable text; original pages remain available for vision input.") }
       return .text(
         parts.joined(separator: "\n\n"),
         "PDFKit text extraction; \(pdf.pageCount) pages, \(empty) pages without extractable text. No OCR. Layout, images and scans are not fully represented."

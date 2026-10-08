@@ -15,6 +15,14 @@ import SwiftUI
 
 @main @MainActor enum BoomMain {
   static func main() {
+    if CommandLine.arguments.contains("--attachment-qualification-smoke") {
+      let app = NSApplication.shared; app.setActivationPolicy(.prohibited)
+      Task {
+        do { try await AttachmentQualificationSmoke.run(arguments: CommandLine.arguments); exit(0) }
+        catch { fputs("Public attachment qualification failed: \(error.localizedDescription)\n", stderr); exit(1) }
+      }
+      app.run(); return
+    }
     if CommandLine.arguments.contains("--inline-media-smoke") {
       let app = NSApplication.shared; app.setActivationPolicy(.prohibited)
       Task {

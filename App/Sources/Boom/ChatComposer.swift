@@ -13,19 +13,10 @@ func nativeEditEvent(_ event: String) {
   var onAttachments: (([AttachmentInput]) -> Void)?
   var onFocus: (() -> Void)?
   var onContentHeight: ((CGFloat) -> Void)?
-  private let placeholderStorage = NSTextStorage()
-  private let placeholderLayout = NSLayoutManager()
-  private let placeholderContainer = NSTextContainer(size: .zero)
+  private let placeholder = NativeTextPlaceholder("Message")
 
   func preparePlaceholder(_ text: String) {
-    placeholderStorage.addLayoutManager(placeholderLayout)
-    placeholderLayout.addTextContainer(placeholderContainer)
-    placeholderStorage.setAttributedString(NSAttributedString(
-      string: text,
-      attributes: [
-        .font: font ?? NSFont.systemFont(ofSize: 14),
-        .foregroundColor: NSColor.placeholderTextColor,
-      ]))
+    placeholder.text = text
   }
   override func layout() {
     super.layout()
@@ -45,13 +36,7 @@ func nativeEditEvent(_ event: String) {
 
   override func draw(_ dirtyRect: NSRect) {
     super.draw(dirtyRect)
-    guard string.isEmpty, !hasMarkedText(), let textContainer else { return }
-    // The placeholder uses the same text container dimensions and origin as
-    // editable glyphs. No SwiftUI overlay or measured padding is involved.
-    placeholderContainer.size = textContainer.size
-    placeholderContainer.lineFragmentPadding = textContainer.lineFragmentPadding
-    let glyphs = placeholderLayout.glyphRange(for: placeholderContainer)
-    placeholderLayout.drawGlyphs(forGlyphRange: glyphs, at: textContainerOrigin)
+    if !hasVisibleGhost { placeholder.draw(in: self) }
   }
 
   override func mouseDown(with event: NSEvent) {
@@ -233,7 +218,7 @@ struct ChatComposer: NSViewRepresentable {
     view.onFocus = onFocus
     context.coordinator.onContentHeight = onContentHeight
     view.onContentHeight = { [weak coordinator = context.coordinator] height in coordinator?.measure(height) }
-    view.registerForDraggedTypes([.fileURL, .png, .tiff])
+    view.registerForDraggedTypes(AttachmentInput.draggingTypes)
     view.setAccessibilityLabel(accessibilityLabel)
     view.setAccessibilityPlaceholderValue(placeholder)
     view.preparePlaceholder(placeholder)

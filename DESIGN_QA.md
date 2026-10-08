@@ -20,6 +20,13 @@ text, search prompts and inline suggestions. Review the actual control at the
 supported appearance and window sizes; font-size equality alone is not layout
 evidence.
 
+Construct the placeholder's complete TextKit graph in its shared renderer's
+initializer. Drawing an empty control must be safe before any representable
+configuration callback, after repeated updates and while reparenting. The
+attachment matrix exposed a crash when a standalone blank manuscript skipped
+the old caller-owned prepare step; both editors now share construction-safe
+prompt rendering, with direct empty-control drawing regression coverage.
+
 ## Before handing off a text UI change
 
 1. Build and launch the exact candidate bundle. Record its source revision,
@@ -154,13 +161,42 @@ real image batch and seeded replay, changed-image and changed-waveform controls,
 automatic suggestions, and combined media. Retain every output; sensitivity and
 successful decoding do not establish accurate interpretation or literary quality.
 Video playback is a separate qualified action from sampled-frame analysis; this
-raw writing adapter admits image/audio only.
+raw writing adapter admits original image/audio, rendered image-only PDF
+pages, and four sampled video frames. Preserve page/frame hashes in recipes;
+sampling a video does not establish coverage of its sound or every frame.
+
+`AttachmentQualificationSmoke` owns the checked-in public format matrix. Each
+new format adds a corpus fixture and runs the same receiving-surface, encrypted
+reopen, native rendering and actual model-input gates. A filename is a hint,
+never a rendering authority: retain the Rust host's detected presentation kind.
+Readable text-bearing files display their canonical content through NativeText
+and compile that captured content into writing prompts, not UUID links. Opaque
+or unsupported inputs retain their original and use one warning icon with a
+hover explanation; they cannot silently enter a model as empty context.
+
+Test both file URLs and external image/audio/video/PDF pasteboard bytes. macOS
+can add synthesized TIFF types to the aggregate pasteboard type list. Read the
+item's original declarations so the encrypted original and receipt refer to the
+actual supplied bytes. Preserve plain-text pasting as native editing. Repeat
+layout after data loads and require both document media and direct chat media to
+fit the receiving width; media never owns an independent fixed-width card.
+
+Text attachments use the shared TextKit reader in a bounded native viewport.
+Short content must consume its measured height; only long content scrolls.
+Inspect PDF text as well as scanned pages in the actual embedded preview.
+PDFKit's layer-backed viewer once showed a blank page in an unshown host while
+extraction and inference passed. The preview now draws locally rendered pages;
+a successful extraction or thumbnail alone cannot qualify that embedded view.
 
 Media preparation replaces a placeholder with a player. Attach preparation and
 teardown to a stable container, not that changing conditional branch. The player
 must consume its proposed area before overlays lay out; require a visible first
 frame and a timeline with nonzero width, alongside playback and decoder checks.
 An unboxed player that shows only controls does not pass visual acceptance.
+Codec decoding is not playback readiness: AVAudioPlayer once accepted Ogg/Opus
+metadata while returning false from prepareToPlay. Both controls now use the
+same memory-backed AVPlayer readiness gate. Every audio/video fixture must
+reach readyToPlay and advance its muted timeline in the exact-bundle journey.
 
 Switch documents and verify playback stops and memory-backed media is released.
 Inspect app-owned storage for plaintext media. Copy or export Markdown and confirm
