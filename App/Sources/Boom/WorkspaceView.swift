@@ -536,36 +536,6 @@ struct ChatPane: View {
     if message.text.isEmpty, let failure = message.failure { return failure }
     return message.text
   }
-  @ViewBuilder private func messageMenu(_ message: ChatMessage) -> some View {
-    if let chatID = model.state.selectedChat {
-      if message.role == .user {
-        Button("Edit & Continue") { model.branch(message.id, from: chatID, editing: true) }
-        Button("Branch from here") { model.branch(message.id, from: chatID) }
-      } else {
-        Button("Regenerate in new branch") { model.regenerate(message.id, from: chatID) }
-          .disabled(message.state != .complete)
-        Button("Branch from here") { model.branch(message.id, from: chatID) }
-        Divider()
-        Button(message.feedback == .helpful ? "Remove thumbs up" : "Thumbs up") {
-          model.rate(message.id, in: chatID, as: .helpful)
-        }
-        Button(message.feedback == .unhelpful ? "Remove thumbs down" : "Thumbs down") {
-          model.rate(message.id, in: chatID, as: .unhelpful)
-        }
-      }
-      Button("Edit text") { model.editingChatMessage = message.id }.disabled(model.isBusy || message.state != .complete)
-      if message.editedFrom != nil {
-        Text("Edited by you · original retained")
-      } else if message.authoredByUser == true && message.role == .assistant {
-        Text("Written by you")
-      }
-      Divider()
-      Button("Copy message") {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(visibleMessageText(message), forType: .string)
-      }
-    }
-  }
   @ViewBuilder private func messageView(_ message: ChatMessage) -> some View {
     if model.editingChatMessage == message.id, let chat = model.selectedChat {
       VStack(alignment: .leading, spacing: 6) {
@@ -583,10 +553,9 @@ struct ChatPane: View {
           .padding(.horizontal, 12).padding(.vertical, 9)
           .background(Color.primary.opacity(0.065), in: RoundedRectangle(cornerRadius: 12))
       }.frame(maxWidth: .infinity, alignment: .trailing)
-        .contentShape(Rectangle()).contextMenu { messageMenu(message) }
     } else {
       VStack(alignment: .leading, spacing: 6) {
-        if needsSpeakerName(message) || message.state != .complete || message.feedback != nil {
+        if needsSpeakerName(message) || message.state != .complete {
           HStack(spacing: 5) {
             if needsSpeakerName(message) {
               Text(assistantName(message))
@@ -595,10 +564,6 @@ struct ChatPane: View {
             if message.state != .complete {
               Text(message.state.rawValue).font(.system(size: 10)).foregroundStyle(.tertiary)
             }
-            if let feedback = message.feedback {
-              Image(systemName: feedback == .helpful ? "hand.thumbsup.fill" : "hand.thumbsdown.fill")
-                .font(.system(size: 10)).foregroundStyle(.tertiary)
-            }
           }
         }
         NativeText(text: visibleMessageText(message))
@@ -606,7 +571,6 @@ struct ChatPane: View {
           ProposalCard(model: model, proposal: proposal)
         }
       }.frame(maxWidth: .infinity, alignment: .leading)
-        .contentShape(Rectangle()).contextMenu { messageMenu(message) }
     }
   }
   private func toggleVoice(_ purpose: VoiceInput.Purpose) {
@@ -670,7 +634,9 @@ struct ChatPane: View {
                 }
               }.id("chat-instructions")
               ForEach(chat.messages) { message in
-                VStack(alignment: .leading, spacing: 0) { messageView(message) }
+                ChatMessageRow(commands: ChatMessageCommands(model: model, chatID: chat.id, message: message)) {
+                  messageView(message)
+                }
               }
 
             }

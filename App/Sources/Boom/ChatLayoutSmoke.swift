@@ -51,6 +51,10 @@ import SwiftUI
       if let view = view as? NSSplitView { return view }
       return view.subviews.lazy.compactMap(split).first
     }
+    func actions(_ view: NSView) -> [ChatMessageActionView] {
+      if let rail = view as? ChatMessageActionView { return [rail] }
+      return view.subviews.flatMap(actions)
+    }
     func inspect(_ name: String, expected: Int) throws {
       let views = reading(host)
       guard views.count == expected else { throw BoomError.invalid("Chat layout fixture lost a message row.") }
@@ -70,6 +74,15 @@ import SwiftUI
         throw BoomError.invalid("Chat rows overlapped during " + name)
       }
       var observation: [String: Any] = ["transition": name, "rows": rows]
+      let rails = actions(host)
+      guard rails.count == texts.count else { throw BoomError.invalid("A message lost its action rail.") }
+      for rail in rails {
+        for button in [rail.copyButton, rail.editButton, rail.branchButton] + (rail.feedbackButton.map { [$0] } ?? []) {
+          let rect = button.convert(button.bounds, to: rail)
+          guard rect.minX >= -1, rect.maxX <= rail.bounds.width + 1 else { throw BoomError.invalid("A message action was clipped.") }
+        }
+      }
+      observation["actionRails"] = rails.count
       if let editor = model.editor, let container = editor.textContainer, let layout = editor.layoutManager {
         layout.ensureLayout(for: container)
         let height = layout.usedRect(for: container).maxY + editor.textContainerInset.height * 2
@@ -97,6 +110,13 @@ import SwiftUI
           } else { window.setContentSize(NSSize(width: width, height: 1800)) }
           try await settle(); try inspect(name, expected: texts.count)
           try image(name)
+          let hovered = actions(host).filter { $0.commands.message.role == .user || $0.commands.message.id == model.selectedChat?.messages.last?.id }
+          let frames = hovered.map(\.frame)
+          hovered.forEach { $0.setHovered(true) }
+          host.layoutSubtreeIfNeeded()
+          guard hovered.map(\.frame) == frames else { throw BoomError.invalid("Hover actions shifted message layout.") }
+          try image(name + "-actions")
+          hovered.forEach { $0.setHovered(false) }
           if index == 1, let chat = model.state.chats.firstIndex(where: { $0.id == model.state.selectedChat }) {
             model.state.chats[chat].messages[2].state = .pending
             model.state.chats[chat].messages[2].text += "\n\n" + String(repeating: "An arriving paragraph at the narrow width. ", count: 3)

@@ -54,6 +54,7 @@ public struct SourceReference: Codable, Equatable, Sendable, Identifiable {
 public struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
   public let id: UUID
   public let role: Role
+  public let timestamp: Date?
   public var text: String
   public var context: String
   public var sources: [SourceReference]
@@ -68,10 +69,11 @@ public struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
     id: UUID = UUID(), role: Role, text: String, context: String = "",
     sources: [SourceReference] = [], state: MessageState = .complete,
     provider: String? = nil, feedback: MessageFeedback? = nil, speaker: Speaker? = nil, failure: String? = nil,
-    authoredByUser: Bool? = nil, editedFrom: UUID? = nil
+    authoredByUser: Bool? = nil, editedFrom: UUID? = nil, timestamp: Date? = Date()
   ) {
     self.id = id
     self.role = role
+    self.timestamp = timestamp
     self.text = text
     self.context = context
     self.sources = sources

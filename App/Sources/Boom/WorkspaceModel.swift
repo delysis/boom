@@ -1068,7 +1068,8 @@ struct CompletionSegment {
     else { throw BoomError.stale("The pending response disappeared.") }
     let message = ChatMessage(id: pending.id, role: .assistant, text: answer, sources: pending.sources,
       state: responseIssue == nil ? .complete : .failed,
-      provider: pending.provider, speaker: pending.speaker, failure: responseIssue)
+      provider: pending.provider, speaker: pending.speaker, failure: responseIssue,
+      timestamp: state.chats[chatIndex].messages[messageIndex].timestamp)
     if recovering && responseIssue != nil { return message }
     state.chats[chatIndex].messages[messageIndex] = message
     if let documentStatus { status = documentStatus }
@@ -1310,7 +1311,7 @@ struct CompletionSegment {
     chat.messageVersions = (chat.messageVersions ?? []) + [original]
     chat.messages[index] = ChatMessage(role: original.role, text: validated,
       context: original.context, sources: original.sources, provider: original.provider,
-      speaker: original.speaker, authoredByUser: true, editedFrom: original.id)
+      speaker: original.speaker, authoredByUser: true, editedFrom: original.id, timestamp: original.timestamp)
     try applyChat(chat); editingChatMessage = nil
   }
   func exportChat(_ chatID: UUID) {

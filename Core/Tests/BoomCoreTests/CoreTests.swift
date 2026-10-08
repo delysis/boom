@@ -137,6 +137,7 @@ final class CoreTests: XCTestCase {
     XCTAssertEqual(edited.attachedDocumentID, documentID)
     let continued = try chat.branch(at: assistant.id, includeMessage: true)
     XCTAssertEqual(continued.messages, [user, assistant])
+    XCTAssertEqual(continued.messages[1].timestamp, assistant.timestamp)
     XCTAssertEqual(chat.messages.count, 3)
     XCTAssertThrowsError(try chat.branch(at: UUID(), includeMessage: true))
   }
@@ -149,6 +150,14 @@ final class CoreTests: XCTestCase {
     let chat = try JSONDecoder().decode(ChatRecord.self, from: Data(legacyChat.utf8))
     XCTAssertNil(chat.attachedDocumentID)
     XCTAssertNil(chat.messages[0].feedback)
+    XCTAssertNil(chat.messages[0].timestamp, "Unknown historical times cannot be invented at decode.")
+  }
+  func testMessageTimestampSurvivesRecordRoundTrip() throws {
+    let date = Date(timeIntervalSince1970: 1_700_000_000)
+    let message = ChatMessage(role: .assistant, text: "At the harbor.", timestamp: date)
+    let decoded = try PropertyListDecoder().decode(ChatMessage.self, from: PropertyListEncoder().encode(message))
+    XCTAssertEqual(decoded, message)
+    XCTAssertEqual(decoded.timestamp, date)
   }
   func testFingerprintChanges() throws {
     let b = DocumentSnapshot(title: "B", text: "x")

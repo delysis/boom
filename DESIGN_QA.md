@@ -80,6 +80,18 @@ record human edits as metadata. Generic authorship labels and prompt scaffolding
 do not belong in the conversation prose. Other participants must still be named
 in model input; the current assistant's own answers use their native role.
 
+Every message has one compact action rail, aligned with its speaker's side.
+Pointer entry or keyboard focus reveals timestamps, copy, edit and branch;
+replies also offer one feedback menu. Reserve the rail's height so entering it
+cannot reflow the transcript. Keep context-menu access as well. Check actual
+button hit regions at narrow widths and edit both roles through the pencil,
+save and discard through native icons, and verify originals remain encrypted.
+New messages retain their creation time across generation retries, completion,
+edits and branches; unknown historical times remain unknown. Test feedback
+selection and removal, branch boundaries, and hidden-action keyboard focus.
+Native fixture renders qualify layout states; they do not by themselves prove
+physical pointer tracking or VoiceOver behavior.
+
 Attachment ownership is chosen by the receiving surface, before inspection or
 any asynchronous work. The document editor captures its document ID, revision
 and insertion range; the chat composer captures its chat ID. The shared
