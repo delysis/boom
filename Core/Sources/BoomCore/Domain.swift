@@ -58,6 +58,7 @@ public struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
   public var text: String
   public var context: String
   public var sources: [SourceReference]
+  public let directAttachments: [UUID]?
   public var state: MessageState
   public var provider: String?
   public var feedback: MessageFeedback?
@@ -69,7 +70,8 @@ public struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
     id: UUID = UUID(), role: Role, text: String, context: String = "",
     sources: [SourceReference] = [], state: MessageState = .complete,
     provider: String? = nil, feedback: MessageFeedback? = nil, speaker: Speaker? = nil, failure: String? = nil,
-    authoredByUser: Bool? = nil, editedFrom: UUID? = nil, timestamp: Date? = Date()
+    authoredByUser: Bool? = nil, editedFrom: UUID? = nil, timestamp: Date? = Date(),
+    directAttachments: [UUID]? = nil
   ) {
     self.id = id
     self.role = role
@@ -77,6 +79,7 @@ public struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
     self.text = text
     self.context = context
     self.sources = sources
+    self.directAttachments = directAttachments
     self.state = state
     self.provider = provider
     self.feedback = feedback

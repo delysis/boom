@@ -29,6 +29,11 @@ enum LocalImage {
 
 /// Decode a paste or drop once, before either editor chooses its destination.
 /// Plain text remains the text view's own paste operation.
+extension NSPasteboard.PasteboardType {
+  static let bloomMedia = Self("com.delysis.bloom.inline-media")
+}
+private struct ClipboardMedia: Codable { let name: String; let data: Data }
+
 enum AttachmentInput {
   case file(URL)
   case bytes(name: String, data: Data)
@@ -39,9 +44,28 @@ enum AttachmentInput {
       !urls.isEmpty {
       return urls.map(AttachmentInput.file)
     }
-    return readImage(pasteboard).map { [$0] }
+    if let data = pasteboard.data(forType: .bloomMedia), data.count <= 67_120_000,
+      let media = try? PropertyListDecoder().decode(ClipboardMedia.self, from: data),
+      !media.name.isEmpty, media.name.utf8.count <= 4096, !media.data.isEmpty, media.data.count <= 67_108_864 {
+      return [.bytes(name: media.name, data: media.data)]
+    }
+    if let image = readImage(pasteboard) { return [image] }
+    for type in pasteboard.types ?? [] {
+      if let uniform = UTType(type.rawValue), uniform.conforms(to: .audio) || uniform.conforms(to: .movie),
+        let data = pasteboard.data(forType: type), !data.isEmpty, data.count <= 67_108_864 {
+        return [.bytes(name: "Pasted media." + (uniform.preferredFilenameExtension ?? "bin"), data: data)]
+      }
+    }
+    return nil
   }
 
+  static func write(_ input: AttachmentInput, to pasteboard: NSPasteboard) {
+    guard case .bytes(let name, let data) = input,
+      let encoded = try? PropertyListEncoder().encode(ClipboardMedia(name: name, data: data)) else { return }
+    pasteboard.clearContents(); pasteboard.setData(encoded, forType: .bloomMedia)
+    if let image = NSImage(data: data), let tiff = image.tiffRepresentation { pasteboard.setData(tiff, forType: .tiff) }
+    else if let type = UTType(filenameExtension: (name as NSString).pathExtension) { pasteboard.setData(data, forType: NSPasteboard.PasteboardType(type.identifier)) }
+  }
   static func readImage(_ pasteboard: NSPasteboard) -> AttachmentInput? {
     if let data = pasteboard.data(forType: .png) {
       return .bytes(name: "Pasted image.png", data: data)
@@ -53,7 +77,11 @@ enum AttachmentInput {
   }
 
   static func canRead(_ pasteboard: NSPasteboard) -> Bool {
-    pasteboard.availableType(from: [.fileURL, .png, .tiff]) != nil
+    pasteboard.availableType(from: [.fileURL, .png, .tiff, .bloomMedia]) != nil
+      || (pasteboard.types ?? []).contains { type in
+        guard let uniform = UTType(type.rawValue) else { return false }
+        return uniform.conforms(to: .audio) || uniform.conforms(to: .movie)
+      }
   }
 }
 

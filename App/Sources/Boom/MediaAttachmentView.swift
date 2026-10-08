@@ -31,100 +31,6 @@ enum AttachmentKind: Equatable {
   }
 }
 
-/// The document owns its attachment controls. The Markdown link remains the
-/// portable source reference; playback and extracted text live beside it in
-/// the editor, with no modal preview or second navigation context.
-struct AttachmentInlineCard: View {
-  @ObservedObject var model: WorkspaceModel
-  let record: AttachmentRecord
-  @State private var bytes: Data?
-  @State private var failure: String?
-  @State private var showsText = false
-  private var kind: AttachmentKind { AttachmentKind(name: record.name) }
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 8) {
-      HStack(spacing: 8) {
-        Image(systemName: kind.symbol).foregroundStyle(.secondary)
-        Text(record.name).font(.system(size: 12, weight: .medium)).lineLimit(1)
-        Spacer(minLength: 8)
-        if record.text.isEmpty {
-          Button(kind == .audio ? "Transcribe" : "Extract text") {
-            model.prepareAttachment(record.id)
-          }.font(.caption).disabled(model.isBusy)
-        }
-        Menu {
-          Button("Export original…") { exportOriginal() }.disabled(bytes == nil)
-        } label: {
-          Image(systemName: "ellipsis").frame(width: 20, height: 20)
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .accessibilityLabel("Attachment options")
-      }
-      if let bytes, kind != .document {
-        AttachmentMediaView(name: record.name, bytes: bytes)
-          .frame(height: mediaHeight)
-          .clipped()
-      }
-      if !record.text.isEmpty {
-        Button {
-          showsText.toggle()
-        } label: {
-          HStack(spacing: 6) {
-            Image(systemName: showsText ? "chevron.down" : "chevron.right")
-              .font(.system(size: 9, weight: .semibold))
-            Text("Extracted text")
-          }.contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .font(.system(size: 12))
-        .foregroundStyle(.secondary)
-        .accessibilityValue(showsText ? "Expanded" : "Collapsed")
-        if showsText {
-          NativeText(text: record.text, pointSize: 12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.top, 6)
-        }
-      }
-      if let failure {
-        Text(failure).font(.caption).foregroundStyle(.secondary)
-      }
-    }
-    .padding(10)
-    .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
-    .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.primary.opacity(0.08)))
-    .task(id: record.rootDigest) {
-      do {
-        let vault = model.store.vault, id = record.id, digest = record.rootDigest
-        let data = try await detachedWork { try vault.get(.attachment, id: id, limit: 67_108_864) }
-        guard Digest.sha256(data) == digest else { throw BoomError.invalid("Attachment original changed.") }
-        bytes = data
-      }
-      catch { failure = error.localizedDescription }
-    }
-  }
-
-  private var mediaHeight: CGFloat {
-    switch kind {
-    case .audio: 70
-    case .image: 240
-    case .video: 260
-    case .pdf: 300
-    case .document: 0
-    }
-  }
-
-  private func exportOriginal() {
-    guard let bytes else { return }
-    let panel = NSSavePanel()
-    panel.nameFieldStringValue = record.name
-    guard panel.runModal() == .OK, let url = panel.url else { return }
-    model.exportFile(to: url) { bytes }
-  }
-}
-
 struct AttachmentMediaView: View {
   let name: String
   let bytes: Data
@@ -155,8 +61,8 @@ struct AttachmentMediaView: View {
   }
 
   private var unavailable: some View {
-    ContentUnavailableView("Preview unavailable", systemImage: kind.symbol,
-      description: Text("The original file can still be exported."))
+    Image(systemName: "exclamationmark.triangle").foregroundStyle(.secondary)
+      .help("Preview unavailable").accessibilityLabel("Preview unavailable")
   }
 }
 
@@ -174,6 +80,23 @@ private struct PDFAttachmentView: NSViewRepresentable {
   }
 }
 
+private struct MediaPlaybackTime: View {
+  let seconds: Double
+  let duration: Double
+  var body: some View {
+    ViewThatFits(in: .horizontal) {
+      Text("\(clock(seconds)) / \(clock(duration))").fixedSize()
+      Text(clock(seconds)).fixedSize()
+    }
+    .font(.system(.caption, design: .monospaced))
+    .accessibilityLabel("\(clock(seconds)) of \(clock(duration))")
+  }
+  private func clock(_ time: Double) -> String {
+    let value = max(0, Int(time.isFinite ? time : 0))
+    return "\(value / 60):\(String(format: "%02d", value % 60))"
+  }
+}
+
 private struct AudioAttachmentPlayer: View {
   let bytes: Data
   @State private var player: AVAudioPlayer?
@@ -183,24 +106,23 @@ private struct AudioAttachmentPlayer: View {
   private let ticker = Timer.publish(every: 0.2, on: .main, in: .common).autoconnect()
 
   var body: some View {
-    HStack(spacing: 14) {
+    HStack(spacing: 8) {
       Button {
         guard let player else { return }
         if player.isPlaying { player.pause() } else { player.play() }
         playing = player.isPlaying
       } label: {
         Image(systemName: playing ? "pause.fill" : "play.fill")
-          .font(.system(size: 18)).frame(width: 36, height: 36)
-      }.buttonStyle(.borderedProminent).disabled(player == nil)
+          .font(.system(size: 18)).frame(width: 28, height: 36)
+      }.buttonStyle(.plain).disabled(player == nil)
+      .accessibilityLabel(playing ? "Pause audio" : "Play audio")
       Slider(value: $seconds, in: 0...max(player?.duration ?? 0, 0.1), onEditingChanged: { editing in
         if !editing { player?.currentTime = seconds }
-      }).disabled(player == nil)
-      Text("\(clock(seconds)) / \(clock(player?.duration ?? 0))")
-        .font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
-        .fixedSize()
+      }).frame(minWidth: 32).disabled(player == nil)
+      MediaPlaybackTime(seconds: seconds, duration: player?.duration ?? 0)
+        .foregroundStyle(.secondary)
     }
-    .padding(16)
-    .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 12))
+    .padding(.horizontal, 4)
     .onAppear {
       do { player = try MemoryMedia.audioPlayer(bytes: bytes); player?.prepareToPlay() }
       catch { failure = error.localizedDescription }
@@ -211,14 +133,13 @@ private struct AudioAttachmentPlayer: View {
       playing = player?.isPlaying == true
     }
     .overlay(alignment: .bottomLeading) {
-      if let failure { Text(failure).font(.caption).foregroundStyle(.secondary) }
+      if let failure {
+        Image(systemName: "exclamationmark.triangle").foregroundStyle(.secondary)
+          .help(failure).accessibilityLabel("Audio unavailable")
+      }
     }
   }
 
-  private func clock(_ time: Double) -> String {
-    let value = max(0, Int(time.isFinite ? time : 0))
-    return "\(value / 60):\(String(format: "%02d", value % 60))"
-  }
 }
 
 private struct VideoAttachmentPlayer: View {
@@ -231,12 +152,18 @@ private struct VideoAttachmentPlayer: View {
   @State private var seconds = 0.0
   @State private var duration = 0.0
   @State private var scrubbing = false
+  @State private var poster: NSImage?
+  @State private var posterTask: Task<Void, Never>?
   private let ticker = Timer.publish(every: 0.2, on: .main, in: .common).autoconnect()
 
   var body: some View {
-    Group {
+    ZStack {
       if let player {
         NativeVideoPlayer(player: player)
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+          .overlay {
+            if !playing, seconds < 0.05, let poster { Image(nsImage: poster).resizable().aspectRatio(contentMode: .fit).allowsHitTesting(false) }
+          }
           .overlay(alignment: .bottom) {
             HStack(spacing: 10) {
               Button {
@@ -254,10 +181,8 @@ private struct VideoAttachmentPlayer: View {
                   player.seek(to: CMTime(seconds: seconds, preferredTimescale: 600))
                 }
               })
-              .disabled(duration <= 0)
-              Text("\(clock(seconds)) / \(clock(duration))")
-                .font(.system(.caption, design: .monospaced))
-                .fixedSize()
+              .frame(minWidth: 32).disabled(duration <= 0)
+              MediaPlaybackTime(seconds: seconds, duration: duration)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
@@ -265,14 +190,15 @@ private struct VideoAttachmentPlayer: View {
             .background(.black.opacity(0.75))
           }
       } else if let failure {
-        ContentUnavailableView("Video unavailable", systemImage: "play.rectangle",
-          description: Text(failure))
+        Image(systemName: "exclamationmark.triangle").foregroundStyle(.secondary)
+          .help(failure).accessibilityLabel("Video unavailable")
       } else {
         ProgressView()
       }
     }
     .onAppear(perform: prepare)
     .onDisappear {
+      posterTask?.cancel(); posterTask = nil; poster = nil
       player?.pause()
       player = nil
       media = nil
@@ -287,11 +213,6 @@ private struct VideoAttachmentPlayer: View {
     }
   }
 
-  private func clock(_ time: Double) -> String {
-    let value = max(0, Int(time.isFinite ? time : 0))
-    return "\(value / 60):\(String(format: "%02d", value % 60))"
-  }
-
   private func prepare() {
     guard player == nil else { return }
     do {
@@ -299,6 +220,14 @@ private struct VideoAttachmentPlayer: View {
       guard source.container == .mp4 else { throw BoomError.invalid("This attachment is not self-contained MP4 video.") }
       media = source
       player = AVPlayer(playerItem: AVPlayerItem(asset: source.asset))
+      posterTask = Task {
+        do {
+          let generator = AVAssetImageGenerator(asset: source.asset)
+          generator.appliesPreferredTrackTransform = true; generator.maximumSize = NSSize(width: 1600, height: 1600)
+          let frame = try await generator.image(at: .zero)
+          try Task.checkCancellation(); poster = NSImage(cgImage: frame.image, size: .zero)
+        } catch is CancellationError {} catch { failure = error.localizedDescription }
+      }
     } catch { failure = error.localizedDescription }
   }
 }
@@ -316,5 +245,48 @@ private struct NativeVideoPlayer: NSViewRepresentable {
 
   func updateNSView(_ view: AVPlayerView, context: Context) {
     if view.player !== player { view.player = player }
+  }
+}
+
+/// The media itself is the presentation. Intentional export/removal lives in
+/// the ordinary context menu, never a permanent filename/options card.
+struct InlineAttachmentView: View {
+  @ObservedObject var model: WorkspaceModel
+  let record: AttachmentRecord
+  var remove: (() -> Void)? = nil
+  @State private var bytes: Data?
+  @State private var failure: String?
+  private var kind: AttachmentKind { AttachmentKind(name: record.name) }
+  var body: some View {
+    Group {
+      if let bytes, kind != .document {
+        AttachmentMediaView(name: record.name, bytes: bytes)
+          .frame(width: kind == .audio ? 260 : kind == .image ? 240 : 300)
+          .frame(height: kind == .audio ? 44 : kind == .image ? 180 : 220)
+      } else if let failure {
+        Image(systemName: "exclamationmark.triangle").foregroundStyle(.secondary).help(failure)
+      } else if kind == .document {
+        Label(record.name, systemImage: "doc.text").font(.caption)
+      } else { ProgressView().controlSize(.small) }
+    }
+    .accessibilityLabel(record.name)
+    .help(record.name)
+    .contextMenu {
+      if let remove { Button("Remove", action: remove) }
+      Button("Export original…") {
+        guard let bytes else { return }
+        let panel = NSSavePanel(); panel.nameFieldStringValue = record.name
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        model.exportFile(to: url) { bytes }
+      }.disabled(bytes == nil)
+    }
+    .task(id: record.rootDigest) {
+      do {
+        let vault = model.store.vault, id = record.id, digest = record.rootDigest
+        let data = try await detachedWork { try vault.get(.attachment, id: id, limit: 67_108_864) }
+        guard Digest.sha256(data) == digest else { throw BoomError.invalid("Attachment original changed.") }
+        try Task.checkCancellation(); bytes = data
+      } catch is CancellationError {} catch { failure = error.localizedDescription }
+    }
   }
 }

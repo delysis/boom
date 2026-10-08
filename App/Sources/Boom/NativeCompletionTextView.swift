@@ -20,7 +20,7 @@ extension WorkspaceModel: NativeCompletionClient {
   var hasCompletionChoices: Bool { showingCandidates }
 }
 
-@MainActor class NativeCompletionTextView: NSTextView {
+@MainActor class NativeCompletionTextView: NativeMediaTextView {
   weak var completionClient: (any NativeCompletionClient)?
   var documentID = UUID()
   private var displayStorage: NSTextStorage?
@@ -91,6 +91,7 @@ extension WorkspaceModel: NativeCompletionClient {
     copy.insert(NSAttributedString(string: completion, attributes: attributes), at: location)
     let display = NSTextStorage(attributedString: copy)
     let layout = NSLayoutManager()
+    layout.delegate = inlineMedia.layout
     let container = NSTextContainer(
       size: textContainer?.size ?? NSSize(width: bounds.width, height: .greatestFiniteMagnitude))
     container.lineFragmentPadding = textContainer?.lineFragmentPadding ?? 5
@@ -105,7 +106,20 @@ extension WorkspaceModel: NativeCompletionClient {
     needsDisplay = true
     completionDisplayDidChange()
   }
-  func completionDisplayDidChange() {}
+  override var mediaPresentation: (NSLayoutManager, NSTextContainer)? {
+    if let displayLayout, let displayContainer { return (displayLayout, displayContainer) }
+    return super.mediaPresentation
+  }
+  override func mediaChanged() {
+    let stamp = visibleStamp
+    let completion = displayStorage.flatMap { storage -> String? in
+      guard let stamp, stamp.caretUTF16 + displayGhostLength <= storage.length else { return nil }
+      return (storage.string as NSString).substring(with: NSRange(location: stamp.caretUTF16, length: displayGhostLength))
+    }
+    clearGhost(); super.mediaChanged()
+    if let completion, let stamp { showGhost(completion, stamp: stamp) }
+  }
+  func completionDisplayDidChange() { inlineMedia.positionViews() }
   var completionDisplayHeight: CGFloat {
     guard let layout = displayLayout, let container = displayContainer else { return 0 }
     container.size = textContainer?.size ?? container.size
@@ -126,6 +140,7 @@ extension WorkspaceModel: NativeCompletionClient {
       super.draw(dirtyRect)
       return
     }
+    inlineMedia.positionViews()
     if drawsBackground { backgroundColor.setFill(); dirtyRect.fill() }
     container.size = textContainer?.size ?? container.size
     let origin = textContainerOrigin

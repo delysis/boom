@@ -15,6 +15,14 @@ import SwiftUI
 
 @main @MainActor enum BoomMain {
   static func main() {
+    if CommandLine.arguments.contains("--inline-media-smoke") {
+      let app = NSApplication.shared; app.setActivationPolicy(.prohibited)
+      Task {
+        do { try await InlineMediaSmoke.run(arguments: CommandLine.arguments); exit(0) }
+        catch { fputs("Public inline media diagnostic failed: \(error.localizedDescription)\n", stderr); exit(1) }
+      }
+      app.run(); return
+    }
     if CommandLine.arguments.contains("--input-completion-smoke") {
       let app = NSApplication.shared; app.setActivationPolicy(.prohibited)
       Task {

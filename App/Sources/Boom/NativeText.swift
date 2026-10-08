@@ -10,15 +10,16 @@ struct NativeText: NSViewRepresentable {
   var presentation = Presentation.markdown
   var pointSize: CGFloat = 14
   var selectable = true
+  var mediaModel: WorkspaceModel? = nil
   func makeNSView(context: Context) -> NativeReadingTextView { NativeReadingTextView(frame: .zero) }
-  func updateNSView(_ view: NativeReadingTextView, context: Context) { view.isSelectable = selectable; view.setSource(text, presentation: presentation, pointSize: pointSize) }
+  func updateNSView(_ view: NativeReadingTextView, context: Context) { view.isSelectable = selectable; view.setMedia(model: mediaModel); view.setSource(text, presentation: presentation, pointSize: pointSize) }
   func sizeThatFits(_ proposal: ProposedViewSize, nsView view: NativeReadingTextView, context: Context) -> CGSize? {
     guard let width = proposal.width, width.isFinite, width > 0 else { return nil }
     return NSSize(width: width, height: view.contentHeight(at: width))
   }
 }
 
-final class NativeReadingTextView: NSTextView {
+final class NativeReadingTextView: NativeMediaTextView {
   private let displayStorage: NSTextStorage
   private let displayLayout: NSLayoutManager
   private let measurement = NativeTextMeasurement()

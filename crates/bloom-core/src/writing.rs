@@ -142,6 +142,87 @@ pub struct Source {
     kind: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MediaReference {
+    pub id: Uuid,
+    pub name: String,
+    pub root_digest: String,
+    pub kind: String,
+}
+
+#[derive(Serialize)]
+pub struct MediaPrompt {
+    pub prompt: String,
+    pub media: Vec<MediaReference>,
+}
+
+pub fn compile_media_prompt(text: &str, media: &[MediaReference]) -> Result<MediaPrompt, Error> {
+    require(
+        text.len() <= 18 * TEXT_LIMIT && media.len() <= 8,
+        "Writing media exceeds its budget.",
+    )?;
+    for reference in media {
+        require(
+            !reference.id.is_nil()
+                && reference.name.len() <= 4096
+                && reference.root_digest.len() == 64
+                && reference
+                    .root_digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+                && ["image", "audio"].contains(&reference.kind.as_str()),
+            "Invalid writing media identity.",
+        )?;
+        require(
+            media
+                .iter()
+                .all(|other| other.id != reference.id || other == reference),
+            "Conflicting writing media identities.",
+        )?;
+    }
+    if media.is_empty() {
+        return Ok(MediaPrompt {
+            prompt: text.into(),
+            media: Vec::new(),
+        });
+    }
+    let mut byte_offsets = vec![0; text.encode_utf16().count() + 1];
+    let mut offset = 0;
+    for (byte, character) in text.char_indices() {
+        byte_offsets[offset] = byte;
+        offset += character.len_utf16();
+    }
+    byte_offsets[offset] = text.len();
+    let mut prompt = String::new();
+    let mut ordered = Vec::new();
+    let mut cursor = 0;
+    for span in crate::markdown::media_spans(text)? {
+        let Some(reference) = media.iter().find(|reference| reference.id == span.id) else {
+            continue;
+        };
+        let start = byte_offsets[span.location];
+        let end = byte_offsets[span.location + span.length];
+        prompt.push_str(&text[cursor..start]);
+        prompt.push_str(if reference.kind == "image" {
+            "<|image|>"
+        } else {
+            "<|audio|>"
+        });
+        ordered.push(reference.clone());
+        cursor = end;
+    }
+    prompt.push_str(&text[cursor..]);
+    require(
+        ordered.len() <= 8,
+        "Writing input exceeds eight media occurrences.",
+    )?;
+    Ok(MediaPrompt {
+        prompt,
+        media: ordered,
+    })
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Recipe {
@@ -151,6 +232,8 @@ pub struct Recipe {
     sources: Vec<Source>,
     prompt: String,
     prompt_digest: String,
+    source_prompt: Option<String>,
+    media: Option<Vec<MediaReference>>,
     omitted_prefix_characters: usize,
     model: String,
     profile: String,
@@ -175,10 +258,27 @@ pub fn validate(recipe: &Recipe) -> Result<bool, Error> {
         "The captured manuscript suffix is invalid.",
     )?;
     let start = boundaries[recipe.omitted_prefix_characters];
+    let source_prompt = recipe.source_prompt.as_deref().unwrap_or(&recipe.prompt);
+    let compiled = compile_media_prompt(source_prompt, recipe.media.as_deref().unwrap_or(&[]))?;
+    require(
+        recipe.media.as_deref().unwrap_or(&[]).iter().all(|media| {
+            recipe.sources.iter().any(|source| {
+                source.id == media.id
+                    && source.kind == "media"
+                    && source.digest == media.root_digest
+            })
+        }),
+        "Writing media is missing its original source identity.",
+    )?;
+    require(
+        compiled.prompt == recipe.prompt
+            && recipe.media.as_deref().unwrap_or(&[]) == compiled.media,
+        "The captured multimodal prompt changed.",
+    )?;
     require(
         recipe.prompt.len() <= 18 * TEXT_LIMIT
             && recipe.prompt.starts_with("<bos>")
-            && recipe.prompt.ends_with(&prefix[start..])
+            && source_prompt.ends_with(&prefix[start..])
             && digest(recipe.prompt.as_bytes()) == recipe.prompt_digest,
         "The captured writing prompt changed; its record was retained.",
     )?;
@@ -190,13 +290,13 @@ pub fn validate(recipe: &Recipe) -> Result<bool, Error> {
         "The captured writing model, sampling, or output budget is invalid.",
     )?;
     require(
-        recipe.sources.len() <= 33
+        recipe.sources.len() <= 41
             && recipe.sources.iter().all(|source| {
                 !source.id.is_nil()
                     && source.title.len() <= TEXT_LIMIT
                     && source.digest.len() == 64
                     && source.digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-                    && ["document", "writing-example"].contains(&source.kind.as_str())
+                    && ["document", "writing-example", "media"].contains(&source.kind.as_str())
             }),
         "The captured writing sources are invalid.",
     )?;
@@ -226,6 +326,44 @@ pub fn branch(recipe: &Recipe, continuation: &str) -> Result<String, Error> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn compiled_media_preserves_order_and_literal_code_and_authored_suffix() -> Result<(), Error> {
+        let a = MediaReference {
+            id: Uuid::from_u128(1),
+            name: "café.png".into(),
+            root_digest: "a".repeat(64),
+            kind: "image".into(),
+        };
+        let b = MediaReference {
+            id: Uuid::from_u128(2),
+            name: "recording.wav".into(),
+            root_digest: "b".repeat(64),
+            kind: "audio".into(),
+        };
+        let image = format!("[Attachment: café](boom-attachment:{})", a.id);
+        let audio = format!("[Attachment: audio](boom-attachment:{})", b.id);
+        let source = format!(
+            "<bos>👩‍💻
+{audio}
+`{image}`
+{image}
+Label:"
+        );
+        let compiled = compile_media_prompt(&source, &[a.clone(), b.clone()])?;
+        assert_eq!(compiled.media, [b, a]);
+        assert_eq!(
+            compiled.prompt,
+            format!(
+                "<bos>👩‍💻
+<|audio|>
+`{image}`
+<|image|>
+Label:"
+            )
+        );
+        Ok(())
+    }
+
     #[test]
     fn history_is_document_scoped_and_preserves_explicit_sets_before_auto_suggestions()
     -> Result<(), Error> {

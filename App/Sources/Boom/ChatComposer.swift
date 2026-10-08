@@ -40,7 +40,8 @@ func nativeEditEvent(_ event: String) {
     if abs(frame.height - height) > 0.5 { setFrameSize(NSSize(width: frame.width, height: height)) }
     onContentHeight?(height)
   }
-  override func completionDisplayDidChange() { reportContentHeight() }
+  override func completionDisplayDidChange() { super.completionDisplayDidChange(); reportContentHeight() }
+  override func mediaChanged() { super.mediaChanged(); reportContentHeight() }
 
   override func draw(_ dirtyRect: NSRect) {
     super.draw(dirtyRect)
@@ -202,6 +203,7 @@ struct ChatComposer: NSViewRepresentable {
     container.lineFragmentPadding = 0
 
     let view = ChatTextView(frame: .zero, textContainer: container)
+    view.setMedia(model: completionModel)
     view.font = NSFont.systemFont(ofSize: 14)
     let paragraph = NSMutableParagraphStyle()
     paragraph.lineSpacing = lineSpacing
@@ -252,6 +254,7 @@ struct ChatComposer: NSViewRepresentable {
 
   func updateNSView(_ input: ChatInputView, context: Context) {
     guard let view = input.scroll.documentView as? ChatTextView else { return }
+    view.setMedia(model: completionModel)
     context.coordinator.text = $text
     context.coordinator.lineSpacing = lineSpacing
     context.coordinator.onContentHeight = onContentHeight

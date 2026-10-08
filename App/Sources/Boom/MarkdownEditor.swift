@@ -17,8 +17,9 @@ import SwiftUI
     guard width.isFinite, width > 0, let storage = textStorage, let container = textContainer else { return nil }
     return CGSize(width: width, height: max(minimumHeight,
       measurement.height(of: storage, width: width, insets: textContainerInset,
-        fragmentPadding: container.lineFragmentPadding)))
+        fragmentPadding: container.lineFragmentPadding), completionDisplayHeight))
   }
+  override func completionDisplayDidChange() { super.completionDisplayDidChange(); invalidateIntrinsicContentSize() }
   override func setFrameSize(_ newSize: NSSize) {
     let changed = frame.width != newSize.width
     super.setFrameSize(newSize)
@@ -264,6 +265,8 @@ import SwiftUI
   }
   override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
     if let inputs = AttachmentInput.read(sender.draggingPasteboard) {
+      let point = convert(sender.draggingLocation, from: nil)
+      setSelectedRange(NSRange(location: characterIndexForInsertion(at: point), length: 0))
       attach(inputs)
       return true
     }
@@ -286,6 +289,7 @@ struct MarkdownEditor: NSViewRepresentable {
     container.heightTracksTextView = false
     let text = MarkdownTextView(frame: .zero, textContainer: container)
     text.owner = model
+    text.setMedia(model: model)
     text.documentID = document.id
     text.documentUndo = model.undoManager(document.id)
     text.delegate = context.coordinator
@@ -317,6 +321,7 @@ struct MarkdownEditor: NSViewRepresentable {
     MarkdownStyle.apply(to: text)
     context.coordinator.view = text
     model.editor = text
+    text.setMedia(model: model)
     text.isEditable = !model.editingLocked
     update(text, document: document)
     updateSearch(text)
@@ -324,6 +329,7 @@ struct MarkdownEditor: NSViewRepresentable {
   }
   func updateNSView(_ text: MarkdownTextView, context: Context) {
     model.editor = text
+    text.setMedia(model: model)
     text.isEditable = !model.editingLocked
     update(text, document: document)
     updateSearch(text)

@@ -103,11 +103,6 @@ struct CompletionSegment {
   private var writingGenerationPolicy: ModelGenerationPolicy?
   var selectedMLXRunner: MLXGemmaRunner? { mlxRunner }
   var completionRunner: MLXGemmaRunner? { baseRunner }
-  func documentAttachments(_ document: DocumentSnapshot) -> [AttachmentRecord] {
-    AttachmentLink.ids(in: document.text).compactMap { id in
-      state.attachments.first { $0.id == id }
-    }
-  }
   func documentAttachmentDestination(id: UUID, range: NSRange) -> AttachmentDestination? {
     guard let document = documents.first(where: { $0.id == id }) else { return nil }
     return .document(id: id, revision: document.revision, range: range)
@@ -794,7 +789,9 @@ struct CompletionSegment {
   }
   private func revalidate(_ sources: [SourceReference], attachments: [SourceReference]) throws {
     for source in sources {
-      guard documents.first(where: { $0.id == source.id })?.revision == source.digest else {
+      let digest = source.kind == "media" ? state.attachments.first(where: { $0.id == source.id })?.rootDigest
+        : documents.first(where: { $0.id == source.id })?.revision
+      guard digest == source.digest else {
         throw BoomError.stale(source.title)
       }
     }
@@ -835,8 +832,8 @@ struct CompletionSegment {
         guard let record = state.attachments.first(where: { $0.id == id }) else { throw BoomError.stale("An attachment was removed.") }
         return record
       }
-      if attachments.contains(where: { $0.awaitingTranscription == true }) {
-        prepareRecordingsForSend(attachments, chat: chat.id, request: request, interaction: interaction,
+      if attachments.contains(where: { $0.needsPreparation }) {
+        prepareMediaForSend(attachments, chat: chat.id, request: request, interaction: interaction,
           selectedIDs: selectedIDs, documentID: state.selectedDocument)
         return
       }
@@ -875,7 +872,7 @@ struct CompletionSegment {
         let replyIDs = targets.map { _ in UUID() }
         if replay == nil {
           self.state.chats[index].messages.append(ChatMessage(role: .user, text: request,
-            context: context, sources: sources, speaker: Speaker(name: "Human")))
+            context: context, sources: sources, speaker: Speaker(name: "Human"), directAttachments: selectedIDs))
         }
         for (offset, voice) in targets.enumerated() {
           self.state.chats[index].messages.append(ChatMessage(id: replyIDs[offset], role: .assistant,
@@ -1133,7 +1130,7 @@ struct CompletionSegment {
   }
   private func revalidateOnDisk(_ sources: [SourceReference], attachments: [SourceReference]) async throws {
     try revalidate(sources, attachments: attachments)
-    for source in sources { try await store.checkDisk(source.id) }
+    for source in sources where source.kind != "media" { try await store.checkDisk(source.id) }
     try revalidate(sources, attachments: attachments)
   }
   private func revalidateResponseSources(_ sources: [SourceReference], attachments: [SourceReference],
@@ -1353,8 +1350,10 @@ struct CompletionSegment {
     guard let role = authoredChatRole, var chat = selectedChat else { return }
     do {
       let text = try ProductCore.chatText(draft)
-      chat.messages.append(ChatMessage(role: role, text: text, authoredByUser: true))
-      try applyChat(chat); draft = ""; authoredChatRole = nil; composerIssue = nil
+      let attachments = pendingAttachments.compactMap { id in state.attachments.first(where: { $0.id == id }) }
+      chat.messages.append(ChatMessage(role: role, text: text, sources: attachments.map(\.reference),
+        authoredByUser: true, directAttachments: attachments.map(\.id)))
+      try applyChat(chat); pendingAttachments = []; draft = ""; authoredChatRole = nil; composerIssue = nil
     } catch { composerIssue = error.localizedDescription }
   }
   func replaceChatMessage(_ text: String, id: UUID, chatID: UUID) throws {
@@ -1367,7 +1366,7 @@ struct CompletionSegment {
     chat.messageVersions = (chat.messageVersions ?? []) + [original]
     chat.messages[index] = ChatMessage(role: original.role, text: validated,
       context: original.context, sources: original.sources, provider: original.provider,
-      speaker: original.speaker, authoredByUser: true, editedFrom: original.id, timestamp: original.timestamp)
+      speaker: original.speaker, authoredByUser: true, editedFrom: original.id, timestamp: original.timestamp, directAttachments: original.directAttachments)
     try applyChat(chat); editingChatMessage = nil
   }
   func exportChat(_ chatID: UUID) {
@@ -1529,6 +1528,9 @@ struct CompletionSegment {
       ?? (0..<count).map { _ in UInt64.random(in: .min ... .max) }
     try ProductCore.admitWritingBatch(width: seeds.count, prompt: 1, output: maxTokens, capacity: 16_384)
     try await flush()
+    let authored = try ProductCore.authoredPrefix(document, caret: offset)
+    let mediaText = previous?.recipe.sourcePrompt ?? ([authored] + writingExampleIDs.compactMap { id in documents.first(where: { $0.id == id })?.text }).joined(separator: "\n\n")
+    let media = try await writingMedia(in: mediaText, flag: flag)
     let recipe: CompletionRecipe
     if let previous { recipe = previous.recipe }
     else {
@@ -1536,11 +1538,11 @@ struct CompletionSegment {
         guard let value = documents.first(where: { $0.id == id }) else { throw BoomError.stale("An example was removed.") }
         return value
       }
-      let sources = ([document] + examples).map { SourceReference(id: $0.id, title: $0.title, digest: $0.revision, kind: "document") }
+      let sources = ([document] + examples).map { SourceReference(id: $0.id, title: $0.title, digest: $0.revision, kind: "document") } + media.map { $0.reference.source }
       try await revalidateOnDisk(sources, attachments: [])
       recipe = try await runner.completionRecipe(document: document, caret: offset,
         sources: sources, examples: examples.map(\.text), profile: profile,
-        maxTokens: maxTokens, flag: flag, batchWidth: seeds.count)
+        maxTokens: maxTokens, flag: flag, batchWidth: seeds.count, media: media)
     }
     try ProductCore.validateWritingRecipe(recipe)
     guard recipe.model == runner.identity else { throw BoomError.stale("Replay requires the original writing model.") }
@@ -1573,7 +1575,10 @@ struct CompletionSegment {
           seed: seed, requestDigest: recipe.promptDigest, maxTokens: recipe.maxTokens,
           generationPolicy: recipe.generationPolicy, batch: bundle.candidates[startIndex + lane].batch)
       }
-      let results = try await runner.runBatch(rawPrompt: recipe.prompt, maxTokens: recipe.maxTokens,
+      let orderedMedia = try (recipe.media ?? []).map { reference -> WritingMediaData in
+        guard let payload = media.first(where: { $0.reference == reference }) else { throw BoomError.stale(reference.name) }; return payload
+      }
+      let results = try await runner.runBatch(rawPrompt: recipe.prompt, media: orderedMedia, maxTokens: recipe.maxTokens,
           settings: recipe.settings, seeds: seeds, flag: flag, background: maxTokens == 64 && !showingCandidates,
           onCheckpoint: { [weak self] updates in
             for update in updates {
@@ -1929,7 +1934,10 @@ struct CompletionSegment {
     let insertion = current.revision == revision
       ? Range(range, in: current.text) : nil
     guard let replacement = insertion else { throw BoomError.stale("The attachment insertion target changed. Its original bytes were retained.") }
-    let value = links
+    // Media occupy their own paragraph while retaining the exact source on
+    // both sides of the captured paste range.
+    let prefix = current.text[..<replacement.lowerBound]
+    let value = (prefix.isEmpty || prefix.hasSuffix("\n") ? "" : "\n") + links
     if state.selectedDocument == id, let editor, editor.documentID == id,
       editor.string == current.text,
       let native = NSRange(replacement, in: current.text) as NSRange? {
@@ -1996,6 +2004,12 @@ struct CompletionSegment {
         record.isImage = LocalImage.canDecode(imported.original)
         if record.isImage == true {
           record.coverage = "Original image available locally"
+        } else if [.audio, .video].contains(AttachmentKind(name: record.name)), record.text.isEmpty {
+          do {
+            _ = try ProductCore.admitMedia(imported.original)
+            record.awaitingPreparation = true
+            record.coverage = "Original media available locally"
+          } catch { record.coverage = "Unreadable locally: " + error.localizedDescription }
         } else if record.text.isEmpty {
           do {
             record = try await self.preparedRecord(
@@ -2061,26 +2075,26 @@ struct CompletionSegment {
     composerIssue = nil; status = "Recorded"; scheduleSave()
     try await flush()
   }
-  private func prepareRecordingsForSend(_ records: [AttachmentRecord], chat: UUID, request: String,
+  private func prepareMediaForSend(_ records: [AttachmentRecord], chat: UUID, request: String,
     interaction: InteractionMode, selectedIDs: [UUID], documentID: UUID?) {
     let unchanged = { [weak self] in
       guard let self else { return false }
       return self.state.selectedChat == chat && self.state.selectedDocument == documentID
         && self.draft == request && self.mode == interaction && self.pendingAttachments == selectedIDs
     }
-    work("Reading audio on this Mac…", after: { [weak self] in
+    work("Reading media on this Mac…", after: { [weak self] in
       guard let self, unchanged(), records.allSatisfy({ original in
-        self.state.attachments.first(where: { $0.id == original.id }).map { $0.awaitingTranscription != true } ?? false
+        self.state.attachments.first(where: { $0.id == original.id }).map { !$0.needsPreparation } ?? false
       }) else { return }
       self.send()
     }) { [weak self] flag in
       guard let self else { return }
-      for original in records where original.awaitingTranscription == true {
+      for original in records where original.needsPreparation {
         let vault = self.store.vault
         let bytes = try await detachedWork { try vault.get(.attachment, id: original.id, limit: 67_108_864) }
         guard Digest.sha256(bytes) == original.rootDigest else { throw BoomError.invalid("The recorded audio changed.") }
         var prepared = try await self.preparedRecord(original, data: bytes, automaticAudio: false, flag: flag)
-        prepared.awaitingTranscription = false
+        prepared.awaitingTranscription = false; prepared.awaitingPreparation = false
         try flag.check()
         guard let index = self.state.attachments.firstIndex(where: { $0.id == original.id }),
           self.state.attachments[index].digest == original.digest else { throw BoomError.stale("The recording changed.") }
@@ -2159,24 +2173,6 @@ struct CompletionSegment {
     updated.transform = note
     updated.coverage = "Partial native transform"
     return updated
-  }
-  func prepareAttachment(_ id: UUID) {
-    guard !isBusy, let attachment = state.attachments.first(where: { $0.id == id }) else { return }
-    work("Preparing \(attachment.name) locally…") { [weak self] flag in
-      guard let self else { return }
-      let vault = self.store.vault
-      let data = try await detachedWork { try vault.get(.attachment, id: id, limit: 67_108_864) }
-      guard Digest.sha256(data) == attachment.rootDigest else {
-        throw BoomError.invalid("Stored attachment digest changed.")
-      }
-      let updated = try await self.preparedRecord(
-        attachment, data: data, automaticAudio: false, flag: flag)
-      guard let index = self.state.attachments.firstIndex(where: { $0.id == id }),
-        self.state.attachments[index].digest == attachment.digest
-      else { throw BoomError.stale(attachment.name) }
-      self.state.attachments[index] = updated
-      self.status = "Attachment ready"
-    }
   }
   private func releaseRunner(_ purpose: ModelPurpose) async {
     if purpose == .consultation {

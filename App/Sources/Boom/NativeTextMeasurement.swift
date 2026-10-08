@@ -4,11 +4,13 @@ import AppKit
 /// width belongs to this isolated layout; it cannot change displayed glyphs,
 /// selections, marked text, scroll positions or Undo registration.
 @MainActor final class NativeTextMeasurement {
+  private let mediaLayout = InlineMediaLayout()
   private let storage = NSTextStorage()
   private let layout = NSLayoutManager()
   private let container = NSTextContainer(size: .zero)
   private var measured: (width: CGFloat, padding: CGFloat, height: CGFloat)?
   init() {
+    layout.delegate = mediaLayout
     layout.addTextContainer(container); storage.addLayoutManager(layout)
   }
   func height(of source: NSAttributedString, width: CGFloat, insets: NSSize, fragmentPadding: CGFloat) -> CGFloat {

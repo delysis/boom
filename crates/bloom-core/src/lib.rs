@@ -698,6 +698,8 @@ pub enum Request {
         caret_utf16: usize,
         examples: Vec<String>,
         capacity: u32,
+        #[serde(default)]
+        media: Vec<writing::MediaReference>,
     },
     CountWritingContext {
         id: Uuid,
@@ -769,6 +771,13 @@ pub enum Request {
     },
     MarkdownSpans {
         text: String,
+    },
+    MediaSpans {
+        text: String,
+    },
+    CompileMediaPrompt {
+        text: String,
+        media: Vec<writing::MediaReference>,
     },
     Layout,
     ValidateImport {
@@ -953,12 +962,14 @@ pub fn execute(request: Request) -> Result<Value, Error> {
             caret_utf16,
             examples,
             capacity,
+            media,
         } => serde_json::to_value(context::begin(
             dictionary,
             &text,
             caret_utf16,
             &examples,
             capacity,
+            &media,
         )?),
         Request::CountWritingContext {
             id,
@@ -1035,6 +1046,10 @@ pub fn execute(request: Request) -> Result<Value, Error> {
         } => serde_json::to_value(document::apply(&patch, &authority, &current)?),
         Request::Search { text, query } => serde_json::to_value(search::search(&text, &query)?),
         Request::MarkdownSpans { text } => serde_json::to_value(markdown::spans(&text)?),
+        Request::MediaSpans { text } => serde_json::to_value(markdown::media_spans(&text)?),
+        Request::CompileMediaPrompt { text, media } => {
+            serde_json::to_value(writing::compile_media_prompt(&text, &media)?)
+        }
         Request::Layout => serde_json::to_value(layout::compiled_layout()),
         Request::ValidateImport { files } => serde_json::to_value(import::validate_import(files)?),
         Request::ValidateDocumentImport { files } => {

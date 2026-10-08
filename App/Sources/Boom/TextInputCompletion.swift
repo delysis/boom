@@ -189,10 +189,11 @@ extension WorkspaceModel {
       target.chatID != nil || target.documentID == state.selectedDocument else { throw BoomError.stale("Input changed.") }
     let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
     guard let chat = selectedChat else { return Digest.sha256("null") }
-    if let cached = inputContextCache, cached.0 == chat { return cached.1 }
-    let digest = Digest.sha256(try encoder.encode(chat))
-    inputContextCache = (chat, digest)
-    return digest
+    let digest: String
+    if let cached = inputContextCache, cached.0 == chat { digest = cached.1 }
+    else { digest = Digest.sha256(try encoder.encode(chat)); inputContextCache = (chat, digest) }
+    let pending = target.messageID == nil && !target.instructions ? pendingAttachments : []
+    return Digest.sha256(digest + pending.compactMap { id in state.attachments.first(where: { $0.id == id }).map { $0.id.uuidString + $0.rootDigest } }.joined())
   }
   func inputContext(_ target: TextInputTarget, text: String, caret: Int) throws -> String {
     _ = try inputContextDigest(target)
@@ -206,22 +207,28 @@ extension WorkspaceModel {
     }
     if target.instructions { messages = [] }
     let turns = messages.filter { $0.state == .complete }.map {
-      PromptTurn(role: $0.role.rawValue, text: $0.text,
+      PromptTurn(role: $0.role.rawValue, text: inputMediaLinks($0.directAttachments ?? []) + $0.text,
         speaker: $0.speaker ?? Speaker(name: $0.role == .user ? "You" : "Bloom"))
     }
-    return try ProductCore.inputContext(instructions: target.instructions ? "" : chat?.instructions ?? "",
+    let mediaIDs = target.instructions ? [] : target.messageID.flatMap { id in chat?.messages.first(where: { $0.id == id }).map { $0.directAttachments ?? [] } } ?? pendingAttachments
+    let context = [chat?.instructions ?? "", inputMediaLinks(mediaIDs)].filter { !$0.isEmpty }.joined(separator: "\n")
+    return try ProductCore.inputContext(instructions: target.instructions ? "" : context,
       history: turns, speaker: speaker, text: text, caret: caret)
+  }
+  private func inputMediaLinks(_ ids: [UUID]) -> String {
+    ids.map { "[Attachment: media](boom-attachment:\($0.uuidString))\n" }.joined()
   }
   func generateInputCandidates(document: DocumentSnapshot, capture: TextInputCapture, count: Int,
     previous: CandidateBundle?, flag: CancellationFlag,
     publish: @escaping @MainActor (CandidateBundle) -> Void) async throws -> CandidateBundle {
     guard let runner = inputCompletionRunner, !isBusy else { throw CancellationError() }
     let seeds = (0..<count).map { _ in UInt64.random(in: .min ... .max) }
+    let media = try await writingMedia(in: previous?.recipe.sourcePrompt ?? document.text, flag: flag)
     let recipe: CompletionRecipe
     if let previous { recipe = previous.recipe }
     else {
       recipe = try await runner.completionRecipe(document: document, caret: document.text.utf16.count,
-        sources: [], examples: [], profile: samplingProfile, maxTokens: 64, flag: flag, batchWidth: 3)
+        sources: media.map { $0.reference.source }, examples: [], profile: samplingProfile, maxTokens: 64, flag: flag, batchWidth: 3, media: media)
     }
     try flag.check(); try ProductCore.validateWritingRecipe(recipe)
     guard recipe.model == runner.identity else { throw BoomError.stale("Completion model changed.") }
@@ -246,7 +253,10 @@ extension WorkspaceModel {
     publish(bundle)
     let progress = InputCandidateProgress(bundle, publish: publish)
     do {
-      let results = try await runner.runBatch(rawPrompt: recipe.prompt, maxTokens: recipe.maxTokens,
+      let orderedMedia = try (recipe.media ?? []).map { reference -> WritingMediaData in
+        guard let payload = media.first(where: { $0.reference == reference }) else { throw BoomError.stale(reference.name) }; return payload
+      }
+      let results = try await runner.runBatch(rawPrompt: recipe.prompt, media: orderedMedia, maxTokens: recipe.maxTokens,
         settings: recipe.settings, seeds: seeds, flag: flag, background: true,
         onCheckpoint: { updates in
           for update in updates {

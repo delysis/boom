@@ -57,7 +57,7 @@ actor MLXGemmaRunner {
     let processedPositions: Int
     let totalPositions: Int
   }
-  struct Output: Sendable {
+  struct Output: Codable, Sendable {
     let text: String
     let tokenIDs: [Int]
     let promptDigest: String
@@ -247,16 +247,31 @@ actor MLXGemmaRunner {
     return dictionary
   }
   func writingContext(document: DocumentSnapshot, caret: Int, examples: [String], capacity: Int,
-    flag: CancellationFlag) async throws -> (WritingPrompt, Int) {
+    flag: CancellationFlag, media: [WritingMediaData] = []) async throws -> (WritingPrompt, Int) {
     try flag.check()
     let tokenizer = await container.perform { $0.tokenizer }
     let dictionary = try writingVocabulary(tokenizer: tokenizer, flag: flag)
     var step = try ProductCore.writingContext(document, caret: caret, examples: examples,
-      capacity: capacity, dictionary: dictionary)
+      capacity: capacity, dictionary: dictionary, media: media.map(\.reference))
     defer { ProductCore.releaseContext(step.id) }
     while step.status == "candidate", let prompt = step.candidate {
       try flag.check()
-      let count = tokenizer.encode(text: prompt.prompt, addSpecialTokens: false).count
+      let count: Int
+      if media.isEmpty { count = tokenizer.encode(text: prompt.prompt, addSpecialTokens: false).count }
+      else {
+        let compiled = try RawWritingInput.compiled(prompt.prompt, media: media.map(\.reference))
+        let ordered = try compiled.media.map { reference -> WritingMediaData in
+          guard let payload = media.first(where: { $0.reference == reference }) else { throw BoomError.stale(reference.name) }; return payload
+        }
+        count = try await ownedOperation(flag: flag, background: true) {
+          try await self.container.perform { context in
+            try await InferenceExecutor.shared.perform { _ in
+              defer { Stream.defaultStream.synchronize() }
+              return try RawWritingInput.prepare(compiled.prompt, media: ordered, context: context).text.tokens.size
+            }
+          }
+        }
+      }
       try flag.check()
       step = try ProductCore.countedContext(step, prompt: prompt, count: count)
       await Task.yield()
@@ -322,15 +337,17 @@ actor MLXGemmaRunner {
     }
   }
   func completionRecipe(document: DocumentSnapshot, caret: Int, sources: [SourceReference],
-    examples: [String], profile: SamplingProfile, maxTokens: Int, flag: CancellationFlag, batchWidth: Int = 1
+    examples: [String], profile: SamplingProfile, maxTokens: Int, flag: CancellationFlag, batchWidth: Int = 1, media: [WritingMediaData] = []
   ) async throws -> CompletionRecipe {
     let capacity = try availableContext(batchWidth: batchWidth) - maxTokens
     let (selected, _) = try await writingContext(document: document, caret: caret, examples: examples,
-      capacity: capacity, flag: flag)
+      capacity: capacity, flag: flag, media: media)
+    let compiled = try RawWritingInput.compiled(selected.prompt, media: media.map(\.reference))
     return CompletionRecipe(document: document, caretUTF16: caret, sources: sources,
-      prompt: selected.prompt, promptDigest: selected.digest, omittedPrefixCharacters: selected.omittedCharacters,
+      prompt: compiled.prompt, promptDigest: Digest.sha256(compiled.prompt), omittedPrefixCharacters: selected.omittedCharacters,
       model: identity, profile: profile, settings: try ProductCore.sampling(profile), maxTokens: maxTokens,
-      generationPolicy: generationPolicy)
+      generationPolicy: generationPolicy, sourcePrompt: compiled.media.isEmpty ? nil : selected.prompt,
+      media: compiled.media.isEmpty ? nil : compiled.media)
   }
   func run(plan: ConsultationPlan, images: [Data], maxTokens: Int, seed: UInt64? = nil,
     flag: CancellationFlag,
@@ -341,23 +358,23 @@ actor MLXGemmaRunner {
       settings: ProductCore.sampling(.standard), seed: seed, flag: flag, onPrefill: onPrefill,
       onCheckpoint: onCheckpoint, onText: onText)
   }
-  func run(rawPrompt: String, maxTokens: Int, settings: SamplingSettings? = nil, seed: UInt64? = nil,
+  func run(rawPrompt: String, media: [WritingMediaData] = [], maxTokens: Int, settings: SamplingSettings? = nil, seed: UInt64? = nil,
     flag: CancellationFlag, background: Bool = false,
     onPrefill: (@Sendable (PrefillProgress) -> Void)? = nil,
     onCheckpoint: (@Sendable (GenerationProgress, String?, Int?) async throws -> Void)? = nil,
     onText: @escaping @Sendable (String) -> Void) async throws -> Output {
-    try await generate(plan: nil, raw: rawPrompt, images: [], maxTokens: maxTokens,
+    try await generate(plan: nil, raw: rawPrompt, images: [], media: media, maxTokens: maxTokens,
       settings: settings ?? ProductCore.sampling(.standard), seed: seed, flag: flag, background: background, onPrefill: onPrefill,
       onCheckpoint: onCheckpoint, onText: onText)
   }
-  private func generate(plan: ConsultationPlan?, raw: String?, images: [Data], maxTokens: Int,
+  private func generate(plan: ConsultationPlan?, raw: String?, images: [Data], media: [WritingMediaData] = [], maxTokens: Int,
     settings: SamplingSettings, seed: UInt64?, flag: CancellationFlag,
     background: Bool = false,
     onPrefill: (@Sendable (PrefillProgress) -> Void)? = nil,
     onCheckpoint: (@Sendable (GenerationProgress, String?, Int?) async throws -> Void)? = nil,
     onText: @escaping @Sendable (String) -> Void) async throws -> Output {
     try await ownedOperation(flag: flag, background: background) {
-      try await self.generateOwned(plan: plan, raw: raw, images: images, maxTokens: maxTokens,
+      try await self.generateOwned(plan: plan, raw: raw, images: images, media: media, maxTokens: maxTokens,
         settings: settings, seed: seed, flag: flag, onPrefill: onPrefill,
         onCheckpoint: onCheckpoint, onText: onText)
     }
@@ -389,7 +406,7 @@ actor MLXGemmaRunner {
   }
   /// One producer, one prompt prefill, and one weight-reading forward pass per
   /// decoding step. Rows never compact: their shape is part of seeded replay.
-  func runBatch(rawPrompt: String, maxTokens: Int, settings: SamplingSettings, seeds: [UInt64],
+  func runBatch(rawPrompt: String, media: [WritingMediaData] = [], maxTokens: Int, settings: SamplingSettings, seeds: [UInt64],
     flag: CancellationFlag, background: Bool = false,
     onPrefill: (@Sendable (PrefillProgress) -> Void)? = nil,
     onCheckpoint: (@Sendable ([BatchCheckpoint]) async throws -> Void)? = nil,
@@ -397,7 +414,7 @@ actor MLXGemmaRunner {
   ) async throws -> [Output] {
     try ProductCore.admitWritingBatch(width: seeds.count, prompt: 1, output: maxTokens, capacity: 16_384)
     if seeds.count == 1 {
-      return [try await run(rawPrompt: rawPrompt, maxTokens: maxTokens, settings: settings,
+      return [try await run(rawPrompt: rawPrompt, media: media, maxTokens: maxTokens, settings: settings,
         seed: seeds[0], flag: flag, background: background, onPrefill: onPrefill,
         onCheckpoint: { progress, stop, token in
           try await onCheckpoint?([BatchCheckpoint(lane: 0, progress: progress, stopReason: stop, stopTokenID: token)])
@@ -405,11 +422,11 @@ actor MLXGemmaRunner {
         onText: { _ in })]
     }
     return try await ownedOperation(flag: flag, background: background) {
-      try await self.generateBatchOwned(raw: rawPrompt, maxTokens: maxTokens, settings: settings,
+      try await self.generateBatchOwned(raw: rawPrompt, media: media, maxTokens: maxTokens, settings: settings,
         seeds: seeds, flag: flag, onPrefill: onPrefill, onCheckpoint: onCheckpoint, onMetrics: onMetrics)
     }
   }
-  private func generateBatchOwned(raw: String, maxTokens: Int, settings: SamplingSettings,
+  private func generateBatchOwned(raw: String, media: [WritingMediaData], maxTokens: Int, settings: SamplingSettings,
     seeds: [UInt64], flag: CancellationFlag,
     onPrefill: (@Sendable (PrefillProgress) -> Void)?,
     onCheckpoint: (@Sendable ([BatchCheckpoint]) async throws -> Void)?,
@@ -422,7 +439,8 @@ actor MLXGemmaRunner {
     return try await container.perform { (context: ModelContext) async throws -> [Output] in
       try await InferenceExecutor.shared.perform { _ in
         defer { Stream.defaultStream.synchronize() }
-        let promptIDs = context.tokenizer.encode(text: raw, addSpecialTokens: false)
+        let input = try RawWritingInput.prepare(raw, media: media, context: context)
+        let promptIDs = input.text.tokens.asArray(Int.self)
         try ProductCore.admitWritingBatch(width: seeds.count, prompt: promptIDs.count,
           output: maxTokens, capacity: capacity)
         let digest = Digest.sha256(try JSONEncoder().encode(promptIDs))
@@ -432,7 +450,7 @@ actor MLXGemmaRunner {
         let cache = try context.model.newCache(parameters: parameters)
         let clock = ContinuousClock(), started = clock.now
         let setupQoSBefore = qos_class_self().rawValue
-        let prepared = try context.model.prepare(LMInput(tokens: MLXArray(promptIDs)),
+        let prepared = try context.model.prepare(input,
           cache: cache, state: nil, prefill: parameters.prefill)
         let setupReturnedSeconds = started.duration(to: clock.now).timeInterval
         let setupQoSAfter = qos_class_self().rawValue
@@ -550,7 +568,7 @@ actor MLXGemmaRunner {
       }
     }
   }
-  private func generateOwned(plan: ConsultationPlan?, raw: String?, images: [Data], maxTokens: Int,
+  private func generateOwned(plan: ConsultationPlan?, raw: String?, images: [Data], media: [WritingMediaData], maxTokens: Int,
     settings: SamplingSettings, seed: UInt64?, flag: CancellationFlag,
     onPrefill: (@Sendable (PrefillProgress) -> Void)?,
     onCheckpoint: (@Sendable (GenerationProgress, String?, Int?) async throws -> Void)?,
@@ -564,7 +582,7 @@ actor MLXGemmaRunner {
         defer { Stream.defaultStream.synchronize() }
         let input: LMInput
         if let plan { input = try await Self.chatInput(plan, images: images, context: context) }
-        else if let raw { input = LMInput(tokens: MLXArray(context.tokenizer.encode(text: raw, addSpecialTokens: false))) }
+        else if let raw { input = try RawWritingInput.prepare(raw, media: media, context: context) }
         else { throw BoomError.invalid("No compiled model input.") }
         let promptIDs = input.text.tokens.asArray(Int.self)
         guard promptIDs.count + maxTokens <= capacity else { throw BoomError.budget("The request exceeds available context.") }

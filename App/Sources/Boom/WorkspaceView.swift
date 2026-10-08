@@ -60,17 +60,9 @@ struct ManuscriptPane: View {
         if let document = model.selectedDocument {
           ScrollView(.vertical) {
             let width = min(760, max(1, pane.size.width - 40))
-            let attachments = model.documentAttachments(document)
-            VStack(spacing: 0) {
-              MarkdownEditor(model: model, document: document,
-                minimumHeight: attachments.isEmpty ? max(180, pane.size.height - 48 -
-                  (model.showingCandidates && model.candidates != nil ? 300 : 0)) : 180)
-              if !attachments.isEmpty {
-                VStack(spacing: 8) {
-                  ForEach(attachments) { attachment in AttachmentInlineCard(model: model, record: attachment) }
-                }.padding(.horizontal, 28).padding(.vertical, 12)
-              }
-            }
+            MarkdownEditor(model: model, document: document,
+              minimumHeight: max(180, pane.size.height - 48 -
+                (model.showingCandidates && model.candidates != nil ? 300 : 0)))
             .frame(width: width)
             .background(Color(nsColor: BoomChrome.paperBackground))
             .padding(.vertical, 24)
@@ -550,7 +542,14 @@ struct ChatPane: View {
     } else if message.role == .user {
       HStack(alignment: .bottom, spacing: 4) {
         Spacer(minLength: 36)
-        NativeText(text: visibleMessageText(message))
+        VStack(alignment: .trailing, spacing: 8) {
+          ForEach(message.directAttachments ?? [], id: \.self) { id in
+            if let record = model.state.attachments.first(where: { $0.id == id }) {
+              InlineAttachmentView(model: model, record: record)
+            }
+          }
+          NativeText(text: visibleMessageText(message), mediaModel: model)
+        }
           .padding(.horizontal, 12).padding(.vertical, 9)
           .background(Color.primary.opacity(0.065), in: RoundedRectangle(cornerRadius: 12))
       }.frame(maxWidth: .infinity, alignment: .trailing)
@@ -567,7 +566,7 @@ struct ChatPane: View {
             }
           }
         }
-        NativeText(text: visibleMessageText(message))
+        NativeText(text: visibleMessageText(message), mediaModel: model)
         ForEach(model.state.proposals.filter { $0.messageID == message.id }) { proposal in
           ProposalCard(model: model, proposal: proposal)
         }
@@ -701,27 +700,19 @@ struct ChatPane: View {
         }
         if !model.pendingAttachments.isEmpty {
           ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
+            HStack(spacing: 12) {
               ForEach(model.pendingAttachments, id: \.self) { id in
                 if let attachment = model.state.attachments.first(where: { $0.id == id }) {
-                  HStack(spacing: 5) {
-                    Label(
-                      attachment.name,
-                      systemImage: attachment.isImage == true ? "photo"
-                        : attachment.text.isEmpty ? "exclamationmark.circle" : "paperclip"
-                    ).lineLimit(1)
-                    Button {
-                      model.removePending(id)
-                    } label: {
-                      Image(systemName: "xmark").font(.system(size: 9))
-                    }.buttonStyle(.plain).disabled(model.isBusy).accessibilityLabel(
-                      "Remove \(attachment.name) from this message")
-                  }.font(.caption).padding(.horizontal, 7).padding(.vertical, 5).background(
-                    Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 5))
+                  InlineAttachmentView(model: model, record: attachment,
+                    remove: { model.removePending(id) }).frame(maxWidth: 320)
                 }
               }
             }
-          }
+          }.frame(height: model.pendingAttachments.compactMap { id in
+            model.state.attachments.first(where: { $0.id == id }).map { record -> CGFloat in
+              switch AttachmentKind(name: record.name) { case .audio: 44; case .image: 180; case .video, .pdf: 220; case .document: 24 }
+            }
+          }.max() ?? 44)
         }
         if let role = model.authoredChatRole {
           HStack {

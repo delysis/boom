@@ -240,6 +240,7 @@ struct Search {
     prefix: String,
     authored: String,
     boundaries: Vec<(usize, usize)>,
+    allowed: Vec<bool>,
     bounds: Vec<u32>,
     costs: Vec<u32>,
     normalized: Vec<u8>,
@@ -260,12 +261,23 @@ pub struct Step {
 }
 
 impl Search {
+    #[cfg(test)]
     fn new(
         dictionary: &Arc<Dictionary>,
         text: &str,
         caret: usize,
         examples: &[String],
         capacity: u32,
+    ) -> Result<Self, Error> {
+        Self::new_with_media(dictionary, text, caret, examples, capacity, &[])
+    }
+    fn new_with_media(
+        dictionary: &Arc<Dictionary>,
+        text: &str,
+        caret: usize,
+        examples: &[String],
+        capacity: u32,
+        media: &[crate::writing::MediaReference],
     ) -> Result<Self, Error> {
         require(
             (1..=16_384).contains(&capacity),
@@ -278,24 +290,54 @@ impl Search {
         )?;
         let prefix = writing_prompt(text, caret, examples, 0)?.prompt;
         let authored = full.prompt[prefix.len()..].to_owned();
+        // Bounds use the compiled marker spelling, not a filename/UUID that
+        // disappears from model input. Expanded soft-token blocks can only
+        // increase that bound. Suffix cuts never split an embedded object.
+        let compiled_prefix = crate::writing::compile_media_prompt(&prefix, media)?.prompt;
+        let compiled_authored = crate::writing::compile_media_prompt(&authored, media)?.prompt;
+        let spans = crate::markdown::media_spans(&authored)?
+            .into_iter()
+            .filter(|span| media.iter().any(|reference| reference.id == span.id))
+            .collect::<Vec<_>>();
         let mut normalized_offset = 0;
+        let mut utf16 = 0;
+        let mut allowed = Vec::new();
         let boundaries = authored
             .grapheme_indices(true)
             .map(|(byte, grapheme)| {
+                let span = spans
+                    .iter()
+                    .find(|span| utf16 >= span.location && utf16 < span.location + span.length);
                 let pair = (byte, normalized_offset);
-                normalized_offset +=
-                    grapheme.len() + grapheme.bytes().filter(|b| *b == b' ').count() * 2;
+                allowed.push(span.is_none_or(|span| utf16 == span.location));
+                if let Some(span) = span {
+                    if utf16 == span.location {
+                        let reference = media
+                            .iter()
+                            .find(|reference| reference.id == span.id)
+                            .expect("filtered media");
+                        normalized_offset += if reference.kind == "image" {
+                            "<|image|>".len()
+                        } else {
+                            "<|audio|>".len()
+                        };
+                    }
+                } else {
+                    normalized_offset +=
+                        grapheme.len() + grapheme.bytes().filter(|b| *b == b' ').count() * 2;
+                }
+                utf16 += grapheme.encode_utf16().count();
                 pair
             })
             .collect();
         // Normalization never shortens text. This cheap bound also avoids a DP
         // over a many-megabyte selection of examples that cannot possibly fit.
         let (prefix_costs, normalized, costs, bounds) =
-            if prefix.len() > (capacity as usize + 1) * dictionary.max_bytes {
+            if compiled_prefix.len() > (capacity as usize + 1) * dictionary.max_bytes {
                 (None, Vec::new(), Vec::new(), Vec::new())
             } else {
-                let p = dictionary.prefix_costs(&normalized(&prefix));
-                let bytes = normalized(&authored);
+                let p = dictionary.prefix_costs(&normalized(&compiled_prefix));
+                let bytes = normalized(&compiled_authored);
                 let costs = dictionary.suffix_costs(&bytes);
                 let bounds = suffix_bounds(&costs, dictionary.max_bytes);
                 (Some(p), bytes, costs, bounds)
@@ -305,6 +347,7 @@ impl Search {
             prefix,
             authored,
             boundaries,
+            allowed,
             bounds,
             prefix_costs,
             costs,
@@ -330,6 +373,9 @@ impl Search {
     fn next(&mut self, id: Uuid) -> Step {
         let start = self.current.map_or(0, |i| i + 1);
         let fitting = (start..self.boundaries.len()).find(|i| {
+            if !self.allowed[*i] {
+                return false;
+            }
             let at = self.boundaries[*i].1;
             self.prefix_costs.as_ref().is_some_and(|prefix| {
                 // The cheap free-fragment bound rejects distant suffixes first.
@@ -414,13 +460,14 @@ pub fn begin(
     caret: usize,
     examples: &[String],
     capacity: u32,
+    media: &[crate::writing::MediaReference],
 ) -> Result<Step, Error> {
     let dictionary = locked()?
         .dictionaries
         .get(&dictionary)
         .cloned()
         .ok_or_else(|| Error("The context vocabulary was released.".into()))?;
-    let mut search = Search::new(&dictionary, text, caret, examples, capacity)?;
+    let mut search = Search::new_with_media(&dictionary, text, caret, examples, capacity, media)?;
     let mut sessions = locked()?;
     require(
         sessions.searches.len() < 8,
@@ -510,6 +557,42 @@ mod tests {
         assert!(search.counted(id, "stale", 1).is_err());
     }
     #[test]
+    fn media_bounds_do_not_charge_a_removed_uuid_or_cut_inside_its_reference() {
+        let media = crate::writing::MediaReference {
+            id: Uuid::from_u128(1),
+            name: "clip.wav".into(),
+            root_digest: "a".repeat(64),
+            kind: "audio".into(),
+        };
+        let link = format!("[Attachment: clip](boom-attachment:{})", media.id);
+        let text = format!("{link}z");
+        let dictionary = dictionary(&["<bos>", "<|audio|>", "z"]);
+        let mut search = Search::new_with_media(
+            &dictionary,
+            &text,
+            text.encode_utf16().count(),
+            &[],
+            3,
+            &[media],
+        )
+        .expect("search");
+        let id = Uuid::new_v4();
+        let step = search.next(id);
+        assert_eq!(
+            step.candidate
+                .as_ref()
+                .expect("candidate")
+                .omitted_characters,
+            0
+        );
+        // A real token oracle can reject the expanded audio block. The next
+        // admissible suffix starts after the whole reference, never in its UUID.
+        let next = search
+            .counted(id, &step.candidate.expect("candidate").digest, 40)
+            .expect("count");
+        assert_eq!(next.candidate.expect("candidate").prompt, "<bos>z");
+    }
+    #[test]
     fn full_fit_is_considered_before_empty_example_prompt() {
         let d = dictionary(&["<bos>", "long\n\na"]);
         let id = Uuid::new_v4();
@@ -580,8 +663,8 @@ mod tests {
     #[test]
     fn released_searches_reject_late_counts_and_release_private_snapshots() {
         let dictionary = vocabulary(descriptor()).expect("dictionary");
-        let first = begin(dictionary, "abcdef", 6, &[], 2).expect("search");
-        let second = begin(dictionary, "abcdef", 6, &[], 2).expect("search");
+        let first = begin(dictionary, "abcdef", 6, &[], 2, &[]).expect("search");
+        let second = begin(dictionary, "abcdef", 6, &[], 2, &[]).expect("search");
         let digest = first.candidate.expect("candidate").digest;
         assert!(counted(first.id, "wrong digest", 1).is_err());
         assert!(release_search(first.id).expect("release"));
@@ -592,7 +675,7 @@ mod tests {
         );
         assert!(release_search(second.id).expect("release"));
         assert!(release_vocabulary(dictionary).expect("release"));
-        assert!(begin(dictionary, "abcdef", 6, &[], 2).is_err());
+        assert!(begin(dictionary, "abcdef", 6, &[], 2, &[]).is_err());
     }
     #[test]
     fn impossible_examples_and_final_grapheme_return_exhaustion() {

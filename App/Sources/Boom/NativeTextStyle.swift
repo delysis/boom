@@ -59,6 +59,7 @@ private struct MarkdownSpan: Decodable {
     var attachmentRanges: [NSRange] = []
     defer {
       synchronize(storage, into: current)
+      (view as? NativeMediaTextView)?.inlineMedia.refresh()
       for range in attachmentRanges { view.setSpellingState(0, range: range) }
     }
     let paragraph = NSMutableParagraphStyle()

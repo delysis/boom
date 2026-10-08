@@ -129,9 +129,9 @@ enum ProductCore {
     ContextVocabulary(id: try call(["op": "context_vocabulary", "descriptor": descriptor]))
   }
   static func writingContext(_ document: DocumentSnapshot, caret: Int, examples: [String],
-    capacity: Int, dictionary: ContextVocabulary) throws -> WritingContextStep {
+    capacity: Int, dictionary: ContextVocabulary, media: [WritingMediaReference] = []) throws -> WritingContextStep {
     try call(["op": "begin_writing_context", "dictionary": dictionary.id.uuidString,
-      "text": document.text, "caretUtf16": caret, "examples": examples, "capacity": capacity])
+      "text": document.text, "caretUtf16": caret, "examples": examples, "capacity": capacity, "media": object(media)])
   }
   static func countedContext(_ step: WritingContextStep, prompt: WritingPrompt, count: Int) throws -> WritingContextStep {
     try call(["op": "count_writing_context", "id": step.id.uuidString,
@@ -353,6 +353,8 @@ struct CompletionRecipe: Codable, Sendable {
   let settings: SamplingSettings
   let maxTokens: Int
   let generationPolicy: ModelGenerationPolicy?
+  var sourcePrompt: String? = nil
+  var media: [WritingMediaReference]? = nil
 }
 struct WritingBatchExecution: Codable, Equatable, Sendable {
   var algorithm = "shared-prefill-fixed-batch-v1"
