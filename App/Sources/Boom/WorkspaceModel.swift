@@ -260,6 +260,7 @@ struct CompletionSegment {
     Task {
       if critical || !writingUsesConsultation { await releaseRunner(inactive) }
       await reclaimModelCache()
+      await VideoPreparationCache.shared.release()
     }
     status = "Memory pressure released the inactive model. It will reload when needed."
   }
@@ -785,6 +786,7 @@ struct CompletionSegment {
     if let mlxRunner { await mlxRunner.join() }
     if let baseRunner { await baseRunner.join() }
     for operation in Array(exportTasks.values) { await operation.task.value }
+    await VideoPreparationCache.shared.release()
     try await flush()
   }
   private func revalidate(_ sources: [SourceReference], attachments: [SourceReference]) throws {
@@ -866,7 +868,7 @@ struct CompletionSegment {
         }
         let fitted = try await runner.fittedRound(voices: targets, history: chat.messages,
           instructions: instructions, context: context, request: request, routing: slugs,
-          images: images, audio: media.audio, reserves: reserves, flag: flag, authority: authority)
+          images: images, media: media.media, reserves: reserves, flag: flag, authority: authority)
         let plans = fitted.plans
         try flag.check()
         try await self.revalidateResponseSources(graph.sources, attachments: attachmentSources, targetID: authority.target?.id)
@@ -917,6 +919,7 @@ struct CompletionSegment {
                 promptDigest: Digest.sha256(plan.rawPrompt), tokenIDs: [], stopReason: "pending",
                 firstTokenSeconds: nil, elapsedSeconds: 0, generationPolicy: runner.generationPolicy)
               let replyID = replyIDs[offset]
+              receipt.media = media.media.isEmpty ? nil : media.media.map(\.reference)
               receipt.attemptID = attemptID; receipt.previousAttemptID = previousAttemptID; receipt.responseID = replyID
               let pendingReceipt = receipt
               try await detachedWork {
@@ -928,7 +931,7 @@ struct CompletionSegment {
                 operationID: flag.operationID, recordID: replyID, attemptID: attemptID,
                 model: provider, seed: seed, requestDigest: Digest.sha256(plan.rawPrompt), maxTokens: outputLimit,
                 generationPolicy: runner.generationPolicy)
-              let result = try await runner.run(plan: plan, images: images, audio: media.audio, maxTokens: outputLimit,
+              let result = try await runner.run(plan: plan, images: images, media: media.media, maxTokens: outputLimit,
                 seed: seed, flag: flag, onCheckpoint: { progress, stop, token in
                   try await checkpointStore.checkpoint(progress, identity: generation, stopReason: stop, stopTokenID: token)
                 }) { [weak self] text in
@@ -1017,7 +1020,7 @@ struct CompletionSegment {
                   let fullContext = [recapturedContext, attachmentText].filter { !$0.isEmpty }.joined(separator: "\n\n")
                   let refreshed = try await runner.fittedRound(voices: [voice], history: fitted.history + round,
                     instructions: instructions, context: fullContext, request: request, routing: slugs,
-                    images: images, reserves: [outputLimit], flag: flag, authority: responseAuthority)
+                    images: images, media: media.media, reserves: [outputLimit], flag: flag, authority: responseAuthority)
                   guard let refreshedPlan = refreshed.plans.first else { throw BoomError.invalid("Missing captured response plan.") }
                   plan = refreshedPlan
                 }
@@ -2120,8 +2123,8 @@ struct CompletionSegment {
             _ = try await MemoryMedia(bytes: bytes).audioReader()
             prepared.coverage = "Original audio waveform available locally"
           } else {
-            _ = try await detachedWork { try await NativeMedia.prepare(data: bytes, name: original.name, audioSeconds: 0, flag: flag) }
-            prepared.coverage = "Four sampled video frames; sound is not represented"
+            let storyboard = try await VideoPreparationCache.shared.prepare(bytes, digest: original.rootDigest, flag: flag)
+            prepared.coverage = storyboard.coverage
           }
         } else { prepared = try await self.preparedRecord(original, data: bytes, automaticAudio: false, flag: flag) }
         prepared.awaitingTranscription = false; prepared.awaitingPreparation = false
@@ -2133,19 +2136,25 @@ struct CompletionSegment {
       self.status = "Audio ready"; self.scheduleSave()
     }
   }
-  func consultationMedia(_ records: [AttachmentRecord], rawAudio: Bool, flag: CancellationFlag) async throws -> (images: [Data], audio: [WritingMediaData]) {
+  func consultationMedia(_ records: [AttachmentRecord], rawAudio: Bool, flag: CancellationFlag) async throws -> (images: [Data], media: [WritingMediaData]) {
     let readable = records.filter { !($0.kind == .audio && !rawAudio) }
     let links = readable.map { "[Attachment: media](boom-attachment:\($0.id))" }.joined(separator: "\n")
     let payloads = try await writingMedia(in: links, flag: flag)
-    let images = payloads.flatMap { $0.reference.kind == "image" ? [$0.bytes] : $0.images }
-    let audio = payloads.filter { $0.reference.kind == "audio" }
+    let media = payloads.filter { $0.reference.kind != "text" }.map { payload in
+      var supplied = payload
+      if !rawAudio && !supplied.audioSegments.isEmpty {
+        supplied.reference.video?.audio = []; supplied.reference.video?.soundtrackOmitted = true
+        supplied.audioSegments = []
+      }
+      return supplied
+    }
     for record in records {
       try flag.check()
       if record.text.isEmpty && ![.image, .audio, .pdf, .video].contains(record.kind) {
         throw BoomError.unavailable("This attachment has no readable local content.")
       }
     }
-    return (images, audio)
+    return ([], media)
   }
   private func preparedRecord(
     _ attachment: AttachmentRecord, data: Data, automaticAudio: Bool, flag: CancellationFlag

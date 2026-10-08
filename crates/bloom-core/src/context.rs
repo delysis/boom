@@ -564,6 +564,7 @@ mod tests {
             text: None,
             source_digest: None,
             frame_digests: None,
+            video: None,
         };
         let link = format!("[Attachment: clip](boom-attachment:{})", media.id);
         let text = format!("{link}z");

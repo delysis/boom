@@ -152,6 +152,7 @@ pub struct MediaReference {
     pub text: Option<String>,
     pub source_digest: Option<String>,
     pub frame_digests: Option<Vec<String>>,
+    pub video: Option<crate::storyboard::Timeline>,
 }
 
 #[derive(Serialize)]
@@ -177,7 +178,7 @@ pub fn compile_media_prompt(text: &str, media: &[MediaReference]) -> Result<Medi
                 && ["image", "audio", "pdf", "video", "text"].contains(&reference.kind.as_str())
                 && if ["pdf", "video"].contains(&reference.kind.as_str()) {
                     reference.frame_digests.as_ref().is_some_and(|frames| {
-                        (1..=8).contains(&frames.len())
+                        (1..=if reference.kind == "video" { 16 } else { 8 }).contains(&frames.len())
                             && frames.iter().all(|digest| {
                                 digest.len() == 64
                                     && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -200,6 +201,13 @@ pub fn compile_media_prompt(text: &str, media: &[MediaReference]) -> Result<Medi
                 },
             "Invalid writing media identity.",
         )?;
+        if let Some(video) = &reference.video {
+            require(
+                reference.kind == "video",
+                "Timeline attached to non-video media.",
+            )?;
+            video.validate(reference.frame_digests.as_ref().map_or(0, Vec::len))?;
+        }
         require(
             media
                 .iter()
@@ -250,6 +258,12 @@ impl MediaReference {
         match self.kind.as_str() {
             "image" => "<|image|>".into(),
             "audio" => "<|audio|>".into(),
+            "video" if self.video.is_some() => self
+                .video
+                .as_ref()
+                .expect("timeline")
+                .prompt_content()
+                .into(),
             "pdf" | "video" => "<|image|>\n"
                 .repeat(self.frame_digests.as_ref().map_or(0, Vec::len))
                 .into(),
@@ -368,6 +382,54 @@ mod tests {
     use super::*;
     use serde_json::json;
     #[test]
+    fn storyboard_sound_is_interleaved_and_invalid_timeline_is_rejected() -> Result<(), Error> {
+        let mut video = MediaReference {
+            id: Uuid::from_u128(4),
+            name: "scene.mp4".into(),
+            root_digest: "a".repeat(64),
+            kind: "video".into(),
+            text: None,
+            source_digest: None,
+            frame_digests: Some(vec!["b".repeat(64), "c".repeat(64)]),
+            video: Some(crate::storyboard::Timeline {
+                duration_ms: 70_000,
+                covered_ms: 60_000,
+                frame_times_ms: vec![0, 5_000],
+                audio: vec![],
+                detected_cuts: 1,
+                omitted_cuts: 0,
+                soundtrack_omitted: false,
+            }),
+        };
+        let source = format!(
+            "👩🏽‍💻\n[Attachment: video](boom-attachment:{})\nContinue:",
+            video.id
+        );
+        assert!(
+            compile_media_prompt(&source, &[video.clone()]).is_err(),
+            "Long visual gap"
+        );
+        let timeline = video.video.as_mut().expect("timeline");
+        timeline.duration_ms = 6_000;
+        timeline.covered_ms = 6_000;
+        timeline.audio = vec![crate::storyboard::AudioSegment {
+            start_ms: 0,
+            end_ms: 6_000,
+            digest: "d".repeat(64),
+        }];
+        let compiled = compile_media_prompt(&source, &[video.clone()])?;
+        assert_eq!(
+            compiled.prompt,
+            "👩🏽‍💻\n[Video 00:00.000]\n<|video|>\n[Video 00:05.000]\n<|video|>\n[Sound 0.000–6.000s]\n<|audio|>\n\nContinue:"
+        );
+        video.video.as_mut().expect("timeline").audio[0].start_ms = 1;
+        assert!(
+            compile_media_prompt(&source, &[video]).is_err(),
+            "Overlapping audio"
+        );
+        Ok(())
+    }
+    #[test]
     fn text_and_sampled_frames_compile_with_captured_content_and_identities() -> Result<(), Error> {
         let text = MediaReference {
             id: Uuid::from_u128(3),
@@ -377,6 +439,7 @@ mod tests {
             text: Some("The café was quiet. 👩‍💻".into()),
             source_digest: Some("b".repeat(64)),
             frame_digests: None,
+            video: None,
         };
         let video = MediaReference {
             id: Uuid::from_u128(4),
@@ -386,6 +449,7 @@ mod tests {
             text: None,
             source_digest: None,
             frame_digests: Some(vec!["d".repeat(64), "e".repeat(64)]),
+            video: None,
         };
         let source = format!(
             "<bos>[Attachment: text](boom-attachment:{})\n[Attachment: video](boom-attachment:{})\nContinue:",
@@ -412,6 +476,7 @@ mod tests {
             text: None,
             source_digest: None,
             frame_digests: None,
+            video: None,
         };
         let b = MediaReference {
             id: Uuid::from_u128(2),
@@ -421,6 +486,7 @@ mod tests {
             text: None,
             source_digest: None,
             frame_digests: None,
+            video: None,
         };
         let image = format!("[Attachment: café](boom-attachment:{})", a.id);
         let audio = format!("[Attachment: audio](boom-attachment:{})", b.id);

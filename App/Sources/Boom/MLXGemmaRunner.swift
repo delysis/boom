@@ -285,34 +285,55 @@ actor MLXGemmaRunner {
     }
     return (prompt, step.testedCandidates)
   }
-  private static func chatInput(_ plan: ConsultationPlan, images: [Data], audio: [WritingMediaData] = [], context: ModelContext) async throws -> LMInput {
-    let media = try images.map { UserInput.Image.ciImage(try LocalImage.decode($0)) }
+  private static func chatInput(_ plan: ConsultationPlan, images: [Data], media: [WritingMediaData] = [], context: ModelContext) async throws -> LMInput {
+    let pictures = images.map { bytes in WritingMediaData(reference: WritingMediaReference(id: UUID(), name: "Image",
+      rootDigest: Digest.sha256(bytes), kind: "image"), bytes: bytes) }
+    let payloads = pictures + media
+    let links = payloads.map { "[Attachment: media](boom-attachment:\($0.reference.id))" }.joined(separator: "\n")
+    let compiled = try RawWritingInput.compiled(links, media: payloads.map(\.reference))
+    let ordered = try compiled.media.map { reference -> WritingMediaData in
+      guard let payload = payloads.first(where: { $0.reference == reference }) else { throw BoomError.invalid("Captured media changed.") }
+      return payload
+    }
     let messages = plan.messages.enumerated().map { index, m -> Chat.Message in
       switch m.role {
       case "system": return .system(m.content)
       case "assistant": return .assistant(m.content)
       default:
-        let last = index == plan.messages.count - 1
-        let markers = last && !audio.isEmpty ? String(repeating: "<|image|>\n", count: images.count) + String(repeating: "<|audio|>\n", count: audio.count) : ""
-        return .user(markers + m.content, images: last && audio.isEmpty ? media : [])
+        guard index == plan.messages.count - 1, !compiled.prompt.isEmpty else { return .user(m.content) }
+        if let sound = compiled.prompt.range(of: "<|audio|>") {
+          // Images precede the question; the first continuous sound window
+          // follows it. Later storyboard windows keep their chronological order.
+          return .user(String(compiled.prompt[..<sound.lowerBound]) + m.content + "\n" + compiled.prompt[sound.lowerBound...])
+        }
+        return .user(compiled.prompt + "\n" + m.content)
       }
     }
     guard !messages.isEmpty else { throw BoomError.invalid("Conversation plan is empty.") }
+    // The template handles roles; the shared raw adapter expands media in the
+    // captured chronological order without decoding/re-encoding token IDs.
+    if !payloads.isEmpty, !(context.model is Gemma4Unified) {
+      guard !payloads.contains(where: { $0.reference.kind == "audio" || !$0.audioSegments.isEmpty }) else { throw BoomError.unavailable("This checkpoint cannot read a video soundtrack.") }
+      let native = try payloads.flatMap { $0.reference.kind == "image" ? [$0.bytes] : $0.images }.map { UserInput.Image.ciImage(try LocalImage.decode($0)) }
+      let plain = plan.messages.enumerated().map { index, m -> Chat.Message in
+        if m.role == "system" { return .system(m.content) }
+        if m.role == "assistant" { return .assistant(m.content) }
+        return .user((index == plan.messages.count - 1 ? compiled.prompt.replacingOccurrences(of: "<|image|>", with: "").replacingOccurrences(of: "<|video|>", with: "") + "\n" : "") + m.content, images: index == plan.messages.count - 1 ? native : [])
+      }
+      return try await context.processor.prepare(input: UserInput(chat: plain, additionalContext: ["enable_thinking": false]))
+    }
     let input = try await context.processor.prepare(input: UserInput(chat: messages,
       additionalContext: ["enable_thinking": false]))
-    guard !audio.isEmpty else { return input }
-    let pictures = images.map { bytes in WritingMediaData(reference: WritingMediaReference(id: UUID(), name: "Image",
-      rootDigest: Digest.sha256(bytes), kind: "image"), bytes: bytes) }
-    return try RawWritingInput.prepare(tokens: input.text.tokens.asArray(Int.self), media: pictures + audio, context: context)
+    return try RawWritingInput.prepare(tokens: input.text.tokens.asArray(Int.self), media: ordered, context: context)
   }
-  func preflight(_ plan: ConsultationPlan, images: [Data], audio: [WritingMediaData] = [], maxTokens: Int, flag: CancellationFlag) async throws -> Int {
+  func preflight(_ plan: ConsultationPlan, images: [Data], media: [WritingMediaData] = [], maxTokens: Int, flag: CancellationFlag) async throws -> Int {
     // Preparing media creates MLX arrays too. It shares the same GPU lease as
     // loading and decoding, and must preempt background autocomplete.
     await GenerationCoordinator.shared.enter(flag: flag)
     do {
       try flag.check()
       let count = try await container.perform { context in
-        let input = try await Self.chatInput(plan, images: images, audio: audio, context: context)
+        let input = try await Self.chatInput(plan, images: images, media: media, context: context)
         return input.text.tokens.size
       }
       guard count + maxTokens <= (try availableContext()) else {
@@ -324,7 +345,7 @@ actor MLXGemmaRunner {
     } catch { await GenerationCoordinator.shared.leave(); throw error }
   }
   func fittedRound(voices: [Voice?], history: [ChatMessage], instructions: String, context: String,
-    request: String, routing: [String], images: [Data], audio: [WritingMediaData] = [], reserves: [Int], flag: CancellationFlag,
+    request: String, routing: [String], images: [Data], media: [WritingMediaData] = [], reserves: [Int], flag: CancellationFlag,
     authority: CapturedDocumentAuthority = .readOnly
   ) async throws -> (plans: [ConsultationPlan], history: [ChatMessage], omittedHistory: Int) {
     guard voices.count == reserves.count else { throw BoomError.invalid("Every participant needs an output reservation.") }
@@ -336,7 +357,7 @@ actor MLXGemmaRunner {
         instructions: instructions, context: context, request: request, routing: routing, authority: authority)
       do {
         for (plan, reserve) in zip(plans, reserves) {
-          _ = try await preflight(plan, images: images, audio: audio, maxTokens: reserve, flag: flag)
+          _ = try await preflight(plan, images: images, media: media, maxTokens: reserve, flag: flag)
         }
         // Every participant receives this exact captured history suffix.
         return (plans, retained, originalCount - retained.count)
@@ -359,12 +380,12 @@ actor MLXGemmaRunner {
       generationPolicy: generationPolicy, sourcePrompt: compiled.media.isEmpty ? nil : selected.prompt,
       media: compiled.media.isEmpty ? nil : compiled.media)
   }
-  func run(plan: ConsultationPlan, images: [Data], audio: [WritingMediaData] = [], maxTokens: Int, seed: UInt64? = nil,
+  func run(plan: ConsultationPlan, images: [Data], media: [WritingMediaData] = [], maxTokens: Int, seed: UInt64? = nil,
     flag: CancellationFlag,
     onPrefill: (@Sendable (PrefillProgress) -> Void)? = nil,
     onCheckpoint: (@Sendable (GenerationProgress, String?, Int?) async throws -> Void)? = nil,
     onText: @escaping @Sendable (String) -> Void) async throws -> Output {
-    try await generate(plan: plan, raw: nil, images: images, media: audio, maxTokens: maxTokens,
+    try await generate(plan: plan, raw: nil, images: images, media: media, maxTokens: maxTokens,
       settings: ProductCore.sampling(.standard), seed: seed, flag: flag, onPrefill: onPrefill,
       onCheckpoint: onCheckpoint, onText: onText)
   }
@@ -591,7 +612,7 @@ actor MLXGemmaRunner {
       try await InferenceExecutor.shared.perform { _ in
         defer { Stream.defaultStream.synchronize() }
         let input: LMInput
-        if let plan { input = try await Self.chatInput(plan, images: images, audio: media, context: context) }
+        if let plan { input = try await Self.chatInput(plan, images: images, media: media, context: context) }
         else if let raw { input = try RawWritingInput.prepare(raw, media: media, context: context) }
         else { throw BoomError.invalid("No compiled model input.") }
         let promptIDs = input.text.tokens.asArray(Int.self)

@@ -89,6 +89,49 @@ final class MemoryMedia: NSObject, AVAssetResourceLoaderDelegate, @unchecked Sen
     guard reader.startReading() else { throw reader.error ?? BoomError.invalid("Audio decoder did not start.") }
     return MemoryAudioReader(owner: self, reader: reader, output: output, duration: duration)
   }
+
+  /// Video sound is placed by presentation time, not concatenated packet order.
+  /// Track offsets and silent gaps remain silence at their original positions.
+  func timedWaveform(endMs: UInt64, flag: CancellationFlag) async throws -> [Float] {
+    guard endMs > 0, endMs <= 60_000,
+      let track = try await asset.loadTracks(withMediaType: .audio).first else { throw BoomError.invalid("Invalid video soundtrack range.") }
+    let reader = try AVAssetReader(asset: asset)
+    reader.timeRange = CMTimeRange(start: .zero, duration: CMTime(value: Int64(endMs), timescale: 1000))
+    let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+      AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 16_000, AVNumberOfChannelsKey: 1,
+      AVLinearPCMBitDepthKey: 32, AVLinearPCMIsFloatKey: true, AVLinearPCMIsBigEndianKey: false,
+      AVLinearPCMIsNonInterleaved: false,
+    ])
+    output.alwaysCopiesSampleData = false
+    guard reader.canAdd(output) else { throw BoomError.invalid("Video soundtrack cannot be decoded.") }
+    reader.add(output)
+    guard reader.startReading() else { throw reader.error ?? BoomError.invalid("Video soundtrack did not start.") }
+    // AVAssetReader is not Sendable. Keep reads and cancellation on this
+    // consumer; the flag is checked at each memory-backed PCM packet boundary.
+    defer { reader.cancelReading(); withExtendedLifetime(self) {} }
+    var samples = [Float](repeating: 0, count: Int(endMs) * 16), lastStart = Int.min, decoded = false
+    while let buffer = output.copyNextSampleBuffer() {
+      try flag.check(); try Task.checkCancellation()
+      let time = CMSampleBufferGetPresentationTimeStamp(buffer).seconds
+      guard time.isFinite, abs(time) < 7201, let block = CMSampleBufferGetDataBuffer(buffer) else { throw BoomError.invalid("Video soundtrack timestamp is invalid.") }
+      let start = Int((time * 16_000).rounded()), length = CMBlockBufferGetDataLength(block)
+      guard start >= lastStart, length > 0, length % 4 == 0, length <= 4_194_304 else { throw BoomError.invalid("Invalid video soundtrack packet.") }
+      lastStart = start
+      var bytes = Data(count: length)
+      let status = bytes.withUnsafeMutableBytes { CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: $0.baseAddress!) }
+      guard status == kCMBlockBufferNoErr else { throw BoomError.invalid("Video soundtrack packet cannot be read.") }
+      try bytes.withUnsafeBytes { raw in
+        for i in 0..<length / 4 {
+          let value = raw.loadUnaligned(fromByteOffset: i * 4, as: Float.self)
+          guard value.isFinite else { throw BoomError.invalid("Video soundtrack contains nonfinite samples.") }
+          if samples.indices.contains(start + i) { samples[start + i] = value; decoded = true }
+        }
+      }
+    }
+    try flag.check()
+    guard reader.status != .failed, decoded else { throw reader.error ?? BoomError.invalid("Video soundtrack decoding failed.") }
+    return samples
+  }
 }
 
 /// Decode one bounded recognition segment at a time, retaining the memory URL owner.

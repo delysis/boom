@@ -16,6 +16,7 @@ struct WritingMediaReference: Codable, Equatable, Sendable {
   var text: String? = nil
   var sourceDigest: String? = nil
   var frameDigests: [String]? = nil
+  var video: VideoTimeline? = nil
   var source: SourceReference { SourceReference(id: id, title: name, digest: sourceDigest ?? rootDigest,
     kind: kind == "text" ? "attachment" : "media") }
 }
@@ -24,6 +25,7 @@ struct WritingMediaData: Sendable {
   let bytes: Data
   var samples: [Float] = []
   var images: [Data] = []
+  var audioSegments: [[Float]] = []
 }
 struct CompiledMediaPrompt: Decodable {
   let prompt: String
@@ -50,18 +52,45 @@ enum RawWritingInput {
     let config = model.config
     let images = try media.flatMap { payload -> [CIImage] in
       if payload.reference.kind == "image" { return [try LocalImage.decode(payload.bytes)] }
-      if ["pdf", "video"].contains(payload.reference.kind) {
+      if payload.reference.kind == "pdf" || payload.reference.kind == "video" && payload.reference.video == nil {
         guard payload.reference.frameDigests == payload.images.map(Digest.sha256) else { throw BoomError.invalid("Rendered media frames changed.") }
         return try payload.images.map(LocalImage.decode)
       }
       return []
     }
-    let audio = media.filter { $0.reference.kind == "audio" }
+    let videos = try media.filter { $0.reference.kind == "video" && $0.reference.video != nil }.flatMap { payload -> [CIImage] in
+      guard payload.reference.frameDigests == payload.images.map(Digest.sha256) else { throw BoomError.invalid("Storyboard frames changed.") }
+      return try payload.images.map(LocalImage.decode)
+    }
+    let audio = try media.flatMap { payload -> [[Float]] in
+      if payload.reference.kind == "audio" { return [payload.samples] }
+      guard payload.reference.kind == "video", let timeline = payload.reference.video else { return [] }
+      guard timeline.audio.count == payload.audioSegments.count else { throw BoomError.invalid("Soundtrack segment count changed.") }
+      for (segment, samples) in zip(timeline.audio, payload.audioSegments) {
+        guard samples.count == Int(segment.endMs - segment.startMs) * 16,
+          NativeStoryboard.waveformDigest(samples) == segment.digest else { throw BoomError.invalid("Soundtrack samples changed.") }
+      }
+      return payload.audioSegments
+    }
     var processedImage: LMInput.ProcessedImage?, imageCounts: [Int] = []
     if !images.isEmpty {
       let prepared = try processor.preprocess(images: images, processing: nil)
       processedImage = LMInput.ProcessedImage(pixels: prepared.pixels, positionIds: prepared.positionIds, frames: prepared.frames)
       imageCounts = prepared.tokenCounts
+    }
+    var processedVideo: LMInput.ProcessedVideo?, videoCounts: [Int] = []
+    if !videos.isEmpty {
+      guard case .directory(let directory) = context.configuration.id else { throw BoomError.invalid("Video processor is not local.") }
+      let bytes = try Data(contentsOf: directory.appendingPathComponent("processor_config.json"))
+      guard bytes.count <= 1_048_576, var configuration = try JSONSerialization.jsonObject(with: bytes) as? [String: Any] else { throw BoomError.invalid("Video processor configuration changed.") }
+      // Preserve every normalization/patch setting from the verified pack; only
+      // the official video visual budget differs from ordinary still images.
+      configuration["max_soft_tokens"] = 70
+      let videoProcessor = Gemma4UnifiedProcessor(try JSONDecoder().decode(Gemma4UnifiedProcessorConfiguration.self,
+        from: JSONSerialization.data(withJSONObject: configuration)), tokenizer: context.tokenizer)
+      let prepared = try videoProcessor.preprocess(images: videos, processing: nil)
+      processedVideo = LMInput.ProcessedVideo(pixels: prepared.pixels, positionIds: prepared.positionIds, frames: prepared.frames)
+      videoCounts = prepared.tokenCounts
     }
     var processedAudio: LMInput.ProcessedAudio?, audioCounts: [Int] = []
     if !audio.isEmpty {
@@ -72,27 +101,31 @@ enum RawWritingInput {
       guard width > 0, width == configuration.outputProjectionDimensions else { throw BoomError.invalid("Unsupported audio frame geometry.") }
       var features: [Float] = []
       for clip in audio {
-        guard !clip.samples.isEmpty, clip.samples.allSatisfy(\.isFinite) else { throw BoomError.invalid("Audio input is empty or nonfinite.") }
-        let count = (clip.samples.count + width - 1) / width
-        audioCounts.append(count); features.append(contentsOf: clip.samples)
-        features.append(contentsOf: repeatElement(0, count: count * width - clip.samples.count))
+        guard !clip.isEmpty, clip.allSatisfy(\.isFinite) else { throw BoomError.invalid("Audio input is empty or nonfinite.") }
+        let count = (clip.count + width - 1) / width
+        audioCounts.append(count); features.append(contentsOf: clip)
+        features.append(contentsOf: repeatElement(0, count: count * width - clip.count))
       }
       processedAudio = LMInput.ProcessedAudio(features: MLXArray(features, [1, audioCounts.reduce(0, +), width]))
     }
-    var tokens: [Int] = [], imageIndex = 0, audioIndex = 0
+    var tokens: [Int] = [], imageIndex = 0, audioIndex = 0, videoIndex = 0
     for token in encoded {
       if token == config.imageTokenId {
         guard imageCounts.indices.contains(imageIndex) else { throw BoomError.invalid("Image placeholder count changed.") }
         tokens.append(config.boiTokenId); tokens.append(contentsOf: repeatElement(token, count: imageCounts[imageIndex]))
         if let end = config.eoiTokenId { tokens.append(end) }; imageIndex += 1
+      } else if token == config.videoTokenId {
+        guard videoCounts.indices.contains(videoIndex) else { throw BoomError.invalid("Video placeholder count changed.") }
+        tokens.append(config.boiTokenId); tokens.append(contentsOf: repeatElement(token, count: videoCounts[videoIndex]))
+        if let end = config.eoiTokenId { tokens.append(end) }; videoIndex += 1
       } else if token == config.audioTokenId {
         guard audioCounts.indices.contains(audioIndex) else { throw BoomError.invalid("Audio placeholder count changed.") }
         tokens.append(config.boaTokenId); tokens.append(contentsOf: repeatElement(token, count: audioCounts[audioIndex]))
         if let end = config.eoaTokenId { tokens.append(end) }; audioIndex += 1
       } else { tokens.append(token) }
     }
-    guard imageIndex == imageCounts.count, audioIndex == audioCounts.count else { throw BoomError.invalid("Media was not represented in the captured prompt.") }
-    return LMInput(text: .init(tokens: MLXArray(tokens).expandedDimensions(axis: 0)), image: processedImage, audio: processedAudio)
+    guard imageIndex == imageCounts.count, audioIndex == audioCounts.count, videoIndex == videoCounts.count else { throw BoomError.invalid("Media was not represented in the captured prompt.") }
+    return LMInput(text: .init(tokens: MLXArray(tokens).expandedDimensions(axis: 0)), image: processedImage, video: processedVideo, audio: processedAudio)
   }
 }
 
@@ -130,11 +163,9 @@ extension WorkspaceModel {
         if ["pdf", "video"].contains(kind) {
           if kind == "pdf" { payload.images = try NativePDF.pages(bytes, flag: flag) }
           else {
-            guard case .video(let frames, _) = try await NativeMedia.prepare(data: bytes, name: record.name, audioSeconds: 0, flag: flag) else { throw BoomError.unavailable("Video frames unavailable.") }
-            payload.images = try frames.map { frame in
-              guard let png = NSBitmapImageRep(cgImage: frame.image).representation(using: .png, properties: [:]) else { throw BoomError.invalid("Video frame cannot be decoded.") }
-              return png
-            }
+            let storyboard = try await VideoPreparationCache.shared.prepare(bytes, digest: record.rootDigest, flag: flag)
+            payload.reference.video = storyboard.timeline; payload.audioSegments = storyboard.sound
+            payload.images = storyboard.images
           }
           payload.reference.frameDigests = payload.images.map(Digest.sha256)
         }

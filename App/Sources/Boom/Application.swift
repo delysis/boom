@@ -15,6 +15,14 @@ import SwiftUI
 
 @main @MainActor enum BoomMain {
   static func main() {
+    if CommandLine.arguments.contains("--video-storyboard-smoke") {
+      let app = NSApplication.shared; app.setActivationPolicy(.prohibited)
+      Task {
+        do { try await VideoStoryboardSmoke.run(arguments: CommandLine.arguments); exit(0) }
+        catch { fputs("Public storyboard controls failed: \(error.localizedDescription)\n", stderr); exit(1) }
+      }
+      app.run(); return
+    }
     if CommandLine.arguments.contains("--attachment-qualification-smoke") {
       let app = NSApplication.shared; app.setActivationPolicy(.prohibited)
       Task {

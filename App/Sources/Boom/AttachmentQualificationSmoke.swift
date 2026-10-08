@@ -137,8 +137,8 @@ import SwiftUI
         let native = try await model.consultationMedia([record],rawAudio:true,flag:CancellationFlag())
         let context = record.text.isEmpty ? record.coverage : record.text
         let plan = try ProductCore.prompt(voice:nil,history:[],instructions:"",context:context,request:"Describe the attachment briefly.",routing:[])
-        _ = try await assistant.preflight(plan,images:native.images,audio:native.audio,maxTokens:8,flag:CancellationFlag())
-        rows[index].consultation = try await assistant.run(plan:plan,images:native.images,audio:native.audio,maxTokens:8,seed:73,flag:CancellationFlag(),onText:{ _ in })
+        _ = try await assistant.preflight(plan,images:native.images,media:native.media,maxTokens:8,flag:CancellationFlag())
+        rows[index].consultation = try await assistant.run(plan:plan,images:native.images,media:native.media,maxTokens:8,seed:73,flag:CancellationFlag(),onText:{ _ in })
       } catch { rows[index].issue = error.localizedDescription }
       try save()
     }

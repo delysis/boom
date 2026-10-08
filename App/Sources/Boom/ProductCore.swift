@@ -439,6 +439,7 @@ struct ConsultationReceipt: Codable, Sendable {
   var attemptID: UUID? = nil
   var previousAttemptID: UUID? = nil
   var responseID: UUID? = nil
+  var media: [WritingMediaReference]? = nil
 }
 
 struct WritingPrompt: Codable { let prompt: String; let digest: String; let totalCharacters: Int; let omittedCharacters: Int }

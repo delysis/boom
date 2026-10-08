@@ -25,6 +25,7 @@ mod restore;
 mod sampling_policy;
 mod search;
 mod setup;
+mod storyboard;
 mod writing;
 
 pub use media::{MediaContainer, admit_media, caf_wave};
@@ -775,6 +776,13 @@ pub enum Request {
     MediaSpans {
         text: String,
     },
+    StoryboardScan {
+        duration_ms: u64,
+    },
+    SelectStoryboard {
+        duration_ms: u64,
+        probes: Vec<storyboard::Probe>,
+    },
     CompileMediaPrompt {
         text: String,
         media: Vec<writing::MediaReference>,
@@ -1047,6 +1055,13 @@ pub fn execute(request: Request) -> Result<Value, Error> {
         Request::Search { text, query } => serde_json::to_value(search::search(&text, &query)?),
         Request::MarkdownSpans { text } => serde_json::to_value(markdown::spans(&text)?),
         Request::MediaSpans { text } => serde_json::to_value(markdown::media_spans(&text)?),
+        Request::StoryboardScan { duration_ms } => {
+            serde_json::to_value(storyboard::scan_plan(duration_ms)?)
+        }
+        Request::SelectStoryboard {
+            duration_ms,
+            probes,
+        } => serde_json::to_value(storyboard::select(duration_ms, &probes)?),
         Request::CompileMediaPrompt { text, media } => {
             serde_json::to_value(writing::compile_media_prompt(&text, &media)?)
         }

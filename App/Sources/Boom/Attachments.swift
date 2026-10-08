@@ -302,25 +302,7 @@ enum NativeMedia {
         "No supported native transform. Use canonical text or a supported image, WAV/AIFF/FLAC/MP3 audio, or self-contained MP4 video. The original and processing receipt remain available."
       )
     }
-    let asset = media.asset
-    do {
-      defer { withExtendedLifetime(media) {} }
-      let duration = try await asset.load(.duration).seconds
-      try ProductCore.mediaDuration(duration)
-      let generator = AVAssetImageGenerator(asset: asset)
-      generator.appliesPreferredTrackTransform = true
-      generator.maximumSize = CGSize(width: 1600, height: 1600)
-      var frames: [NativeFrame] = []
-      for i in 0..<4 {
-        try flag.check()
-        let seconds = min(max(0, duration - 0.05), duration * Double(i) / 4)
-        let frame = try await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 600))
-        frames.append(NativeFrame(seconds: frame.actualTime.seconds, image: frame.image))
-      }
-      return .video(
-        frames,
-        "Four sampled still frames from a \(String(format:"%.1f",duration))-second MP4. No audio or continuous motion was analyzed; descriptions are machine-generated and partial."
-      )
-    }
+    let storyboard = try await NativeStoryboard.prepare(data, flag: flag)
+    return .video(storyboard.frames, storyboard.coverage)
   }
 }

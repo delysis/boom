@@ -4,3 +4,6 @@ App/Tests/BoomTests/Fixtures/Attachments/* -text
 App/Tests/BoomTests/Fixtures/Attachments/*.png binary
 App/Tests/BoomTests/Fixtures/Attachments/*.pdf binary
 App/Tests/BoomTests/Fixtures/Attachments/*.bin binary
+
+App/Tests/BoomTests/Fixtures/Storyboard/*.mp4 binary
+App/Tests/BoomTests/Fixtures/Storyboard/*.wav binary
