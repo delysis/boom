@@ -121,15 +121,14 @@ fn is_windows_device_name(component: &str) -> bool {
         .split('.')
         .next()
         .unwrap_or_default()
-        .trim_end_matches([' ', '.'])
-        .to_ascii_uppercase();
-    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || stem
-            .strip_prefix("COM")
-            .or_else(|| stem.strip_prefix("LPT"))
-            .is_some_and(|number| {
-                number.len() == 1 && number.as_bytes()[0].is_ascii_digit() && number != "0"
-            })
+        .trim_end_matches([' ', '.']);
+    let bytes = stem.as_bytes();
+    ["CON", "PRN", "AUX", "NUL"]
+        .iter()
+        .any(|name| stem.eq_ignore_ascii_case(name))
+        || (bytes.len() == 4
+            && matches!(bytes[3], b'1'..=b'9')
+            && (bytes[..3].eq_ignore_ascii_case(b"COM") || bytes[..3].eq_ignore_ascii_case(b"LPT")))
 }
 
 #[cfg(test)]
@@ -158,5 +157,84 @@ mod tests {
                 .expect("name policy should complete");
             assert!(!result.accepted);
         }
+    }
+
+    // Retain the previous predicate as a differential oracle, not production code.
+    fn original_device_name(component: &str) -> bool {
+        let stem = component
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches([' ', '.'])
+            .to_ascii_uppercase();
+        matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || stem
+                .strip_prefix("COM")
+                .or_else(|| stem.strip_prefix("LPT"))
+                .is_some_and(|number| {
+                    number.len() == 1 && number.as_bytes()[0].is_ascii_digit() && number != "0"
+                })
+    }
+
+    #[test]
+    fn device_name_predicate_preserves_ascii_cases_and_suffixes() {
+        for root in ["CON", "PRN", "AUX", "NUL", "COM", "LPT"] {
+            for mask in 0..8 {
+                let spelling: String = root
+                    .bytes()
+                    .enumerate()
+                    .map(|(index, byte)| {
+                        char::from(if mask & (1 << index) == 0 {
+                            byte
+                        } else {
+                            byte.to_ascii_lowercase()
+                        })
+                    })
+                    .collect();
+                for suffix in ["", "0", "1", "9", "10", "1.txt", " .txt", "¹", "é", "\0"] {
+                    let name = format!("{spelling}{suffix}");
+                    assert_eq!(
+                        is_windows_device_name(&name),
+                        original_device_name(&name),
+                        "{name:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn device_name_predicate_preserves_short_ascii_and_unicode_negatives() {
+        for first in 0_u8..=127 {
+            for second in 0_u8..=127 {
+                let name = String::from_utf8(vec![first, second]).expect("ASCII fixture");
+                assert_eq!(
+                    is_windows_device_name(&name),
+                    original_device_name(&name),
+                    "{name:?}"
+                );
+            }
+        }
+        for name in [
+            "",
+            "ordinary",
+            "ＣＯＮ",
+            "COM¹",
+            "LPT²",
+            "cön",
+            "NUL🌱",
+            "con...",
+            "com1 ",
+        ] {
+            assert_eq!(
+                is_windows_device_name(name),
+                original_device_name(name),
+                "{name:?}"
+            );
+        }
+        assert!(
+            !is_windows_device_name("COM¹"),
+            "This refactor does not expand the policy."
+        );
     }
 }

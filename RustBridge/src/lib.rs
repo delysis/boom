@@ -225,7 +225,7 @@ pub unsafe extern "C" fn boom_attachment_inspect(
 }
 
 /// # Safety
-/// `buffer` must be an as-yet-unfreed value returned by boom_attachment_inspect.
+/// `buffer` must be an as-yet-unfreed value returned by one of this module's C entry points.
 #[no_mangle]
 pub unsafe extern "C" fn boom_attachment_free(buffer: BoomAttachmentBuffer) {
     if !buffer.data.is_null() {

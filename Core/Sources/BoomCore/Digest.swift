@@ -71,6 +71,9 @@ public enum Digest {
     }
     return h.map { String(format: "%08x", $0) }.joined()
   }
+  /// Local Swift JSON identity encoding: sorted keys, unescaped slashes and
+  /// otherwise JSONEncoder defaults. This is not a cross-language canonical
+  /// JSON format; persisted identities must retain these encoding semantics.
   public static func canonical<T: Encodable>(_ value: T) throws -> Data {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]

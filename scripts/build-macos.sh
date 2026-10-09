@@ -78,7 +78,7 @@ cp "$OUT/source-files.sha256" "$OUT/dependency-locks.sha256" "$APP/Contents/Reso
 cp "$HERE/LICENSE" "$HERE/NOTICE.md" "$APP/Contents/Resources/"
 # Inventory only resolved package sources, never the developer's entire Cargo cache.
 (cd "$HERE" && cargo metadata --locked --format-version 1) > "$OUT/cargo-metadata.json"
-swift "$HERE/scripts/collect-notices.swift" "$HERE" "$OUT/cargo-metadata.json" "$APP/Contents/Resources/ThirdPartyNotices" "$OUT/license-inventory.json"
+swift "$HERE/scripts/collect-notices.swift" "$HERE" "$OUT/cargo-metadata.json" "$APP/Contents/Resources/ThirdPartyNotices" "$OUT/license-inventory.json" "$MLX_RUNTIME"
 # Review the exact lockfiles, missing notices, and license eligibility before distribution.
 cp "$HERE/Cargo.lock" "$OUT/Cargo.lock"
 cp "$HERE/App/Package.resolved" "$OUT/Package.resolved"

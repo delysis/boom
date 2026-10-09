@@ -24,21 +24,20 @@ struct ImportedDirectoryRows: View {
       return (document, file)
     }.sorted { $0.1.path < $1.1.path }
   }
-  private var folders: [String] {
-    Array(Set(entries.compactMap { _, file in
+  var body: some View {
+    let items = entries
+    let folders = Array(Set(items.compactMap { _, file -> String? in
       let remaining = file.path.dropFirst(prefix.count)
       guard let slash = remaining.firstIndex(of: "/") else { return nil }
       return String(remaining[..<slash])
     })).sorted()
-  }
-  var body: some View {
     VStack(alignment: .leading, spacing: 4) {
       ForEach(folders, id: \.self) { name in
         DisclosureGroup(name, isExpanded: Binding(get: { !model.librarySearch.isEmpty || expanded.contains(name) }, set: { value in if value { expanded.insert(name) } else { expanded.remove(name) } })) {
           AnyView(ImportedDirectoryRows(model: model, folderID: folderID, prefix: prefix + name + "/"))
         }
       }
-      ForEach(entries.filter { !$0.1.path.dropFirst(prefix.count).contains("/") }, id: \.0.id) { document, _ in
+      ForEach(items.filter { !$0.1.path.dropFirst(prefix.count).contains("/") }, id: \.0.id) { document, _ in
         Button { model.selectDocument(document.id) } label: {
           Label(document.title, systemImage: "doc.text").lineLimit(1)
             .frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 6).padding(.horizontal, 7)

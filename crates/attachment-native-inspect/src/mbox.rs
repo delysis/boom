@@ -6,14 +6,18 @@ impl InspectionState {
     pub(super) fn expand_mbox(&mut self, parent: &ObjectId, depth: u16, bytes: &[u8]) {
         // Count before parsing: do not allocate an attacker-selected subset of
         // a mailbox which cannot fit the remaining entry/edge budget.
+        let limit = self
+            .budget
+            .remaining_entries()
+            .min(self.budget.remaining_edges()) as usize;
         let count = bytes
             .split(|b| *b == b'\n')
             .filter(|line| line.starts_with(b"From "))
+            // One excess member establishes rejection; its tail cannot alter
+            // the outcome or budget charges. Saturate for 32-bit platforms.
+            .take(limit.saturating_add(1))
             .count();
-        if count == 0
-            || count > self.budget.remaining_entries() as usize
-            || count > self.budget.remaining_edges() as usize
-        {
+        if count == 0 || count > limit {
             self.issue(
                 "mbox_entry_limit",
                 IssueClass::Budget,
