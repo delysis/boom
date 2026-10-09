@@ -11,9 +11,18 @@ enum BoomChrome {
     }
   }
   static let sidebarBackground = color(dark: (0.16, 0.16, 0.16), light: (0.96, 0.945, 0.92))
-  static let canvasBackground = color(dark: (0.14, 0.14, 0.14), light: (0.955, 0.945, 0.928))
-  static let paperBackground = color(dark: (0.15, 0.15, 0.15), light: (1, 1, 1))
+  static let documentBackground = color(dark: (0.15, 0.15, 0.15), light: (1, 1, 1))
   static let inputBackground = color(dark: (0.125, 0.125, 0.125), light: (1, 1, 1))
+}
+
+/// Shared pane edges and control geometry. Keep native text insets separate:
+/// they belong to TextKit, rather than an overlay or a toolbar offset.
+enum WorkspaceGeometry {
+  static let paneInset: CGFloat = 12
+  static let inputInset: CGFloat = 12
+  static let controlSize: CGFloat = 24
+  static let headerHeight: CGFloat = 24
+  static let proseMaximumWidth: CGFloat = 760
 }
 
 struct WorkspaceView: View {
@@ -58,18 +67,17 @@ struct ManuscriptPane: View {
     GeometryReader { pane in
       VStack(spacing: 0) {
         if let document = model.selectedDocument {
-          ScrollView(.vertical) {
-            let width = min(760, max(1, pane.size.width - 40))
-            MarkdownEditor(model: model, document: document,
-              minimumHeight: max(180, pane.size.height - 48 -
-                (model.showingCandidates && model.candidates != nil ? 300 : 0)))
-            .frame(width: width)
-            .background(Color(nsColor: BoomChrome.paperBackground))
-            .padding(.vertical, 24)
-            .frame(maxWidth: .infinity)
+          GeometryReader { viewport in
+            ScrollView(.vertical) {
+              let width = min(WorkspaceGeometry.proseMaximumWidth, max(1, viewport.size.width))
+              MarkdownEditor(model: model, document: document,
+                minimumHeight: max(1, viewport.size.height))
+              .frame(width: width)
+              .frame(maxWidth: .infinity)
+            }
           }
         } else {
-          Text("Import a document or create a new one").foregroundStyle(.secondary)
+          Color.clear.accessibilityLabel("No document selected")
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         if let issue = model.writingIssue {
@@ -80,7 +88,7 @@ struct ManuscriptPane: View {
             .background(Color(nsColor: BoomChrome.sidebarBackground))
         }
       }
-    }.background(Color(nsColor: BoomChrome.canvasBackground))
+    }.background(Color(nsColor: BoomChrome.documentBackground))
   }
 }
 
@@ -105,11 +113,17 @@ struct LibraryView: View {
         .foregroundStyle(.tertiary)
       Spacer()
       if let add {
-        Button(action: add) { Image(systemName: "plus") }
+        Button(action: add) {
+          Image(systemName: "plus")
+            .frame(width: WorkspaceGeometry.controlSize, height: WorkspaceGeometry.controlSize)
+            .contentShape(Rectangle())
+        }
           .buttonStyle(.plain).font(.system(size: 11, weight: .medium))
           .foregroundStyle(.secondary).accessibilityLabel("New \(title.dropLast())")
       }
-    }.padding(.horizontal, 14).padding(.top, 18).padding(.bottom, 7)
+    }.frame(height: WorkspaceGeometry.headerHeight)
+      .padding(.horizontal, WorkspaceGeometry.paneInset)
+      .padding(.top, WorkspaceGeometry.paneInset).padding(.bottom, 8)
   }
   private func row(_ title: String, symbol: String, selected: Bool) -> some View {
     HStack(spacing: 10) {
@@ -118,7 +132,7 @@ struct LibraryView: View {
       Text(title).font(.system(size: 13)).lineLimit(1)
       Spacer(minLength: 0)
     }
-    .padding(.horizontal, 11).padding(.vertical, 8)
+    .padding(8)
     .frame(maxWidth: .infinity, alignment: .leading)
     .background(selected ? Color.primary.opacity(0.075) : .clear,
       in: RoundedRectangle(cornerRadius: 7))
@@ -139,10 +153,10 @@ struct LibraryView: View {
       Spacer(minLength: 0)
     }
     .font(.system(size: 13))
-    .padding(.horizontal, 11).padding(.vertical, 8)
+    .padding(8)
     .frame(maxWidth: .infinity, alignment: .leading)
     .background(Color.primary.opacity(0.075), in: RoundedRectangle(cornerRadius: 7))
-    .padding(.horizontal, 7)
+    .padding(.horizontal, 4)
   }
   private func beginRename(_ target: RenameTarget, title: String) {
     if renameTarget != nil { commitRename() }
@@ -222,7 +236,7 @@ struct LibraryView: View {
                 Button { chooseDocument(document.id) } label: {
                   row(document.title, symbol: "doc.text",
                     selected: model.showsDocument && model.selectedDocumentIDs.contains(document.id))
-                }.buttonStyle(.plain).padding(.horizontal, 7)
+                }.buttonStyle(.plain).padding(.horizontal, 4)
               }
             }
               .contextMenu {
@@ -252,7 +266,7 @@ struct LibraryView: View {
           }
           Button { model.importFolder() } label: {
             row("Import folder…", symbol: "folder.badge.plus", selected: false)
-          }.buttonStyle(.plain).padding(.horizontal, 7).disabled(model.isBusy)
+          }.buttonStyle(.plain).padding(.horizontal, 4).disabled(model.isBusy)
           } else {
           heading("Chats") {
             do { try model.newChat() } catch { model.report(error) }
@@ -265,7 +279,7 @@ struct LibraryView: View {
                 Button { chooseChat(chat.id) } label: {
                   row(chat.title, symbol: "bubble.left",
                     selected: model.showsChat && model.selectedChatIDs.contains(chat.id))
-                }.buttonStyle(.plain).padding(.horizontal, 7)
+                }.buttonStyle(.plain).padding(.horizontal, 4)
               }
             }
               .contextMenu {
@@ -290,7 +304,7 @@ struct LibraryView: View {
                 Button { model.editVoice(voice) } label: {
                   row(voice.name + " · @" + voice.slug, symbol: "pin",
                     selected: model.showsChat && model.state.selectedChat == voice.id)
-                }.buttonStyle(.plain).padding(.horizontal, 7)
+                }.buttonStyle(.plain).padding(.horizontal, 4)
               }
             }.contextMenu {
               Button("Consult @" + voice.slug) { model.consultVoice(voice) }
@@ -314,6 +328,7 @@ struct ChatPane: View {
   @ObservedObject var model: WorkspaceModel
   @StateObject private var voice = VoiceInput()
   @State private var composerFocusRequest = 0
+  @State private var composerHeight: CGFloat = 36
   @State private var voiceChatID: UUID?
   @State private var voiceDocumentID: UUID?
   @State private var voiceDraft = ""
@@ -359,7 +374,8 @@ struct ChatPane: View {
       Button("Choose files…") { model.chooseChatAttachmentFiles() }
       Button("Paste image") { model.pasteImageIntoCurrentChat() }
     } label: {
-      Image(systemName: "paperclip").frame(width: 22, height: 22)
+      Image(systemName: "paperclip")
+        .frame(width: WorkspaceGeometry.controlSize, height: WorkspaceGeometry.controlSize)
     }.menuStyle(.borderlessButton).fixedSize().disabled(model.isBusy)
       .accessibilityLabel("Attach files or paste an image")
   }
@@ -378,7 +394,7 @@ struct ChatPane: View {
   private var recordingButton: some View {
     Button { toggleVoice(.recording) } label: {
       Image(systemName: voice.purpose == .recording ? "stop.circle.fill" : "waveform")
-        .frame(width: 22, height: 22)
+        .frame(width: WorkspaceGeometry.controlSize, height: WorkspaceGeometry.controlSize)
     }.buttonStyle(.plain).disabled((model.isBusy && !model.settingUpModels && !voice.isRecording) ||
       voice.starting || voice.transcribing || acceptingCapture ||
       (voice.isRecording && voice.purpose != .recording))
@@ -387,7 +403,7 @@ struct ChatPane: View {
   private var transcriptionButton: some View {
     Button { toggleVoice(.transcription) } label: {
       Image(systemName: voice.purpose == .transcription ? "stop.circle.fill" : "mic")
-        .frame(width: 22, height: 22)
+        .frame(width: WorkspaceGeometry.controlSize, height: WorkspaceGeometry.controlSize)
     }.buttonStyle(.plain).disabled((model.isBusy && !model.settingUpModels && !voice.isRecording) ||
       voice.starting || voice.transcribing || acceptingCapture ||
       (voice.isRecording && voice.purpose != .transcription))
@@ -432,7 +448,8 @@ struct ChatPane: View {
         Button("Write an answer") { model.authorChatMessage(.assistant) }
       }
     } label: {
-      Image(systemName: "square.and.pencil").frame(width: 22, height: 22)
+      Image(systemName: "square.and.pencil")
+        .frame(width: WorkspaceGeometry.controlSize, height: WorkspaceGeometry.controlSize)
     }.menuStyle(.borderlessButton).fixedSize().disabled(model.isBusy)
       .accessibilityLabel("New chat").help("Start a chat, optionally about the current document")
   }
@@ -481,7 +498,8 @@ struct ChatPane: View {
           (voice.isRecording && voice.purpose != .transcription))
       }
     } label: {
-      Image(systemName: "ellipsis").frame(width: 22, height: 22)
+      Image(systemName: "ellipsis")
+        .frame(width: WorkspaceGeometry.controlSize, height: WorkspaceGeometry.controlSize)
     }.menuStyle(.borderlessButton).fixedSize()
       .accessibilityLabel("More message controls")
   }
@@ -619,15 +637,17 @@ struct ChatPane: View {
         ScrollView {
           LazyVStack(alignment: .leading, spacing: 16) {
             if let chat = model.selectedChat {
-              VStack(alignment: .leading, spacing: 0) {
-                if model.showingChatInstructions == chat.id {
-                  ChatInstructions(model: model, chat: chat)
-                } else if !(chat.instructions ?? "").isEmpty {
-                  Button("Instructions") { model.openChatInstructions(chat.id) }
-                    .buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
-                    .disabled(model.isBusy)
-                }
-              }.id("chat-instructions")
+              if model.showingChatInstructions == chat.id || !(chat.instructions ?? "").isEmpty {
+                VStack(alignment: .leading, spacing: 0) {
+                  if model.showingChatInstructions == chat.id {
+                    ChatInstructions(model: model, chat: chat)
+                  } else {
+                    Button("Instructions") { model.openChatInstructions(chat.id) }
+                      .buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
+                      .disabled(model.isBusy)
+                  }
+                }.id("chat-instructions")
+              }
               ForEach(chat.messages) { message in
                 ChatMessageRow(commands: ChatMessageCommands(model: model, chatID: chat.id, message: message)) {
                   messageView(message)
@@ -636,7 +656,8 @@ struct ChatPane: View {
 
             }
             Color.clear.frame(height: 1).id("bottom")
-          }.padding(.horizontal, 16).padding(.vertical, 18)
+          }.padding(.horizontal, WorkspaceGeometry.paneInset + WorkspaceGeometry.inputInset)
+            .padding(.vertical, WorkspaceGeometry.paneInset)
         }
           .onAppear {
             DispatchQueue.main.async {
@@ -754,13 +775,15 @@ struct ChatPane: View {
           onSend: { model.send() }, onCancel: { model.cancel() },
           onAttachments: { model.attachToCurrentChat($0) },
           onFocus: { model.noteInputFocus(.chat) },
+          onContentHeight: { composerHeight = min(140, max(36, $0)) },
           completionModel: model, completionTarget: TextInputTarget(chatID: model.state.selectedChat,
             documentID: model.state.selectedDocument)
-        ).frame(height: CGFloat(50 + 18 * min(3, model.draft.filter { $0 == "\n" }.count)))
+        ).frame(height: composerHeight)
         composerControls
-      }.padding(10)
+      }.padding(WorkspaceGeometry.inputInset)
         .background(Color(nsColor: BoomChrome.inputBackground), in: RoundedRectangle(cornerRadius: 12))
-        .padding(.horizontal, 12).padding(.bottom, 12).padding(.top, 8)
+        .padding(.horizontal, WorkspaceGeometry.paneInset)
+        .padding(.bottom, WorkspaceGeometry.paneInset).padding(.top, 8)
     }
     .background(Color(nsColor: BoomChrome.sidebarBackground))
     .onChange(of: model.state.selectedChat) { _, _ in voice.stopSpeaking() }

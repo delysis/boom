@@ -13,6 +13,7 @@ func nativeEditEvent(_ event: String) {
   var onAttachments: (([AttachmentInput]) -> Void)?
   var onFocus: (() -> Void)?
   var onContentHeight: ((CGFloat) -> Void)?
+  var minimumContentHeight: CGFloat = 50
   private let placeholder = NativeTextPlaceholder("Message")
 
   func preparePlaceholder(_ text: String) {
@@ -23,12 +24,20 @@ func nativeEditEvent(_ event: String) {
     reportContentHeight()
   }
   func reportContentHeight() {
+    guard prepareTextLayout() else { return }
     guard let layoutManager, let textContainer else { return }
     layoutManager.ensureLayout(for: textContainer)
     let used = layoutManager.usedRect(for: textContainer)
     let lastLine = layoutManager.extraLineFragmentRect
-    let height = ceil(max(minSize.height, max(max(used.maxY, lastLine.maxY) + textContainerInset.height * 2, completionDisplayHeight)))
-    if abs(frame.height - height) > 0.5 { setFrameSize(NSSize(width: frame.width, height: height)) }
+    // AppKit raises minSize to the viewport size. That is a floor for the
+    // scrolling document, not a content measurement: publishing it prevents
+    // a grown composer from shrinking after its text is cleared.
+    let height = ceil(max(minimumContentHeight,
+      max(max(used.maxY, lastLine.maxY) + textContainerInset.height * 2, completionDisplayHeight)))
+    let documentHeight = max(height, enclosingScrollView?.contentSize.height ?? 0)
+    if abs(frame.height - documentHeight) > 0.5 {
+      setFrameSize(NSSize(width: frame.width, height: documentHeight))
+    }
     onContentHeight?(height)
   }
   override func completionDisplayDidChange() { super.completionDisplayDidChange(); reportContentHeight() }
@@ -203,7 +212,8 @@ struct ChatComposer: NSViewRepresentable {
     view.isVerticallyResizable = true
     view.isHorizontallyResizable = false
     view.autoresizingMask = [.width]
-    view.minSize = NSSize(width: 0, height: onContentHeight == nil ? 50 : 20)
+    view.minimumContentHeight = onContentHeight == nil ? 50 : 20
+    view.minSize = NSSize(width: 0, height: view.minimumContentHeight)
     view.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
       height: CGFloat.greatestFiniteMagnitude)
     view.isAutomaticQuoteSubstitutionEnabled = false
@@ -247,7 +257,7 @@ struct ChatComposer: NSViewRepresentable {
     view.onCancel = onCancel
     view.onAttachments = onAttachments
     view.onFocus = onFocus
-    if view.string != text, !view.hasMarkedText() {
+    if view.string != text, !view.nativeEditInProgress, !view.hasMarkedText() {
       view.endGhostBoundary(); context.coordinator.completion?.invalidateGhost()
       view.string = text
       MarkdownStyle.apply(to: view, bodyFont: NSFont.systemFont(ofSize: 14), lineSpacing: lineSpacing)

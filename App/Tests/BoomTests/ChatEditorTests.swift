@@ -6,6 +6,76 @@ import CryptoKit
 @testable import Boom
 
 final class ChatEditorTests: XCTestCase {
+  private final class TransactionLayout: NSLayoutManager {
+    var prematureLayouts = 0
+    override func ensureLayout(for container: NSTextContainer) {
+      if textStorage?.editedMask.isEmpty == false {
+        prematureLayouts += 1
+        return
+      }
+      super.ensureLayout(for: container)
+    }
+  }
+  @MainActor func testSharedTextLayoutWaitsForCharacterTransactionsToCommit() throws {
+    _ = NSApplication.shared
+    for chat in [false, true] {
+      let storage = NSTextStorage(), layout = TransactionLayout(), container = NSTextContainer()
+      storage.addLayoutManager(layout); layout.addTextContainer(container)
+      let view: NativeMediaTextView = chat
+        ? ChatTextView(frame: NSRect(x: 0, y: 0, width: 420, height: 600), textContainer: container)
+        : MarkdownTextView(frame: NSRect(x: 0, y: 0, width: 420, height: 600), textContainer: container)
+      container.size = NSSize(width: 420, height: CGFloat.greatestFiniteMagnitude)
+      let reference = "[Attachment: image](boom-attachment:\(UUID().uuidString))"
+      view.string = String(repeating: "Long prose before Undo. 👩🏽‍💻\n", count: 240) + reference
+      MarkdownStyle.apply(to: view)
+      layout.ensureLayout(for: container)
+      let before = layout.prematureLayouts
+      storage.beginEditing()
+      storage.replaceCharacters(in: NSRange(location: 0, length: storage.length), with: "Short text.\n" + reference)
+      MarkdownStyle.apply(to: view)
+      view.inlineMedia.positionViews()
+      (view as? ChatTextView)?.reportContentHeight()
+      XCTAssertEqual(layout.prematureLayouts, before,
+        "Shared styling, media and sizing must not read a glyph graph while its character edit is pending.")
+      storage.endEditing()
+      view.inlineMedia.positionViews()
+      (view as? ChatTextView)?.reportContentHeight()
+      layout.ensureLayout(for: container)
+      XCTAssertEqual(layout.characterRange(forGlyphRange: NSRange(location: 0, length: layout.numberOfGlyphs), actualGlyphRange: nil).length,
+        storage.length)
+      XCTAssertEqual(view.string, "Short text.\n" + reference)
+    }
+  }
+  @MainActor func testComposerGrowsForWrappedTextAndShrinksAfterClearing() async throws {
+    _ = NSApplication.shared
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-composer-sizing-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 480, height: 680))
+    window.isReleasedWhenClosed = false
+    let host = NSHostingView(rootView: ChatPane(model: model)); window.contentView = host
+    defer { window.close() }
+    func update() async throws {
+      for _ in 0..<4 { host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(25)) }
+    }
+    try await update()
+    let input = try XCTUnwrap(nativeEditor(in: host))
+    let scroll = try XCTUnwrap(input.enclosingScrollView)
+    let emptyHeight = scroll.bounds.height
+    input.setAccessibilityValue(String(repeating: "Words wrap naturally without explicit line breaks. ", count: 10))
+    try await update()
+    XCTAssertEqual(model.draft, input.string)
+    XCTAssertGreaterThan(scroll.bounds.height, emptyHeight)
+    XCTAssertLessThanOrEqual(scroll.bounds.height, 140)
+    window.setContentSize(NSSize(width: 300, height: 680)); try await update()
+    XCTAssertLessThanOrEqual(scroll.bounds.height, 140)
+    XCTAssertGreaterThan(input.bounds.height, scroll.bounds.height, "Long drafts remain scrollable.")
+    input.setAccessibilityValue(""); try await update()
+    XCTAssertEqual(model.draft, "")
+    XCTAssertEqual(scroll.bounds.height, emptyHeight, accuracy: 1)
+    try await model.shutdown()
+  }
   @MainActor func testUnsentDocumentComposerDoesNotCreateChatAndFirstSendCapturesDocument() async throws {
     _ = NSApplication.shared
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-lazy-chat-" + UUID().uuidString)

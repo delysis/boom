@@ -87,8 +87,15 @@ struct DocumentChatHistory: View {
       Spacer(minLength: 4)
       Button {
         do { try model.newChat(about: model.state.selectedDocument) } catch { model.report(error) }
-      } label: { Image(systemName: "square.and.pencil") }
-        .buttonStyle(.plain).help("New chat about this document").disabled(model.isBusy)
-    }.foregroundStyle(.secondary).padding(.horizontal, 16).padding(.vertical, 12)
+      } label: {
+        Image(systemName: "square.and.pencil")
+          .frame(width: WorkspaceGeometry.controlSize, height: WorkspaceGeometry.controlSize)
+          .contentShape(Rectangle())
+      }
+        .buttonStyle(.plain)
+        .help("New chat about this document").disabled(model.isBusy)
+    }.frame(height: WorkspaceGeometry.headerHeight)
+      .foregroundStyle(.secondary).padding(.horizontal, WorkspaceGeometry.paneInset)
+      .padding(.top, WorkspaceGeometry.paneInset).padding(.bottom, 8)
   }
 }

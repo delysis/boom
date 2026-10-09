@@ -267,7 +267,22 @@ import SwiftUI
     try await finish(model, evidence: evidence, phase: "reopen-before-branch", recorder: recorder)
     model.selectCandidate(2)
     try await recorder?.checkpoint("Selected third captured alternative for branching")
+    let branchReady: [String: String] = [
+      "busy": String(model.isBusy), "markedText": String(model.editor?.hasMarkedText() ?? false),
+      "candidateState": model.candidates?.candidates[2].state.rawValue ?? "missing",
+      "document": model.state.selectedDocument?.uuidString ?? "missing",
+      "parentDigest": model.documents.first(where: { $0.id == fixture.document.id })?.revision ?? "missing",
+      "expectedParentDigest": Digest.sha256(liveText),
+    ]
     model.branchCandidate(2)
+    try write(branchReady.merging([
+      "resultDocument": model.state.selectedDocument?.uuidString ?? "missing",
+      "resultDigest": model.selectedDocument?.revision ?? "missing",
+      "expectedDigest": Digest.sha256(try ProductCore.branchWriting(alternatives.recipe, continuation: alternatives.candidates[2].text)),
+      "resultCandidate": model.state.selectedDocument.flatMap { model.state.manuscriptOrigins[$0]?.candidateID.uuidString } ?? "missing",
+      "expectedCandidate": alternatives.candidates[2].id.uuidString,
+      "failure": model.errorMessage ?? "none",
+    ]) { _, result in result }, to: evidence.appendingPathComponent("branch-observation.json"))
     guard let branch = model.selectedDocument, branch.id != fixture.document.id,
       branch.text == (try ProductCore.branchWriting(alternatives.recipe, continuation: alternatives.candidates[2].text)),
       model.documents.first(where: { $0.id == fixture.document.id })?.text == liveText,

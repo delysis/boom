@@ -198,6 +198,26 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
     window.disableSnapshotRestoration()
     return window
   }
+  /// Live windows and native layout fixtures use exactly the same AppKit chrome.
+  func configureWorkspaceWindow(_ window: NSWindow, model: WorkspaceModel) {
+    self.model = model
+    self.window = window
+    window.title = "Bloom"
+    window.backgroundColor = BoomChrome.sidebarBackground
+    window.titlebarAppearsTransparent = true
+    window.toolbarStyle = .unifiedCompact
+    window.isReleasedWhenClosed = false
+    window.contentView = NSHostingView(rootView: WorkspaceView(model: model))
+    let toolbar = NSToolbar(identifier: "BoomComposerToolbar")
+    toolbar.delegate = self
+    toolbar.displayMode = .iconOnly
+    toolbar.allowsUserCustomization = false
+    window.toolbar = toolbar
+    observer = model.objectWillChange.sink { [weak self] _ in
+      DispatchQueue.main.async { self?.refreshToolbar() }
+    }
+    refreshToolbar()
+  }
   func applicationDidFinishLaunching(_ notification: Notification) {
     Task { await openWorkspace() }
   }
@@ -251,27 +271,13 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
       #else
       window.contentMinSize = NSSize(width: model.layout.isAuthor ? 750 : 540, height: 440)
       #endif
-      window.title = "Bloom"
-      window.backgroundColor = BoomChrome.sidebarBackground
-      window.titlebarAppearsTransparent = true
-      window.toolbarStyle = .unifiedCompact
-      window.isReleasedWhenClosed = false
-      window.contentView = NSHostingView(rootView: WorkspaceView(model: model))
-      let toolbar = NSToolbar(identifier: "BoomComposerToolbar")
-      toolbar.delegate = self
-      toolbar.displayMode = .iconOnly
-      toolbar.allowsUserCustomization = false
-      window.toolbar = toolbar
+      configureWorkspaceWindow(window, model: model)
       #if BOOM_UI_TEST
       window.minSize = NSSize(width: 310, height: 500)
       #else
       window.minSize = NSSize(width: model.layout.isAuthor ? 760 : 550, height: 500)
       #endif
-      self.window = window
       NSApp.mainMenu = makeMenu()
-      observer = model.objectWillChange.sink { [weak self] _ in
-        DispatchQueue.main.async { self?.refreshToolbar() }
-      }
       if backgroundCheck {
         window.setFrameOrigin(NSPoint(x: -10_000, y: -10_000))
         window.orderBack(nil)

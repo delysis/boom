@@ -291,7 +291,7 @@ struct MarkdownEditor: NSViewRepresentable {
     text.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
     text.textContainerInset = NSSize(width: 28, height: 28)
     text.font = MarkdownStyle.body
-    text.backgroundColor = BoomChrome.paperBackground
+    text.backgroundColor = BoomChrome.documentBackground
     text.isAutomaticQuoteSubstitutionEnabled = false
     text.isAutomaticDashSubstitutionEnabled = false
     text.isAutomaticTextReplacementEnabled = false
@@ -309,7 +309,7 @@ struct MarkdownEditor: NSViewRepresentable {
     model.editor = text
     text.setMedia(model: model)
     text.isEditable = !model.editingLocked
-    update(text, document: document)
+    update(text)
     updateSearch(text)
     return text
   }
@@ -317,10 +317,12 @@ struct MarkdownEditor: NSViewRepresentable {
     model.editor = text
     text.setMedia(model: model)
     text.isEditable = !model.editingLocked
-    update(text, document: document)
+    update(text)
     updateSearch(text)
   }
   private func updateSearch(_ view: MarkdownTextView) {
+    guard !view.nativeEditInProgress, let document = model.selectedDocument,
+      view.documentID == document.id else { return }
     let found = model.documentSearch[document.id]
     let valid = !view.hasMarkedText() && view.string == document.text && found?.revision == document.revision
       && found?.query == model.librarySearch
@@ -333,7 +335,11 @@ struct MarkdownEditor: NSViewRepresentable {
     guard let width = proposal.width else { return nil }
     return text.manuscriptSize(width: width, minimumHeight: minimumHeight)
   }
-  private func update(_ text: MarkdownTextView, document: DocumentSnapshot) {
+  private func update(_ text: MarkdownTextView) {
+    // A representable can carry a prior render's value during an AppKit edit.
+    // AppKit publishes that edit through its delegate before another model
+    // snapshot may replace it. Resolve the live document after that boundary.
+    guard !text.nativeEditInProgress, let document = model.selectedDocument else { return }
     // SwiftUI status/streaming updates must never overwrite in-flight marked text.
     if text.documentID == document.id, text.hasMarkedText() { return }
     if text.documentID != document.id || text.string != document.text {

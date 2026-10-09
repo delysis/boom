@@ -7,6 +7,7 @@ final class ModelTransfer: NSObject, URLSessionDataDelegate, @unchecked Sendable
   private let lock = NSLock()
   private let fileBytes: UInt64
   private let range: CheckpointRange
+  private let receivedBytes: (@Sendable (UInt64) -> Void)?
   private var continuation: CheckedContinuation<Data, Error>?
   private var session: URLSession?
   private var task: URLSessionDataTask?
@@ -17,13 +18,14 @@ final class ModelTransfer: NSObject, URLSessionDataDelegate, @unchecked Sendable
   private var failure: Error?
   private var outcome: Result<Data, Error>?
 
-  private init(fileBytes: UInt64, range: CheckpointRange) {
-    self.fileBytes = fileBytes; self.range = range
+  private init(fileBytes: UInt64, range: CheckpointRange, receivedBytes: (@Sendable (UInt64) -> Void)?) {
+    self.fileBytes = fileBytes; self.range = range; self.receivedBytes = receivedBytes
   }
   static func fetch(_ url: URL, fileBytes: UInt64, offset: UInt64,
-    configuration: URLSessionConfiguration = .ephemeral) async throws -> Data {
+    configuration: URLSessionConfiguration = .ephemeral,
+    receivedBytes: (@Sendable (UInt64) -> Void)? = nil) async throws -> Data {
     let range = try ProductCore.checkpointRange(fileBytes: fileBytes, offset: offset)
-    let transfer = ModelTransfer(fileBytes: fileBytes, range: range)
+    let transfer = ModelTransfer(fileBytes: fileBytes, range: range, receivedBytes: receivedBytes)
     var request = URLRequest(url: url)
     request.setValue("bytes=\(range.first)-\(range.last)", forHTTPHeaderField: "Range")
     request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
@@ -64,6 +66,9 @@ final class ModelTransfer: NSObject, URLSessionDataDelegate, @unchecked Sendable
       failure = BoomError.invalid("The server exceeded its model range."); dataTask.cancel(); return
     }
     body.append(data)
+    // Progress means validated bytes consumed on the serial delegate queue,
+    // not merely a response submitted by the transport.
+    receivedBytes?(UInt64(body.count))
   }
   func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
     lock.lock()

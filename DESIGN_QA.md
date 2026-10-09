@@ -128,6 +128,18 @@ not select a layout from a fixed window-width cutoff. Inspect the narrowest
 chat-only pane and a wide three-pane layout. Confirm all actions remain
 reachable and no control is clipped or moved to a second row.
 
+Pane edges use `WorkspaceGeometry`, rather than independent per-pane padding.
+Align the library and conversation headers, and align conversation prose with
+the composer's text origin. The document is one continuous native writing
+surface with a bounded prose measure, never a sheet that grows with the window
+or the text. Do not reintroduce a paper perimeter without actual pagination.
+The composer grows from native wrapped-text measurement, with a bounded scrolling
+height; counting newline characters does not measure wrapped prose. The layout
+smoke also captures complete native windows through the same toolbar construction
+as the live app. Inspect those light/dark, wide/narrow renders, including an empty
+focused composer and its first typed glyph. Keep glyph/overlap checks separate
+from the visual assessment of spacing and native chrome.
+
 Rename a selected document and chat through both a second click and their
 context menus. The title must become an editable field in the same sidebar row;
 Return commits, Escape cancels, and neither path opens a modal rename alert.
@@ -319,6 +331,30 @@ isolated measurement helper. The chat input owns a native scrolling document;
 AppKit controls that inner document's frame and reports content height through
 its live native layout. Preserve Undo and IME composition in both. These are
 explicit layout contracts over the same engine, not interchangeable controls.
+
+Never force live TextKit layout during an open `NSTextStorage` editing
+transaction. Undo may have replaced the characters while the glyph graph still
+describes the prior text. The shared `NativeMediaTextView` gate defers media
+positioning, input sizing and drawing until pending edits have been processed;
+plain prose does not run a media layout pass. Exercise a long-to-short Undo with
+real continuations and repeated whole-document replacements, including media,
+and reject typesetter warnings as well as crashes. Native text bytes alone do
+not qualify that graph's readiness.
+
+The same boundary protects native edits from model-to-view replacement. A
+SwiftUI render may still carry the document from before an insertion or Undo;
+resolve the current selected document after the native delegate publishes its
+edit. Verify expected manuscript bytes immediately after replacement, after
+layout, and after switching away and back. Comparing the view with the model
+alone can miss a stale snapshot that has reverted both.
+
+Model-transfer cancellation returns after URLSession's final task delegates
+and invalidation callback. Its fixture observes accepted body bytes before
+cancelling, checks no consumer progress after return, and independently awaits
+the mock transport's stop acknowledgement. Do not assume an ordering between
+`URLProtocol.stopLoading` and URLSession invalidation: Apple's
+[session contract](https://developer.apple.com/documentation/foundation/urlsession/finishtasksandinvalidate())
+guarantees the delegate boundary, not that transport-internal callback order.
 
 The resize regression first reproduced 18-point rows drawing up to 237 points
 of wrapped text. Before handing off a prose change, run the native populated-chat

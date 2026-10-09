@@ -102,6 +102,34 @@ struct InlineMediaSpan: Decodable {
 
 @MainActor class NativeMediaTextView: NSTextView {
   let inlineMedia = NativeInlineMedia()
+  private var deferredLayout = false
+  private var nativeEditDepth = 0
+  var nativeEditInProgress: Bool { nativeEditDepth > 0 }
+  /// TextKit has not applied accumulated character edits to its glyph graph
+  /// until the storage transaction closes. Never force that graph from an
+  /// editing delegate, media projection, or a speculative resize callback.
+  func prepareTextLayout() -> Bool {
+    guard !nativeEditInProgress, let storage = textStorage, storage.editedMask.isEmpty else {
+      deferTextLayout()
+      return false
+    }
+    return true
+  }
+  private func deferTextLayout() {
+    guard !deferredLayout else { return }
+    deferredLayout = true
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      self.deferredLayout = false
+      self.invalidateIntrinsicContentSize()
+      self.needsLayout = true; self.needsDisplay = true
+    }
+  }
+  override func insertText(_ value: Any, replacementRange: NSRange) {
+    nativeEditDepth += 1
+    defer { nativeEditDepth -= 1; deferTextLayout() }
+    super.insertText(value, replacementRange: replacementRange)
+  }
   var mediaPresentation: (NSLayoutManager, NSTextContainer)? {
     guard let layoutManager, let textContainer else { return nil }; return (layoutManager, textContainer)
   }
@@ -119,7 +147,11 @@ struct InlineMediaSpan: Decodable {
   func mediaChanged() {
     invalidateIntrinsicContentSize(); needsLayout = true; needsDisplay = true
   }
-  override func didChangeText() { super.didChangeText(); if !hasMarkedText() { inlineMedia.refresh() } }
+  override func didChangeText() {
+    nativeEditDepth += 1
+    defer { nativeEditDepth -= 1; deferTextLayout() }
+    super.didChangeText(); if !hasMarkedText() { inlineMedia.refresh() }
+  }
   override func copy(_ sender: Any?) {
     if let payload = inlineMedia.selectedOriginal(selectedRange()) {
       AttachmentInput.write(payload, to: .general); return
@@ -130,8 +162,14 @@ struct InlineMediaSpan: Decodable {
     if isEditable, inlineMedia.selectedOriginal(selectedRange()) != nil { copy(sender); insertText("", replacementRange: selectedRange()); return }
     super.cut(sender)
   }
-  override func layout() { super.layout(); inlineMedia.positionViews() }
-  override func draw(_ dirtyRect: NSRect) { inlineMedia.positionViews(); super.draw(dirtyRect) }
+  override func layout() {
+    guard prepareTextLayout() else { return }
+    super.layout(); inlineMedia.positionViews()
+  }
+  override func draw(_ dirtyRect: NSRect) {
+    guard prepareTextLayout() else { return }
+    inlineMedia.positionViews(); super.draw(dirtyRect)
+  }
   override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); if window == nil { inlineMedia.stop() } else { inlineMedia.refresh() } }
   override func setSelectedRange(_ range: NSRange, affinity: NSSelectionAffinity, stillSelecting: Bool) {
     var selection = range
@@ -230,7 +268,13 @@ struct InlineMediaSpan: Decodable {
     positionViews()
   }
   func positionViews() {
+    if spans.isEmpty {
+      for host in hosts.values { host.removeFromSuperview() }
+      hosts.removeAll()
+      return
+    }
     guard let view, let (manager, container) = view.mediaPresentation, let storage = manager.textStorage else { return }
+    guard view.prepareTextLayout() else { return }
     manager.ensureLayout(for: container)
     var counts: [UUID: Int] = [:], retained = Set<String>()
     storage.enumerateAttribute(.mediaStart, in: NSRange(location: 0, length: storage.length)) { value, range, _ in

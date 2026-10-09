@@ -31,16 +31,23 @@ final class ManuscriptSizingTests: XCTestCase {
       host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(20))
       manager.undo()
       XCTAssertEqual(editor.string, fixture.document.text)
+      let liveText = fixture.document.text + "\nA later human revision.\n"
       manager.beginUndoGrouping()
-      editor.insertText(fixture.document.text + "\nA later human revision.\n", replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
+      editor.insertText(liveText, replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
       manager.endUndoGrouping()
+      XCTAssertEqual(editor.string, liveText)
+      XCTAssertEqual(model.selectedDocument?.text, liveText,
+        "A native replacement immediately after Undo must publish before a prior view snapshot can echo back.")
       host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(20))
+      XCTAssertEqual(editor.string, liveText)
+      XCTAssertEqual(model.selectedDocument?.text, liveText)
       try model.newDocument()
       host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(20))
       model.selectDocument(fixture.document.id)
       host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(20))
       let current = try XCTUnwrap(model.editor)
-      XCTAssertEqual(current.string, model.selectedDocument?.text)
+      XCTAssertEqual(current.string, liveText)
+      XCTAssertEqual(model.selectedDocument?.text, liveText)
       current.replaceDocument(fixture.document.text, action: "Restore fixture")
       host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(20))
     }
@@ -68,7 +75,7 @@ final class ManuscriptSizingTests: XCTestCase {
     }
     XCTAssertEqual(layout.geometryChanges, firstGeometry, "Status and streaming updates must not invalidate unchanged geometry.")
     XCTAssertEqual(view.manuscriptSize(width: 480, minimumHeight: first.height + 100)?.height, first.height + 100)
-    XCTAssertEqual(layout.geometryChanges, firstGeometry, "A minimum page-height change needs no geometry invalidation.")
+    XCTAssertEqual(layout.geometryChanges, firstGeometry, "A viewport-height change needs no geometry invalidation.")
     _ = view.manuscriptSize(width: 320, minimumHeight: 100)
     XCTAssertEqual(layout.geometryChanges, firstGeometry,
       "A proposed width must not change the displayed text container.")

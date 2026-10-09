@@ -133,6 +133,7 @@ extension WorkspaceModel: NativeCompletionClient {
     return attributes
   }
   override func draw(_ dirtyRect: NSRect) {
+    guard prepareTextLayout() else { return }
     guard let layout = displayLayout, let container = displayContainer, let stamp = visibleStamp,
       stamp.documentID == documentID, selectedRange().length == 0,
       stamp.caretUTF16 == selectedRange().location, !hasMarkedText()
