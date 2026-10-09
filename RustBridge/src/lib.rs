@@ -3,10 +3,10 @@
 //! No filesystem paths, network handles, model handles or subprocess APIs exist here.
 use attachment_native_host::{AttachmentHost, AttachmentHostConfig, ProvidedAttachment};
 use attachment_native_types::{DetectedFormat, MediaFamily, PreparedPart, TargetCapabilities};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    panic::{AssertUnwindSafe, catch_unwind},
+    panic::{catch_unwind, AssertUnwindSafe},
     ptr, slice, str,
 };
 
