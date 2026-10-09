@@ -1,0 +1,67 @@
+{
+  "schema": 1,
+  "date": "2026-10-09",
+  "platform": "macOS arm64",
+  "rust": "1.92.0",
+  "swift": "6.4",
+  "boom_source_commit": "ad6cdb91c8bd8a0b004990596c1dc3fed1a3889b",
+  "native_source_commit": "3ac1fac906ced743d6aa50de7363baf5c00763cc",
+  "native_import_pin": "d6915bad3ca7fa68ed483acff82ae86313934fd1",
+  "source_inventory_sha256": "5d98488d599fc94b3c022b2a198a0ca259cd85456f0aa0bc0e627afd9f350080",
+  "boom_executable_sha256": "5c3cf4a179d9d8520a1a4f25917ec108e22e42f5dc3f4305f83af1715450d7cd",
+  "checks": {
+    "native_attachment_group": {
+      "passed": 195,
+      "failed": 0,
+      "ignored": 0
+    },
+    "information_attachment_bridge": {
+      "passed": 3,
+      "failed": 0
+    },
+    "native_policy": "passed",
+    "native_workspace_format": "passed",
+    "native_attachment_clippy": "passed",
+    "native_attachment_boundaries": "passed",
+    "boom_rust_workspace": {
+      "passed": 304,
+      "failed": 0,
+      "ignored": 0
+    },
+    "boom_core": {
+      "passed": 46,
+      "failed": 0
+    },
+    "boom_app": {
+      "passed": 163,
+      "failed": 0
+    },
+    "notice_collector_fixtures": {
+      "passed": 8,
+      "failed": 0
+    },
+    "swift_scripts_c_header": "passed",
+    "native_layout": "passed",
+    "native_import_relaunch_restore": "passed",
+    "real_model_preemption_and_replay": "passed",
+    "development_signing": "passed"
+  },
+  "failed_attempts_retained": [
+    "delivered E04: 238 macOS differential failures",
+    "first all-NSString repair: 574 differential failures",
+    "first native build: RustBridge edition formatting mismatch",
+    "native release stage: disk full after all tests passed",
+    "first notice inventory: task-only runtime dependency symlink unavailable"
+  ],
+  "limits": [
+    "Native-platform ci-required workflow is disabled_manually; no hosted pass claimed",
+    "layout fixture is unshown; no physical interaction or VoiceOver claim",
+    "model check is cancellation and replay, not throughput or literary-quality acceptance",
+    "notice source inventory complete; unresolved notices remain and distribution_approved is false",
+    "development signing is not Developer ID, notarization or distribution qualification"
+  ],
+  "source_correspondence": {
+    "source_inventory_before_equals_after": true,
+    "all_five_incorporated_attachment_crates_byte_equal": true
+  }
+}
