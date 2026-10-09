@@ -1,3 +1,5 @@
+> Historical proposal and authoring-environment report. Its original Linux receipts are unavailable in the supplied archive. **Erratum:** the proposed bounded Swift split failed 238 macOS differential comparisons; an all-NSString replacement failed 574. The integrated repair preserves String two-LF paragraph matching and uses NSString UTF-16 searches for at most three line ends. Fresh macOS evidence and retained failures are recorded in [the integration ledger](../compendium-i-integration.md); the historical claims below are not current acceptance receipts.
+
 # E04 — Ask for fewer pieces, not a different language
 
 Unranked elegance archive. Exact base: `88ee71642e5d5cdeaa25764d314aac82bc8cfa84`.
