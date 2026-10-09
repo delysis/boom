@@ -41,31 +41,34 @@ public final class CancellationFlag: @unchecked Sendable {
   private var handlers: [UUID: @Sendable () -> Void] = [:]
   public init() {}
   public func cancel() {
-    lock.lock()
-    value = true
-    let callbacks = Array(handlers.values)
-    handlers.removeAll()
-    lock.unlock()
+    let callbacks = lock.withLock {
+      value = true
+      let callbacks = Array(handlers.values)
+      handlers.removeAll()
+      return callbacks
+    }
     for callback in callbacks { callback() }
   }
   /// Registration races safely with cancellation. Callbacks run outside the
   /// lock and may already be executing when their registration is removed.
   public func onCancel(_ handler: @escaping @Sendable () -> Void) -> UUID? {
-    lock.lock()
-    if value { lock.unlock(); handler(); return nil }
-    let id = UUID(); handlers[id] = handler
-    lock.unlock()
+    let id: UUID? = lock.withLock {
+      guard !value else { return nil }
+      let id = UUID()
+      handlers[id] = handler
+      return id
+    }
+    if id == nil { handler() }
     return id
   }
   public func removeCancellationHandler(_ id: UUID?) {
     guard let id else { return }
-    lock.lock(); handlers.removeValue(forKey: id); lock.unlock()
+    let removed = lock.withLock { handlers.removeValue(forKey: id) }
+    // Captured objects may reenter this flag from deinit. Keep their last
+    // release outside the critical section, just like callback execution.
+    withExtendedLifetime(removed) {}
   }
-  public var isCancelled: Bool {
-    lock.lock()
-    defer { lock.unlock() }
-    return value
-  }
+  public var isCancelled: Bool { lock.withLock { value } }
   public func check() throws { if isCancelled { throw CancellationError() } }
 }
 
