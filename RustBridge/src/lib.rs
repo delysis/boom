@@ -3,10 +3,10 @@
 //! No filesystem paths, network handles, model handles or subprocess APIs exist here.
 use attachment_native_host::{AttachmentHost, AttachmentHostConfig, ProvidedAttachment};
 use attachment_native_types::{DetectedFormat, MediaFamily, PreparedPart, TargetCapabilities};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    panic::{catch_unwind, AssertUnwindSafe},
+    panic::{AssertUnwindSafe, catch_unwind},
     ptr, slice, str,
 };
 
@@ -225,7 +225,7 @@ pub unsafe extern "C" fn boom_attachment_inspect(
 }
 
 /// # Safety
-/// `buffer` must be an as-yet-unfreed value returned by boom_attachment_inspect.
+/// `buffer` must be an as-yet-unfreed value returned by one of this module's C entry points.
 #[no_mangle]
 pub unsafe extern "C" fn boom_attachment_free(buffer: BoomAttachmentBuffer) {
     if !buffer.data.is_null() {

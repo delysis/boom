@@ -6,21 +6,21 @@ final class CoreTests: XCTestCase {
   func testLibrarySelectionRangeToggleAndRename() {
     let rows = (0..<5).map { _ in UUID() }
     var selection = LibrarySelection(ids: [rows[1]])
-    XCTAssertTrue(selection.click(rows[3], visible: rows, primary: rows[1], gesture: .range).open)
+    XCTAssertEqual(selection.click(rows[3], visible: rows, primary: rows[1], gesture: .range), .open)
     XCTAssertEqual(selection.ids, Set(rows[1...3]))
-    XCTAssertTrue(selection.click(rows[4], visible: rows, primary: rows[3], gesture: .additiveRange).open)
+    XCTAssertEqual(selection.click(rows[4], visible: rows, primary: rows[3], gesture: .additiveRange), .open)
     XCTAssertEqual(selection.ids, Set(rows[1...4]))
-    XCTAssertFalse(selection.click(rows[2], visible: rows, primary: rows[4], gesture: .toggle).open)
+    XCTAssertEqual(selection.click(rows[2], visible: rows, primary: rows[4], gesture: .toggle), .none)
     XCTAssertFalse(selection.ids.contains(rows[2]))
-    XCTAssertTrue(selection.click(rows[2], visible: rows, primary: rows[4], gesture: .plain).open)
+    XCTAssertEqual(selection.click(rows[2], visible: rows, primary: rows[4], gesture: .plain), .open)
     XCTAssertEqual(selection.ids, [rows[2]])
-    XCTAssertTrue(selection.click(rows[2], visible: rows, primary: rows[2], gesture: .plain).rename)
+    XCTAssertEqual(selection.click(rows[2], visible: rows, primary: rows[2], gesture: .plain), .rename)
   }
   func testLibrarySelectionFilteredAnchorFallsBackToClickedRow() {
     let rows = (0..<3).map { _ in UUID() }
     var selection = LibrarySelection(ids: [rows[0]], anchor: rows[0])
-    XCTAssertTrue(selection.click(rows[2], visible: [rows[1], rows[2]],
-      primary: rows[0], gesture: .range).open)
+    XCTAssertEqual(selection.click(rows[2], visible: [rows[1], rows[2]],
+      primary: rows[0], gesture: .range), .open)
     XCTAssertEqual(selection.ids, [rows[2]])
     XCTAssertEqual(selection.anchor, rows[2])
   }
@@ -88,6 +88,10 @@ final class CoreTests: XCTestCase {
     let p = try ContextGraph.resolve(root: a, all: [a, b, c])
     XCTAssertEqual(p.documents.map(\.title), ["C", "B"])
     try p.revalidate(against: [a, b, c])
+    XCTAssertThrowsError(try p.revalidate(against: [a, b, c, c]))
+    var changed = c; changed.text = "changed"
+    XCTAssertThrowsError(try p.revalidate(against: [a, b, c, changed]))
+    XCTAssertThrowsError(try p.revalidate(against: [a, b, changed, c]))
     XCTAssertThrowsError(try p.revalidate(against: [a, b]))
   }
   func testContextCycle() {

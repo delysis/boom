@@ -44,6 +44,8 @@ public struct DocumentGrant: Sendable {
     self.snapshot = snapshot
   }
 }
+/// Inert native range/replacement data from the Rust planner. Construction is
+/// not a grant: the owning commit path rechecks document identity and revision.
 public struct ValidatedEdit: Equatable, Sendable {
   public let range: NSRange
   public let replacement: String

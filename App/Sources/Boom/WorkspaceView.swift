@@ -175,10 +175,14 @@ struct LibraryView: View {
       id, visible: visible, primary: model.state.selectedDocument, gesture: clickGesture(modifiers))
     documentAnchor = selection.anchor
     model.selectedDocumentIDs = selection.ids
-    if result.rename, let document = model.documents.first(where: { $0.id == id }) {
-      beginRename(.document(id), title: document.title)
+    switch result {
+    case .none: break
+    case .open: model.selectDocument(id, preservingSelection: true)
+    case .rename:
+      if let document = model.documents.first(where: { $0.id == id }) {
+        beginRename(.document(id), title: document.title)
+      }
     }
-    if result.open { model.selectDocument(id, preservingSelection: true) }
   }
   private func chooseChat(_ id: UUID) {
     if renameTarget != nil { commitRename() }
@@ -189,10 +193,14 @@ struct LibraryView: View {
       id, visible: visible, primary: model.state.selectedChat, gesture: clickGesture(modifiers))
     chatAnchor = selection.anchor
     model.selectedChatIDs = selection.ids
-    if result.rename, let chat = model.state.chats.first(where: { $0.id == id }) {
-      beginRename(.chat(id), title: chat.title)
+    switch result {
+    case .none: break
+    case .open: model.selectChat(id, preservingSelection: true)
+    case .rename:
+      if let chat = model.state.chats.first(where: { $0.id == id }) {
+        beginRename(.chat(id), title: chat.title)
+      }
     }
-    if result.open { model.selectChat(id, preservingSelection: true) }
   }
   private func clickGesture(_ modifiers: NSEvent.ModifierFlags) -> LibrarySelection.Click {
     if modifiers.contains(.shift) {

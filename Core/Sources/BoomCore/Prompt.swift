@@ -11,9 +11,20 @@ public enum GemmaPrompt {
     guard let content = text.firstIndex(where: { !$0.isWhitespace }) else {
       return admissibleCompletion(text) ? text : nil
     }
-    let paragraph = text[content...].components(separatedBy: "\n\n").first ?? ""
-    let visible = String(text[..<content])
-      + paragraph.components(separatedBy: "\n").prefix(3).joined(separator: "\n")
+    // Keep String's paragraph delimiter semantics. Foundation's one-LF
+    // splitter also cuts inside CRLF graphemes, so locate line ends in UTF-16.
+    let paragraph = text[content...].split(
+      separator: "\n\n", maxSplits: 1, omittingEmptySubsequences: false).first ?? ""
+    let source = String(paragraph) as NSString
+    var end = source.length
+    var cursor = 0
+    for line in 0..<3 {
+      let delimiter = source.range(of: "\n", range: NSRange(location: cursor, length: end - cursor))
+      guard delimiter.location != NSNotFound else { break }
+      if line == 2 { end = delimiter.location; break }
+      cursor = NSMaxRange(delimiter)
+    }
+    let visible = String(text[..<content]) + source.substring(to: end)
     return admissibleCompletion(visible) ? visible : nil
   }
 }
@@ -41,31 +52,34 @@ public final class CancellationFlag: @unchecked Sendable {
   private var handlers: [UUID: @Sendable () -> Void] = [:]
   public init() {}
   public func cancel() {
-    lock.lock()
-    value = true
-    let callbacks = Array(handlers.values)
-    handlers.removeAll()
-    lock.unlock()
+    let callbacks = lock.withLock {
+      value = true
+      let callbacks = Array(handlers.values)
+      handlers.removeAll()
+      return callbacks
+    }
     for callback in callbacks { callback() }
   }
   /// Registration races safely with cancellation. Callbacks run outside the
   /// lock and may already be executing when their registration is removed.
   public func onCancel(_ handler: @escaping @Sendable () -> Void) -> UUID? {
-    lock.lock()
-    if value { lock.unlock(); handler(); return nil }
-    let id = UUID(); handlers[id] = handler
-    lock.unlock()
+    let id: UUID? = lock.withLock {
+      guard !value else { return nil }
+      let id = UUID()
+      handlers[id] = handler
+      return id
+    }
+    if id == nil { handler() }
     return id
   }
   public func removeCancellationHandler(_ id: UUID?) {
     guard let id else { return }
-    lock.lock(); handlers.removeValue(forKey: id); lock.unlock()
+    let removed = lock.withLock { handlers.removeValue(forKey: id) }
+    // Captured objects may reenter this flag from deinit. Keep their last
+    // release outside the critical section, just like callback execution.
+    withExtendedLifetime(removed) {}
   }
-  public var isCancelled: Bool {
-    lock.lock()
-    defer { lock.unlock() }
-    return value
-  }
+  public var isCancelled: Bool { lock.withLock { value } }
   public func check() throws { if isCancelled { throw CancellationError() } }
 }
 

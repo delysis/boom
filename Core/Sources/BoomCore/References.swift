@@ -9,6 +9,9 @@ public struct WikiReference: Equatable, Sendable {
   }
 }
 public enum ReferenceParser {
+  private static let wikiPattern = try! NSRegularExpression(pattern: #"\[\[([^\[\]\n]{1,256})\]\]"#)
+  private static let voicePattern = try! NSRegularExpression(
+    pattern: #"(?<![\p{L}\p{N}_@./:-])@([a-z][a-z0-9_-]{0,47})(?![a-z0-9_-])"#)
   /// Strip Markdown code and escaped characters before looking for references.
   /// Deliberately conservative: malformed/open code fences suppress links to EOF.
   public static func visibleText(_ text: String) -> String {
@@ -66,7 +69,7 @@ public enum ReferenceParser {
   public static func wiki(_ text: String) throws -> [WikiReference] {
     let visible = visibleText(text)
     let ns = visible as NSString
-    let regex = try NSRegularExpression(pattern: #"\[\[([^\[\]\n]{1,256})\]\]"#)
+    let regex = wikiPattern
     var result: [WikiReference] = []
     for match in regex.matches(in: visible, range: NSRange(location: 0, length: ns.length)) {
       let body = ns.substring(with: match.range(at: 1))
@@ -89,8 +92,7 @@ public enum ReferenceParser {
   public static func voices(_ text: String) throws -> [String] {
     let visible = visibleText(text)
     let ns = visible as NSString
-    let regex = try NSRegularExpression(
-      pattern: #"(?<![\p{L}\p{N}_@./:-])@([a-z][a-z0-9_-]{0,47})(?![a-z0-9_-])"#)
+    let regex = voicePattern
     var seen = Set<String>()
     return regex.matches(in: visible, range: NSRange(location: 0, length: ns.length)).compactMap {
       m in
@@ -131,8 +133,14 @@ public struct ContextPlan: Equatable, Sendable {
     }
   }
   public func revalidate(against current: [DocumentSnapshot]) throws {
+    var indexed: [UUID: DocumentSnapshot] = [:]
+    for document in current {
+      guard indexed.updateValue(document, forKey: document.id) == nil else {
+        throw BoomError.invalid("Duplicate document IDs.")
+      }
+    }
     for d in documents {
-      guard current.first(where: { $0.id == d.id })?.revision == d.revision else {
+      guard indexed[d.id]?.revision == d.revision else {
         throw BoomError.stale("Referenced document \(d.title)")
       }
     }
@@ -141,10 +149,9 @@ public struct ContextPlan: Equatable, Sendable {
 /// Stable Markdown links to encrypted local originals. The filename in the
 /// label is presentation only; the UUID is resolved against workspace records.
 public enum AttachmentLink {
+  private static let pattern = try! NSRegularExpression(
+    pattern: #"\]\(boom-attachment:([0-9A-Fa-f-]{36})\)"#)
   public static func ids(in text: String) -> [UUID] {
-    guard let pattern = try? NSRegularExpression(
-      pattern: #"\]\(boom-attachment:([0-9A-Fa-f-]{36})\)"#)
-    else { return [] }
     let source = text as NSString
     var seen = Set<UUID>()
     return pattern.matches(in: text, range: NSRange(location: 0, length: source.length))

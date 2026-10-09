@@ -3,6 +3,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 (cd "$HERE" && cargo fmt --all -- --check && cargo test --workspace --locked && cargo clippy --workspace --all-targets --locked -- -D warnings)
 (cd "$HERE/Core" && swift test)
+if [[ "$(uname -s)" == Darwin ]]; then python3 "$HERE/scripts/test-notice-collector.py"; fi
 swiftc -frontend -parse "$HERE"/App/Sources/Boom/*.swift
 # Each executable script has top-level statements; parse it as its own source unit.
 for script in "$HERE"/scripts/*.swift; do swiftc -frontend -parse "$script"; done
