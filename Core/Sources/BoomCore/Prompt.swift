@@ -11,9 +11,13 @@ public enum GemmaPrompt {
     guard let content = text.firstIndex(where: { !$0.isWhitespace }) else {
       return admissibleCompletion(text) ? text : nil
     }
-    let paragraph = text[content...].components(separatedBy: "\n\n").first ?? ""
+    // Bound the number of pieces, not the authored content or its Unicode
+    // semantics. Empty lines and leading whitespace remain significant.
+    let paragraph = text[content...].split(
+      separator: "\n\n", maxSplits: 1, omittingEmptySubsequences: false).first ?? ""
     let visible = String(text[..<content])
-      + paragraph.components(separatedBy: "\n").prefix(3).joined(separator: "\n")
+      + paragraph.split(separator: "\n", maxSplits: 3, omittingEmptySubsequences: false)
+        .prefix(3).joined(separator: "\n")
     return admissibleCompletion(visible) ? visible : nil
   }
 }
