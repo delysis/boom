@@ -11,7 +11,8 @@ final class RetainedInputTests: XCTestCase {
   }
 
   @MainActor func testRestoredDraftNeverRetainsConsultationEditingAuthority() async throws {
-    for chatOwner in [false, true] {
+    let ownerKinds = try ProductCore.layout().isAuthor ? [false, true] : [true]
+    for chatOwner in ownerKinds {
       let store = try store(), model = try await WorkspaceModel(storeOverride: store, loadModels: false)
       if chatOwner { try model.newChat(about: model.state.selectedDocument) }
       let first = try XCTUnwrap(chatOwner ? model.state.selectedChat : model.state.selectedDocument)
@@ -62,6 +63,7 @@ final class RetainedInputTests: XCTestCase {
   }
 
   @MainActor func testUnsentDocumentDraftDoesNotMoveToAnotherManuscript() async throws {
+    guard try ProductCore.layout().isAuthor else { throw XCTSkip("The chat edition has no manuscript composer.") }
     let store = try store(), model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     let first = try XCTUnwrap(model.state.selectedDocument)
     model.draft = "Question about the first manuscript."
@@ -83,6 +85,7 @@ final class RetainedInputTests: XCTestCase {
 
   @MainActor func testWritingExampleOrderSurvivesRestartWithoutStartingGeneration() async throws {
     let store = try store(), model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    if model.state.selectedDocument == nil { try model.newDocument() }
     let manuscript = try XCTUnwrap(model.state.selectedDocument)
     try model.addWritingExample(title: "Lantern", prose: "The lantern crosses the harbor.", manuscriptID: manuscript)
     try model.addWritingExample(title: "Window", prose: "The window holds a pale reflection.", manuscriptID: manuscript)
@@ -121,6 +124,7 @@ final class RetainedInputTests: XCTestCase {
 
   @MainActor func testEncryptedBackupRestoresDraftAndOrderedExamples() async throws {
     let store = try store(), model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    if model.state.selectedDocument == nil { try model.newDocument() }
     let manuscript = try XCTUnwrap(model.state.selectedDocument)
     try model.addWritingExample(title: "Public prose", prose: "Rain follows the ferry upstream.", manuscriptID: manuscript)
     let examples = model.writingExampleIDs
@@ -149,7 +153,9 @@ final class RetainedInputTests: XCTestCase {
     XCTAssertNil(legacy["composerDrafts"]); XCTAssertNil(legacy["writingExampleIDs"])
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     XCTAssertEqual(model.selectedDocument, document); XCTAssertEqual(model.draft, "")
-    XCTAssertTrue(model.writingExampleIDs.isEmpty); XCTAssertTrue(model.state.chats.isEmpty)
+    XCTAssertTrue(model.writingExampleIDs.isEmpty)
+    XCTAssertEqual(model.state.chats.count, model.layout.isAuthor ? 0 : 1)
+    XCTAssertTrue(model.state.chats.allSatisfy { $0.messages.isEmpty })
     XCTAssertFalse(model.isBusy)
     try await model.shutdown()
   }
