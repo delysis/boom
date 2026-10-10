@@ -106,7 +106,8 @@ import MLXVLM
       + "Immutable upstream and runtime revisions, source hashes and output hashes are in bloom-model.json. "
       + "Conversion modifies weights and configuration; upstream attribution is retained in UPSTREAM-MODEL-CARD.md and NOTICE.txt.\n\n"
       + "This is a weights and configuration repository. It contains no Bloom application source or user data. "
-      + "32 GB MacBook performance and distribution qualification remain open.\n").utf8)
+      + "Bloom qualifies these packs on the registered development Mac within a 24 GiB application ceiling. "
+      + "A manifest records provenance; live inference, performance and packaged application checks are separate gates.\n").utf8)
       .write(to: output.appendingPathComponent("README.md"), options: .atomic)
     let manifest = Manifest(schema: 1, purpose: purpose, upstreamRepository: args[4], upstreamRevision: args[5],
       upstreamFiles: upstream, runtimeRevision: "9afc3b55f75a0d41a3d0c11330b9df6a036d24e4",

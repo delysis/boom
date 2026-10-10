@@ -187,20 +187,7 @@ enum AttachmentProcessor {
       receipt: response, original: data)
   }
   static func readGranted(_ url: URL, limit: Int = 67_108_864, allowEmpty: Bool = false) throws -> Data {
-    let v = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
-    guard v.isRegularFile == true, v.isSymbolicLink != true, let size = v.fileSize, (allowEmpty || size > 0),
-      size <= limit
-    else {
-      throw BoomError.budget(
-        "Choose a regular file up to 64 MiB; symlinks and directories are not attachments.")
-    }
-    let handle = try FileHandle(forReadingFrom: url)
-    defer { try? handle.close() }
-    let data = try handle.read(upToCount: limit + 1) ?? Data()
-    guard data.count <= limit else {
-      throw BoomError.budget("File grew beyond its import limit while reading.")
-    }
-    return data
+    try RegularFile(url, limit: Int64(limit), allowEmpty: allowEmpty).data()
   }
 }
 

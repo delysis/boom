@@ -9,9 +9,10 @@ git -C "$HERE/.deps/MLXSwiftLM" diff --quiet HEAD || { echo 'MLX Swift LM source
 EDITION="${2:-author}"
 SIGN_PROFILE="${3:-development}"
 case "$SIGN_PROFILE" in
+  prepare) SIGN_IDENTITY= ;;
   development) SIGN_IDENTITY="${BLOOM_SIGN_IDENTITY:-Apple Development: georgewalkeriv@gmail.com (FZ4WD25KGG)}" ;;
   distribution) SIGN_IDENTITY="${BLOOM_SIGN_IDENTITY:?Set BLOOM_SIGN_IDENTITY to your Developer ID Application identity.}" ;;
-  *) echo 'Choose development or distribution for the third build argument.' >&2; exit 1 ;;
+  *) echo 'Choose prepare, development or distribution for the third build argument.' >&2; exit 1 ;;
 esac
 case "$EDITION" in
   author) RUST_FEATURES=(--no-default-features) ;;
@@ -27,7 +28,7 @@ exec > >(tee "$OUT/build.log") 2>&1
 source_inventory() {
   (
     cd "$HERE"
-    { find App/Sources App/Tests Core/Sources Core/Tests RustBridge/src crates scripts -type f; printf '%s\n' App/Package.swift Core/Package.swift RustBridge/Cargo.toml Cargo.toml Info.plist Entitlements.plist NOTICE.md; } | LC_ALL=C sort | while IFS= read -r path; do shasum -a 256 "$path"; done
+    { find App/Sources App/Tests Core/Sources Core/Tests RustBridge/src RustBridge/tests crates scripts licenses -type f; printf '%s\n' App/Package.swift Core/Package.swift RustBridge/Cargo.toml Cargo.toml Info.plist Entitlements.plist LICENSE LICENSE-MIT LICENSE-APACHE NOTICE.md; } | LC_ALL=C sort | while IFS= read -r path; do shasum -a 256 "$path"; done
   )
 }
 source_inventory > "$OUT/source-files-before.sha256"
@@ -43,9 +44,16 @@ xcrun --sdk macosx --show-sdk-version
 (cd "$HERE" && cargo build -p bloom-core --bin bloom-delivery --release --locked)
 mkdir -p "$HERE/.build-support"
 python3 - "$CARGO_TARGET_DIR/release" "$EDITION" "$HERE/.build-support/RustProductBuild.json" <<'PYBUILD'
-import json,sys
+import hashlib,json,pathlib,sys
+library = pathlib.Path(sys.argv[1]) / 'libboom_attachment_ffi.a'
+digest = hashlib.sha256()
+with library.open('rb') as stream:
+    for block in iter(lambda: stream.read(1024 * 1024), b''):
+        digest.update(block)
 with open(sys.argv[3], 'w') as stream:
-    json.dump({'libraryDirectory':sys.argv[1], 'edition':sys.argv[2]}, stream)
+    json.dump({'libraryDirectory':sys.argv[1], 'librarySHA256':digest.hexdigest(),
+               'edition':sys.argv[2]}, stream, sort_keys=True)
+    stream.write('\n')
 PYBUILD
 swift "$HERE/scripts/record-native-libs.swift" "$OUT/rust-native-link.log" "$HERE/.build-support/RustNativeLink.json"
 (cd "$HERE/App" && swift test --manifest-cache none --disable-automatic-resolution)
@@ -85,12 +93,14 @@ cp "$HERE/App/Package.resolved" "$OUT/Package.resolved"
 # TCC reads the app's privacy descriptions from its signed bundle identity.
 # Signing only the SwiftPM executable leaves Info.plist unbound and can abort
 # Speech or microphone access when launched outside LaunchServices.
-"$CARGO_TARGET_DIR/release/bloom-delivery" sign "$APP" "$OUT" "$SIGN_PROFILE" "$SIGN_IDENTITY" "$HERE/Entitlements.plist"
-cp "$OUT/delivery/signed-entitlements.plist" "$OUT/signed-entitlements.plist"
-cat "$OUT/delivery/designated-requirement.stdout" "$OUT/delivery/designated-requirement.stderr" > "$OUT/designated-requirement.txt"
-cat "$OUT/delivery/signing-scope.stdout" "$OUT/delivery/signing-scope.stderr" > "$OUT/code-signing-scope.txt"
+if [[ "$SIGN_PROFILE" != prepare ]]; then
+  "$CARGO_TARGET_DIR/release/bloom-delivery" sign "$APP" "$OUT" "$SIGN_PROFILE" "$SIGN_IDENTITY" "$HERE/Entitlements.plist"
+  cp "$OUT/delivery/signed-entitlements.plist" "$OUT/signed-entitlements.plist"
+  cat "$OUT/delivery/designated-requirement.stdout" "$OUT/delivery/designated-requirement.stderr" > "$OUT/designated-requirement.txt"
+  cat "$OUT/delivery/signing-scope.stdout" "$OUT/delivery/signing-scope.stderr" > "$OUT/code-signing-scope.txt"
+fi
 otool -L "$APP/Contents/MacOS/Bloom" > "$OUT/dynamic-dependencies.txt"
 shasum -a 256 "$APP/Contents/MacOS/Bloom" > "$OUT/executable.sha256"
 du -sk "$APP" > "$OUT/bundle-size-kib.txt"
-echo "Built $APP"
+echo "Built $APP ($SIGN_PROFILE profile)"
 echo 'Build success is not UI, Keychain, download, media, or real-weight acceptance. Run the documented native gates.'

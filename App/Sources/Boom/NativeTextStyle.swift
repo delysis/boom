@@ -18,12 +18,15 @@ private struct MarkdownSpan: Decodable {
     let title: NSRange
     let hidden: [NSRange]
   }
-  static func wikiDisplays(in source: String) -> [WikiDisplay] {
+  static func wikiDisplays(in source: String, excluding literalRanges: [NSRange] = []) -> [WikiDisplay] {
     guard let pattern = try? NSRegularExpression(pattern: #"\[\[([^\[\]\n]{1,256})\]\]"#)
     else { return [] }
     let text = source as NSString
     return pattern.matches(in: source, range: NSRange(location: 0, length: text.length))
       .compactMap { match in
+        guard !literalRanges.contains(where: { NSIntersectionRange($0, match.range).length > 0 }) else {
+          return nil
+        }
         let body = text.substring(with: match.range(at: 1))
         let parts = body.split(separator: "|", omittingEmptySubsequences: false)
         guard parts.count <= 2, !parts[0].trimmingCharacters(in: .whitespaces).isEmpty else {
@@ -104,7 +107,9 @@ private struct MarkdownSpan: Decodable {
         storage.addAttributes([.font: NSFont.systemFont(ofSize: 0.1), .foregroundColor: NSColor.clear], range: range)
       } else { storage.addAttribute(.foregroundColor, value: NSColor.tertiaryLabelColor, range: range) }
     }
-    for display in wikiDisplays(in: storage.string) {
+    let literalRanges = spans.filter { $0.kind == "code" }
+      .map { NSRange(location: $0.location, length: $0.length) }
+    for display in wikiDisplays(in: storage.string, excluding: literalRanges) {
       for range in display.hidden {
         storage.addAttributes([
           .font: NSFont.systemFont(ofSize: 0.1),

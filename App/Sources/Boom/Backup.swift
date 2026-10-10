@@ -56,6 +56,8 @@ enum WorkspaceBackup {
     }
     let state = try PropertyListDecoder().decode(WorkspaceState.self, from: index.bytes)
     guard state.schema == 1 else { throw BoomError.invalid("Unsupported workspace in backup.") }
+    guard index.bytes.count <= Vault.workspaceLimit else { throw BoomError.budget("Workspace index exceeds 128 MiB.") }
+    try state.validateRetainedInput()
     let entries = records.map { record in
       VaultInventoryEntry(name: record.kind + "-" + record.id.uuidString + ".sealed", regular: true,
         digest: record.kind == "attachment" ? Digest.sha256(record.bytes) : nil,
@@ -94,10 +96,7 @@ enum WorkspaceBackup {
     guard try FileManager.default.contentsOfDirectory(atPath: vault.root.path).isEmpty else {
       throw BoomError.denied("Restore requires a fresh empty workspace.")
     }
-    let values = try source.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
-    guard values.isRegularFile == true, values.isSymbolicLink != true,
-      let size = values.fileSize, size <= limit + 128 else { throw BoomError.invalid("Invalid backup file.") }
-    let bytes = try Data(contentsOf: source)
+    let bytes = try RegularFile(source, limit: Int64(limit + 128)).data()
     let headerCount = magic.count + 16
     guard bytes.count > headerCount + 28, bytes.starts(with: magic) else { throw BoomError.invalid("Unsupported backup format.") }
     let header = Data(bytes.prefix(headerCount)), salt = Data(header.suffix(16))

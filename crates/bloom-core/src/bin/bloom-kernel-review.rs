@@ -77,6 +77,7 @@ fn main() -> Result<()> {
     let done = read(&root.join("driver-complete.json"))?;
     require(
         done["exit_code"] == 0
+            && done["executable_unchanged"] == true
             && done["child_joined"] == true
             && done["timed_out"] == false
             && done["source_pack_unchanged"] == true

@@ -50,6 +50,18 @@ struct VaultInventoryEntry: Encodable, Sendable {
   let digest: String?
   let bytes: Int?
 }
+struct ComposerOwner: Codable, Hashable, Sendable {
+  enum Kind: String, Codable, Sendable { case chat, document }
+  let kind: Kind
+  let id: UUID
+}
+struct ComposerDraft: Codable, Sendable {
+  let owner: ComposerOwner
+  let text: String
+  let attachments: [UUID]
+  let mode: InteractionMode
+  let authoredRole: Role?
+}
 struct WorkspaceState: Codable, Sendable {
   var schema = 1
   var documents: [DocumentIndex] = []
@@ -70,7 +82,31 @@ struct WorkspaceState: Codable, Sendable {
   var autocomplete = true
   var preferredModels: [String: String]? = nil
   var recordingDrafts: [UUID: [UUID]]? = nil
+  var composerDrafts: [ComposerDraft]? = nil
+  var writingExampleIDs: [UUID]? = nil
   var theme = "system"
+
+  func validateRetainedInput() throws {
+    let documents = Set(documents.map(\.id)), chats = Set(chats.map(\.id))
+    let attachments = Set(attachments.map(\.id))
+    let examples = writingExampleIDs ?? []
+    guard examples.count <= 32, Set(examples).count == examples.count,
+      examples.allSatisfy(documents.contains) else {
+      throw BoomError.invalid("Writing example selection is inconsistent; encrypted records retained.")
+    }
+    var owners = Set<ComposerOwner>()
+    for draft in composerDrafts ?? [] {
+      guard owners.insert(draft.owner).inserted,
+        (draft.owner.kind == .chat ? chats : documents).contains(draft.owner.id),
+        draft.attachments.count <= 8, Set(draft.attachments).count == draft.attachments.count,
+        draft.attachments.allSatisfy(attachments.contains) else {
+        throw BoomError.invalid("Unsent message ownership is inconsistent; encrypted records retained.")
+      }
+      guard draft.text.utf8.count <= 2_097_152 else {
+        throw BoomError.budget("Unsent text exceeds 2 MiB. Shorten it or copy it to a document before closing.")
+      }
+    }
+  }
 }
 
 /// One current format. Decryption/schema failure NEVER becomes an empty workspace.
@@ -111,7 +147,7 @@ final class Vault: @unchecked Sendable {
     FileManager.default.fileExists(atPath: url(kind, id).path)
   }
   func put(_ data: Data, kind: Kind, id: UUID) throws {
-    guard data.count <= (kind == .workspace ? Self.workspaceLimit : 1_100_000_000) else {
+    guard data.count <= ([Kind.workspace, .saveJournal].contains(kind) ? Self.workspaceLimit : 1_100_000_000) else {
       throw BoomError.budget("Private record exceeds its bound.")
     }
     lock.lock()
@@ -134,11 +170,13 @@ final class Vault: @unchecked Sendable {
     lock.lock()
     defer { lock.unlock() }
     let target = url(kind, id)
-    let v = try target.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
-    guard v.isRegularFile == true, v.isSymbolicLink != true, let size = v.fileSize,
-      size <= limit + 64 else { throw BoomError.invalid("Private record has an unsafe type or size.") }
-    return try AES.GCM.open(AES.GCM.SealedBox(combined: Data(contentsOf: target)),
+    let bound = limit.addingReportingOverflow(64)
+    guard limit >= 0, !bound.overflow else { throw BoomError.invalid("Invalid private read bound.") }
+    let ciphertext = try RegularFile(target, limit: Int64(bound.partialValue)).data()
+    let data = try AES.GCM.open(AES.GCM.SealedBox(combined: ciphertext),
       using: key, authenticating: aad(kind, id))
+    guard data.count <= limit else { throw BoomError.budget("Private record exceeds its read bound.") }
+    return data
   }
   func encode<T: Encodable>(_ value: T, kind: Kind, id: UUID) throws {
     let encoder = PropertyListEncoder(); encoder.outputFormat = .binary
@@ -287,6 +325,7 @@ actor WorkspaceStore {
         Set(state.voices.map(\.slug)).count == state.voices.count,
         Set(state.voices.map(\.id)).count == state.voices.count
       else { throw BoomError.invalid("Duplicate identities in workspace index.") }
+      try state.validateRetainedInput()
       try vault.validateInventory(state, hasIndex: hasIndex)
       for voice in state.voices + state.voiceVersions {
         guard try ProductCore.voice(voice.draft).revision == voice.revision else {
@@ -453,9 +492,7 @@ actor WorkspaceStore {
     }
   }
   func saveDocument(_ document: DocumentSnapshot) throws {
-    guard document.text.utf8.count <= 2_097_152 else {
-      throw BoomError.budget("Markdown document exceeds 2 MiB.")
-    }
+    try Self.validateDocumentSize(document)
     let u = documentURL(document.id)
     let coordinator = NSFileCoordinator(filePresenter: nil)
     var coordinationError: NSError?
@@ -487,6 +524,7 @@ actor WorkspaceStore {
     diskRevisions.removeValue(forKey: id)
   }
   func persist(_ state: WorkspaceState) throws {
+    try state.validateRetainedInput()
     try vault.encode(state, kind: .workspace, id: Vault.workspaceID)
   }
   struct SaveJournal: Codable {
@@ -495,16 +533,28 @@ actor WorkspaceStore {
     let documents: [DocumentSnapshot]
     let before: [UUID: String]
   }
+  private static func validateDocumentSize(_ document: DocumentSnapshot) throws {
+    guard document.text.utf8.count <= 2_097_152 else {
+      throw BoomError.budget("Markdown document exceeds 2 MiB.")
+    }
+  }
   private func recoverSave() throws {
     guard vault.exists(.saveJournal, Vault.workspaceID) else { return }
     let journal = try vault.decode(SaveJournal.self, kind: .saveJournal, id: Vault.workspaceID, limit: Vault.workspaceLimit)
     guard journal.schema == 1, journal.state.schema == 1,
       Set(journal.documents.map(\.id)).count == journal.documents.count,
+      Set(journal.state.documents.map(\.id)).count == journal.state.documents.count,
       journal.documents.allSatisfy({ doc in journal.state.documents.contains { $0.id == doc.id } }) else {
       throw BoomError.invalid("Invalid save journal; existing records retained.")
     }
+    try journal.state.validateRetainedInput()
+    let encoder = PropertyListEncoder(); encoder.outputFormat = .binary
+    guard try encoder.encode(journal.state).count <= Vault.workspaceLimit else {
+      throw BoomError.budget("Workspace index exceeds 128 MiB; save journal retained.")
+    }
     // Validate every record before repairing any of them.
     for document in journal.documents {
+      try Self.validateDocumentSize(document)
       let actual = vault.exists(.document, document.id) ? Digest.sha256(try readDocument(document.id)) : nil
       guard actual == journal.before[document.id] || actual == document.revision else {
         throw BoomError.stale("An interrupted save conflicts with a document; journal retained.")
@@ -519,11 +569,26 @@ actor WorkspaceStore {
   }
   func save(_ state: WorkspaceState, documents: [DocumentSnapshot]) throws {
     try recoverSave()
-    for document in documents { try checkDisk(document.id) }
+    guard state.schema == 1, Set(documents.map(\.id)).count == documents.count,
+      Set(state.documents.map(\.id)).count == state.documents.count,
+      documents.allSatisfy({ document in state.documents.contains { $0.id == document.id } }) else {
+      throw BoomError.invalid("Invalid save identities; existing records retained.")
+    }
+    try state.validateRetainedInput()
+    for document in documents {
+      try Self.validateDocumentSize(document)
+      try checkDisk(document.id)
+    }
     let journal = SaveJournal(schema: 1, state: state, documents: documents, before: diskRevisions)
-    try vault.encode(journal, kind: .saveJournal, id: Vault.workspaceID)
+    // The complete transaction must fit the same bounds used by reopening.
+    let encoder = PropertyListEncoder(); encoder.outputFormat = .binary
+    let indexBytes = try encoder.encode(state), journalBytes = try encoder.encode(journal)
+    guard indexBytes.count <= Vault.workspaceLimit, journalBytes.count <= Vault.workspaceLimit else {
+      throw BoomError.budget("Workspace save exceeds 128 MiB. Existing records were retained.")
+    }
+    try vault.put(journalBytes, kind: .saveJournal, id: Vault.workspaceID)
     for document in documents { try saveDocument(document) }
-    try persist(state)
+    try vault.put(indexBytes, kind: .workspace, id: Vault.workspaceID)
     try vault.remove(.saveJournal, id: Vault.workspaceID)
   }
 }

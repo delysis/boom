@@ -13,7 +13,12 @@ const COLLECTIONS: &[&str] = &[
     "attachments",
     "proposals",
 ];
-const OPTIONAL_COLLECTIONS: &[&str] = &["importedFolders", "importedFiles"];
+const OPTIONAL_COLLECTIONS: &[&str] = &[
+    "importedFolders",
+    "importedFiles",
+    "composerDrafts",
+    "writingExampleIDs",
+];
 const OTHER_FIELDS: &[&str] = &[
     "schema",
     "documents",
@@ -209,6 +214,22 @@ mod tests {
         assert!(admit(&state, &[], &[], false).is_err());
         state = fresh();
         state["manuscriptOrigins"] = json!([Uuid::new_v4(), {"revision":"captured"}]);
+        assert!(admit(&state, &[], &[], false).is_err());
+    }
+
+    #[test]
+    fn retained_input_and_example_selection_prevent_backup_replacement() {
+        let mut state = fresh();
+        state["composerDrafts"] = json!([]);
+        state["writingExampleIDs"] = json!([]);
+        assert!(admit(&state, &[], &[], false).is_ok());
+        state["composerDrafts"] = json!([{
+            "owner": {"kind": "document", "id": Uuid::new_v4()},
+            "text": "Retain this public unsent text", "attachments": []
+        }]);
+        assert!(admit(&state, &[], &[], false).is_err());
+        state["composerDrafts"] = json!([]);
+        state["writingExampleIDs"] = json!([Uuid::new_v4()]);
         assert!(admit(&state, &[], &[], false).is_err());
     }
 }

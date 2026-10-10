@@ -41,9 +41,9 @@ import SwiftUI
     if identity == nil || !searchRanges.isEmpty { searchIdentity = identity }
     needsDisplay = true
   }
-  private let placeholder = NativeTextPlaceholder("Begin writing…")
+  private let placeholder = NativeTextPlaceholder("Prose")
   func preparePlaceholder() {
-    setAccessibilityPlaceholderValue("Begin writing…")
+    setAccessibilityPlaceholderValue("Prose")
   }
   override func draw(_ dirtyRect: NSRect) {
     super.draw(dirtyRect)

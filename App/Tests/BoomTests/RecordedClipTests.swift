@@ -45,6 +45,7 @@ final class RecordedClipTests: XCTestCase {
     XCTAssertEqual(loaded.attachments.first { $0.id == id }, record)
     let reopened = try await WorkspaceModel(storeOverride: store, loadModels: false)
     XCTAssertEqual(reopened.pendingAttachments, [id])
+    XCTAssertEqual(reopened.draft, "Keep these words.")
     XCTAssertTrue(reopened.selectedChat?.messages.isEmpty == true)
     try await reopened.shutdown()
   }

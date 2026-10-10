@@ -63,19 +63,9 @@ enum LocalModelDirectories {
 }
 enum ModelInstaller {
   static func hashFile(_ url: URL, maxBytes: Int64) throws -> (sha256: String, bytes: Int64) {
-    let info = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
-    guard info.isRegularFile == true, info.isSymbolicLink != true,
-      let size = info.fileSize, Int64(size) <= maxBytes else { throw BoomError.invalid("Unsafe model file.") }
-    let handle = try FileHandle(forReadingFrom: url); defer { try? handle.close() }
-    var hash = SHA256(), total: Int64 = 0
-    while try autoreleasepool(invoking: { () throws -> Bool in
-      guard let chunk = try handle.read(upToCount: 4_194_304), !chunk.isEmpty else { return false }
-      total += Int64(chunk.count)
-      guard total <= maxBytes else { throw BoomError.budget("Model file grew during verification.") }
-      hash.update(data: chunk)
-      return true
-    }) {
-    }
+    let file = try RegularFile(url, limit: maxBytes)
+    var hash = SHA256()
+    let total = try file.chunks { hash.update(data: $0) }
     return (hash.finalize().map { String(format: "%02x", $0) }.joined(), total)
   }
 }

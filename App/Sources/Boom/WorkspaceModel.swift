@@ -45,9 +45,9 @@ struct CompletionSegment {
   @Published var selectedDocumentIDs: Set<UUID> = []
   @Published var selectedChatIDs: Set<UUID> = []
   @Published var composerFocusEpoch = 0
-  @Published var draft = ""
-  @Published var mode: InteractionMode = .ask
-  @Published var pendingAttachments: [UUID] = []
+  @Published var draft = "" { didSet { if draft != oldValue { retainComposerDraft() } } }
+  @Published var mode: InteractionMode = .ask { didSet { if mode != oldValue { retainComposerDraft() } } }
+  @Published var pendingAttachments: [UUID] = [] { didSet { if pendingAttachments != oldValue { retainComposerDraft() } } }
   @Published var isBusy = false
   @Published var status = "Install a consultation model to begin"
   @Published var errorMessage: String?
@@ -61,7 +61,7 @@ struct CompletionSegment {
   @Published var consultationStyle: ConsultationStyle = .separate
   @Published var showingChatInstructions: UUID?
   @Published var editingChatMessage: UUID?
-  @Published var authoredChatRole: Role?
+  @Published var authoredChatRole: Role? { didSet { if authoredChatRole != oldValue { retainComposerDraft() } } }
   @Published var samplingProfile: SamplingProfile = .standard
   @Published var candidates: CandidateBundle?
   @Published var showingCandidates = false
@@ -78,7 +78,16 @@ struct CompletionSegment {
   @Published var editingWritingExamples: WritingExamplesRequest?
   @Published var editingLocked = false
   @Published var backupRequest: BackupRequest?
-  @Published var writingExampleIDs: [UUID] = []
+  @Published var writingExampleIDs: [UUID] = [] {
+    didSet {
+      if writingExampleIDs != oldValue {
+        state.writingExampleIDs = writingExampleIDs
+        scheduleSave()
+      }
+    }
+  }
+  private var composerOwner: ComposerOwner?
+  private var restoringComposer = false
   let layout: ProductLayout
   @Published var librarySearch = "" { didSet { if oldValue != librarySearch { refreshSearch() } } }
   @Published private(set) var documentSearch: [UUID: DocumentSearchMatches] = [:]
@@ -112,7 +121,7 @@ struct CompletionSegment {
     if let id = state.selectedChat, state.chats.contains(where: { $0.id == id }) {
       return .chat(id: id)
     }
-    scheduleSave()
+    retainComposerDraft()
     var next = state
     let chat = ChatRecord(attachedDocumentID: layout.isAuthor ? state.selectedDocument : nil)
     next.chats.append(chat)
@@ -120,6 +129,7 @@ struct CompletionSegment {
     next.showChat = true
     scheduleSave()
     state = next
+    transferDocumentDraftToChat()
     selectedChatIDs = [chat.id]
     compactPane = "chat"
     return .chat(id: chat.id)
@@ -223,9 +233,10 @@ struct CompletionSegment {
     self.documents = loaded.1
     selectedDocumentIDs = Set(state.selectedDocument.map { [$0] } ?? [])
     selectedChatIDs = Set(state.selectedChat.map { [$0] } ?? [])
-    if let chat = state.selectedChat { pendingAttachments = state.recordingDrafts?[chat] ?? [] }
     if layout.isAuthor && documents.isEmpty { try newDocument() }
     if state.chats.isEmpty && !layout.isAuthor { try newChat() }
+    writingExampleIDs = state.writingExampleIDs ?? []
+    restoreComposerDraft()
     if let id = state.selectedDocument {
       let history = try await store.candidateHistory(for: id, ids: state.candidateIDs)
       savedExplorations = history.explorations
@@ -351,9 +362,48 @@ struct CompletionSegment {
   }
   func dismissError() { errorMessage = nil }
   func finishComposition() { editor?.finishComposition() }
+  private var selectedComposerOwner: ComposerOwner? {
+    if let chat = state.selectedChat, state.chats.contains(where: { $0.id == chat }) {
+      return ComposerOwner(kind: .chat, id: chat)
+    }
+    if let document = state.selectedDocument, documents.contains(where: { $0.id == document }) {
+      return ComposerOwner(kind: .document, id: document)
+    }
+    return nil
+  }
+  private func retainComposerDraft(schedule: Bool = true) {
+    guard !restoringComposer, let owner = composerOwner,
+      owner.kind == .chat ? state.chats.contains(where: { $0.id == owner.id })
+        : documents.contains(where: { $0.id == owner.id }) else { return }
+    var drafts = (state.composerDrafts ?? []).filter { $0.owner != owner }
+    if !draft.isEmpty || !pendingAttachments.isEmpty {
+      drafts.append(ComposerDraft(owner: owner, text: draft, attachments: pendingAttachments,
+        mode: mode, authoredRole: authoredChatRole))
+    }
+    if !drafts.isEmpty || state.composerDrafts != nil { state.composerDrafts = drafts }
+    if schedule { scheduleSave() }
+  }
+  private func restoreComposerDraft() {
+    restoringComposer = true
+    defer { restoringComposer = false }
+    composerOwner = selectedComposerOwner
+    let retained = state.composerDrafts?.first { $0.owner == composerOwner }
+    draft = retained?.text ?? ""
+    pendingAttachments = retained?.attachments ?? (state.selectedChat.flatMap { state.recordingDrafts?[$0] } ?? [])
+    mode = retained?.mode ?? .ask
+    authoredChatRole = retained?.authoredRole
+  }
+  private func transferDocumentDraftToChat() {
+    if let owner = composerOwner, owner.kind == .document {
+      state.composerDrafts?.removeAll { $0.owner == owner }
+    }
+    composerOwner = selectedComposerOwner
+    retainComposerDraft()
+  }
   func flush() async throws {
     saveTask?.cancel()
     saveTask = nil
+    retainComposerDraft(schedule: false)
     let captured = documents.filter { dirty.contains($0.id) }
     // The editable source is the chat; portable voice records are its immutable snapshots.
     for voice in state.voices {
@@ -383,12 +433,12 @@ struct CompletionSegment {
   func newDocument() throws {
     finishComposition()
     cancel()
-    scheduleSave()
+    retainComposerDraft()
     let document = DocumentSnapshot(title: "Untitled", text: "")
     dirty.insert(document.id)
     documents.append(document)
     state.selectedDocument = document.id
-    mode = .ask
+    restoreComposerDraft()
     resetContinuationView()
     selectedDocumentIDs = [document.id]
     state.showDocument = true
@@ -399,7 +449,7 @@ struct CompletionSegment {
   func newChat(about documentID: UUID? = nil) throws {
     finishComposition()
     cancel()
-    scheduleSave()
+    retainComposerDraft()
     if let documentID, !documents.contains(where: { $0.id == documentID }) {
       throw BoomError.invalid("The document for this chat no longer exists.")
     }
@@ -410,10 +460,8 @@ struct CompletionSegment {
     composerFocusEpoch &+= 1
     state.showChat = true
     compactPane = "chat"
-    pendingAttachments = []
-    draft = ""
-    mode = .ask
-    authoredChatRole = nil; showingChatInstructions = nil; editingChatMessage = nil
+    restoreComposerDraft()
+    showingChatInstructions = nil; editingChatMessage = nil
     scheduleSave()
   }
   private func ensureChatForSend() {
@@ -448,11 +496,13 @@ struct CompletionSegment {
         throw BoomError.invalid("Only your messages can be edited and continued.")
       }
       let nextChat = try original.branch(at: messageID, includeMessage: !editing)
+      retainComposerDraft()
       var next = state
       next.chats.append(nextChat)
       next.selectedChat = nextChat.id
       scheduleSave()
       state = next
+      restoreComposerDraft()
       selectedChatIDs = [nextChat.id]
       pendingAttachments = editing
         ? message.sources.filter { $0.kind == "attachment" }.map(\.id) : []
@@ -505,15 +555,15 @@ struct CompletionSegment {
   func selectDocument(_ id: UUID, preservingSelection: Bool = false) {
       guard documents.contains(where: { $0.id == id }) else { return }
       finishComposition()
-      scheduleSave()
+      retainComposerDraft()
       cancel()
       state.selectedDocument = id
       resetContinuationView()
       if layout.isAuthor, selectedChat?.attachedDocumentID != id {
         state.selectedChat = state.chats.last(where: { $0.attachedDocumentID == id })?.id
-        mode = .ask
-        draft = ""; pendingAttachments = []; showingChatInstructions = nil; editingChatMessage = nil
+        showingChatInstructions = nil; editingChatMessage = nil
       }
+      restoreComposerDraft()
       if !preservingSelection { selectedDocumentIDs = [id] }
       state.showDocument = true
         compactPane = "document"
@@ -525,15 +575,14 @@ struct CompletionSegment {
   func selectChat(_ id: UUID, preservingSelection: Bool = false) {
     guard state.chats.contains(where: { $0.id == id }) else { return }
     cancel()
+    retainComposerDraft()
     state.selectedChat = id
     if !preservingSelection { selectedChatIDs = [id] }
     composerFocusEpoch &+= 1
     state.showChat = true
     compactPane = "chat"
-    pendingAttachments = state.recordingDrafts?[id] ?? []
-    draft = ""
-    mode = .ask
-    authoredChatRole = nil; showingChatInstructions = nil; editingChatMessage = nil
+    restoreComposerDraft()
+    showingChatInstructions = nil; editingChatMessage = nil
     scheduleSave()
   }
   func focusEditor(_ id: UUID) {
@@ -546,13 +595,17 @@ struct CompletionSegment {
   func deleteDocuments(_ ids: Set<UUID>) {
     guard !isBusy, !ids.isEmpty else { return }
     let targets = documents.filter { ids.contains($0.id) }
+    let discardsDrafts = (state.composerDrafts ?? []).contains { $0.owner.kind == .document && ids.contains($0.owner.id) }
     guard !targets.isEmpty, confirm(targets.count == 1 ? "Delete \(targets[0].title)?" : "Delete \(targets.count) documents?",
-      message: "Encrypted records move to macOS Trash after the library change is saved. Captured chat sources and receipts stay.") else { return }
+      message: "Encrypted records move to macOS Trash after the library change is saved. Captured chat sources and receipts stay."
+        + (discardsDrafts ? " Their unsent text and pending attachment selection will be discarded." : "")) else { return }
     finishComposition()
     work("Deleting documents…") { [weak self] _ in
       guard let self else { return }
       try await self.flush()
       self.documents.removeAll { ids.contains($0.id) }
+      self.state.composerDrafts?.removeAll { $0.owner.kind == .document && ids.contains($0.owner.id) }
+      self.writingExampleIDs.removeAll { ids.contains($0) }
       self.state.importedFiles = self.state.importedFiles?.filter { !ids.contains($0.key) }
       if self.state.selectedDocument.map(ids.contains) == true {
         self.state.selectedDocument = self.documents.first?.id
@@ -560,6 +613,7 @@ struct CompletionSegment {
         self.resetContinuationView()
       }
       self.selectedDocumentIDs.subtract(ids)
+      self.restoreComposerDraft()
       self.invalidateGhost()
       try await self.flush()
       for document in targets {
@@ -573,16 +627,20 @@ struct CompletionSegment {
     guard !isBusy, !ids.isEmpty else { return }
     let targets = state.chats.filter { ids.contains($0.id) }
     let removesCurrent = state.selectedChat.map { ids.contains($0) } ?? false
+    let discardsDrafts = (state.composerDrafts ?? []).contains { $0.owner.kind == .chat && ids.contains($0.owner.id) }
+      || (state.recordingDrafts ?? [:]).contains { ids.contains($0.key) && !$0.value.isEmpty }
     guard !targets.isEmpty,
       confirm(
         targets.count == 1 ? "Delete \(targets[0].title)?" : "Delete \(targets.count) chats?",
         message: "Their messages and pinned voices will be removed from the library. Captured voice revisions and edit receipts stay."
-          + (removesCurrent && !draft.isEmpty ? " The unsent message will be discarded." : "")
+          + (discardsDrafts ? " Their unsent text and pending attachment selection will be discarded." : "")
       ) else { return }
-      scheduleSave()
+      retainComposerDraft()
       var next = state
       next.chats.removeAll { ids.contains($0.id) }
       next.voices.removeAll { ids.contains($0.id) }
+      next.composerDrafts?.removeAll { $0.owner.kind == .chat && ids.contains($0.owner.id) }
+      next.recordingDrafts = next.recordingDrafts?.filter { !ids.contains($0.key) }
       if let selected = next.selectedChat, ids.contains(selected) {
         next.selectedChat = next.chats.first?.id
       }
@@ -591,9 +649,7 @@ struct CompletionSegment {
       selectedChatIDs.subtract(ids)
       if selectedChatIDs.isEmpty, let id = next.selectedChat { selectedChatIDs = [id] }
       if removesCurrent {
-        draft = ""
-        pendingAttachments = []
-        mode = .ask
+        restoreComposerDraft()
         composerFocusEpoch &+= 1
       }
   }
@@ -773,9 +829,13 @@ struct CompletionSegment {
   }
   func shutdown() async throws {
     speechOutput.stopSpeaking()
+    speechSetupTask?.cancel()
     modelPickerTask?.cancel()
     finishComposition()
     cancel()
+    await VoiceInput.cancelSpeechPreparationAndJoin()
+    if let speechSetupTask { await speechSetupTask.value }
+    speechSetupTask = nil
     for input in inputCompletions { await input.value?.join() }
     saveTask?.cancel()
     searchEpoch &+= 1; searchTask?.cancel()
@@ -1842,9 +1902,10 @@ struct CompletionSegment {
     }
   }
   private func selectImportedDocument(_ id: UUID) {
+    retainComposerDraft()
     state.selectedDocument = id; selectedDocumentIDs = [id]; state.showDocument = true
     caret = 0; resetContinuationView()
-    state.selectedChat = nil; draft = ""; pendingAttachments = []
+    state.selectedChat = nil; restoreComposerDraft()
     showingChatInstructions = nil; editingChatMessage = nil
     compactPane = "document"; invalidateGhost(); focusEditor(id)
   }
@@ -2084,8 +2145,10 @@ struct CompletionSegment {
       throw BoomError.stale("The recording's conversation changed.")
     }
     if state.selectedChat == nil {
+      retainComposerDraft()
       let chat = ChatRecord(attachedDocumentID: layout.isAuthor ? documentID : nil)
       state.chats.append(chat); state.selectedChat = chat.id; selectedChatIDs = [chat.id]
+      transferDocumentDraftToChat()
     }
     var record = imported.record
     record.text = ""; record.coverage = "Audio"; record.awaitingTranscription = true
@@ -2444,7 +2507,8 @@ struct CompletionSegment {
         self.dirty.removeAll(); self.undoManagers.removeAll()
         self.selectedDocumentIDs = Set(self.state.selectedDocument.map { [$0] } ?? [])
         self.selectedChatIDs = Set(self.state.selectedChat.map { [$0] } ?? [])
-        self.draft = ""; self.pendingAttachments = []; self.invalidateGhost()
+        self.writingExampleIDs = self.state.writingExampleIDs ?? []
+        self.restoreComposerDraft(); self.invalidateGhost()
         self.status = "Backup restored"
       } else {
         try await self.store.exportBackup(passphrase: passphrase, to: request.url)

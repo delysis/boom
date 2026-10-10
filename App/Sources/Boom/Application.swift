@@ -222,6 +222,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
     Task { await openWorkspace() }
   }
   private func openWorkspace() async {
+    var retainedDirectory: URL?
     do {
       let arguments = try QualificationLaunch.current()
       let override: WorkspaceStore?
@@ -231,6 +232,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
           throw BoomError.invalid("Native checks require an explicit absolute encrypted workspace path.")
         }
         let root = URL(fileURLWithPath: arguments[index + 1]).standardizedFileURL
+        retainedDirectory = root.appendingPathComponent("Private", isDirectory: true)
         let session: VaultSession
         if let scopeIndex = arguments.firstIndex(of: "--native-check-qualification-id") {
           guard arguments.filter({ $0 == "--native-check-qualification-id" }).count == 1,
@@ -250,7 +252,12 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
           nativeEvidence = try await NativeCheckEvidence(directory: URL(fileURLWithPath: arguments[evidenceIndex + 1]), session: session)
         }
         isNativeCheck = true
-      } else { override = nil }
+      } else {
+        override = nil
+        retainedDirectory = try FileManager.default.url(for: .applicationSupportDirectory,
+          in: .userDomainMask, appropriateFor: nil, create: false)
+          .appendingPathComponent("Bloom/Private", isDirectory: true)
+      }
       let backgroundCheck = isNativeCheck && arguments.contains("--native-check-background")
       let noModels = isNativeCheck && arguments.contains("--native-check-no-models")
       let model = try await WorkspaceModel(storeOverride: override, loadModels: !noModels)
@@ -291,7 +298,18 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
       alert.messageText = "Bloom could not open its local workspace"
       alert.informativeText = error.localizedDescription
       alert.alertStyle = .critical
-      alert.runModal()
+      alert.addButton(withTitle: "Quit")
+      let canReveal = retainedDirectory.flatMap {
+        try? $0.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+      }.map { $0.isDirectory == true && $0.isSymbolicLink != true } ?? false
+      if canReveal {
+        let button = alert.addButton(withTitle: "Reveal")
+        button.toolTip = "Reveal the retained encrypted records in Finder so they can be copied before repair."
+        button.setAccessibilityLabel("Reveal retained encrypted records")
+      }
+      if alert.runModal() == .alertSecondButtonReturn, let directory = retainedDirectory {
+        NSWorkspace.shared.activateFileViewerSelecting([directory])
+      }
       NSApp.terminate(nil)
     }
   }

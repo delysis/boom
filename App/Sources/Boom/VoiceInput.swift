@@ -14,14 +14,28 @@ import Speech
   private var transcriptionFlag: CancellationFlag?
   private var generation = 0
   private let speaker = AVSpeechSynthesizer()
-  private static var speechPreparation: Task<Void, Error>?
+  private static var speechPreparation: (id: UUID, task: Task<Void, Error>)?
 
-  static func prepareOnDeviceSpeech() async throws {
-    if let preparation = speechPreparation { try await preparation.value; return }
-    let preparation = Task { try await VoiceInput().installSpeechAsset() }
-    speechPreparation = preparation
-    defer { speechPreparation = nil }
+  static func prepareOnDeviceSpeech(
+    installation: @escaping @MainActor () async throws -> Void = { try await VoiceInput().installSpeechAsset() }
+  ) async throws {
+    try Task.checkCancellation()
+    if let preparation = speechPreparation {
+      try await preparation.task.value
+      try Task.checkCancellation()
+      return
+    }
+    let id = UUID(), preparation = Task { try await installation() }
+    speechPreparation = (id, preparation)
+    defer { if speechPreparation?.id == id { speechPreparation = nil } }
     try await preparation.value
+    try Task.checkCancellation()
+  }
+  static func cancelSpeechPreparationAndJoin() async {
+    guard let preparation = speechPreparation else { return }
+    preparation.task.cancel()
+    _ = try? await preparation.task.value
+    if speechPreparation?.id == preparation.id { speechPreparation = nil }
   }
 
   var isRecording: Bool { engine != nil }
@@ -116,11 +130,15 @@ import Speech
   }
 
   func installSpeechAsset() async throws {
+    try Task.checkCancellation()
     if #available(macOS 26.0, *) {
       let module = try await dictationModule()
+      try Task.checkCancellation()
       if let request = try await AssetInventory.assetInstallationRequest(supporting: [module]) {
+        try Task.checkCancellation()
         try await request.downloadAndInstall()
       }
+      try Task.checkCancellation()
       _ = try await readyDictationModule()
     } else { try await authorizeLegacySpeech() }
   }

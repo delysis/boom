@@ -4,6 +4,10 @@ As of the user's October 7, 2026 scope update, current delivery requires a runna
 
 The default build is an Apple Development build for local work. Distribution is a separate, explicit build profile. It requires a Developer ID Application identity and requests Apple's secure signing timestamp. Both profiles verify the actual signature, hardened-runtime bit, microphone entitlement, signed identity and privacy descriptions, source/lock inventories and model catalog through the workspace's safe Rust `bloom-delivery` tool. The tool records each native command, output and result before proceeding. It does not run Bloom, access its vault, submit to Apple or publish weights.
 
+Use `scripts/build-macos.sh NEW_OUTPUT author|chat prepare` to build and check a concrete bundle before using signing credentials. This profile retains the same source, lock, resources and complete notice inventory but performs no certificate signing. It is a preparation artifact, and still requires signing and installed native acceptance for delivery.
+
+The build records the exact Rust static-library SHA-256 in `product-build.json`. SwiftPM also uses that digest as a C-shim compilation input so a new Rust archive forces the native executable to relink. Use the consolidated build script after Rust changes; its recorded archive, executable and source inventories identify the delivered copy.
+
 Apple describes the certificate, timestamp and hardened-runtime requirements in [Notarizing macOS software](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution), and submission/stapling in [Customizing the notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow). Bloom deliberately supports its current single-executable bundle. Unexpected nested executables or resource symlinks refuse preparation rather than receiving blanket signing permissions.
 
 Set `BLOOM_SIGN_IDENTITY` locally to the full Developer ID Application identity or its fingerprint. Keep the signing identity stable across builds. Build each edition into a different fresh directory:
@@ -13,7 +17,7 @@ scripts/build-macos.sh "$PWD/out/author-distribution" author distribution
 scripts/build-macos.sh "$PWD/out/chat-distribution" chat distribution
 ```
 
-An unavailable identity, wrong certificate type, failed timestamp service or failed signature check leaves evidence and fails the build. There is no fallback to development signing. Development retains its existing designated requirement and no timestamp-server request. Distribution builds require network access for Apple's signing timestamp; app startup and inference remain local operations.
+An unavailable identity, wrong certificate type, failed timestamp service or failed signature check leaves evidence and fails the build. There is no fallback to development signing. Development retains its existing designated requirement and no timestamp-server request. Distribution builds require network access for Apple's signing timestamp. Initial automatic model and speech-asset setup may download their public assets; later startup and generation use admitted local files. Qualify that cached path separately with outbound networking denied.
 
 The consolidated gate builds the delivery tool at `target/release/bloom-delivery` (or `target/chat/release/bloom-delivery` for chat). Independently inspect any exact bundle into fresh evidence:
 

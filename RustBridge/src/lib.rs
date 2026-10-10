@@ -10,6 +10,8 @@ use std::{
     ptr, slice, str,
 };
 
+mod encoding;
+
 const MAX_INPUT: usize = 64 * 1024 * 1024;
 const MAX_OUTPUT: usize = 8 * 1024 * 1024;
 
@@ -95,11 +97,11 @@ fn process(name: &str, bytes: &[u8]) -> Value {
     }
 }
 fn owned(value: Value) -> BoomAttachmentBuffer {
-    let mut bytes =
-        serde_json::to_vec(&value).unwrap_or_else(|_| b"{\"schema\":1,\"ok\":false}".to_vec());
-    if bytes.len() > MAX_OUTPUT {
-        bytes = b"{\"schema\":1,\"ok\":false,\"error\":{\"code\":\"output_limit\",\"message\":\"Attachment receipt exceeds 8 MiB; no context admitted.\"}}".to_vec();
-    }
+    let bytes = match encoding::encode(&value, MAX_OUTPUT) {
+        Ok(bytes) => bytes,
+        Err(encoding::EncodingError::Limit) => b"{\"schema\":1,\"ok\":false,\"error\":{\"code\":\"output_limit\",\"message\":\"Attachment receipt exceeds 8 MiB; no context admitted.\"}}".to_vec(),
+        Err(encoding::EncodingError::Failed) => b"{\"schema\":1,\"ok\":false,\"error\":{\"code\":\"serialization_failed\",\"message\":\"Product reply could not be encoded.\"}}".to_vec(),
+    };
     let boxed = bytes.into_boxed_slice();
     let length = boxed.len();
     BoomAttachmentBuffer {
@@ -124,9 +126,9 @@ pub unsafe extern "C" fn bloom_core_request(
         // SAFETY: caller provides a live immutable buffer for this call only.
         let bytes = unsafe { slice::from_raw_parts(data, length) };
         match serde_json::from_slice::<bloom_core::Request>(bytes) {
-            Ok(request) => match bloom_core::execute(request) {
+            Ok(request) => match bloom_core::execute_for_transport(request) {
                 Ok(value) => json!({"schema":1,"ok":true,"value":value}),
-                Err(e) => error("invalid", &e.to_string()),
+                Err(e) => error(e.code(), &e.to_string()),
             },
             Err(_) => error("request_invalid", "Malformed product request."),
         }

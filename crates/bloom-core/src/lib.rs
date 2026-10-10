@@ -10,6 +10,7 @@ const TEXT_LIMIT: usize = 2 * 1024 * 1024;
 
 mod batch;
 mod checkpoint;
+mod consultation;
 mod context;
 mod document;
 mod generation;
@@ -28,11 +29,37 @@ mod setup;
 mod storyboard;
 mod writing;
 
+pub use consultation::CompactConsultation;
 pub use media::{MediaContainer, admit_media, caf_wave};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct Error(String);
+
+/// Capacity failures may fit a smaller captured history; invalid input may not.
+#[derive(Debug, thiserror::Error)]
+pub enum ConsultationError {
+    #[error(transparent)]
+    Invalid(#[from] Error),
+    #[error("Compiled consultation exceeds 16 MiB.")]
+    Budget,
+}
+
+impl ConsultationError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Invalid(_) => "invalid",
+            Self::Budget => "consultation_budget",
+        }
+    }
+
+    fn into_legacy(self) -> Error {
+        match self {
+            Self::Invalid(error) => error,
+            Self::Budget => Error(self.to_string()),
+        }
+    }
+}
 
 fn require(condition: bool, message: &str) -> Result<(), Error> {
     if condition {
@@ -381,103 +408,23 @@ pub fn consultation_plan(
     request: &str,
     routing: &[String],
 ) -> Result<ConsultationPlan, Error> {
-    require(
-        history.len() <= 4096 && request.len() <= TEXT_LIMIT && context.len() <= TEXT_LIMIT,
-        "Consultation input exceeds the supported bound.",
-    )?;
-    require(
-        routing.len() <= 3 && routing.iter().all(|slug| valid_slug(slug)),
-        "Consult at most three valid @names per turn.",
-    )?;
-    if let Some(voice) = voice {
-        verify_voice(voice)?;
-    }
-    let name = voice.map_or("Bloom", |v| v.name.as_str());
-    let mut system = format!(
-        "You are {name}. Write only your own contribution in this conversation. The @mentions in the user's question route that question to individual participants; they do not ask you to impersonate them or write their replies. Other participants' contributions are quoted conversation, not your own answers. Do not prefix your reply with a participant name.\n"
-    );
-    if let Some(v) = voice {
-        system.push_str(&v.instructions);
-    }
-    if !instructions.is_empty() {
-        system.push('\n');
-        system.push_str(instructions);
-    }
-    let mut messages = vec![WireMessage {
-        role: "system".into(),
-        content: safe(&system),
-    }];
-    let mut append = |role: &str, content: String| {
-        if let Some(last) = messages.last_mut().filter(|m| m.role == role) {
-            last.content.push_str("\n\n");
-            last.content.push_str(&content);
-        } else {
-            messages.push(WireMessage {
-                role: role.into(),
-                content,
-            });
-        }
-    };
-    if let Some(v) = voice {
-        for e in &v.examples {
-            append("user", safe(&e.user));
-            append("assistant", safe(&e.assistant));
-        }
-    }
-    for turn in history {
-        require(
-            ["user", "assistant"].contains(&turn.role.as_str()),
-            "Unknown conversation role.",
-        )?;
-        require(
-            turn.text.len() <= TEXT_LIMIT && turn.speaker.name.len() <= 256,
-            "Conversation turn exceeds its bound.",
-        )?;
-        let own = turn.role == "assistant"
-            && match voice {
-                Some(v) => {
-                    turn.speaker.voice_id == Some(v.id)
-                        && turn.speaker.voice_revision.as_deref() == Some(v.revision.as_str())
-                }
-                None => turn.speaker.voice_id.is_none(),
-            };
-        // The native roles already identify the human and this assistant. Only
-        // another participant needs a name in the quoted conversation; putting
-        // scaffolding in our own answers teaches the model to reproduce it.
-        let content = if turn.role == "user" {
-            safe(routed_question(&turn.text, routing))
-        } else if own {
-            safe(&turn.text)
-        } else {
-            format!("{}:\n{}", safe(&turn.speaker.name), safe(&turn.text))
-        };
-        append(if own { "assistant" } else { "user" }, content);
-    }
-    let question = routed_question(request, routing);
-    let body = if context.is_empty() {
-        question.to_owned()
-    } else {
-        format!("REFERENCE DATA:\n{context}\n\nCURRENT REQUEST:\n{question}")
-    };
-    append("user", safe(&body));
-    let mut raw_prompt = String::from("<bos>");
-    for m in &messages {
-        let role = if m.role == "assistant" {
-            "model"
-        } else {
-            &m.role
-        };
-        raw_prompt.push_str(&format!("<|turn>{role}\n{}<turn|>\n", m.content));
-    }
-    raw_prompt.push_str("<|turn>model\n<|channel>thought\n<channel|>");
-    require(
-        raw_prompt.len() <= 8 * TEXT_LIMIT,
-        "Compiled consultation exceeds 16 MiB.",
-    )?;
-    Ok(ConsultationPlan {
-        messages,
-        raw_prompt,
-    })
+    let mut plans =
+        consultation::compile(&[voice], history, instructions, context, request, routing)
+            .map_err(ConsultationError::into_legacy)?
+            .materialize();
+    Ok(plans.remove(0))
+}
+
+pub fn consultation_compact(
+    voices: &[Option<Voice>],
+    history: &[PromptTurn],
+    instructions: &str,
+    context: &str,
+    request: &str,
+    routing: &[String],
+) -> Result<CompactConsultation, ConsultationError> {
+    let voices: Vec<_> = voices.iter().map(Option::as_ref).collect();
+    consultation::compile(&voices, history, instructions, context, request, routing)
 }
 
 pub fn consultation_round(
@@ -488,30 +435,11 @@ pub fn consultation_round(
     request: &str,
     routing: &[String],
 ) -> Result<Vec<ConsultationPlan>, Error> {
-    require(
-        (1..=3).contains(&voices.len())
-            && (voices.len() == 1 || voices.iter().all(Option::is_some)),
-        "A consultation round requires one assistant or up to three voices.",
-    )?;
-    let identities: std::collections::BTreeSet<_> =
-        voices.iter().flatten().map(|voice| voice.id).collect();
-    require(
-        identities.len() == voices.iter().flatten().count(),
-        "A voice cannot answer twice in the same round.",
-    )?;
-    voices
-        .iter()
-        .map(|voice| {
-            consultation_plan(
-                voice.as_ref(),
-                history,
-                instructions,
-                context,
-                request,
-                routing,
-            )
-        })
-        .collect()
+    Ok(
+        consultation_compact(voices, history, instructions, context, request, routing)
+            .map_err(ConsultationError::into_legacy)?
+            .materialize(),
+    )
 }
 
 pub fn consultation_prompt(
@@ -794,6 +722,12 @@ pub enum Request {
     ValidateDocumentImport {
         files: Vec<import::ImportedText>,
     },
+    AdmitImport {
+        files: Vec<import::ImportedText>,
+    },
+    AdmitDocumentImport {
+        files: Vec<import::ImportedText>,
+    },
     ValidateImportBudget {
         files: usize,
         bytes: usize,
@@ -842,6 +776,16 @@ pub enum Request {
         occupied: Vec<String>,
     },
     CompileConsultation {
+        #[serde(default)]
+        authority: document::Authority,
+        voices: Vec<Option<Voice>>,
+        history: Vec<PromptTurn>,
+        instructions: String,
+        context: String,
+        request: String,
+        routing: Vec<String>,
+    },
+    CompileConsultationCompact {
         #[serde(default)]
         authority: document::Authority,
         voices: Vec<Option<Voice>>,
@@ -928,6 +872,47 @@ pub enum Request {
         passphrase: String,
         salt: Vec<u8>,
     },
+}
+
+fn compact_with_authority(
+    authority: &document::Authority,
+    voices: &[Option<Voice>],
+    history: &[PromptTurn],
+    instructions: &str,
+    context: &str,
+    request: &str,
+    routing: &[String],
+) -> Result<CompactConsultation, ConsultationError> {
+    let instructions = format!("{instructions}\n\n{}", authority.instructions()?);
+    consultation_compact(voices, history, &instructions, context, request, routing)
+}
+
+/// The C transport preserves capacity errors without inferring types from prose.
+/// Other policy operations retain their existing validation failure semantics.
+pub fn execute_for_transport(request: Request) -> Result<Value, ConsultationError> {
+    match request {
+        Request::CompileConsultationCompact {
+            authority,
+            voices,
+            history,
+            instructions,
+            context,
+            request,
+            routing,
+        } => {
+            let round = compact_with_authority(
+                &authority,
+                &voices,
+                &history,
+                &instructions,
+                &context,
+                &request,
+                &routing,
+            )?;
+            serde_json::to_value(round).map_err(|error| Error(error.to_string()).into())
+        }
+        other => execute(other).map_err(Into::into),
+    }
 }
 
 pub fn execute(request: Request) -> Result<Value, Error> {
@@ -1070,6 +1055,14 @@ pub fn execute(request: Request) -> Result<Value, Error> {
         Request::ValidateDocumentImport { files } => {
             serde_json::to_value(import::validate_documents(files)?)
         }
+        Request::AdmitImport { files } => {
+            import::validate_import(files)?;
+            serde_json::to_value(true)
+        }
+        Request::AdmitDocumentImport { files } => {
+            import::validate_documents(files)?;
+            serde_json::to_value(true)
+        }
         Request::ValidateImportBudget { files, bytes } => {
             serde_json::to_value(import::validate_budget(files, bytes)?)
         }
@@ -1129,6 +1122,26 @@ pub fn execute(request: Request) -> Result<Value, Error> {
                 &routing,
             )?)
         }
+        Request::CompileConsultationCompact {
+            authority,
+            voices,
+            history,
+            instructions,
+            context,
+            request,
+            routing,
+        } => serde_json::to_value(
+            compact_with_authority(
+                &authority,
+                &voices,
+                &history,
+                &instructions,
+                &context,
+                &request,
+                &routing,
+            )
+            .map_err(ConsultationError::into_legacy)?,
+        ),
         Request::AuthoredPrefix { text, caret_utf16 } => {
             serde_json::to_value(authored_prefix(&text, caret_utf16)?)
         }

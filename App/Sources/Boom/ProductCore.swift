@@ -27,6 +27,23 @@ enum ProductCore {
   static func importedDocuments(_ files: [ImportedText]) throws -> [ImportedText] {
     try call(["op": "validate_document_import", "files": object(files)])
   }
+  static func admitImportedTexts(_ files: [ImportedText], documents: Bool = false) throws {
+    var bytes = 0
+    for file in files {
+      let total = bytes.addingReportingOverflow(file.text.utf8.count)
+      guard !total.overflow else { throw BoomError.budget("Import size cannot be represented.") }
+      bytes = total.partialValue
+    }
+    try importBudget(files: files.count, bytes: bytes)
+    let operation = documents ? "admit_document_import" : "admit_import"
+    // Validate the complete path set together, then acknowledge bounded texts.
+    // Worst-case JSON escaping of eight MiB need not fit a sixteen-MiB request.
+    let paths = files.map { ImportedText(path: $0.path, text: "") }
+    let _: Bool = try call(["op": operation, "files": object(paths)])
+    for file in files {
+      let _: Bool = try call(["op": operation, "files": object([file])])
+    }
+  }
   static func importBudget(files: Int, bytes: Int) throws {
     let _: Bool = try call(["op": "validate_import_budget", "files": files, "bytes": bytes])
   }
@@ -61,10 +78,11 @@ enum ProductCore {
     let ok: Bool
     let value: T?
     let error: Failure?
-    struct Failure: Decodable { let message: String }
+    struct Failure: Decodable { let code: String; let message: String }
   }
   static func call<T: Decodable>(_ request: [String: Any], as: T.Type = T.self) throws -> T {
     let data = try JSONSerialization.data(withJSONObject: request)
+    guard data.count <= 16_777_216 else { throw BoomError.budget("Product request exceeds 16 MiB.") }
     let buffer = data.withUnsafeBytes {
       bloom_core_request($0.bindMemory(to: UInt8.self).baseAddress, data.count)
     }
@@ -72,12 +90,16 @@ enum ProductCore {
   }
   private static func response<T: Decodable>(_ buffer: BoomAttachmentBuffer) throws -> T {
     defer { boom_attachment_free(buffer) }
-    guard let pointer = buffer.data, buffer.length > 0, buffer.length <= 16_777_216 else {
+    guard let pointer = buffer.data, buffer.length > 0, buffer.length <= 8_388_608 else {
       throw BoomError.invalid("Invalid product-core response.")
     }
     let response = try JSONDecoder().decode(
       Envelope<T>.self, from: Data(bytes: pointer, count: buffer.length))
     guard response.ok, let value = response.value else {
+      if let failure = response.error,
+        ["input_limit", "output_limit", "consultation_budget"].contains(failure.code) {
+        throw BoomError.budget(failure.message)
+      }
       throw BoomError.invalid(response.error?.message ?? "Product request failed.")
     }
     return value
@@ -114,9 +136,42 @@ enum ProductCore {
       PromptTurn(role: message.role.rawValue, text: message.text,
         speaker: message.speaker ?? Speaker(name: message.role == .user ? "Human" : "Bloom"))
     }
-    return try call(["op": "compile_consultation", "authority": object(authority),
+    let compiled: CompactConsultation = try call(["op": "compile_consultation_compact", "authority": object(authority),
       "voices": try voices.map { try $0.map { try object($0) } ?? NSNull() },
       "history": object(turns), "instructions": instructions, "context": context, "request": request, "routing": routing])
+    guard compiled.schema == 1, compiled.plans.count == voices.count else {
+      throw BoomError.invalid("Inconsistent consultation reply.")
+    }
+    return try compiled.plans.map { plan in
+      ConsultationPlan(messages: try plan.messages.map { message in
+        guard ["system", "user", "assistant"].contains(message.role) else {
+          throw BoomError.invalid("Invalid consultation role.")
+        }
+        return ConsultationPlan.Message(role: message.role, content: try compiled.text(message.content))
+      }, rawPrompt: try compiled.text(plan.rawPrompt))
+    }
+  }
+  private struct CompactConsultation: Decodable {
+    struct Plan: Decodable {
+      struct Message: Decodable { let role: String; let content: [Int] }
+      let messages: [Message]
+      let rawPrompt: [Int]
+    }
+    let schema: Int
+    let texts: [String]
+    let plans: [Plan]
+    func text(_ references: [Int]) throws -> String {
+      var bytes = 0
+      for index in references {
+        guard texts.indices.contains(index) else { throw BoomError.invalid("Invalid consultation text reference.") }
+        let total = bytes.addingReportingOverflow(texts[index].utf8.count)
+        guard !total.overflow, total.partialValue <= 16_777_216 else {
+          throw BoomError.budget("Consultation prompt exceeds 16 MiB.")
+        }
+        bytes = total.partialValue
+      }
+      return references.map { texts[$0] }.joined()
+    }
   }
   static func authoredPrefix(_ document: DocumentSnapshot, caret: Int) throws -> String {
     try call(["op": "authored_prefix", "text": document.text, "caretUtf16": caret])

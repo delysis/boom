@@ -1,0 +1,24 @@
+{
+  "packages" : [
+    {
+      "files" : [
+        {
+          "git_blob" : "a0d72719c9c55c6fbb8050950548a62bacc0aeba",
+          "path" : "licenses\/html-to-markdown-rs-3.10.6\/LICENSE",
+          "sha256" : "c63dc76a907b2511aed2745a09c36d5533df1d519c93622f2721b236a72743b7",
+          "upstream_path" : "LICENSE"
+        },
+        {
+          "git_blob" : "59830a93b839bcff6ca730b559310ef661f8a2e6",
+          "path" : "licenses\/html-to-markdown-rs-3.10.6\/ATTRIBUTIONS.md",
+          "sha256" : "f66dad7a11d3404194cd3631279928cff6a9f4c9b7a77aec9149b6afe3ad2fa5",
+          "upstream_path" : "ATTRIBUTIONS.md"
+        }
+      ],
+      "package" : "rust:html-to-markdown-rs:3.10.6",
+      "repository" : "https:\/\/github.com\/xberg-io\/html-to-markdown",
+      "revision" : "53e4abd3a67ea065ed54f1e4c17f779f484ffa61"
+    }
+  ],
+  "schema" : 1
+}

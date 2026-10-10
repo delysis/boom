@@ -6,6 +6,7 @@ use crate::{
 use attachment_native_types::{DetectedFormat, ObjectId, SegmentKind, TextFormat, TextSegment};
 use quick_xml::Reader;
 use quick_xml::events::Event;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) fn is_structural_member(format: DetectedFormat, name: &str) -> bool {
@@ -518,14 +519,14 @@ pub(crate) fn canonicalize_open_document(
 }
 
 #[derive(Debug, Clone)]
-struct SheetCell {
+struct SheetCell<'a> {
     reference: String,
-    value: String,
+    value: Cow<'a, str>,
     formula: Option<String>,
 }
 
-struct ParsedSheet {
-    cells: Vec<SheetCell>,
+struct ParsedSheet<'a> {
+    cells: Vec<SheetCell<'a>>,
     warnings: Vec<String>,
     issues: Vec<ProcessorFailure>,
 }
@@ -609,13 +610,13 @@ fn parse_shared_strings(
     Ok(strings)
 }
 
-fn parse_sheet(
+fn parse_sheet<'a>(
     bytes: &[u8],
-    shared: &[String],
+    shared: &'a [String],
     limits: &DocumentLimits,
     remaining_cells: &mut u64,
     work_budget: &mut CanonicalizationWorkBudget,
-) -> Result<ParsedSheet, ProcessorFailure> {
+) -> Result<ParsedSheet<'a>, ProcessorFailure> {
     if bytes.len() > limits.max_processor_input_bytes {
         return Err(ProcessorFailure::partial(
             "xlsx_sheet_input_limit",
@@ -625,13 +626,14 @@ fn parse_sheet(
     let mut reader = Reader::from_reader(bytes);
     reader.config_mut().trim_text(false);
     let mut cells = Vec::new();
-    let mut current: Option<SheetCell> = None;
+    let mut current: Option<SheetCell<'a>> = None;
     let mut cell_type = String::new();
     let mut capture = Capture::None;
     let mut events = 0_u64;
     let mut warnings = Vec::new();
     let mut issues = Vec::new();
     let mut elements = Vec::new();
+    let mut cells_exhausted = false;
     loop {
         check_xml_event_budget(&mut events, limits, work_budget)?;
         match reader.read_event() {
@@ -640,12 +642,27 @@ fn parse_sheet(
                 push_xml_element(&mut elements, element.name().as_ref(), limits)?;
                 match local_name(element.name().as_ref()) {
                     b"c" => {
+                        if *remaining_cells == 0 {
+                            if !cells_exhausted {
+                                let failure = ProcessorFailure::partial(
+                                    "xlsx_cell_limit_exceeded",
+                                    "Worksheet cells were truncated at the configured cell limit.",
+                                );
+                                warnings.push(failure.safe_message.clone());
+                                issues.push(failure);
+                                cells_exhausted = true;
+                            }
+                            // Keep validating the XML tail without retaining more cells.
+                            current = None;
+                            capture = Capture::None;
+                            continue;
+                        }
                         let reference = attribute(&element, b"r")?
                             .unwrap_or_else(|| format!("cell-{}", cells.len().saturating_add(1)));
                         cell_type = attribute(&element, b"t")?.unwrap_or_default();
                         current = Some(SheetCell {
                             reference,
-                            value: String::new(),
+                            value: Cow::Owned(String::new()),
                             formula: None,
                         });
                     }
@@ -668,15 +685,6 @@ fn parse_sheet(
                 match local_name(element.name().as_ref()) {
                     b"v" | b"f" | b"t" => capture = Capture::None,
                     b"c" => {
-                        if *remaining_cells == 0 {
-                            let failure = ProcessorFailure::partial(
-                                "xlsx_cell_limit_exceeded",
-                                "Worksheet cells were truncated at the configured cell limit.",
-                            );
-                            warnings.push(failure.safe_message.clone());
-                            issues.push(failure);
-                            break;
-                        }
                         if let Some(mut cell) = current.take() {
                             if cell_type == "s" && !cell.value.is_empty() {
                                 cell.value = cell
@@ -684,7 +692,7 @@ fn parse_sheet(
                                     .parse::<usize>()
                                     .ok()
                                     .and_then(|index| shared.get(index))
-                                    .cloned()
+                                    .map(|value| Cow::Borrowed(value.as_str()))
                                     .unwrap_or_else(|| {
                                         let failure = ProcessorFailure::malformed(
                                             "xlsx_shared_string_reference_missing",
@@ -692,7 +700,7 @@ fn parse_sheet(
                                         );
                                         warnings.push(failure.safe_message.clone());
                                         issues.push(failure);
-                                        "[missing shared string]".to_string()
+                                        Cow::Borrowed("[missing shared string]")
                                     });
                             }
                             if !cell.value.is_empty() || cell.formula.is_some() {
@@ -707,10 +715,10 @@ fn parse_sheet(
                 }
             }
             Ok(Event::Text(value)) => {
+                let value = decoded_text(&value)?;
                 if let Some(cell) = current.as_mut() {
-                    let value = decoded_text(&value)?;
                     match capture {
-                        Capture::Value => cell.value.push_str(&value),
+                        Capture::Value => cell.value.to_mut().push_str(&value),
                         Capture::Formula => cell
                             .formula
                             .get_or_insert_with(String::new)
@@ -723,7 +731,7 @@ fn parse_sheet(
                 if let Some(cell) = current.as_mut() {
                     let value = decoded_cdata(&value)?;
                     match capture {
-                        Capture::Value => cell.value.push_str(&value),
+                        Capture::Value => cell.value.to_mut().push_str(&value),
                         Capture::Formula => cell
                             .formula
                             .get_or_insert_with(String::new)
@@ -1201,9 +1209,10 @@ mod tests {
             &limits,
             std::time::Instant::now() + std::time::Duration::from_secs(1),
         );
+        let shared = ["hello".to_string()];
         let parsed = parse_sheet(
             br#"<worksheet><sheetData><row><c r="A1" t="s"><v>0</v></c><c r="B1"><f>1+1</f><v>2</v></c></row></sheetData></worksheet>"#,
-            &["hello".to_string()],
+            &shared,
             &limits,
             &mut remaining,
             &mut work_budget,
@@ -1229,6 +1238,54 @@ mod tests {
             &mut work_budget,
         )?;
         assert_eq!(strings, vec![String::new(), "second".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_shared_cells_borrow_one_value_without_text_amplification()
+    -> Result<(), ProcessorFailure> {
+        let limits = DocumentLimits::default();
+        let mut work = CanonicalizationWorkBudget::new(
+            &limits,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        let shared = ["é".repeat(512)];
+        let cells = (1..=32)
+            .map(|row| format!("<c r=\"A{row}\" t=\"s\"><v>0</v></c>"))
+            .collect::<String>();
+        let xml = format!("<worksheet>{cells}</worksheet>");
+        let parsed = parse_sheet(xml.as_bytes(), &shared, &limits, &mut 32, &mut work)?;
+        assert_eq!(parsed.cells.len(), 32);
+        assert!(parsed.issues.is_empty());
+        for cell in &parsed.cells {
+            assert!(matches!(cell.value, Cow::Borrowed(_)));
+            assert_eq!(cell.value.as_ptr(), shared[0].as_ptr());
+            assert_eq!(cell.value, shared[0]);
+        }
+        assert_eq!(parsed.cells[31].reference, "A32");
+        Ok(())
+    }
+
+    #[test]
+    fn exhausted_cell_budget_keeps_validating_the_xml_tail() -> Result<(), ProcessorFailure> {
+        let limits = DocumentLimits::default();
+        let mut work = CanonicalizationWorkBudget::new(
+            &limits,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        let valid = b"<worksheet><c r=\"A1\"><v>1</v></c><c r=\"A2\"><v>2</v></c></worksheet>";
+        let parsed = parse_sheet(valid, &[], &limits, &mut 1, &mut work)?;
+        assert_eq!(parsed.cells.len(), 1);
+        assert_eq!(parsed.cells[0].value, "1");
+        assert_eq!(parsed.issues.len(), 1);
+        assert_eq!(parsed.issues[0].code, "xlsx_cell_limit_exceeded");
+        let malformed = b"<worksheet><c r=\"A1\"><v>1</v></c><c r=\"A2\"><v>2</v></c><unclosed>";
+        let error = parse_sheet(malformed, &[], &limits, &mut 1, &mut work)
+            .err()
+            .ok_or_else(|| {
+                ProcessorFailure::malformed("test_failure", "Malformed tail admitted.")
+            })?;
+        assert_eq!(error.code, "xlsx_sheet_malformed");
         Ok(())
     }
 

@@ -51,7 +51,7 @@ enum FolderImport {
     }
     if let enumerationError { throw enumerationError }
     files.sort { $0.path < $1.path }
-    _ = try ProductCore.importedTexts(files.map { ImportedText(path: $0.path, text: $0.text) })
+    try ProductCore.admitImportedTexts(files.map { ImportedText(path: $0.path, text: $0.text) })
     return files
   }
 }
@@ -59,7 +59,7 @@ enum FolderImport {
 enum DocumentImport {
   static func read(_ urls: [URL], flag: CancellationFlag) throws -> [FolderImport.File] {
     try flag.check()
-    _ = try ProductCore.importedDocuments(urls.map { ImportedText(path: $0.lastPathComponent, text: "") })
+    try ProductCore.admitImportedTexts(urls.map { ImportedText(path: $0.lastPathComponent, text: "") }, documents: true)
     var files: [FolderImport.File] = [], totalBytes = 0
     for url in urls {
       try flag.check()
@@ -73,7 +73,7 @@ enum DocumentImport {
       }
       files.append(FolderImport.File(id: UUID(), path: url.lastPathComponent, original: original, text: text))
     }
-    _ = try ProductCore.importedDocuments(files.map { ImportedText(path: $0.path, text: $0.text) })
+    try ProductCore.admitImportedTexts(files.map { ImportedText(path: $0.path, text: $0.text) }, documents: true)
     return files
   }
 }

@@ -353,9 +353,9 @@ actor MLXGemmaRunner {
     let originalCount = retained.count
     while true {
       try flag.check()
-      let plans = try ProductCore.consultationRound(voices: voices, history: retained,
-        instructions: instructions, context: context, request: request, routing: routing, authority: authority)
       do {
+        let plans = try ProductCore.consultationRound(voices: voices, history: retained,
+          instructions: instructions, context: context, request: request, routing: routing, authority: authority)
         for (plan, reserve) in zip(plans, reserves) {
           _ = try await preflight(plan, images: images, media: media, maxTokens: reserve, flag: flag)
         }

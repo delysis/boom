@@ -13,12 +13,21 @@ Newly authored product source is provided under the adjacent MIT license. This d
 
 Bloom uses MLX for inference. Native-platform reuse is confined to attachment crates. No Cotabby implementation or AGPL source is copied or linked.
 
+The local remediation includes the shared NPE-007 repair to XZ block-header
+property bounds in `attachment-native-inspect`, bounded MIME traversal before
+eager message parsing, ZIP directory count/extent admission and parser-domain
+binding (including explicit ambiguity refusal), and borrowed XLSX shared-string values with complete
+trailing XML validation in `attachment-native-document`. Their canonical owner is `delysis/native-platform`;
+this is a reviewed local delta from the recorded import, not a new upstream
+release or an assertion that the modified copy remains byte-identical to the
+pinned subtree. The exact audit patch and before/after hashes identify the delta.
+
 Primary model documentation:
 
 - [Gemma 4 model card](https://ai.google.dev/gemma/docs/core/model_card_4)
 - [Gemma 4 prompt format](https://ai.google.dev/gemma/docs/core/prompt-formatting-gemma4)
 - [Gemma Apache 2.0 license](https://ai.google.dev/gemma/apache_2)
 
-The build notice collector inventories the actual resolved Cargo packages and Swift dependencies. It preserves top-level notices and declared license files without scanning unrelated caches. The generated inventory records `distribution_approved: false`; compilation does not constitute a distribution license review. Retain attribution for statically linked Rust dependencies as well as Swift dependencies.
+The build notice collector inventories the actual resolved Cargo packages and Swift dependencies. It preserves top-level notices, bounded LICENSES/LICENCES directories and declared license files without scanning unrelated caches. Workspace-root notices apply only to identified workspace members. The exact omitted upstream notices for `html-to-markdown-rs` are retained under `licenses/`, bound to its published source revision and raw hashes in `supplemental.json`. An incomplete notice inventory refuses packaging. The generated inventory records `distribution_approved: false`; compilation does not constitute a distribution license review. Retain attribution for statically linked Rust dependencies as well as Swift dependencies.
 
 Model integrity and runtime licensing are separate from eligibility to distribute weights. Review each exact model's license and notices before publication. Local packs and the app source remain separate artifacts.

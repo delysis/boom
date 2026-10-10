@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the real collector against exact, missing and mismatched sources."""
 import json
+import hashlib
 import pathlib
 import subprocess
 import tempfile
@@ -44,7 +45,8 @@ class NoticeCollectorTests(unittest.TestCase):
         return subprocess.check_output(["git", "-C", str(directory), *args], text=True).strip()
 
     def collect(self):
-        (self.root / "metadata.json").write_text(json.dumps({"packages": self.packages}))
+        metadata = {"packages": self.packages, **getattr(self, "workspace", {})}
+        (self.root / "metadata.json").write_text(json.dumps(metadata))
         (self.root / "App/Package.resolved").write_text(json.dumps({"pins": self.pins}))
         result = subprocess.run([str(self.binary), str(self.root), str(self.root / "metadata.json"),
             str(self.root / "notices"), str(self.root / "inventory.json"), self.runtime_revision], capture_output=True, text=True)
@@ -94,7 +96,7 @@ class NoticeCollectorTests(unittest.TestCase):
     def test_untracked_notice_does_not_borrow_the_pin(self):
         (self.checkout / "NOTICE-extra").write_text("Untracked notice")
         result, record = self.collect()
-        self.assertEqual(result.returncode, 0)
+        self.assertNotEqual(result.returncode, 0)
         self.assertFalse(record["notices_complete"])
         row = next(row for row in record["packages"] if row["package"] == "swift:library")
         self.assertEqual(row["status"], "notices_incomplete")
@@ -103,10 +105,98 @@ class NoticeCollectorTests(unittest.TestCase):
     def test_missing_notice_is_explicit(self):
         (self.root / "rust/LICENSE").unlink()
         result, record = self.collect()
-        self.assertEqual(result.returncode, 0)
+        self.assertNotEqual(result.returncode, 0)
         self.assertTrue(record["source_inventory_complete"])
         self.assertFalse(record["notices_complete"])
         self.assertIn("notices_missing", [row["status"] for row in record["packages"]])
+
+    def test_workspace_inheritance_cannot_cover_a_registry_crate(self):
+        (self.root / "rust/LICENSE").unlink()
+        raw = b"Inherited workspace permission\n"
+        (self.root / "LICENSE-MIT").write_bytes(raw)
+        self.packages[0].update(id="workspace-member", source=None)
+        self.workspace = {"workspace_root": str(self.root), "workspace_members": ["workspace-member"]}
+        external = self.root / "registry"
+        external.mkdir()
+        self.packages.append({"name": "external", "version": "2.0.0", "id": "registry-package",
+            "source": "registry+fixture", "manifest_path": str(external / "Cargo.toml"), "license": "MIT"})
+        result, record = self.collect()
+        self.assertNotEqual(result.returncode, 0)
+        member = next(row for row in record["packages"] if row["package"] == "rust:fixture:1.0.0")
+        registry = next(row for row in record["packages"] if row["package"] == "rust:external:2.0.0")
+        self.assertEqual(member["status"], "retained")
+        self.assertEqual((self.root / "notices" / member["retained_notices"][0]).read_bytes(), raw)
+        self.assertEqual(registry["status"], "notices_missing")
+
+    def test_directory_licence_and_authors_are_retained_as_raw_bytes(self):
+        rust = self.root / "rust"
+        (rust / "LICENSE").unlink()
+        (rust / "LICENSES").mkdir()
+        notices = {"LICENSES/Apache-2.0.txt": b"Apache fixture\n", "LICENSES/MIT.txt": b"MIT fixture\n",
+            "LICENCE": b"British spelling\n", "AUTHORS": b"Author permission body\n"}
+        for name, raw in notices.items():
+            (rust / name).write_bytes(raw)
+        result, record = self.collect()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = next(row for row in record["packages"] if row["package"].startswith("rust:"))
+        self.assertEqual({(self.root / "notices" / name).read_bytes() for name in row["retained_notices"]}, set(notices.values()))
+
+    def test_license_directory_symlinks_and_nested_directories_are_rejected(self):
+        rust = self.root / "rust"
+        (rust / "LICENSES").mkdir()
+        (rust / "LICENSES/link").symlink_to(rust / "LICENSE")
+        (rust / "LICENSES/nested").mkdir()
+        (rust / "LICENSES/nested/LICENSE").write_text("Hidden nested notice")
+        result, record = self.collect()
+        self.assertNotEqual(result.returncode, 0)
+        row = next(row for row in record["packages"] if row["package"].startswith("rust:"))
+        self.assertEqual(row["status"], "notices_incomplete")
+        self.assertEqual(row["rejected_notices"], ["link", "nested"])
+
+    def supplemental(self):
+        rust = self.root / "rust"
+        (rust / "LICENSE").unlink()
+        revision = "1" * 40
+        repository = "https://github.com/fixture/repository"
+        self.packages[0]["repository"] = repository
+        (rust / ".cargo_vcs_info.json").write_text(json.dumps({"git": {"sha1": revision}}))
+        raw = b"Exact omitted upstream license\n"
+        path = "licenses/fixture-1.0.0/LICENSE"
+        (self.root / path).parent.mkdir(parents=True)
+        (self.root / path).write_bytes(raw)
+        blob = hashlib.sha1(f"blob {len(raw)}\0".encode() + raw).hexdigest()
+        manifest = {"schema": 1, "packages": [{"package": "rust:fixture:1.0.0", "revision": revision,
+            "repository": repository, "files": [{"path": path, "upstream_path": "LICENSE",
+                "git_blob": blob, "sha256": hashlib.sha256(raw).hexdigest()}]}]}
+        (self.root / "licenses/supplemental.json").write_text(json.dumps(manifest))
+        return path
+
+    def test_supplemental_notice_is_bound_to_source_revision_and_raw_hashes(self):
+        path = self.supplemental()
+        result, record = self.collect()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(record["notices_complete"])
+        row = next(row for row in record["packages"] if row["package"].startswith("rust:"))
+        self.assertEqual((self.root / "notices" / row["retained_notices"][0]).read_bytes(), (self.root / path).read_bytes())
+        self.assertEqual(row["supplemental_revision"], "1" * 40)
+
+    def test_supplemental_notice_cannot_cover_a_changed_source(self):
+        self.supplemental()
+        (self.root / "rust/.cargo_vcs_info.json").write_text(json.dumps({"git": {"sha1": "2" * 40}}))
+        result, record = self.collect()
+        self.assertNotEqual(result.returncode, 0)
+        row = next(row for row in record["packages"] if row["package"].startswith("rust:"))
+        self.assertEqual(row["status"], "notices_missing")
+        self.assertIn("supplemental_source_mismatch", row["rejected_notices"])
+
+    def test_tampered_supplemental_notice_is_rejected(self):
+        path = self.supplemental()
+        (self.root / path).write_text("Changed raw content")
+        result, record = self.collect()
+        self.assertNotEqual(result.returncode, 0)
+        row = next(row for row in record["packages"] if row["package"].startswith("rust:"))
+        self.assertEqual(row["retained_notices"], [])
+        self.assertIn(path, row["rejected_notices"])
 
 if __name__ == "__main__":
     unittest.main()

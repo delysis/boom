@@ -171,11 +171,11 @@ struct WritingExamplesView: View {
   @State private var failure: String?
   var body: some View {
     VStack(alignment: .leading, spacing: 16) {
-      Text("Writing examples").font(.title2)
-      Text("Choose prose that suggests a voice or rhythm. Bloom reads these passages, in order, before your manuscript.")
-        .foregroundStyle(.secondary)
+      Text("Examples").font(.title2)
+        .help("Choose prose that suggests a voice or rhythm. Bloom reads these passages, in order, before your manuscript.")
+        .accessibilityHint("Bloom reads these passages, in order, before your manuscript.")
       if !model.writingExampleIDs.isEmpty {
-        Text("Included, in this order").font(.headline)
+        Text("Included").font(.headline)
         ForEach(model.writingExampleIDs, id: \.self) { id in
           if let document = model.documents.first(where: { $0.id == id }) {
             HStack {
@@ -190,14 +190,14 @@ struct WritingExamplesView: View {
         }
       }
       if adding {
-        TextField("Example title", text: $title).accessibilityLabel("Example title")
+        TextField("Title", text: $title).accessibilityLabel("Example title")
+          .help("The title is only for your library.")
         ChatComposer(text: $prose, focusRequest: 0, onSend: {}, onCancel: {},
-          placeholder: "Example prose", accessibilityLabel: "Example prose").frame(height: 180)
+          placeholder: "Prose", accessibilityLabel: "Example prose").frame(height: 180)
           .accessibilityLabel("Example prose")
         HStack {
-          Text("Paste the passage itself; its title is only for your library.").font(.caption).foregroundStyle(.secondary)
           Spacer()
-          Button("Add example") {
+          Button("Add") {
             do {
               try model.addWritingExample(title: title, prose: prose, manuscriptID: request.manuscriptID)
               title = ""; prose = ""; adding = false; failure = nil
@@ -206,11 +206,8 @@ struct WritingExamplesView: View {
         }
       } else {
         let available = model.documents.filter { $0.id != request.manuscriptID && !model.writingExampleIDs.contains($0.id) && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-        if available.isEmpty && model.writingExampleIDs.isEmpty {
-          Text("No passages added yet.").foregroundStyle(.secondary)
-        }
         if !available.isEmpty {
-          Text("From your documents").font(.headline)
+          Text("Documents").font(.headline)
           ScrollView {
             VStack(alignment: .leading, spacing: 10) {
               ForEach(available) { document in
@@ -230,8 +227,10 @@ struct WritingExamplesView: View {
           }.frame(maxHeight: 180)
         }
         HStack {
-          Button("Paste a passage…") { adding = true }
-          Button("Import prose…") { model.importWritingExamples(manuscriptID: request.manuscriptID) }
+          Button("Paste", systemImage: "doc.on.clipboard") { adding = true }
+            .help("Paste a passage").accessibilityLabel("Paste a passage")
+          Button("Import", systemImage: "square.and.arrow.down") { model.importWritingExamples(manuscriptID: request.manuscriptID) }
+            .help("Import prose").accessibilityLabel("Import prose")
         }
       }
       if let failure { Text(failure).foregroundStyle(.red).textSelection(.enabled) }
@@ -256,20 +255,24 @@ struct BackupPassphraseView: View {
   @State private var confirmation = ""
   var body: some View {
     VStack(alignment: .leading, spacing: 16) {
-      Text(request.restoring ? "Restore complete backup" : "Encrypt complete backup").font(.title2)
-      Text("Documents, chats, voices, branches, continuations, originals and receipts are included. Model weights are kept separately.")
-        .font(.callout).foregroundStyle(.secondary)
-      SecureField("Backup passphrase", text: $passphrase)
-      if !request.restoring { SecureField("Repeat passphrase", text: $confirmation) }
-      Text(request.restoring ? "Restore requires a fresh workspace. Existing authored data is retained." : "Keep this passphrase safe. It is independent of this Mac's Keychain key.")
-        .font(.caption).foregroundStyle(.secondary)
+      Text(request.restoring ? "Restore" : "Backup").font(.title2)
+        .help("Documents, chats, voices, branches, continuations, originals and receipts are included. Model weights are kept separately.")
+        .accessibilityHint("Documents, chats, voices, branches, continuations, originals and receipts are included. Model weights are kept separately.")
+      SecureField("Passphrase", text: $passphrase)
+        .accessibilityLabel("Backup passphrase")
+        .help(request.restoring ? "Restore requires a fresh workspace. Existing authored data is retained." : "Keep this passphrase safe. It is independent of this Mac's Keychain key.")
+        .accessibilityHint(request.restoring ? "Restore requires a fresh workspace. Existing authored data is retained." : "Keep this passphrase safe. It is independent of this Mac's Keychain key.")
+      if !request.restoring {
+        SecureField("Repeat", text: $confirmation).accessibilityLabel("Repeat passphrase")
+      }
       HStack {
         Spacer()
         Button("Cancel") { model.backupRequest = nil }.keyboardShortcut(.cancelAction)
-        Button(request.restoring ? "Restore" : "Export backup") {
+        Button(request.restoring ? "Restore" : "Export") {
           model.performBackup(request, passphrase: passphrase)
           passphrase = ""; confirmation = ""
-        }.disabled(passphrase.utf8.count < 8 || (!request.restoring && passphrase != confirmation))
+        }.accessibilityLabel(request.restoring ? "Restore" : "Export backup")
+          .disabled(passphrase.utf8.count < 8 || (!request.restoring && passphrase != confirmation))
           .keyboardShortcut(.defaultAction)
       }
     }.padding(24).frame(width: 470)
