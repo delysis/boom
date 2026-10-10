@@ -59,7 +59,6 @@ struct ComposerDraft: Codable, Sendable {
   let owner: ComposerOwner
   let text: String
   let attachments: [UUID]
-  let mode: InteractionMode
   let authoredRole: Role?
 }
 struct WorkspaceState: Codable, Sendable {

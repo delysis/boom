@@ -10,6 +10,29 @@ final class RetainedInputTests: XCTestCase {
     return try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
   }
 
+  @MainActor func testRestoredDraftNeverRetainsConsultationEditingAuthority() async throws {
+    for chatOwner in [false, true] {
+      let store = try store(), model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+      if chatOwner { try model.newChat(about: model.state.selectedDocument) }
+      let first = try XCTUnwrap(chatOwner ? model.state.selectedChat : model.state.selectedDocument)
+      let text = "An unsent request for its original owner."
+      model.draft = text; model.mode = .edit
+      if chatOwner { try model.newChat() } else { try model.newDocument() }
+      XCTAssertEqual(model.mode, .ask)
+      if chatOwner { model.selectChat(first) } else { model.selectDocument(first) }
+      XCTAssertEqual(model.draft, text)
+      XCTAssertEqual(model.mode, .ask, "Switching restores input, not an earlier editing grant")
+      model.mode = .edit
+      try await model.shutdown()
+      let reopened = try await WorkspaceModel(storeOverride: store, loadModels: false)
+      XCTAssertEqual(reopened.draft, text)
+      XCTAssertEqual(reopened.mode, .ask, "Restart requires a fresh editing-mode selection")
+      XCTAssertTrue(reopened.state.chats.allSatisfy { $0.messages.isEmpty })
+      XCTAssertFalse(reopened.isBusy)
+      try await reopened.shutdown()
+    }
+  }
+
   @MainActor func testChatDraftsKeepTheirOwnerAcrossSwitchAndRestart() async throws {
     let store = try store(), model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     try model.newChat()
@@ -22,16 +45,17 @@ final class RetainedInputTests: XCTestCase {
     model.draft = "Another conversation's unfinished question."
     model.selectChat(first)
     XCTAssertEqual(model.draft, text)
-    XCTAssertEqual(model.mode, .propose)
+    XCTAssertEqual(model.mode, .ask)
     model.selectChat(second)
     XCTAssertEqual(model.draft, "Another conversation's unfinished question.")
     model.selectChat(first)
+    model.mode = .propose
     try await model.shutdown()
     let sealed = try Data(contentsOf: store.vault.recordURL(.workspace, Vault.workspaceID))
     XCTAssertNil(sealed.range(of: Data(text.utf8)))
     let reopened = try await WorkspaceModel(storeOverride: store, loadModels: false)
     XCTAssertEqual(reopened.draft, text)
-    XCTAssertEqual(reopened.mode, .propose)
+    XCTAssertEqual(reopened.mode, .ask)
     XCTAssertTrue(reopened.state.chats.allSatisfy { $0.messages.isEmpty })
     XCTAssertFalse(reopened.isBusy); XCTAssertFalse(reopened.modelReady)
     try await reopened.shutdown()
@@ -135,7 +159,7 @@ final class RetainedInputTests: XCTestCase {
     let chat = ChatRecord()
     var state = WorkspaceState(); state.chats = [chat]; state.selectedChat = chat.id
     state.composerDrafts = [ComposerDraft(owner: ComposerOwner(kind: .chat, id: UUID()),
-      text: "This has a different owner.", attachments: [], mode: .ask, authoredRole: nil)]
+      text: "This has a different owner.", attachments: [], authoredRole: nil)]
     try store.vault.encode(state, kind: .workspace, id: Vault.workspaceID)
     let file = store.vault.recordURL(.workspace, Vault.workspaceID), before = try Data(contentsOf: file)
     switch await store.load() {

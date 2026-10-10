@@ -46,7 +46,7 @@ struct CompletionSegment {
   @Published var selectedChatIDs: Set<UUID> = []
   @Published var composerFocusEpoch = 0
   @Published var draft = "" { didSet { if draft != oldValue { retainComposerDraft() } } }
-  @Published var mode: InteractionMode = .ask { didSet { if mode != oldValue { retainComposerDraft() } } }
+  @Published var mode: InteractionMode = .ask
   @Published var pendingAttachments: [UUID] = [] { didSet { if pendingAttachments != oldValue { retainComposerDraft() } } }
   @Published var isBusy = false
   @Published var status = "Install a consultation model to begin"
@@ -378,7 +378,7 @@ struct CompletionSegment {
     var drafts = (state.composerDrafts ?? []).filter { $0.owner != owner }
     if !draft.isEmpty || !pendingAttachments.isEmpty {
       drafts.append(ComposerDraft(owner: owner, text: draft, attachments: pendingAttachments,
-        mode: mode, authoredRole: authoredChatRole))
+        authoredRole: authoredChatRole))
     }
     if !drafts.isEmpty || state.composerDrafts != nil { state.composerDrafts = drafts }
     if schedule { scheduleSave() }
@@ -390,7 +390,7 @@ struct CompletionSegment {
     let retained = state.composerDrafts?.first { $0.owner == composerOwner }
     draft = retained?.text ?? ""
     pendingAttachments = retained?.attachments ?? (state.selectedChat.flatMap { state.recordingDrafts?[$0] } ?? [])
-    mode = retained?.mode ?? .ask
+    mode = .ask
     authoredChatRole = retained?.authoredRole
   }
   private func transferDocumentDraftToChat() {
