@@ -16,7 +16,7 @@ CandidateBundle records retain recipes, seeds, actual outputs, token IDs, termin
 
 ## Model and generation ownership
 
-The signed catalog binds local converted packs and pinned public source checkpoints to expected hashes. Cache discovery is separate from admission: a file's presence does not prove integrity or residency. Startup automatically reuses verified local packs or installs pinned public snapshots anonymously with resumable transfers and hash verification. Generation uses admitted local files. Conversion is a developer executable rather than an installation dependency.
+The signed catalog binds local converted packs and pinned public source checkpoints to expected hashes. Cache discovery is separate from admission: a file's presence does not prove integrity or residency. Public snapshot links resolve only within that snapshot or its corresponding blob store; configuration lookup and complete file verification share that path policy. Converted packs require regular files. Startup automatically reuses verified local packs or installs pinned public snapshots anonymously with resumable transfers and hash verification. Generation uses admitted local files. Conversion is a developer executable rather than an installation dependency.
 
 GenerationCoordinator serializes model loading and GPU generation. Cancellation retains ownership until the producer is joined. Foreground requests cancel background suggestions. UI callbacks capture cancellation/operation identity, candidate identity and editor epoch. Model identity and available memory determine context admission; architecture's advertised context is not a promise that it fits.
 
