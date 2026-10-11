@@ -194,6 +194,7 @@ actor MLXGemmaRunner {
     guard let geometry = generationPolicy.prefill else { throw BoomError.invalid("The loaded model has no prefill geometry.") }
     return PrefillParameters(stepSize: geometry.tokenCeiling, chunking: .balanced,
       progress: { processed, total in
+        PerformanceTrace.prefill(processed: processed, total: total)
         callback?(PrefillProgress(operationID: operationID, processedPositions: processed, totalPositions: total))
       })
   }
@@ -412,7 +413,11 @@ actor MLXGemmaRunner {
   }
   private func ownedOperation<R: Sendable>(flag: CancellationFlag, background: Bool,
     operation: @escaping @Sendable () async throws -> R) async throws -> R {
+    let queueTrace = PerformanceTrace.begin("Model.Queue")
     await GenerationCoordinator.shared.enter(flag: flag, background: background)
+    PerformanceTrace.end("Model.Queue", queueTrace)
+    let trace = PerformanceTrace.begin("Model.Operation")
+    defer { PerformanceTrace.end("Model.Operation", trace) }
     let watch: OperationMemoryWatch
     do { watch = try OperationMemoryWatch(flag: flag) }
     catch { await GenerationCoordinator.shared.leave(); throw error }
@@ -481,8 +486,11 @@ actor MLXGemmaRunner {
         let cache = try context.model.newCache(parameters: parameters)
         let clock = ContinuousClock(), started = clock.now
         let setupQoSBefore = qos_class_self().rawValue
-        let prepared = try context.model.prepare(input,
-          cache: cache, state: nil, prefill: parameters.prefill)
+        let prepared = try {
+          let trace = PerformanceTrace.begin("Model.BatchPrepare")
+          defer { PerformanceTrace.end("Model.BatchPrepare", trace) }
+          return try context.model.prepare(input, cache: cache, state: nil, prefill: parameters.prefill)
+        }()
         let setupReturnedSeconds = started.duration(to: clock.now).timeInterval
         let setupQoSAfter = qos_class_self().rawValue
         let initial: LMOutput
@@ -493,7 +501,9 @@ actor MLXGemmaRunner {
         }
         guard initial.state == nil else { throw BoomError.invalid("This checkpoint needs unsupported per-row inference state.") }
         var logits = initial.logits[0..., -1, 0...]
+        let initialTrace = PerformanceTrace.begin("Model.BatchInitialEvaluation")
         eval(logits); eval(cache)
+        PerformanceTrace.end("Model.BatchInitialEvaluation", initialTrace)
         try flag.check()
         // Preserve each existing cache object's offsets and rotating-window
         // metadata. Only its leading tensor dimension changes.
@@ -626,8 +636,12 @@ actor MLXGemmaRunner {
         let clock = ContinuousClock(), started = clock.now
         let setupQoSBefore = qos_class_self().rawValue
         let components = GenerationComponents(logitProcessorFactory: { CheckpointTokenMask(policy.suppressedTokenIDs) })
-        let (stream, task) = try generateTokensTask(input: input, parameters: parameters, context: context,
-          includeStopToken: true, components: components)
+        let (stream, task) = try {
+          let trace = PerformanceTrace.begin("Model.StreamConstruction")
+          defer { PerformanceTrace.end("Model.StreamConstruction", trace) }
+          return try generateTokensTask(input: input, parameters: parameters, context: context,
+            includeStopToken: true, components: components)
+        }()
         let setupReturnedSeconds = started.duration(to: clock.now).timeInterval
         let setupQoSAfter = qos_class_self().rawValue
         var tokens: [Int] = [], text = "", ended = false, reason = "output_limit"
@@ -646,7 +660,10 @@ actor MLXGemmaRunner {
                 stopToken = token; reason = ends.contains(token) ? "eos" : "model_control"
                 ended = true; task.cancel(); break
               }
-              if first == nil { first = started.duration(to: clock.now).timeInterval }
+              if first == nil {
+                first = started.duration(to: clock.now).timeInterval
+                PerformanceTrace.event("Model.FirstToken")
+              }
               tokens.append(token)
               let decoded = context.tokenizer.decode(tokenIds: tokens)
               if !decoded.hasSuffix("\u{FFFD}"), decoded != text {

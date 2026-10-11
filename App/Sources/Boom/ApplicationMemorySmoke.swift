@@ -280,7 +280,9 @@ import Synchronization
           let inserted = clock.now
           editor.insertText("", replacementRange: NSRange(location: 0, length: 1))
           let deleted = clock.now
+          let layoutTrace = PerformanceTrace.begin("Editor.HostLayout")
           host.layoutSubtreeIfNeeded()
+          PerformanceTrace.end("Editor.HostLayout", layoutTrace)
           let ended = clock.now
           delays.append(max(0, expected.duration(to: ended).timeInterval))
           typingObservations.append(["phase": phase,

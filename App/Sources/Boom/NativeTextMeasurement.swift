@@ -43,6 +43,8 @@ import AppKit
     measured.removeAll(keepingCapacity: true)
   }
   func height(of source: NSTextStorage, width: CGFloat, insets: NSSize, fragmentPadding: CGFloat) -> CGFloat {
+    let trace = PerformanceTrace.begin("Text.Measurement")
+    defer { PerformanceTrace.end("Text.Measurement", trace) }
     guard width.isFinite, width > 0 else { return 18 + insets.height * 2 }
     if self.source !== source {
       NotificationCenter.default.removeObserver(self, name: NSTextStorage.didProcessEditingNotification, object: nil)

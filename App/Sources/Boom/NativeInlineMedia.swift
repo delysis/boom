@@ -126,6 +126,8 @@ struct InlineMediaSpan: Decodable {
     }
   }
   override func insertText(_ value: Any, replacementRange: NSRange) {
+    let trace = PerformanceTrace.begin("Editor.InsertText")
+    defer { PerformanceTrace.end("Editor.InsertText", trace) }
     nativeEditDepth += 1
     defer { nativeEditDepth -= 1; deferTextLayout() }
     super.insertText(value, replacementRange: replacementRange)

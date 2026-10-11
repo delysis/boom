@@ -321,6 +321,8 @@ struct MarkdownEditor: NSViewRepresentable {
     return text
   }
   func updateNSView(_ text: MarkdownTextView, context: Context) {
+    let trace = PerformanceTrace.begin("Editor.Update")
+    defer { PerformanceTrace.end("Editor.Update", trace) }
     model.editor = text
     text.setMedia(model: model)
     text.isEditable = !model.editingLocked
@@ -328,6 +330,8 @@ struct MarkdownEditor: NSViewRepresentable {
     updateSearch(text)
   }
   private func updateSearch(_ view: MarkdownTextView) {
+    let trace = PerformanceTrace.begin("Editor.SearchUpdate")
+    defer { PerformanceTrace.end("Editor.SearchUpdate", trace) }
     guard !view.nativeEditInProgress, let document = model.selectedDocument,
       view.documentID == document.id else { return }
     let found = model.documentSearch[document.id]
