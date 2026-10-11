@@ -60,6 +60,58 @@ final class ManuscriptSizingTests: XCTestCase {
       super.textContainerChangedGeometry(container)
     }
   }
+  @MainActor func testAlternatingProposedWidthsReuseMeasuredGlyphGeometry() {
+    let source = NSTextStorage(string: String(repeating:
+      "The harbor was quiet. A light moved across the water, and the keeper watched from the window.\n", count: 800),
+      attributes: [.font: NSFont.systemFont(ofSize: 15)])
+    let layout = Layout(), measurement = NativeTextMeasurement(layout: layout)
+    let narrow = measurement.height(of: source, width: 240, insets: .zero, fragmentPadding: 5)
+    let wide = measurement.height(of: source, width: 760, insets: .zero, fragmentPadding: 5)
+    let prepared = layout.geometryChanges
+    XCTAssertGreaterThan(narrow, wide)
+    for _ in 0..<6 {
+      XCTAssertEqual(measurement.height(of: source, width: 240, insets: .zero, fragmentPadding: 5), narrow)
+      XCTAssertEqual(measurement.height(of: source, width: 760, insets: .zero, fragmentPadding: 5), wide)
+    }
+    XCTAssertEqual(layout.geometryChanges, prepared,
+      "Repeated SwiftUI proposals must reuse their measured heights instead of rebuilding all glyphs.")
+  }
+
+  @MainActor func testSizingInvalidatesForAttributesOpenEditsAndDifferentStorage() {
+    let source = NSTextStorage(string: String(repeating: "The harbor was quiet.\n", count: 8),
+      attributes: [.font: NSFont.systemFont(ofSize: 15)])
+    let measurement = NativeTextMeasurement()
+    func height(_ storage: NSTextStorage, width: CGFloat = 320) -> CGFloat {
+      measurement.height(of: storage, width: width, insets: .zero, fragmentPadding: 5)
+    }
+    let original = height(source)
+    source.addAttribute(.font, value: NSFont.systemFont(ofSize: 30),
+      range: NSRange(location: 0, length: source.length))
+    let styled = height(source)
+    XCTAssertGreaterThan(styled, original, "An attribute-only edit invalidates the snapshot.")
+    source.beginEditing()
+    source.append(NSAttributedString(string: String(repeating: "More prose.\n", count: 12),
+      attributes: [.font: NSFont.systemFont(ofSize: 30)]))
+    let firstEdit = height(source)
+    XCTAssertGreaterThan(firstEdit, styled)
+    source.append(NSAttributedString(string: String(repeating: "Still more.\n", count: 12),
+      attributes: [.font: NSFont.systemFont(ofSize: 30)]))
+    let secondEdit = height(source)
+    XCTAssertGreaterThan(secondEdit, firstEdit,
+      "A second edit in the same transaction has not posted its notification yet.")
+    source.endEditing()
+    XCTAssertEqual(height(source), secondEdit)
+    let other = NSTextStorage(string: "Short", attributes: [.font: NSFont.systemFont(ofSize: 15)])
+    let short = height(other)
+    XCTAssertLessThan(short, original)
+    other.replaceCharacters(in: NSRange(location: 0, length: other.length),
+      with: String(repeating: "A different source.\n", count: 20))
+    XCTAssertGreaterThan(height(other), short, "The new storage must be observed too.")
+    XCTAssertEqual(source.string, String(repeating: "The harbor was quiet.\n", count: 8)
+      + String(repeating: "More prose.\n", count: 12) + String(repeating: "Still more.\n", count: 12),
+      "Measurement must preserve the exact text of its source.")
+  }
+
   @MainActor func testUnchangedSizingReusesLayoutAndChangesStillMeasure() throws {
     let storage = NSTextStorage(), layout = Layout(), container = NSTextContainer()
     storage.addLayoutManager(layout); layout.addTextContainer(container)
