@@ -268,6 +268,7 @@ struct MarkdownEditor: NSViewRepresentable {
   func makeNSView(context: Context) -> MarkdownTextView {
     let storage = NSTextStorage()
     let layout = NSLayoutManager()
+    layout.allowsNonContiguousLayout = true
     let container = NSTextContainer(size: NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude))
     storage.addLayoutManager(layout)
     layout.addTextContainer(container)
