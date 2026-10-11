@@ -367,7 +367,7 @@ struct ChatPane: View {
             Button("Detach document") { model.attachDocument(nil, to: chat.id) }
             Divider()
           }
-          ForEach(model.documents) { document in
+          ForEach(model.documents.map { DocumentIndex(id: $0.id, title: $0.title) }, id: \.id) { document in
             Button(document.title) { model.attachDocument(document.id, to: chat.id) }
           }
         }
