@@ -34,6 +34,69 @@ final class NativeInputIdentityTests: XCTestCase {
     for _ in 0..<8 { host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(10)) }
   }
 
+  @MainActor private func manuscript(_ model: WorkspaceModel, source: String) async throws
+    -> (NSWindow, NSView, MarkdownTextView) {
+    try model.newDocument()
+    let id = try XCTUnwrap(model.state.selectedDocument)
+    model.updateDocument(source, id: id, caret: source.utf16.count)
+    let host = NSHostingView(rootView: MarkdownEditor(model: model, documentID: id))
+    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 500, height: 400))
+    window.isReleasedWhenClosed = false; window.contentView = host
+    do {
+      try await settle(host)
+      return (window, host, try XCTUnwrap(model.editor))
+    } catch { window.close(); throw error }
+  }
+
+  @MainActor func testManuscriptCompositionCommitIsNotReplacedByStatusRendering() async throws {
+    let model = try await model(), source = "Cafe\u{301} 👩🏽‍💻 waits."
+    let (window, host, editor) = try await manuscript(model, source: source)
+    defer { window.close() }
+    XCTAssertTrue(window.makeFirstResponder(editor))
+    editor.setSelectedRange(NSRange(location: source.utf16.count, length: 0))
+    let edits = CharacterEdits(), storage = try XCTUnwrap(editor.textStorage)
+    storage.delegate = edits
+    defer { storage.delegate = nil }
+    editor.setMarkedText("に", selectedRange: NSRange(location: 1, length: 0),
+      replacementRange: NSRange(location: NSNotFound, length: 0))
+    XCTAssertTrue(editor.hasMarkedText())
+    XCTAssertEqual(Data(try XCTUnwrap(model.selectedDocument).text.utf8), Data(source.utf8))
+    editor.unmarkText()
+    XCTAssertFalse(editor.hasMarkedText())
+    let committed = try XCTUnwrap(model.selectedDocument)
+    XCTAssertEqual(Data(committed.text.utf8), Data((source + "に").utf8))
+    let count = edits.count, nativeVersion = editor.sourceVersion, caret = editor.selectedRange()
+    for index in 0..<4 { model.status = "Committed status \(index)"; try await settle(host) }
+    XCTAssertEqual(edits.count, count, "A committed input-method edit must not be replaced again during rendering.")
+    XCTAssertEqual(editor.sourceVersion, nativeVersion)
+    XCTAssertEqual(editor.selectedRange(), caret)
+    XCTAssertEqual(model.selectedDocument?.textVersion, committed.textVersion)
+    XCTAssertEqual(Data(editor.string.utf8), Data(committed.text.utf8))
+    let store = model.store
+    try await model.shutdown()
+    let restored = try await store.load().get().1
+    let retained = try XCTUnwrap(restored.first(where: { $0.id == committed.id }))
+    XCTAssertEqual(Data(retained.text.utf8), Data(committed.text.utf8))
+  }
+
+  @MainActor func testUnmarkWithoutCompositionDoesNotPublishANewManuscript() async throws {
+    let model = try await model()
+    let (window, host, editor) = try await manuscript(model, source: "A public lantern.")
+    defer { window.close() }
+    XCTAssertFalse(editor.hasMarkedText())
+    let document = try XCTUnwrap(model.selectedDocument), nativeVersion = editor.sourceVersion
+    let edits = CharacterEdits(), storage = try XCTUnwrap(editor.textStorage)
+    storage.delegate = edits
+    defer { storage.delegate = nil }
+    editor.unmarkText()
+    model.status = "Unmarked status"; try await settle(host)
+    XCTAssertEqual(model.selectedDocument?.textVersion, document.textVersion,
+      "The native no-op must not create a document revision or schedule another source publication.")
+    XCTAssertEqual(editor.sourceVersion, nativeVersion)
+    XCTAssertEqual(edits.count, 0)
+    try await model.shutdown()
+  }
+
   @MainActor func testContextCacheTracksExactCanonicalFormChangesInInstructionsAndMessages() async throws {
     let model = try await model()
     let index = try XCTUnwrap(model.state.chats.firstIndex { $0.id == model.state.selectedChat })

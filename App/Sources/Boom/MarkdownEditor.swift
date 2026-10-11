@@ -232,10 +232,17 @@ import SwiftUI
     unmarkText()
   }
   override func unmarkText() {
+    let wasComposing = hasMarkedText()
     super.unmarkText()
-    guard !applyingExternal, !hasMarkedText() else { return }
+    guard wasComposing, !applyingExternal, !hasMarkedText() else { return }
+    if let document = owner?.documents.first(where: { $0.id == documentID }), displays(document) {
+      return
+    }
     MarkdownStyle.apply(to: self)
     owner?.updateDocument(string, id: documentID, caret: selectedRange().location)
+    if let document = owner?.documents.first(where: { $0.id == documentID }) {
+      synchronized(with: document)
+    }
   }
   override func resignFirstResponder() -> Bool {
     finishComposition()
