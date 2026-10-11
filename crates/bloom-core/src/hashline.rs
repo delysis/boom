@@ -852,8 +852,8 @@ mod tests {
         let a = context_v3(&[], &[make("Partial")], &authority).expect("render");
         let b = context_v3(&[], &[make("Complete")], &authority).expect("render");
         assert_eq!(
-            a.prompt[..a.body_bytes].as_bytes(),
-            b.prompt[..b.body_bytes].as_bytes()
+            &a.prompt.as_bytes()[..a.body_bytes],
+            &b.prompt.as_bytes()[..b.body_bytes]
         );
         assert!(a.prompt[..a.body_bytes].ends_with(text));
         assert!(!a.prompt[..a.body_bytes].contains("COVERAGE"));
