@@ -19,6 +19,12 @@ case "$EDITION" in
   *) echo 'Choose author or chat for the second build argument.' >&2; exit 1 ;;
 esac
 if [[ "$EDITION" == author ]]; then export CARGO_TARGET_DIR="$HERE/target"; else export CARGO_TARGET_DIR="$HERE/target/chat"; fi
+
+# Clean compiler intermediates once this whole job finishes, including failures.
+JANITOR="$HOME/Library/Application Support/RustTargetJanitor/rust-target-janitor"
+if [[ "${RUST_JANITOR_ACTIVE:-}" != 1 && -x "$JANITOR" ]]; then
+    exec "$JANITOR" --finish-build --rust-root "$CARGO_TARGET_DIR" --swift-root "$HERE/Core/.build" --swift-root "$HERE/App/.build" -- /bin/bash "$0" "$@"
+fi
 OUT="${1:-$HERE/out/$(date -u +%Y%m%dT%H%M%SZ)}"
 [[ ! -e "$OUT" ]] || { echo "Refusing to overwrite $OUT" >&2; exit 1; }
 mkdir -p "$OUT"
