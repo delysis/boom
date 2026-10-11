@@ -1,6 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Clean compiler intermediates once this whole job finishes, including failures.
+JANITOR="$HOME/Library/Application Support/RustTargetJanitor/rust-target-janitor"
+JANITOR_TARGET="${CARGO_TARGET_DIR:-$HERE/target}"
+[[ "$JANITOR_TARGET" == /* ]] || JANITOR_TARGET="$HERE/$JANITOR_TARGET"
+if [[ "$(uname -s)" == Darwin && "${RUST_JANITOR_ACTIVE:-}" != 1 && -x "$JANITOR" ]]; then
+    exec "$JANITOR" --finish-build --rust-root "$JANITOR_TARGET" --swift-root "$HERE/Core/.build" -- /bin/bash "$0" "$@"
+fi
 (cd "$HERE" && cargo fmt --all -- --check && cargo test --workspace --locked && cargo clippy --workspace --all-targets --locked -- -D warnings)
 (cd "$HERE/Core" && swift test)
 if [[ "$(uname -s)" == Darwin ]]; then python3 "$HERE/scripts/test-notice-collector.py"; fi
