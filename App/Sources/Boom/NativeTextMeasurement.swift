@@ -18,7 +18,30 @@ import AppKit
     layout.addTextContainer(container); storage.addLayoutManager(layout)
   }
   deinit { NotificationCenter.default.removeObserver(self) }
-  @objc private func sourceDidEdit(_ notification: Notification) { needsSnapshot = true }
+  @objc private func sourceDidEdit(_ notification: Notification) {
+    guard let source = notification.object as? NSTextStorage, self.source === source,
+      !needsSnapshot else { return }
+    let edited = source.editedRange, delta = source.changeInLength
+    let expected = storage.length.addingReportingOverflow(delta)
+    guard !expected.overflow, expected.partialValue == source.length,
+      edited.location <= source.length, edited.length <= source.length - edited.location else {
+      needsSnapshot = true; return
+    }
+    // Native attribute fixing can cover the surrounding paragraph. Carry it
+    // with the character edit while keeping other paragraphs' glyphs valid.
+    let range = (source.string as NSString).paragraphRange(for: edited)
+    let oldLength = range.length.subtractingReportingOverflow(delta)
+    guard !oldLength.overflow, oldLength.partialValue >= 0,
+      range.location <= storage.length, oldLength.partialValue <= storage.length - range.location else {
+      needsSnapshot = true; return
+    }
+    let previous = NSRange(location: range.location, length: oldLength.partialValue)
+    let replacement = source.attributedSubstring(from: range)
+    if previous.length == replacement.length,
+      storage.attributedSubstring(from: previous).isEqual(to: replacement) { return }
+    storage.replaceCharacters(in: previous, with: replacement)
+    measured.removeAll(keepingCapacity: true)
+  }
   func height(of source: NSTextStorage, width: CGFloat, insets: NSSize, fragmentPadding: CGFloat) -> CGFloat {
     guard width.isFinite, width > 0 else { return 18 + insets.height * 2 }
     if self.source !== source {

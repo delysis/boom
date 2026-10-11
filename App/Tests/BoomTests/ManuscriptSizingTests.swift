@@ -55,10 +55,43 @@ final class ManuscriptSizingTests: XCTestCase {
   }
   private final class Layout: NSLayoutManager {
     var geometryChanges = 0
+    var editedRanges: [NSRange] = []
+    override func processEditing(for textStorage: NSTextStorage, edited editMask: NSTextStorageEditActions,
+      range newCharRange: NSRange, changeInLength delta: Int, invalidatedRange invalidatedCharRange: NSRange) {
+      editedRanges.append(newCharRange)
+      super.processEditing(for: textStorage, edited: editMask, range: newCharRange,
+        changeInLength: delta, invalidatedRange: invalidatedCharRange)
+    }
     override func textContainerChangedGeometry(_ container: NSTextContainer) {
       geometryChanges += 1
       super.textContainerChangedGeometry(container)
     }
+  }
+  @MainActor func testSmallSourceEditsKeepUnchangedMeasurementGlyphs() throws {
+    let original = String(repeating:
+      "The harbor was quiet. A light moved across the water, and the keeper watched from the window.\n", count: 800)
+    let source = NSTextStorage(string: original, attributes: [.font: NSFont.systemFont(ofSize: 15)])
+    let layout = Layout(), measurement = NativeTextMeasurement(layout: layout)
+    func height(_ value: NativeTextMeasurement) -> CGFloat {
+      value.height(of: source, width: 380, insets: .zero, fragmentPadding: 5)
+    }
+    _ = height(measurement)
+    let prefix = "🙂 New prose.\n"
+    let edits: [() -> Void] = [
+      { source.replaceCharacters(in: NSRange(location: 0, length: 0), with: prefix) },
+      { source.replaceCharacters(in: NSRange(location: 0, length: prefix.utf16.count), with: "") },
+      { source.addAttribute(.font, value: NSFont.systemFont(ofSize: 30), range: NSRange(location: 0, length: 20)) },
+    ]
+    for edit in edits {
+      layout.editedRanges.removeAll()
+      edit()
+      XCTAssertEqual(height(measurement), height(NativeTextMeasurement()),
+        "Incremental sizing must match a fresh native layout.")
+      XCTAssertTrue(try XCTUnwrap(layout.textStorage).isEqual(to: source))
+      XCTAssertFalse(layout.editedRanges.contains { $0.length >= original.utf16.count },
+        "A local source edit must not replace the whole measurement snapshot: \(layout.editedRanges)")
+    }
+    XCTAssertEqual(source.string, original)
   }
   @MainActor func testAlternatingProposedWidthsReuseMeasuredGlyphGeometry() {
     let source = NSTextStorage(string: String(repeating:
@@ -75,6 +108,28 @@ final class ManuscriptSizingTests: XCTestCase {
     }
     XCTAssertEqual(layout.geometryChanges, prepared,
       "Repeated SwiftUI proposals must reuse their measured heights instead of rebuilding all glyphs.")
+  }
+
+  @MainActor func testIncrementalSizingIncludesNativeParagraphAttributeFixes() throws {
+    let first = "Before the keeper arrived.\n", second = "After the keeper left.\n"
+    let source = NSTextStorage(string: first + second + String(repeating: "The harbor was quiet.\n", count: 80),
+      attributes: [.font: NSFont.systemFont(ofSize: 15)])
+    let paragraph = NSMutableParagraphStyle(); paragraph.headIndent = 24; paragraph.lineSpacing = 12
+    source.addAttribute(.paragraphStyle, value: paragraph, range: NSRange(location: 0, length: first.utf16.count))
+    let layout = Layout(), measurement = NativeTextMeasurement(layout: layout)
+    func height(_ value: NativeTextMeasurement) -> CGFloat {
+      value.height(of: source, width: 260, insets: NSSize(width: 28, height: 28), fragmentPadding: 5)
+    }
+    _ = height(measurement)
+    let separator = first.utf16.count - 1
+    source.replaceCharacters(in: NSRange(location: separator, length: 1), with: "🙂")
+    XCTAssertEqual(height(measurement), height(NativeTextMeasurement()))
+    XCTAssertTrue(try XCTUnwrap(layout.textStorage).isEqual(to: source),
+      "Joining paragraphs must include attributes fixed outside the original character edit.")
+    source.replaceCharacters(in: NSRange(location: separator, length: 2), with: "\n")
+    XCTAssertEqual(height(measurement), height(NativeTextMeasurement()))
+    XCTAssertTrue(try XCTUnwrap(layout.textStorage).isEqual(to: source))
+    XCTAssertEqual(source.string, first + second + String(repeating: "The harbor was quiet.\n", count: 80))
   }
 
   @MainActor func testSizingInvalidatesForAttributesOpenEditsAndDifferentStorage() {
