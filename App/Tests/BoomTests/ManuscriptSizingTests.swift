@@ -6,6 +6,35 @@ import XCTest
 @testable import Boom
 
 final class ManuscriptSizingTests: XCTestCase {
+  @MainActor private final class SizingDelegate: NSObject, NSTextViewDelegate {
+    weak var view: MarkdownTextView?
+    var measured: CGSize?
+    var nativeEditWasOpen = false
+    func textDidChange(_ notification: Notification) {
+      guard let view else { return }
+      nativeEditWasOpen = view.nativeEditInProgress
+      measured = view.manuscriptSize(width: 380, minimumHeight: 100)
+    }
+  }
+  @MainActor func testLiveEditSizingKeepsStableFrameUntilNativeEditFinishes() throws {
+    _ = NSApplication.shared
+    let view = MarkdownTextView(frame: .zero)
+    view.isRichText = false; view.isVerticallyResizable = false; view.isHorizontallyResizable = false
+    view.font = NSFont.systemFont(ofSize: 15)
+    let original = "The harbor was quiet.\n"
+    view.string = original
+    let stable = try XCTUnwrap(view.manuscriptSize(width: 380, minimumHeight: 100))
+    view.setFrameSize(stable)
+    let delegate = SizingDelegate(); delegate.view = view; view.delegate = delegate
+    let added = String(repeating: "More public prose.\n", count: 60)
+    view.insertText(added, replacementRange: NSRange(location: 0, length: 0))
+    XCTAssertTrue(delegate.nativeEditWasOpen, "Exercise the actual native text-change callback.")
+    XCTAssertEqual(delegate.measured, stable,
+      "Speculative sizing during a native edit must keep the stable frame until its deferred invalidation.")
+    let finished = try XCTUnwrap(view.manuscriptSize(width: 380, minimumHeight: 100))
+    XCTAssertGreaterThan(finished.height, stable.height)
+    XCTAssertEqual(view.string, added + original)
+  }
   @MainActor func testFullReplacementAfterUndoAndDocumentSwitchKeepsGlyphsValid() async throws {
     _ = NSApplication.shared
     let url = try XCTUnwrap(Bundle.module.url(forResource: "ManuscriptSizing", withExtension: "json", subdirectory: "Fixtures"))
