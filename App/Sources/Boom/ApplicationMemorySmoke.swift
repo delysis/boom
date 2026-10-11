@@ -183,6 +183,7 @@ import Synchronization
     try write(receipt, "receipt.json", evidence: evidence)
     let probe = try Probe(evidence.appendingPathComponent("memory-samples.jsonl"))
     var typing: Task<[Double], Error>?
+    var typingObservations: [[String: Any]] = []
     var model: WorkspaceModel?
     var window: NSWindow?
     do {
@@ -265,7 +266,6 @@ import Synchronization
         throw BoomError.invalid("The production offscreen editor did not accept keyboard focus.")
       }
       workspace.isBusy = true
-      var typingObservations: [[String: Any]] = []
       typing = Task { @MainActor in
         var delays: [Double] = []
         while !Task.isCancelled {
@@ -424,6 +424,7 @@ import Synchronization
       receipt["peak_sampled_process_footprint_bytes"] = measured.0; receipt["memory_samples"] = measured.1
       receipt["typing_samples_seconds"] = typingDelays
       receipt["typing_observations"] = typingObservations
+      receipt["typing_observations_complete"] = true
       receipt["typing_scope"] = "offscreen production editor insertion, deletion, model update and layout plus main-actor scheduling; not physical keystrokes"
       receipt["maximum_typing_latency_seconds"] = typingDelays.max() ?? 0
       receipt["swap_after"] = swap()
@@ -446,6 +447,12 @@ import Synchronization
       if let model { model.isBusy = false; try await model.shutdown() }; window?.close()
       let measured = try probe.finish()
       receipt["peak_sampled_process_footprint_bytes"] = measured.0; receipt["memory_samples"] = measured.1
+      let typingDelays = typingObservations.compactMap { $0["combined_seconds"] as? Double }
+      receipt["typing_samples_seconds"] = typingDelays
+      receipt["typing_observations"] = typingObservations
+      receipt["typing_observations_complete"] = false
+      receipt["maximum_typing_latency_seconds"] = typingDelays.max() as Any? ?? NSNull()
+      receipt["typing_scope"] = "offscreen production editor insertion, deletion, model update and layout plus main-actor scheduling; not physical keystrokes"
       receipt["status"] = "failed"; receipt["error"] = String(describing: error); receipt["swap_after"] = swap()
       try write(receipt, "receipt.json", evidence: evidence); throw error
     }
