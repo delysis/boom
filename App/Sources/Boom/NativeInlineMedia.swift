@@ -258,7 +258,7 @@ struct InlineMediaSpan: Decodable {
     if parsedSourceVersion != version {
       let trace = PerformanceTrace.begin("Editor.MediaParse")
       defer { PerformanceTrace.end("Editor.MediaParse", trace) }
-      spans = (try? ProductCore.call(["op": "media_spans", "text": storage.string])) ?? []
+      spans = (try? ProductCore.markdownMediaSpans(storage.string)) ?? []
       parsedSourceVersion = version
     }
     let records = model?.state.attachments ?? []

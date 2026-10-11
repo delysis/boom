@@ -20,6 +20,28 @@ enum ProductCore {
   static func search(_ text: String, query: String) throws -> SearchMatches {
     try call(["op": "search", "text": text, "query": query])
   }
+  static func markdownSpans<T: Decodable>(_ text: String, as: T.Type = T.self) throws -> T {
+    try parseText(text, using: bloom_markdown_spans)
+  }
+  static func markdownMediaSpans(_ text: String) throws -> [InlineMediaSpan] {
+    try parseText(text, using: bloom_markdown_media_spans)
+  }
+  private static func parseText<T: Decodable>(_ text: String,
+    using parser: (UnsafePointer<UInt8>?, Int) -> BoomAttachmentBuffer) throws -> T {
+    // String owns the contiguous UTF-8 only for this synchronous call. The
+    // parser borrows it; no whole-document JSON escaping or request copy.
+    var source = text
+    let inputTrace = PerformanceTrace.begin("Bridge.InputUTF8")
+    return try source.withUTF8 { bytes in
+      PerformanceTrace.end("Bridge.InputUTF8", inputTrace)
+      let buffer = {
+        let trace = PerformanceTrace.begin("Bridge.Execute")
+        defer { PerformanceTrace.end("Bridge.Execute", trace) }
+        return parser(bytes.baseAddress, bytes.count)
+      }()
+      return try response(buffer)
+    }
+  }
   static func layout() throws -> ProductLayout { try call(["op": "layout"]) }
   static func importedTexts(_ files: [ImportedText]) throws -> [ImportedText] {
     try call(["op": "validate_import", "files": object(files)])

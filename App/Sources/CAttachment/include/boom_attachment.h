@@ -13,6 +13,10 @@ BoomAttachmentBuffer boom_attachment_inspect(const uint8_t *name, size_t name_le
                                             const uint8_t *data, size_t length);
 void boom_attachment_free(BoomAttachmentBuffer buffer);
 BoomAttachmentBuffer bloom_core_request(const uint8_t *data, size_t length);
+/* Borrow raw UTF-8 text; empty text may use a null pointer. Results retain the
+ * same bounded JSON envelope and exactly-once free contract as core_request. */
+BoomAttachmentBuffer bloom_markdown_spans(const uint8_t *data, size_t length);
+BoomAttachmentBuffer bloom_markdown_media_spans(const uint8_t *data, size_t length);
 BoomAttachmentBuffer bloom_media_admit(const uint8_t *data, size_t length);
 /* Success returns binary WAV bytes; failure returns a JSON error object. */
 BoomAttachmentBuffer bloom_caf_wave(const uint8_t *data, size_t length);

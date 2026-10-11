@@ -1000,6 +1000,15 @@ pub fn execute_for_transport(request: Request) -> Result<Value, ConsultationErro
     }
 }
 
+/// Borrowed editor text uses the same parser and limits as the JSON transport.
+pub fn markdown_spans(text: &str) -> Result<Value, Error> {
+    serde_json::to_value(markdown::spans(text)?).map_err(|error| Error(error.to_string()))
+}
+
+pub fn markdown_media_spans(text: &str) -> Result<Value, Error> {
+    serde_json::to_value(markdown::media_spans(text)?).map_err(|error| Error(error.to_string()))
+}
+
 pub fn execute(request: Request) -> Result<Value, Error> {
     match request {
         Request::CheckpointRequirements { checkpoint } => {
@@ -1138,8 +1147,8 @@ pub fn execute(request: Request) -> Result<Value, Error> {
             current,
         } => serde_json::to_value(document::apply(&patch, &authority, &current)?),
         Request::Search { text, query } => serde_json::to_value(search::search(&text, &query)?),
-        Request::MarkdownSpans { text } => serde_json::to_value(markdown::spans(&text)?),
-        Request::MediaSpans { text } => serde_json::to_value(markdown::media_spans(&text)?),
+        Request::MarkdownSpans { text } => return markdown_spans(&text),
+        Request::MediaSpans { text } => return markdown_media_spans(&text),
         Request::StoryboardScan { duration_ms } => {
             serde_json::to_value(storyboard::scan_plan(duration_ms)?)
         }

@@ -136,6 +136,59 @@ pub unsafe extern "C" fn bloom_core_request(
     owned(outcome.unwrap_or_else(|_| error("core_panic", "Product request failed.")))
 }
 
+/// The caller owns readable immutable input for this call. Empty text needs no
+/// pointer; every result retains the existing bounded JSON/free-once contract.
+unsafe fn markdown_request(
+    data: *const u8,
+    length: usize,
+    parse: fn(&str) -> Result<Value, bloom_core::Error>,
+) -> BoomAttachmentBuffer {
+    if length > 16 * 1024 * 1024 || (length != 0 && data.is_null()) {
+        return owned(error("input_limit", "Product request exceeds 16 MiB."));
+    }
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        let bytes = if length == 0 {
+            &[]
+        } else {
+            // SAFETY: the caller owns this immutable buffer until this call returns.
+            unsafe { slice::from_raw_parts(data, length) }
+        };
+        let text = match str::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => return error("request_invalid", "Markdown text is not UTF-8."),
+        };
+        match parse(text) {
+            Ok(value) => json!({"schema":1,"ok":true,"value":value}),
+            Err(e) => error("invalid", &e.to_string()),
+        }
+    }));
+    owned(outcome.unwrap_or_else(|_| error("core_panic", "Product request failed.")))
+}
+
+/// # Safety
+/// Nonempty input must address readable immutable bytes for this call. Empty
+/// input may use a null pointer. Malformed UTF-8 is refused. Free the result once.
+#[no_mangle]
+pub unsafe extern "C" fn bloom_markdown_spans(
+    data: *const u8,
+    length: usize,
+) -> BoomAttachmentBuffer {
+    // SAFETY: the caller supplies the borrowed buffer required by markdown_request.
+    unsafe { markdown_request(data, length, bloom_core::markdown_spans) }
+}
+
+/// # Safety
+/// Nonempty input must address readable immutable bytes for this call. Empty
+/// input may use a null pointer. Malformed UTF-8 is refused. Free the result once.
+#[no_mangle]
+pub unsafe extern "C" fn bloom_markdown_media_spans(
+    data: *const u8,
+    length: usize,
+) -> BoomAttachmentBuffer {
+    // SAFETY: the caller supplies the borrowed buffer required by markdown_request.
+    unsafe { markdown_request(data, length, bloom_core::markdown_media_spans) }
+}
+
 /// # Safety
 /// For nonzero lengths, pointers must address readable immutable buffers of the
 /// supplied lengths for this call. The embedding Swift Data.withUnsafeBytes owns them.

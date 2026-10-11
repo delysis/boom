@@ -28,6 +28,7 @@ private struct MarkdownSpan: Decodable {
     guard let pattern = wikiPattern
     else { return [] }
     let text = source as NSString
+    guard text.range(of: "[[", options: .literal).location != NSNotFound else { return [] }
     return pattern.matches(in: source, range: NSRange(location: 0, length: text.length))
       .compactMap { match in
         guard !literalRanges.contains(where: { NSIntersectionRange($0, match.range).length > 0 }) else {
@@ -73,12 +74,13 @@ private struct MarkdownSpan: Decodable {
     let spans: [MarkdownSpan] = {
       let trace = PerformanceTrace.begin("Editor.MarkdownParse")
       defer { PerformanceTrace.end("Editor.MarkdownParse", trace) }
-      return (try? ProductCore.call(["op": "markdown_spans", "text": source])) ?? []
+      return (try? ProductCore.markdownSpans(source)) ?? []
     }()
     let literalRanges = spans.filter { $0.kind == "code" }
       .map { NSRange(location: $0.location, length: $0.length) }
     let wikis = wikiDisplays(in: source, excluding: literalRanges)
-    let attachments = attachmentPattern?.matches(in: source, range: full) ?? []
+    let attachments = text.range(of: "[Attachment: ", options: .literal).location == NSNotFound
+      ? [] : (attachmentPattern?.matches(in: source, range: full) ?? [])
     view.typingAttributes = base
     defer {
       (view as? NativeMediaTextView)?.inlineMedia.refresh()
