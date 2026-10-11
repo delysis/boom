@@ -109,6 +109,7 @@ struct InlineMediaSpan: Decodable {
   var drawObservation: ((ContinuousClock.Instant, ContinuousClock.Instant) -> Void)?
   private weak var observedSource: NSTextStorage?
   private var characterVersion = UUID()
+  private var cachedMarkup: (version: UUID, value: ProductCore.MarkupProjection)?
   /// Character edits invalidate source consumers; display attributes do not.
   /// Rebinding a text container also starts a new source identity.
   var sourceVersion: UUID {
@@ -116,6 +117,7 @@ struct InlineMediaSpan: Decodable {
       NotificationCenter.default.removeObserver(self, name: NSTextStorage.didProcessEditingNotification, object: nil)
       observedSource = textStorage
       characterVersion = UUID()
+      cachedMarkup = nil
       if let storage = textStorage {
         NotificationCenter.default.addObserver(self, selector: #selector(sourceDidEdit(_:)),
           name: NSTextStorage.didProcessEditingNotification, object: storage)
@@ -123,10 +125,23 @@ struct InlineMediaSpan: Decodable {
     }
     return characterVersion
   }
+  /// One projection belongs to the exact native character version. Attribute
+  /// updates may reuse its small span arrays; no source buffer is cached.
+  var markupProjection: ProductCore.MarkupProjection {
+    let version = sourceVersion
+    let pendingCharacters = textStorage?.editedMask.contains(.editedCharacters) == true
+    if !pendingCharacters, let cachedMarkup, cachedMarkup.version == version { return cachedMarkup.value }
+    let value = ProductCore.markupProjection(textStorage?.string ?? "")
+    // An open storage transaction can contain new characters before its
+    // didProcessEditing notification advances sourceVersion.
+    cachedMarkup = pendingCharacters ? nil : (version, value)
+    return value
+  }
   @objc private func sourceDidEdit(_ notification: Notification) {
     guard let storage = notification.object as? NSTextStorage, storage === observedSource,
       storage.editedMask.contains(.editedCharacters) else { return }
     characterVersion = UUID()
+    cachedMarkup = nil
   }
   deinit { NotificationCenter.default.removeObserver(self) }
   private var deferredLayout = false
@@ -255,11 +270,10 @@ struct InlineMediaSpan: Decodable {
     defer { PerformanceTrace.end("Editor.MediaRefresh", trace) }
     guard let view, let storage = view.textStorage else { return }
     let version = view.sourceVersion
-    if parsedSourceVersion != version {
-      let trace = PerformanceTrace.begin("Editor.MediaParse")
-      defer { PerformanceTrace.end("Editor.MediaParse", trace) }
-      spans = (try? ProductCore.markdownMediaSpans(storage.string)) ?? []
-      parsedSourceVersion = version
+    let pendingCharacters = storage.editedMask.contains(.editedCharacters)
+    if pendingCharacters || parsedSourceVersion != version {
+      spans = view.markupProjection.media
+      parsedSourceVersion = pendingCharacters ? nil : version
     }
     let records = model?.state.attachments ?? []
     let ids = Set(spans.map(\.id))

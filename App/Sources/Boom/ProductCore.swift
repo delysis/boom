@@ -26,6 +26,32 @@ enum ProductCore {
   static func markdownMediaSpans(_ text: String) throws -> [InlineMediaSpan] {
     try parseText(text, using: bloom_markdown_media_spans)
   }
+  struct MarkupProjection {
+    let markdown: [MarkdownSpan]
+    let media: [InlineMediaSpan]
+  }
+  /// Both parsers borrow one UTF-8 representation. Their independent parser
+  /// options and failure behavior stay unchanged; the result retains no text.
+  static func markupProjection(_ text: String) -> MarkupProjection {
+    let projectionTrace = PerformanceTrace.begin("Editor.Projection")
+    defer { PerformanceTrace.end("Editor.Projection", projectionTrace) }
+    var source = text
+    let inputTrace = PerformanceTrace.begin("Bridge.InputUTF8")
+    return source.withUTF8 { bytes in
+      PerformanceTrace.end("Bridge.InputUTF8", inputTrace)
+      let markdown: [MarkdownSpan] = {
+        let trace = PerformanceTrace.begin("Editor.MarkdownParse")
+        defer { PerformanceTrace.end("Editor.MarkdownParse", trace) }
+        return (try? parseBorrowedText(bytes, using: bloom_markdown_spans)) ?? []
+      }()
+      let media: [InlineMediaSpan] = {
+        let trace = PerformanceTrace.begin("Editor.MediaParse")
+        defer { PerformanceTrace.end("Editor.MediaParse", trace) }
+        return (try? parseBorrowedText(bytes, using: bloom_markdown_media_spans)) ?? []
+      }()
+      return MarkupProjection(markdown: markdown, media: media)
+    }
+  }
   private static func parseText<T: Decodable>(_ text: String,
     using parser: (UnsafePointer<UInt8>?, Int) -> BoomAttachmentBuffer) throws -> T {
     // String owns the contiguous UTF-8 only for this synchronous call. The
@@ -34,13 +60,17 @@ enum ProductCore {
     let inputTrace = PerformanceTrace.begin("Bridge.InputUTF8")
     return try source.withUTF8 { bytes in
       PerformanceTrace.end("Bridge.InputUTF8", inputTrace)
-      let buffer = {
-        let trace = PerformanceTrace.begin("Bridge.Execute")
-        defer { PerformanceTrace.end("Bridge.Execute", trace) }
-        return parser(bytes.baseAddress, bytes.count)
-      }()
-      return try response(buffer)
+      return try parseBorrowedText(bytes, using: parser)
     }
+  }
+  private static func parseBorrowedText<T: Decodable>(_ bytes: UnsafeBufferPointer<UInt8>,
+    using parser: (UnsafePointer<UInt8>?, Int) -> BoomAttachmentBuffer) throws -> T {
+    let buffer = {
+      let trace = PerformanceTrace.begin("Bridge.Execute")
+      defer { PerformanceTrace.end("Bridge.Execute", trace) }
+      return parser(bytes.baseAddress, bytes.count)
+    }()
+    return try response(buffer)
   }
   static func layout() throws -> ProductLayout { try call(["op": "layout"]) }
   static func importedTexts(_ files: [ImportedText]) throws -> [ImportedText] {

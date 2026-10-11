@@ -5,7 +5,7 @@ import BoomCore
   var applyingExternal: Bool { get set }
 }
 
-private struct MarkdownSpan: Decodable {
+struct MarkdownSpan: Decodable {
   let kind: String
   let location: Int
   let length: Int
@@ -71,11 +71,14 @@ private struct MarkdownSpan: Decodable {
     let base: [NSAttributedString.Key: Any] = [
       .font: bodyFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: paragraph,
     ]
-    let spans: [MarkdownSpan] = {
+    let spans: [MarkdownSpan]
+    if let native = view as? NativeMediaTextView {
+      spans = native.markupProjection.markdown
+    } else {
       let trace = PerformanceTrace.begin("Editor.MarkdownParse")
       defer { PerformanceTrace.end("Editor.MarkdownParse", trace) }
-      return (try? ProductCore.markdownSpans(source)) ?? []
-    }()
+      spans = (try? ProductCore.markdownSpans(source)) ?? []
+    }
     let literalRanges = spans.filter { $0.kind == "code" }
       .map { NSRange(location: $0.location, length: $0.length) }
     let wikis = wikiDisplays(in: source, excluding: literalRanges)
