@@ -64,7 +64,7 @@ struct TextInputCapture: Codable, Sendable {
     model.registerInputCompletion(self)
   }
   func update(selection: NSRange, marked: Bool, target: TextInputTarget) {
-    guard let view else { invalidateGhost(); return }
+    guard let view else { model?.revokeInputJoinedRetentions(id); invalidateGhost(); return }
     let sourceVersion = view.sourceVersion
     let sourceChanged = completionDocument == nil || documentSourceVersion != sourceVersion
     let changed = self.target != target || sourceChanged || caret != selection.location
@@ -72,6 +72,7 @@ struct TextInputCapture: Codable, Sendable {
       completionDocument = DocumentSnapshot(id: id, title: "Chat input", text: view.string)
       documentSourceVersion = sourceVersion
     }
+    if self.target != target { model?.revokeInputJoinedRetentions(id) }
     self.target = target; caret = selection.location
     if changed || marked || selection.length != 0 {
       invalidateGhost()
@@ -98,6 +99,15 @@ struct TextInputCapture: Codable, Sendable {
     ghostStamp = nil; stampedDocumentVersion = nil; ghostText = ""; view?.clearGhost()
   }
   func join() async { invalidateGhost(); if let task { await task.value } }
+  var joinedRetentionOwnerIsLive: Bool {
+    guard let model, view != nil else { return false }
+    if let id = target.chatID {
+      guard let chat = model.state.chats.first(where: { $0.id == id }) else { return false }
+      if let message = target.messageID, !chat.messages.contains(where: { $0.id == message }) { return false }
+    }
+    if let id = target.documentID, !model.documents.contains(where: { $0.id == id }) { return false }
+    return true
+  }
   private var eligible: Bool {
     guard let model, !model.isBusy, model.state.autocomplete, model.inputCompletionRunner != nil,
       let view, view.window?.firstResponder === view, !view.hasMarkedText(),
@@ -133,7 +143,23 @@ struct TextInputCapture: Codable, Sendable {
         let raw = try model.inputContext(target, text: document.text, caret: capturedCaret)
         let compiled = DocumentSnapshot(id: document.id, title: document.title, text: raw)
         let result = try await model.generateInputCandidates(document: compiled, capture: capture,
-          count: count, previous: previous, flag: operation) { [weak self] bundle in
+          count: count, previous: previous, flag: operation,
+          beforeCachePublication: { [weak self, weak model] in
+            guard let sourceOwner = self, let workspaceOwner = model else {
+              throw BoomError.stale("The input source changed before prompt-cache publication.")
+            }
+            try await MainActor.run {
+              try operation.check()
+              guard sourceOwner.epoch == capturedEpoch,
+                sourceOwner.completionDocument?.textVersion == document.textVersion,
+                sourceOwner.view?.sourceVersion == sourceOwner.documentSourceVersion,
+                sourceOwner.caret == capturedCaret, sourceOwner.target == target,
+                (try? workspaceOwner.inputContextDigest(target)) == digest,
+                sourceOwner.view?.hasMarkedText() == false else {
+                throw BoomError.stale("The input source changed before prompt-cache publication.")
+              }
+            }
+          }) { [weak self] bundle in
             guard let self, self.epoch == capturedEpoch, !operation.isCancelled,
               self.completionDocument?.textVersion == document.textVersion,
               self.view?.sourceVersion == self.documentSourceVersion, self.caret == capturedCaret,
@@ -245,18 +271,29 @@ extension WorkspaceModel {
   }
   func generateInputCandidates(document: DocumentSnapshot, capture: TextInputCapture, count: Int,
     previous: CandidateBundle?, flag: CancellationFlag,
+    beforeCachePublication: @escaping @Sendable () async throws -> Void,
     publish: @escaping @MainActor (CandidateBundle) -> Void) async throws -> CandidateBundle {
     guard let runner = inputCompletionRunner, !isBusy else { throw CancellationError() }
     let seeds = (0..<count).map { _ in UInt64.random(in: .min ... .max) }
     let media = try await writingMedia(in: previous?.recipe.sourcePrompt ?? document.text, flag: flag)
+    let cacheOwner = PromptCacheOwner(namespace: inferenceCacheNamespace,
+      entity: capture.snapshot.id, route: .inputCompletion)
+    let pairedAdmission = makePairedContextAdmission(runner: runner,
+      purpose: baseRunner === runner ? .writing : .consultation, owner: cacheOwner, flag: flag) {
+      // The same captured target/text/caret/context validator used by successful
+      // cache publication also gates a peer release and the exact retry.
+      try await beforeCachePublication()
+    }
     let recipe: CompletionRecipe
     if let previous { recipe = previous.recipe }
     else {
       recipe = try await runner.completionRecipe(document: document, caret: document.text.utf16.count,
-        sources: media.map { $0.reference.source }, examples: [], profile: samplingProfile, maxTokens: 64, flag: flag, batchWidth: 3, media: media)
+        sources: media.map { $0.reference.source }, examples: [], profile: samplingProfile, maxTokens: 64, flag: flag, batchWidth: seeds.count, media: media,
+        cacheOwner: cacheOwner, pairedAdmission: pairedAdmission)
     }
     try flag.check(); try ProductCore.validateWritingRecipe(recipe)
     guard recipe.model == runner.identity else { throw BoomError.stale("Completion model changed.") }
+    let executionPolicy = try ProductCore.resolvedGenerationPolicy(recipe.generationPolicy, loaded: runner.generationPolicy)
     var bundle = previous ?? CandidateBundle(id: UUID(), recipe: recipe, origin: nil,
       candidates: [], selected: 0, input: capture)
     let start = bundle.candidates.count
@@ -281,8 +318,14 @@ extension WorkspaceModel {
       let orderedMedia = try (recipe.media ?? []).map { reference -> WritingMediaData in
         guard let payload = media.first(where: { $0.reference == reference }) else { throw BoomError.stale(reference.name) }; return payload
       }
+      // The input source ID survives glyph edits; textVersion identifies only a snapshot.
+      let joinedRetention = try makeJoinedRetentionRequest(owner: cacheOwner,
+        runner: runner, policy: executionPolicy, operationID: flag.operationID)
+      defer { finishJoinedRetentionRequest(joinedRetention) }
       let results = try await runner.runBatch(rawPrompt: recipe.prompt, media: orderedMedia, maxTokens: recipe.maxTokens,
         settings: recipe.settings, seeds: seeds, flag: flag, background: true,
+        cacheOwner: cacheOwner, executionPolicy: executionPolicy, joinedRetention: joinedRetention,
+        beforeCachePublication: beforeCachePublication, pairedAdmission: pairedAdmission,
         onCheckpoint: { updates in
           for update in updates {
             try await checkpointStore.checkpoint(update.progress, identity: generations[update.lane],
@@ -296,6 +339,7 @@ extension WorkspaceModel {
         bundle.candidates[index].promptTokens = result.promptTokens; bundle.candidates[index].outputTokens = result.outputTokens
         bundle.candidates[index].state = result.stopReason == "cancelled" ? .cancelled : (result.text.isEmpty ? .failed : .complete)
         bundle.candidates[index].stopReason = result.stopReason; bundle.candidates[index].stopTokenID = result.stopTokenID
+        bundle.candidates[index].executionOrigin = result.executionOrigin
       }
       try await saveInputCandidate(bundle)
       try flag.check(); publish(bundle)

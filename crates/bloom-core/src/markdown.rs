@@ -5,6 +5,17 @@ use serde::Serialize;
 use std::ops::Range;
 use uuid::Uuid;
 
+fn byte_to_utf16_offsets(text: &str) -> Vec<usize> {
+    let mut offsets = vec![0_usize; text.len() + 1];
+    let mut utf16 = 0;
+    for (byte, character) in text.char_indices() {
+        offsets[byte] = utf16;
+        utf16 += character.len_utf16();
+    }
+    offsets[text.len()] = utf16;
+    offsets
+}
+
 #[derive(Serialize)]
 pub struct MediaSpan {
     pub id: Uuid,
@@ -16,13 +27,7 @@ pub struct MediaSpan {
 /// remote URLs remain prose; the original UTF-16 positions never change.
 pub fn media_spans(text: &str) -> Result<Vec<MediaSpan>, Error> {
     require(text.len() <= TEXT_LIMIT, "Markdown exceeds 2 MiB.")?;
-    let mut offsets = vec![0_usize; text.len() + 1];
-    let mut utf16 = 0;
-    for (byte, character) in text.char_indices() {
-        offsets[byte] = utf16;
-        utf16 += character.len_utf16();
-    }
-    offsets[text.len()] = utf16;
+    let mut offsets = None;
     let mut result = Vec::new();
     for (event, range) in Parser::new(text).into_offset_iter() {
         let Event::Start(Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. }) = event else {
@@ -41,6 +46,7 @@ pub fn media_spans(text: &str) -> Result<Vec<MediaSpan>, Error> {
             result.len() < 4096,
             "Document exceeds 4096 media references.",
         )?;
+        let offsets = offsets.get_or_insert_with(|| byte_to_utf16_offsets(text));
         result.push(MediaSpan {
             id,
             location: offsets[range.start],
@@ -60,16 +66,11 @@ pub struct Span {
 
 pub fn spans(text: &str) -> Result<Vec<Span>, Error> {
     require(text.len() <= TEXT_LIMIT, "Markdown exceeds 2 MiB.")?;
-    let mut offsets = vec![0_usize; text.len() + 1];
-    let mut utf16 = 0;
-    for (byte, character) in text.char_indices() {
-        offsets[byte] = utf16;
-        utf16 += character.len_utf16();
-    }
-    offsets[text.len()] = utf16;
+    let mut offsets = None;
     let mut result = Vec::new();
     let mut add = |kind, range: Range<usize>, level| {
         if range.start < range.end && result.len() < 20_000 {
+            let offsets = offsets.get_or_insert_with(|| byte_to_utf16_offsets(text));
             result.push(Span {
                 kind,
                 location: offsets[range.start],
@@ -163,6 +164,34 @@ mod tests {
             link
         );
         assert_eq!(span.id.to_string(), id);
+        Ok(())
+    }
+    #[test]
+    fn plain_unicode_prefix_and_final_media_keep_original_utf16_ranges() -> Result<(), Error> {
+        let prefix = "café 🙂 👩‍💻 plain prose\n".repeat(256);
+        assert!(spans(&prefix)?.is_empty());
+        assert!(media_spans(&prefix)?.is_empty());
+        let id = "884646c1-14b4-490d-be8c-8953af793315";
+        let link = format!("[tail🙂](boom-attachment:{id})");
+        let text = format!("{prefix}{link}");
+        let expected_location = prefix.encode_utf16().count();
+        let expected_length = link.encode_utf16().count();
+        let media = media_spans(&text)?;
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0].id.to_string(), id);
+        assert_eq!(media[0].location, expected_location);
+        assert_eq!(media[0].length, expected_length);
+        let styled = spans(&text)?;
+        let link_span = styled
+            .iter()
+            .find(|span| span.kind == "link")
+            .expect("parsed link styling");
+        assert_eq!(link_span.location, expected_location);
+        assert_eq!(link_span.length, expected_length);
+        assert_eq!(
+            link_span.location + link_span.length,
+            text.encode_utf16().count()
+        );
         Ok(())
     }
     #[test]

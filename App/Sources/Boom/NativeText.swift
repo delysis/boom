@@ -1,4 +1,5 @@
 import AppKit
+import BoomCore
 import SwiftUI
 
 /// The complete TextKit graph exists at construction, even for standalone or
@@ -23,18 +24,55 @@ import SwiftUI
   }
 }
 
+private func readingText(for message: ChatMessage) -> String {
+  if message.state == .pending { return message.text.isEmpty ? "…" : message.text }
+  if message.text.isEmpty, let failure = message.failure { return failure }
+  return message.text
+}
+private func readingText(for candidate: WritingCandidate) -> String {
+  guard candidate.text.isEmpty else { return candidate.text }
+  switch candidate.state {
+  case .pending: return "Writing a continuation…"
+  case .cancelled: return "Stopped before any prose was produced."
+  default: return "The model ended this continuation before producing prose."
+  }
+}
+
 /// One sizing contract for selectable Markdown inside a SwiftUI row. SwiftUI
 /// owns the frame; AppKit lays out glyphs at that frame's width. Measurement
 /// never changes the live container, including during speculative proposals.
 struct NativeText: NSViewRepresentable {
   enum Presentation { case markdown, literal, removed, added }
   let text: String
+  private var readingVersion: UUID?
   var presentation = Presentation.markdown
   var pointSize: CGFloat = 14
   var selectable = true
   var mediaModel: WorkspaceModel? = nil
+
+  init(text: String, presentation: Presentation = .markdown, pointSize: CGFloat = 14,
+    selectable: Bool = true, mediaModel: WorkspaceModel? = nil) {
+    self.text = text; readingVersion = nil
+    self.presentation = presentation; self.pointSize = pointSize
+    self.selectable = selectable; self.mediaModel = mediaModel
+  }
+  init(message: ChatMessage, presentation: Presentation = .markdown, pointSize: CGFloat = 14,
+    selectable: Bool = true, mediaModel: WorkspaceModel? = nil) {
+    self.init(text: readingText(for: message), presentation: presentation, pointSize: pointSize,
+      selectable: selectable, mediaModel: mediaModel)
+    readingVersion = message.readingVersion
+  }
+  init(candidate: WritingCandidate, presentation: Presentation = .markdown, pointSize: CGFloat = 14,
+    selectable: Bool = true, mediaModel: WorkspaceModel? = nil) {
+    self.init(text: readingText(for: candidate), presentation: presentation, pointSize: pointSize,
+      selectable: selectable, mediaModel: mediaModel)
+    readingVersion = candidate.readingVersion
+  }
   func makeNSView(context: Context) -> NativeReadingTextView { NativeReadingTextView(frame: .zero) }
-  func updateNSView(_ view: NativeReadingTextView, context: Context) { view.isSelectable = selectable; view.setMedia(model: mediaModel); view.setSource(text, presentation: presentation, pointSize: pointSize) }
+  func updateNSView(_ view: NativeReadingTextView, context: Context) {
+    view.isSelectable = selectable; view.setMedia(model: mediaModel)
+    view.setSource(text, readingVersion: readingVersion, presentation: presentation, pointSize: pointSize)
+  }
   func sizeThatFits(_ proposal: ProposedViewSize, nsView view: NativeReadingTextView, context: Context) -> CGSize? {
     guard let width = proposal.width, width.isFinite, width > 0 else { return nil }
     return NSSize(width: width, height: view.contentHeight(at: width))
@@ -86,6 +124,7 @@ final class NativeReadingTextView: NativeMediaTextView {
   private var pointSize: CGFloat = 14
   private var acknowledgedSource: String?
   private var acknowledgedSourceVersion: UUID?
+  private var acknowledgedReadingVersion: UUID?
 
   override init(frame: NSRect, textContainer: NSTextContainer? = nil) {
     let container = textContainer ?? NSTextContainer(size: NSSize(width: frame.width, height: .greatestFiniteMagnitude))
@@ -106,9 +145,32 @@ final class NativeReadingTextView: NativeMediaTextView {
   required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
   func setSource(_ source: String, presentation: NativeText.Presentation = .markdown, pointSize: CGFloat = 14) {
-    let sourceChanged = acknowledgedSourceVersion != sourceVersion
-      || (acknowledgedSource.map { !($0 as NSString).isEqual(to: source) } ?? true)
-    guard sourceChanged || self.presentation != presentation || self.pointSize != pointSize else { return }
+    setSource(source, readingVersion: nil, presentation: presentation, pointSize: pointSize)
+  }
+  func setSource(_ message: ChatMessage, presentation: NativeText.Presentation = .markdown, pointSize: CGFloat = 14) {
+    setSource(readingText(for: message), readingVersion: message.readingVersion,
+      presentation: presentation, pointSize: pointSize)
+  }
+  func setSource(_ candidate: WritingCandidate, presentation: NativeText.Presentation = .markdown, pointSize: CGFloat = 14) {
+    setSource(readingText(for: candidate), readingVersion: candidate.readingVersion,
+      presentation: presentation, pointSize: pointSize)
+  }
+  /// Only this file can pair a String with a reading identity. Typed entry points
+  /// derive both from their owner; arbitrary String callers retain exact equality.
+  fileprivate func setSource(_ source: String, readingVersion: UUID?,
+    presentation: NativeText.Presentation, pointSize: CGFloat) {
+    let sourceChanged: Bool
+    if let readingVersion {
+      sourceChanged = acknowledgedSourceVersion != sourceVersion
+        || acknowledgedReadingVersion != readingVersion
+    } else {
+      sourceChanged = acknowledgedSourceVersion != sourceVersion
+        || (acknowledgedSource.map { !($0 as NSString).isEqual(to: source) } ?? true)
+    }
+    guard sourceChanged || self.presentation != presentation || self.pointSize != pointSize else {
+      acknowledgedReadingVersion = readingVersion
+      return
+    }
     self.presentation = presentation; self.pointSize = pointSize
     if sourceChanged { string = source; acknowledgedSource = source }
     if presentation == .markdown {
@@ -124,6 +186,7 @@ final class NativeReadingTextView: NativeMediaTextView {
       textStorage?.setAttributes(attributes, range: NSRange(location: 0, length: source.utf16.count))
     }
     acknowledgedSourceVersion = sourceVersion
+    acknowledgedReadingVersion = readingVersion
     // Representables may be measured before updateNSView supplies their text.
     // Invalidate that initial empty measurement as well as subsequent edits.
     invalidateIntrinsicContentSize()

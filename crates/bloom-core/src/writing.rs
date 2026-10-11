@@ -60,6 +60,9 @@ mod input_tests {
     #[test]
     fn attributed_input_is_raw_prose_and_caret_bound() {
         let history = [crate::PromptTurn {
+            context: None,
+            routing: None,
+            prompt_contract: None,
             role: "assistant".into(),
             text: "The harbor was quiet.".into(),
             speaker: crate::Speaker {

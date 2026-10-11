@@ -14,6 +14,32 @@ struct GenerationIdentity: Codable, Equatable, Sendable {
   let generationPolicy: ModelGenerationPolicy?
   var batch: WritingBatchExecution? = nil
 }
+/// A durable observation of the admitted lookup, not a warm replay transcript.
+/// Absent metadata is unknown; a historical policy never implies a cold run.
+struct GenerationExecutionOrigin: Codable, Equatable, Sendable {
+  let schema: Int
+  let cacheAlgorithm: String
+  let cachedPromptTokens: Int
+  let cacheMissReason: String?
+
+  func isValid(promptTokens: Int) -> Bool {
+    guard schema == 1, promptTokens > 0, promptTokens <= 16_384,
+      cachedPromptTokens >= 0, cachedPromptTokens < promptTokens,
+      Self.identifier(cacheAlgorithm) else { return false }
+    if cachedPromptTokens > 0 { return cacheMissReason == nil }
+    return cacheMissReason.map(Self.identifier) == true
+  }
+  func isConfirmedCold(promptTokens: Int) -> Bool {
+    isValid(promptTokens: promptTokens) && cachedPromptTokens == 0
+  }
+  private static func identifier(_ value: String) -> Bool {
+    !value.isEmpty && value.utf8.count <= 128 && value.utf8.allSatisfy {
+      (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0)
+        || $0 == 45 || $0 == 46 || $0 == 95
+    }
+  }
+}
+
 struct GenerationProgress: Codable, Sendable {
   let text: String
   let tokenIDs: [Int]
@@ -21,6 +47,7 @@ struct GenerationProgress: Codable, Sendable {
   let promptTokens: Int
   let firstTokenSeconds: Double?
   let elapsedSeconds: Double
+  var executionOrigin: GenerationExecutionOrigin? = nil
 }
 struct GenerationCheckpoint: Codable, Sendable {
   let schema: Int
@@ -68,7 +95,9 @@ extension WorkspaceStore {
       operationID: receipt.operationID, recordID: receipt.responseID ?? id, attemptID: attemptID, model: receipt.model,
       seed: receipt.seed, requestDigest: Digest.sha256(receipt.plan.rawPrompt), maxTokens: journal.identity.maxTokens,
       generationPolicy: receipt.generationPolicy)
-    return try ProductCore.generationCheckpoint(journal, expected: expected)
+    let admitted = try ProductCore.generationCheckpoint(journal, expected: expected)
+    try validateExecutionOrigin(receipt.executionOrigin, journal: admitted)
+    return admitted
   }
   func writingCheckpoint(bundle: CandidateBundle, candidate: WritingCandidate) throws -> GenerationCheckpoint? {
     guard vault.exists(.generationJournal, candidate.id) else { return nil }
@@ -77,7 +106,14 @@ extension WorkspaceStore {
       recordID: bundle.id, attemptID: candidate.id, model: bundle.recipe.model,
       seed: candidate.seed, requestDigest: bundle.recipe.promptDigest, maxTokens: bundle.recipe.maxTokens,
       generationPolicy: bundle.recipe.generationPolicy, batch: candidate.batch)
-    return try ProductCore.generationCheckpoint(journal, expected: expected)
+    let admitted = try ProductCore.generationCheckpoint(journal, expected: expected)
+    try validateExecutionOrigin(candidate.executionOrigin, journal: admitted)
+    return admitted
+  }
+  private func validateExecutionOrigin(_ captured: GenerationExecutionOrigin?, journal: GenerationCheckpoint) throws {
+    guard captured == nil || captured == journal.progress.executionOrigin else {
+      throw BoomError.invalid("The recorded execution origin differs from its checkpoint; records retained.")
+    }
   }
 }
 
@@ -88,6 +124,7 @@ extension ConsultationReceipt {
   mutating func retain(_ progress: GenerationProgress) {
     promptDigest = progress.promptDigest; tokenIDs = progress.tokenIDs
     firstTokenSeconds = progress.firstTokenSeconds; elapsedSeconds = progress.elapsedSeconds
+    executionOrigin = progress.executionOrigin
   }
 }
 extension WritingCandidate {
@@ -113,5 +150,15 @@ extension WritingCandidate {
   mutating func retain(_ progress: GenerationProgress) {
     text = progress.text; promptTokens = progress.promptTokens
     tokenIDs = progress.tokenIDs; outputTokens = progress.tokenIDs.count
+    executionOrigin = progress.executionOrigin
+  }
+  func coldReplayPolicy(recipe: CompletionRecipe, loadedModel: String,
+    loadedPolicy: ModelGenerationPolicy) throws -> ModelGenerationPolicy {
+    guard state == .complete, recipe.model == loadedModel,
+      executionOrigin?.isConfirmedCold(promptTokens: promptTokens) == true else {
+      throw BoomError.unavailable("Seed replay requires a confirmed cold execution; saved output is retained.")
+    }
+    if let batch { try ProductCore.validateWritingBatch(batch, seed: seed) }
+    return try ProductCore.resolvedGenerationPolicy(recipe.generationPolicy, loaded: loadedPolicy)
   }
 }

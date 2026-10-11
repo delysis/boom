@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 public enum BoomError: Error, LocalizedError, Equatable {
   case invalid(String)
@@ -16,15 +17,31 @@ public enum BoomError: Error, LocalizedError, Equatable {
     }
   }
 }
+/// Owned by one exact snapshot text value. Copies may share only until a text
+/// assignment replaces the memo. It retains the digest, never the source text.
+private final class SnapshotRevisionMemo: Sendable {
+  private let cached = Mutex<String?>(nil)
+  func revision(for text: String) -> String {
+    cached.withLock { value in
+      if let value { return value }
+      let digest = Digest.sha256(text)
+      value = digest
+      return digest
+    }
+  }
+}
 public struct DocumentSnapshot: Codable, Equatable, Identifiable, Sendable {
   private enum CodingKeys: String, CodingKey { case id, title, text }
+  private var revisionMemo = SnapshotRevisionMemo()
   public let id: UUID
   public var title: String
-  public var text: String { didSet { textVersion = UUID() } }
+  public var text: String {
+    didSet { textVersion = UUID(); revisionMemo = SnapshotRevisionMemo() }
+  }
   /// Local change identity for native synchronization. Never encoded or used
   /// in place of the content digest for authorization, evidence or replay.
   public private(set) var textVersion = UUID()
-  public var revision: String { Digest.sha256(text) }
+  public var revision: String { revisionMemo.revision(for: text) }
   public init(id: UUID = UUID(), title: String, text: String) {
     self.id = id
     self.title = title
@@ -59,27 +76,45 @@ public struct SourceReference: Codable, Equatable, Sendable, Identifiable {
     self.kind = kind
   }
 }
+public enum ConsultationPromptContract: String, Codable, Equatable, Sendable {
+  case textHistoryV1 = "text_history_v1"
+  case referenceHistoryV2 = "reference_history_v2"
+  case referenceBindingsV3 = "reference_bindings_v3"
+}
 public struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
+  private enum CodingKeys: String, CodingKey {
+    case id, role, timestamp, text, context, sources, directAttachments, state
+    case provider, feedback, speaker, failure, authoredByUser, editedFrom
+    case consultationRouting, consultationPromptContract
+  }
+  /// Local ownership for the derived reading text, not persistence or authority.
+  /// Copies retain it; text/state/failure assignment and decoding create a new one.
+  public private(set) var readingVersion = UUID()
   public let id: UUID
   public let role: Role
   public let timestamp: Date?
-  public var text: String
+  public var text: String { didSet { readingVersion = UUID() } }
   public var context: String
   public var sources: [SourceReference]
   public let directAttachments: [UUID]?
-  public var state: MessageState
+  public var state: MessageState { didSet { readingVersion = UUID() } }
   public var provider: String?
   public var feedback: MessageFeedback?
   public var speaker: Speaker?
-  public var failure: String?
+  public var failure: String? { didSet { readingVersion = UUID() } }
   public var authoredByUser: Bool?
   public var editedFrom: UUID?
+  /// Captured only when this user turn actually enters a consultation plan.
+  /// Missing metadata remains legacy; never infer it from today's routing.
+  public let consultationRouting: [String]?
+  public let consultationPromptContract: ConsultationPromptContract?
   public init(
     id: UUID = UUID(), role: Role, text: String, context: String = "",
     sources: [SourceReference] = [], state: MessageState = .complete,
     provider: String? = nil, feedback: MessageFeedback? = nil, speaker: Speaker? = nil, failure: String? = nil,
     authoredByUser: Bool? = nil, editedFrom: UUID? = nil, timestamp: Date? = Date(),
-    directAttachments: [UUID]? = nil
+    directAttachments: [UUID]? = nil, consultationRouting: [String]? = nil,
+    consultationPromptContract: ConsultationPromptContract? = nil
   ) {
     self.id = id
     self.role = role
@@ -95,8 +130,20 @@ public struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
     self.failure = failure
     self.authoredByUser = authoredByUser
     self.editedFrom = editedFrom
+    self.consultationRouting = consultationRouting
+    self.consultationPromptContract = consultationPromptContract
   }
   public var promptText: String { context.isEmpty ? text : context + "\n\nUSER REQUEST\n" + text }
+  public static func == (left: Self, right: Self) -> Bool {
+    // A local reading version never changes ordinary canonical value equality.
+    left.id == right.id && left.role == right.role && left.timestamp == right.timestamp
+      && left.text == right.text && left.context == right.context && left.sources == right.sources
+      && left.directAttachments == right.directAttachments && left.state == right.state
+      && left.provider == right.provider && left.feedback == right.feedback && left.speaker == right.speaker
+      && left.failure == right.failure && left.authoredByUser == right.authoredByUser
+      && left.editedFrom == right.editedFrom && left.consultationRouting == right.consultationRouting
+      && left.consultationPromptContract == right.consultationPromptContract
+  }
 }
 public struct ChatRecord: Codable, Equatable, Sendable, Identifiable {
   private enum CodingKeys: String, CodingKey {

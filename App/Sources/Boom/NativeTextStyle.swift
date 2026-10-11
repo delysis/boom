@@ -14,12 +14,18 @@ private struct MarkdownSpan: Decodable {
 
 @MainActor enum MarkdownStyle {
   static let body = NSFont.systemFont(ofSize: 15)
+  private static let wikiPattern = try? NSRegularExpression(pattern: #"\[\[([^\[\]\n]{1,256})\]\]"#)
+  private static let attachmentPattern = try? NSRegularExpression(pattern: #"\[Attachment: ((?:\\.|[^\\\]\n])+)\]\(boom-attachment:[0-9A-Fa-f-]{36}\)"#)
+  private static let owned: Set<NSAttributedString.Key> = [
+    .font, .foregroundColor, .paragraphStyle, .backgroundColor,
+    .strikethroughStyle, .underlineStyle,
+  ]
   struct WikiDisplay {
     let title: NSRange
     let hidden: [NSRange]
   }
   static func wikiDisplays(in source: String, excluding literalRanges: [NSRange] = []) -> [WikiDisplay] {
-    guard let pattern = try? NSRegularExpression(pattern: #"\[\[([^\[\]\n]{1,256})\]\]"#)
+    guard let pattern = wikiPattern
     else { return [] }
     let text = source as NSString
     return pattern.matches(in: source, range: NSRange(location: 0, length: text.length))
@@ -45,9 +51,7 @@ private struct MarkdownSpan: Decodable {
     let trace = PerformanceTrace.begin("Editor.Style")
     defer { PerformanceTrace.end("Editor.Style", trace) }
     guard let current = view.textStorage else { return }
-    // Compute the same projection without invalidating the live text layout.
-    // Most inserted prose already has its correct native typing attributes.
-    let storage = NSMutableAttributedString(string: current.string)
+    let source = current.string
     let bodyFont = bodyFont ?? body
     let manager = view.undoManager
     let registered = view.undoManager?.isUndoRegistrationEnabled == true
@@ -59,27 +63,36 @@ private struct MarkdownSpan: Decodable {
       native?.applyingExternal = previous
       if registered { manager?.enableUndoRegistration() }
     }
-    let text = storage.string as NSString
+    let text = source as NSString
     let full = NSRange(location: 0, length: text.length)
-    var attachmentRanges: [NSRange] = []
-    defer {
-      synchronize(storage, into: current)
-      (view as? NativeMediaTextView)?.inlineMedia.refresh()
-      for range in attachmentRanges { view.setSpellingState(0, range: range) }
-    }
     let paragraph = NSMutableParagraphStyle()
     paragraph.lineSpacing = lineSpacing
-    storage.setAttributes(
-      [.font: bodyFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: paragraph], range: full)
-    func matches(_ pattern: String, _ action: (NSTextCheckingResult) -> Void) {
-      guard let regex = try? NSRegularExpression(pattern: pattern) else { return }
-      for result in regex.matches(in: storage.string, range: full) { action(result) }
-    }
+    let base: [NSAttributedString.Key: Any] = [
+      .font: bodyFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: paragraph,
+    ]
     let spans: [MarkdownSpan] = {
       let trace = PerformanceTrace.begin("Editor.MarkdownParse")
       defer { PerformanceTrace.end("Editor.MarkdownParse", trace) }
-      return (try? ProductCore.call(["op": "markdown_spans", "text": storage.string])) ?? []
+      return (try? ProductCore.call(["op": "markdown_spans", "text": source])) ?? []
     }()
+    let literalRanges = spans.filter { $0.kind == "code" }
+      .map { NSRange(location: $0.location, length: $0.length) }
+    let wikis = wikiDisplays(in: source, excluding: literalRanges)
+    let attachments = attachmentPattern?.matches(in: source, range: full) ?? []
+    view.typingAttributes = base
+    defer {
+      (view as? NativeMediaTextView)?.inlineMedia.refresh()
+      for match in attachments { view.setSpellingState(0, range: match.range) }
+    }
+    // Parsing remains authoritative, including code and reference syntax. A
+    // plain result needs only an attribute diff, not a full attributed copy.
+    if spans.isEmpty, wikis.isEmpty, attachments.isEmpty {
+      synchronizePlain(base, into: current)
+      return
+    }
+    let storage = NSMutableAttributedString(string: source)
+    storage.setAttributes(base, range: full)
+    defer { synchronize(storage, into: current) }
     for span in spans where span.kind != "syntax" {
       let range = NSRange(location: span.location, length: span.length)
       guard NSMaxRange(range) <= text.length else { continue }
@@ -113,9 +126,7 @@ private struct MarkdownSpan: Decodable {
         storage.addAttributes([.font: NSFont.systemFont(ofSize: 0.1), .foregroundColor: NSColor.clear], range: range)
       } else { storage.addAttribute(.foregroundColor, value: NSColor.tertiaryLabelColor, range: range) }
     }
-    let literalRanges = spans.filter { $0.kind == "code" }
-      .map { NSRange(location: $0.location, length: $0.length) }
-    for display in wikiDisplays(in: storage.string, excluding: literalRanges) {
+    for display in wikis {
       for range in display.hidden {
         storage.addAttributes([
           .font: NSFont.systemFont(ofSize: 0.1),
@@ -131,8 +142,7 @@ private struct MarkdownSpan: Decodable {
     // Keep Markdown as the editable, portable source of truth while rendering
     // local attachment references as file names. The UUID and punctuation
     // retain their character positions for selection, undo and autosave.
-    matches(#"\[Attachment: ((?:\\.|[^\\\]\n])+)\]\(boom-attachment:[0-9A-Fa-f-]{36}\)"#) { match in
-      attachmentRanges.append(match.range)
+    for match in attachments {
       storage.addAttributes([
         .font: NSFont.systemFont(ofSize: 1),
         .foregroundColor: NSColor.clear,
@@ -143,17 +153,26 @@ private struct MarkdownSpan: Decodable {
         .underlineStyle: NSUnderlineStyle.single.rawValue,
       ], range: match.range(at: 1))
     }
-    view.typingAttributes = [
-      .font: bodyFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: paragraph,
-    ]
+  }
+  private static func synchronizePlain(_ expected: [NSAttributedString.Key: Any], into current: NSTextStorage) {
+    let trace = PerformanceTrace.begin("Editor.StyleSynchronize")
+    defer { PerformanceTrace.end("Editor.StyleSynchronize", trace) }
+    var edits: [(NSRange, [NSAttributedString.Key: Any])] = []
+    current.enumerateAttributes(in: NSRange(location: 0, length: current.length)) { existing, range, _ in
+      let before = existing.filter { owned.contains($0.key) }
+      guard !(before as NSDictionary).isEqual(expected as NSDictionary) else { return }
+      var replacement = existing.filter { !owned.contains($0.key) }
+      replacement.merge(expected) { _, value in value }
+      edits.append((range, replacement))
+    }
+    guard !edits.isEmpty else { return }
+    current.beginEditing()
+    for (range, attributes) in edits { current.setAttributes(attributes, range: range) }
+    current.endEditing()
   }
   private static func synchronize(_ desired: NSAttributedString, into current: NSTextStorage) {
     let trace = PerformanceTrace.begin("Editor.StyleSynchronize")
     defer { PerformanceTrace.end("Editor.StyleSynchronize", trace) }
-    let owned: Set<NSAttributedString.Key> = [
-      .font, .foregroundColor, .paragraphStyle, .backgroundColor,
-      .strikethroughStyle, .underlineStyle,
-    ]
     var edits: [(NSRange, [NSAttributedString.Key: Any])] = []
     desired.enumerateAttributes(in: NSRange(location: 0, length: desired.length)) { expected, range, _ in
       var position = range.location

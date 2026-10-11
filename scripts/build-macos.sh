@@ -62,9 +62,10 @@ with open(sys.argv[3], 'w') as stream:
     stream.write('\n')
 PYBUILD
 swift "$HERE/scripts/record-native-libs.swift" "$OUT/rust-native-link.log" "$HERE/.build-support/RustNativeLink.json"
-(cd "$HERE/App" && swift test --manifest-cache none --disable-automatic-resolution)
-(cd "$HERE/App" && swift build -c release --manifest-cache none --disable-automatic-resolution)
-BIN="$(cd "$HERE/App" && swift build -c release --manifest-cache none --show-bin-path)"
+# Use locked macro sources consistently instead of experimental prebuilts.
+(cd "$HERE/App" && swift test --manifest-cache none --disable-automatic-resolution --disable-experimental-prebuilts)
+(cd "$HERE/App" && swift build -c release --manifest-cache none --disable-automatic-resolution --disable-experimental-prebuilts)
+BIN="$(cd "$HERE/App" && swift build -c release --manifest-cache none --disable-automatic-resolution --disable-experimental-prebuilts --show-bin-path)"
 APP="$OUT/Bloom.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN/Boom" "$APP/Contents/MacOS/Bloom"

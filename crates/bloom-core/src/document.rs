@@ -30,6 +30,23 @@ pub struct Authority {
 }
 
 impl Authority {
+    pub fn instructions_v3(&self) -> Result<String, Error> {
+        if self.mode == Mode::Ask {
+            return self.instructions();
+        }
+        let target = self
+            .target
+            .as_ref()
+            .ok_or_else(|| Error("Choose a document before requesting edits.".into()))?;
+        require(target.text.len() <= TEXT_LIMIT, "Document exceeds 2 MiB.")?;
+        Ok(crate::hashline::instructions_v3(
+            if self.mode == Mode::Edit {
+                "Edit: a valid patch will be applied by Bloom after validation."
+            } else {
+                "Propose: a valid patch will be shown for user review. It will not be applied automatically."
+            },
+        ))
+    }
     pub fn instructions(&self) -> Result<String, Error> {
         if self.mode == Mode::Ask {
             return Ok("Document permission: Ask (read only). You have no tool to modify documents in this request. Never claim you have saved, updated, or edited a document. You may offer wording in your answer. If asked to apply an edit, explain briefly that the user can choose Propose or Edit beside the message field.".into());

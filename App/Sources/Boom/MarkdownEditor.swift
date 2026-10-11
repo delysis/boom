@@ -51,10 +51,17 @@ import SwiftUI
   }
   func highlightSearch(_ ranges: [NSRange], identity: String?) {
     guard let layout = layoutManager, let storage = textStorage else { return }
+    let projected = ranges.filter { NSMaxRange($0) <= storage.length }
+    // Status and generation publications also update this native view. An
+    // empty search has no attribute work and must not request another paint.
+    if searchRanges.isEmpty, projected.isEmpty {
+      if identity == nil { searchIdentity = nil }
+      return
+    }
     for range in searchRanges where NSMaxRange(range) <= storage.length {
       layout.removeTemporaryAttribute(.backgroundColor, forCharacterRange: range)
     }
-    searchRanges = ranges.filter { NSMaxRange($0) <= storage.length }
+    searchRanges = projected
     for range in searchRanges {
       layout.addTemporaryAttribute(.backgroundColor, value: NSColor.systemYellow.withAlphaComponent(0.22),
         forCharacterRange: range)
@@ -437,13 +444,18 @@ struct MarkdownEditor: NSViewRepresentable {
     }
     func textDidChange(_ notification: Notification) {
       guard let view, !view.applyingExternal else { return }
+      let trace = PerformanceTrace.begin("Editor.NativePublication")
+      defer { PerformanceTrace.end("Editor.NativePublication", trace) }
       if !view.movingGhostBoundary { view.endGhostBoundary() }
       guard !view.hasMarkedText() else {
         model.invalidateGhost()
         return
       }
       MarkdownStyle.apply(to: view)
-      model.updateDocument(view.string, id: view.documentID, caret: view.selectedRange().location)
+      let sourceTrace = PerformanceTrace.begin("Editor.SourceRead")
+      let source = view.string
+      PerformanceTrace.end("Editor.SourceRead", sourceTrace)
+      model.updateDocument(source, id: view.documentID, caret: view.selectedRange().location)
       if let document = model.documents.first(where: { $0.id == view.documentID }) {
         view.synchronized(with: document)
       }

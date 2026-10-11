@@ -30,8 +30,46 @@ final class ConsultationFixtureTests: XCTestCase {
     XCTAssertThrowsError(try MLXNativeSmoke.validateConsultationArguments(["--consultation-fixture"]))
     XCTAssertThrowsError(try MLXNativeSmoke.validateConsultationArguments(["--consultation-warmup"]))
     for other in ["--base", "--edit-smoke", "--propose-smoke", "--unchanged-smoke",
-      "--memory-budget", "--residency-fallback", "--preempt", "--writing-fixtures", "--batch"] {
+      "--memory-budget", "--residency-fallback", "--preempt", "--writing-fixtures", "--batch",
+      "--prompt-cache-smoke", "--cache-consultation-fixture"] {
       XCTAssertThrowsError(try MLXNativeSmoke.validateConsultationArguments(pair + [other]))
+    }
+  }
+
+  func testCacheDiagnosticRequiresBothExactPacksAndItsDedicatedFixture() throws {
+    let cache = ["--mlx-smoke", "--prompt-cache-smoke", "--pack", "/public/writing",
+      "--consultation-pack", "/public/consultation", "--evidence", "/public/fresh"]
+    try MLXNativeSmoke.validateConsultationArguments(cache)
+    try MLXNativeSmoke.validateCacheArguments(cache)
+    try MLXNativeSmoke.validateCacheArguments(cache + ["--cache-consultation-fixture", "/public/4k.json", "--seed", "42"])
+    XCTAssertThrowsError(try MLXNativeSmoke.validateCacheArguments(["--cache-consultation-fixture", "/public/4k.json"]))
+    for other in ["--base", "--edit-smoke", "--propose-smoke", "--unchanged-smoke",
+      "--memory-budget", "--residency-fallback", "--preempt", "--writing-fixtures", "--batch",
+      "--shared-model", "--consultation-fixture", "--consultation-warmup",
+      "--benchmark-prefill-tokens", "--benchmark-cache-mib", "--fixture", "--unknown"] {
+      XCTAssertThrowsError(try MLXNativeSmoke.validateCacheArguments(cache + [other]), other)
+    }
+    XCTAssertThrowsError(try MLXNativeSmoke.validateCacheArguments(cache + ["--seed", "43"]))
+    XCTAssertThrowsError(try MLXNativeSmoke.validateCacheArguments(cache + ["--seed", "42", "--seed", "42"]))
+    XCTAssertThrowsError(try MLXNativeSmoke.validateCacheArguments(cache + ["--prompt-cache-smoke"]))
+  }
+
+  func testCachePathsRejectMissingDuplicatedRelativeAndFlagValuesBeforeExecution() throws {
+    let paths = ["--pack", "--consultation-pack", "--evidence", "--cache-consultation-fixture"]
+    let cache = ["--prompt-cache-smoke", "--pack", "/public/writing",
+      "--consultation-pack", "/public/consultation", "--evidence", "/public/fresh",
+      "--cache-consultation-fixture", "/public/4k.json"]
+    for path in paths {
+      let index = try XCTUnwrap(cache.firstIndex(of: path))
+      var missingValue = cache; missingValue.remove(at: index + 1)
+      XCTAssertThrowsError(try MLXNativeSmoke.validateCacheArguments(missingValue), path)
+      var relative = cache; relative[index + 1] = "public/relative"
+      XCTAssertThrowsError(try MLXNativeSmoke.validateCacheArguments(relative), path)
+      XCTAssertThrowsError(try MLXNativeSmoke.validateCacheArguments(cache + [path, "/public/duplicate"]), path)
+      if path != "--cache-consultation-fixture" {
+        var missingPath = cache; missingPath.removeSubrange(index...(index + 1))
+        XCTAssertThrowsError(try MLXNativeSmoke.validateCacheArguments(missingPath), path)
+      }
     }
   }
 }

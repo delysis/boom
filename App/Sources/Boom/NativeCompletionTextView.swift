@@ -72,6 +72,8 @@ extension WorkspaceModel: NativeCompletionClient {
       return
     }
     if visibleStamp == stamp, let displayStorage {
+      let trace = PerformanceTrace.begin("Editor.GhostUpdate")
+      defer { PerformanceTrace.end("Editor.GhostUpdate", trace) }
       displayStorage.beginEditing()
       displayStorage.replaceCharacters(
         in: NSRange(location: location, length: displayGhostLength), with: completion)
@@ -86,10 +88,12 @@ extension WorkspaceModel: NativeCompletionClient {
     }
     // A separate DISPLAY layout contains the ghost. Canonical textStorage,
     // accessibility value, clipboard, autosave and undo never contain it.
-    let copy = NSMutableAttributedString(attributedString: storage)
+    let snapshotTrace = PerformanceTrace.begin("Editor.GhostSnapshot")
+    let display = NSTextStorage(attributedString: storage)
     let attributes = ghostAttributes()
-    copy.insert(NSAttributedString(string: completion, attributes: attributes), at: location)
-    let display = NSTextStorage(attributedString: copy)
+    display.insert(NSAttributedString(string: completion, attributes: attributes), at: location)
+    PerformanceTrace.end("Editor.GhostSnapshot", snapshotTrace)
+    let graphTrace = PerformanceTrace.begin("Editor.GhostGraph")
     let layout = NSLayoutManager()
     layout.delegate = inlineMedia.layout
     let container = NSTextContainer(
@@ -103,6 +107,7 @@ extension WorkspaceModel: NativeCompletionClient {
     displayContainer = container
     visibleStamp = stamp
     displayGhostLength = (completion as NSString).length
+    PerformanceTrace.end("Editor.GhostGraph", graphTrace)
     needsDisplay = true
     completionDisplayDidChange()
   }
@@ -141,6 +146,11 @@ extension WorkspaceModel: NativeCompletionClient {
       super.draw(dirtyRect)
       return
     }
+    let trace = PerformanceTrace.begin("Editor.GhostDraw")
+    defer { PerformanceTrace.end("Editor.GhostDraw", trace) }
+    let observer = drawObservation
+    let started = observer.map { _ in ContinuousClock().now }
+    defer { if let observer, let started { observer(started, ContinuousClock().now) } }
     inlineMedia.positionViews()
     if drawsBackground { backgroundColor.setFill(); dirtyRect.fill() }
     container.size = textContainer?.size ?? container.size

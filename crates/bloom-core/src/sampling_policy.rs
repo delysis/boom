@@ -12,6 +12,8 @@ pub enum TextDecoding {
 pub enum PrefillChunking {
     #[serde(rename = "balanced_v1")]
     BalancedV1,
+    #[serde(rename = "fixed_v1")]
+    FixedV1,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -24,7 +26,7 @@ pub struct Prefill {
 impl Default for Prefill {
     fn default() -> Self {
         Self {
-            chunking: PrefillChunking::BalancedV1,
+            chunking: PrefillChunking::FixedV1,
             token_ceiling: 512,
         }
     }
@@ -163,6 +165,37 @@ pub fn admit(captured: Option<&Policy>, loaded: &Policy) -> Result<bool, Error> 
     Ok(true)
 }
 
+/// Resolve a recorded execution without replacing its prefill algorithm.
+/// Checkpoint and decoder settings remain exact; only a supported chunking
+/// strategy may differ from the current default at the same token ceiling.
+pub fn resolve_execution_policy(
+    captured: Option<&Policy>,
+    loaded: &Policy,
+) -> Result<Policy, Error> {
+    loaded.validate()?;
+    let captured = captured.ok_or_else(|| Error(
+        "This continuation cannot be replayed in this build. The original is saved; Explore creates a new set.".into()))?;
+    captured.validate()?;
+    require(
+        loaded.text_decoding.is_some() && captured.text_decoding.is_some(),
+        "Replay requires recorded decoding settings.",
+    )?;
+    let loaded_prefill = loaded
+        .prefill
+        .ok_or_else(|| Error("The loaded model must declare prefill geometry.".into()))?;
+    let captured_prefill = captured
+        .prefill
+        .ok_or_else(|| Error("Replay requires recorded prefill geometry.".into()))?;
+    require(
+        captured_prefill.token_ceiling == loaded_prefill.token_ceiling,
+        "Replay requires the original prefill token ceiling.",
+    )?;
+    let mut effective = loaded.clone();
+    effective.prefill = Some(captured_prefill);
+    admit(Some(captured), &effective)?;
+    Ok(captured.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,6 +325,84 @@ mod tests {
         let restored: Policy =
             serde_json::from_slice(&encoded).map_err(|e| Error(e.to_string()))?;
         assert_eq!(restored, smaller);
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_default_and_historical_balanced_execution_remain_distinct() -> Result<(), Error> {
+        let current = policy()?;
+        assert_eq!(
+            serde_json::to_value(current.prefill).map_err(|e| Error(e.to_string()))?,
+            json!({"chunking":"fixed_v1","tokenCeiling":512})
+        );
+        let mut historical = current.clone();
+        historical.prefill = Some(Prefill {
+            chunking: PrefillChunking::BalancedV1,
+            token_ceiling: 512,
+        });
+        let encoded = serde_json::to_vec(&historical).map_err(|e| Error(e.to_string()))?;
+        let restored: Policy =
+            serde_json::from_slice(&encoded).map_err(|e| Error(e.to_string()))?;
+        assert_eq!(restored, historical);
+        assert!(admit(Some(&historical), &current).is_err());
+        let effective = resolve_execution_policy(Some(&restored), &current)?;
+        assert_eq!(effective, historical);
+        assert!(admit(Some(&historical), &effective)?);
+        assert_eq!(resolve_execution_policy(Some(&current), &current)?, current);
+        assert_eq!(
+            resolve_execution_policy(Some(&current), &historical)?,
+            current
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn execution_resolution_rejects_changed_checkpoint_fields_and_geometry() -> Result<(), Error> {
+        let current = policy()?;
+        let mut changed = current.clone();
+        changed.vocabulary_size = 32;
+        assert!(resolve_execution_policy(Some(&changed), &current).is_err());
+        changed = current.clone();
+        changed.eos_token_ids = vec![1];
+        assert!(resolve_execution_policy(Some(&changed), &current).is_err());
+        changed = current.clone();
+        changed.suppressed_token_ids.clear();
+        assert!(resolve_execution_policy(Some(&changed), &current).is_err());
+        changed = current.clone();
+        changed.control_token_ids.insert(2, 2);
+        assert!(resolve_execution_policy(Some(&changed), &current).is_err());
+        changed = current.clone();
+        changed.prefill = Some(Prefill {
+            chunking: PrefillChunking::BalancedV1,
+            token_ceiling: 1024,
+        });
+        assert!(resolve_execution_policy(Some(&changed), &current).is_err());
+        changed = current.clone();
+        changed.schema = 2;
+        assert!(resolve_execution_policy(Some(&changed), &current).is_err());
+        assert!(resolve_execution_policy(Some(&changed), &changed).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn execution_resolution_never_fills_missing_decoder_or_prefill_records() -> Result<(), Error> {
+        let current = policy()?;
+        assert!(resolve_execution_policy(None, &current).is_err());
+        for missing_prefill in [false, true] {
+            let mut incomplete = current.clone();
+            if missing_prefill {
+                incomplete.prefill = None;
+            } else {
+                incomplete.text_decoding = None;
+            }
+            incomplete.validate()?;
+            assert!(resolve_execution_policy(Some(&incomplete), &current).is_err());
+            assert!(resolve_execution_policy(Some(&current), &incomplete).is_err());
+            assert!(resolve_execution_policy(Some(&incomplete), &incomplete).is_err());
+        }
+        let mut encoded = serde_json::to_value(&current).map_err(|e| Error(e.to_string()))?;
+        encoded["prefill"]["chunking"] = json!("future_chunking");
+        assert!(serde_json::from_value::<Policy>(encoded).is_err());
         Ok(())
     }
 }

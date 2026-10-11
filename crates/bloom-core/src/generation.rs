@@ -29,6 +29,43 @@ pub struct Identity {
     pub batch: Option<crate::batch::Execution>,
 }
 
+/// The actual prefix lookup result. None on a legacy record means unknown.
+/// This descriptor is deliberately not an encrypted warm replay transcript.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionOrigin {
+    pub schema: u32,
+    pub cache_algorithm: String,
+    pub cached_prompt_tokens: usize,
+    pub cache_miss_reason: Option<String>,
+}
+impl ExecutionOrigin {
+    fn valid_identifier(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
+    }
+    fn validate(&self, prompt_tokens: usize) -> Result<(), Error> {
+        require(
+            self.schema == 1
+                && prompt_tokens > 0
+                && prompt_tokens <= 16_384
+                && self.cached_prompt_tokens < prompt_tokens
+                && Self::valid_identifier(&self.cache_algorithm)
+                && if self.cached_prompt_tokens == 0 {
+                    self.cache_miss_reason
+                        .as_deref()
+                        .is_some_and(Self::valid_identifier)
+                } else {
+                    self.cache_miss_reason.is_none()
+                },
+            "Invalid captured execution origin; records retained.",
+        )
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Progress {
@@ -39,6 +76,8 @@ pub struct Progress {
     pub prompt_tokens: usize,
     pub first_token_seconds: Option<f64>,
     pub elapsed_seconds: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_origin: Option<ExecutionOrigin>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -75,6 +114,9 @@ fn valid(checkpoint: &Checkpoint, expected: &Identity) -> Result<(), Error> {
         "Invalid captured generation identity.",
     )?;
     let progress = &checkpoint.progress;
+    if let Some(origin) = &progress.execution_origin {
+        origin.validate(progress.prompt_tokens)?;
+    }
     if let Some(batch) = &expected.batch {
         require(
             expected.kind == Kind::Writing,
@@ -168,6 +210,7 @@ pub fn validate(
             previous.stop_reason.is_none()
                 && next.progress.prompt_digest == previous.progress.prompt_digest
                 && next.progress.prompt_tokens == previous.progress.prompt_tokens
+                && next.progress.execution_origin == previous.progress.execution_origin
                 && next
                     .progress
                     .token_ids
@@ -206,6 +249,7 @@ mod tests {
                 prompt_tokens: 12,
                 first_token_seconds: Some(0.1),
                 elapsed_seconds: 0.2,
+                execution_origin: None,
             },
             stop_reason: None,
             stop_token_id: None,
@@ -351,5 +395,89 @@ mod tests {
         let mut invalid = base.clone();
         invalid.progress.token_ids.clear();
         assert!(validate(&base.identity, None, invalid).is_err());
+    }
+    #[test]
+    fn origins_bind_actual_prefix_counts_and_cold_miss_reasons() -> Result<(), Error> {
+        let base = checkpoint();
+        for (count, miss) in [
+            (0, Some("no_owner")),
+            (0, Some("unsupported_input")),
+            (0, Some("residency_evicted")),
+            (11, None),
+        ] {
+            let mut next = base.clone();
+            next.progress.execution_origin = Some(ExecutionOrigin {
+                schema: 1,
+                cache_algorithm: "resident-hybrid-prefix-v3".into(),
+                cached_prompt_tokens: count,
+                cache_miss_reason: miss.map(str::to_owned),
+            });
+            validate(&next.identity, None, next.clone())?;
+            for malformed in ["schema", "algorithm", "miss"] {
+                let mut invalid = next.clone();
+                let origin = invalid
+                    .progress
+                    .execution_origin
+                    .as_mut()
+                    .ok_or_else(|| Error("Missing fixture origin".into()))?;
+                match malformed {
+                    "schema" => origin.schema = 2,
+                    "algorithm" => origin.cache_algorithm = String::new(),
+                    _ => {
+                        origin.cached_prompt_tokens = 0;
+                        origin.cache_miss_reason = Some("free-form content".into());
+                    }
+                }
+                assert!(validate(&base.identity, None, invalid).is_err());
+            }
+            for (invalid_count, invalid_miss) in [(12, None), (0, None), (1, Some("no_owner"))] {
+                let mut invalid = next.clone();
+                let origin = invalid
+                    .progress
+                    .execution_origin
+                    .as_mut()
+                    .ok_or_else(|| Error("Missing fixture origin".into()))?;
+                origin.cached_prompt_tokens = invalid_count;
+                origin.cache_miss_reason = invalid_miss.map(str::to_owned);
+                assert!(validate(&base.identity, None, invalid).is_err());
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn legacy_origins_stay_unknown_and_checkpoints_cannot_change_their_origin() -> Result<(), Error>
+    {
+        let legacy = checkpoint();
+        let wire = serde_json::to_value(&legacy).map_err(|error| Error(error.to_string()))?;
+        assert!(wire["progress"].get("executionOrigin").is_none());
+        let restored: Checkpoint =
+            serde_json::from_value(wire).map_err(|error| Error(error.to_string()))?;
+        assert!(restored.progress.execution_origin.is_none());
+        validate(&restored.identity, None, restored.clone())?;
+        let mut warm = restored.clone();
+        warm.progress.execution_origin = Some(ExecutionOrigin {
+            schema: 1,
+            cache_algorithm: "resident-hybrid-prefix-v3".into(),
+            cached_prompt_tokens: 8,
+            cache_miss_reason: None,
+        });
+        assert!(validate(&warm.identity, Some(&restored), warm.clone()).is_err());
+        let mut cold = warm.clone();
+        cold.progress.execution_origin = Some(ExecutionOrigin {
+            schema: 1,
+            cache_algorithm: "resident-hybrid-prefix-v3".into(),
+            cached_prompt_tokens: 0,
+            cache_miss_reason: Some("no_owner".into()),
+        });
+        assert!(validate(&warm.identity, Some(&warm), cold).is_err());
+        let mut missing = warm.clone();
+        missing.progress.execution_origin = None;
+        assert!(validate(&warm.identity, Some(&warm), missing).is_err());
+        let mut next = warm.clone();
+        next.progress.token_ids.push(3);
+        next.progress.text.push_str(" more");
+        next.progress.elapsed_seconds = 0.3;
+        validate(&warm.identity, Some(&warm), next)?;
+        Ok(())
     }
 }

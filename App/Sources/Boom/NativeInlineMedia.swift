@@ -56,17 +56,18 @@ struct InlineMediaSpan: Decodable {
     properties props: UnsafePointer<NSLayoutManager.GlyphProperty>, characterIndexes indexes: UnsafePointer<Int>,
     font: NSFont, forGlyphRange range: NSRange) -> Int {
     guard let storage = manager.textStorage else { return 0 }
+    guard let first = (0..<range.length).first(where: { index in
+      indexes[index] >= 0 && indexes[index] < storage.length
+        && storage.attribute(.mediaItem, at: indexes[index], effectiveRange: nil) != nil
+    }) else { return 0 }
     var generated = Array(UnsafeBufferPointer(start: glyphs, count: range.length))
     var properties = Array(UnsafeBufferPointer(start: props, count: range.length))
-    var changed = false
-    for i in 0..<range.length where indexes[i] < storage.length {
+    for i in first..<range.length where indexes[i] >= 0 && indexes[i] < storage.length {
       if storage.attribute(.mediaItem, at: indexes[i], effectiveRange: nil) != nil {
         generated[i] = 0
         properties[i] = storage.attribute(.mediaStart, at: indexes[i], effectiveRange: nil) != nil ? .controlCharacter : .null
-        changed = true
       }
     }
-    guard changed else { return 0 }
     manager.setGlyphs(generated, properties: properties, characterIndexes: indexes, font: font, forGlyphRange: range)
     return range.length
   }
@@ -102,6 +103,10 @@ struct InlineMediaSpan: Decodable {
 
 @MainActor class NativeMediaTextView: NSTextView {
   let inlineMedia = NativeInlineMedia()
+  /// Optional component observers retain only monotonic timing. Ordinary views
+  /// leave these nil; they neither change scheduling nor retain authored text.
+  var deferredLayoutObservation: ((ContinuousClock.Instant, ContinuousClock.Instant, ContinuousClock.Instant) -> Void)?
+  var drawObservation: ((ContinuousClock.Instant, ContinuousClock.Instant) -> Void)?
   private weak var observedSource: NSTextStorage?
   private var characterVersion = UUID()
   /// Character edits invalidate source consumers; display attributes do not.
@@ -140,11 +145,21 @@ struct InlineMediaSpan: Decodable {
   private func deferTextLayout() {
     guard !deferredLayout else { return }
     deferredLayout = true
+    let wait = PerformanceTrace.begin("Editor.DeferredLayoutWait")
+    let observer = deferredLayoutObservation
+    let scheduled = observer.map { _ in ContinuousClock().now }
     DispatchQueue.main.async { [weak self] in
+      PerformanceTrace.end("Editor.DeferredLayoutWait", wait)
       guard let self else { return }
+      let started = observer.map { _ in ContinuousClock().now }
+      let trace = PerformanceTrace.begin("Editor.DeferredLayout")
+      defer { PerformanceTrace.end("Editor.DeferredLayout", trace) }
       self.deferredLayout = false
       self.invalidateIntrinsicContentSize()
       self.needsLayout = true; self.needsDisplay = true
+      if let observer, let scheduled, let started {
+        observer(scheduled, started, ContinuousClock().now)
+      }
     }
   }
   override func insertText(_ value: Any, replacementRange: NSRange) {
@@ -191,6 +206,11 @@ struct InlineMediaSpan: Decodable {
     super.layout(); inlineMedia.positionViews()
   }
   override func draw(_ dirtyRect: NSRect) {
+    let trace = PerformanceTrace.begin("Editor.Draw")
+    defer { PerformanceTrace.end("Editor.Draw", trace) }
+    let observer = drawObservation
+    let started = observer.map { _ in ContinuousClock().now }
+    defer { if let observer, let started { observer(started, ContinuousClock().now) } }
     guard prepareTextLayout() else { return }
     inlineMedia.positionViews(); super.draw(dirtyRect)
   }

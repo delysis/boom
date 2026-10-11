@@ -33,6 +33,15 @@ enum PerformanceTrace {
     os_signpost(.begin, log: log, name: name, signpostID: id)
     return id
   }
+  /// A diagnostic event number correlates a slow edit with its nested stages.
+  /// It identifies only the observation, never a document or source value.
+  static func begin(_ name: StaticString, event: UInt64) -> OSSignpostID? {
+    guard enabled, log.signpostsEnabled else { return nil }
+    let id = OSSignpostID(log: log)
+    os_signpost(.begin, log: log, name: name, signpostID: id,
+      "event=%{public}llu", event)
+    return id
+  }
   static func end(_ name: StaticString, _ id: OSSignpostID?) {
     guard let id else { return }
     os_signpost(.end, log: log, name: name, signpostID: id)

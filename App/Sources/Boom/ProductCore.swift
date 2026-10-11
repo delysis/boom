@@ -81,14 +81,24 @@ enum ProductCore {
     struct Failure: Decodable { let code: String; let message: String }
   }
   static func call<T: Decodable>(_ request: [String: Any], as: T.Type = T.self) throws -> T {
-    let data = try JSONSerialization.data(withJSONObject: request)
+    let data = try {
+      let trace = PerformanceTrace.begin("Bridge.Encode")
+      defer { PerformanceTrace.end("Bridge.Encode", trace) }
+      return try JSONSerialization.data(withJSONObject: request)
+    }()
     guard data.count <= 16_777_216 else { throw BoomError.budget("Product request exceeds 16 MiB.") }
-    let buffer = data.withUnsafeBytes {
-      bloom_core_request($0.bindMemory(to: UInt8.self).baseAddress, data.count)
-    }
+    let buffer = {
+      let trace = PerformanceTrace.begin("Bridge.Execute")
+      defer { PerformanceTrace.end("Bridge.Execute", trace) }
+      return data.withUnsafeBytes {
+        bloom_core_request($0.bindMemory(to: UInt8.self).baseAddress, data.count)
+      }
+    }()
     return try response(buffer)
   }
   private static func response<T: Decodable>(_ buffer: BoomAttachmentBuffer) throws -> T {
+    let trace = PerformanceTrace.begin("Bridge.Decode")
+    defer { PerformanceTrace.end("Bridge.Decode", trace) }
     defer { boom_attachment_free(buffer) }
     guard let pointer = buffer.data, buffer.length > 0, buffer.length <= 8_388_608 else {
       throw BoomError.invalid("Invalid product-core response.")
@@ -123,23 +133,37 @@ enum ProductCore {
     try call(["op": "validate_chat_text", "text": text, "instructions": instructions])
   }
   static func prompt(
-    voice: Voice?, history: [ChatMessage], instructions: String, context: String, request: String, routing: [String], authority: CapturedDocumentAuthority = .readOnly
+    voice: Voice?, history: [ChatMessage], instructions: String, context: String, request: String, routing: [String], authority: CapturedDocumentAuthority = .readOnly,
+    promptContract: ConsultationPromptContract = .referenceHistoryV2,
+    renderedContext: RenderedReferenceContext? = nil, capturedSources: [SourceReference] = []
   ) throws -> ConsultationPlan {
     guard let plan = try consultationRound(voices: [voice], history: history, instructions: instructions,
-      context: context, request: request, routing: routing, authority: authority).first else { throw BoomError.invalid("Empty consultation round.") }
+      context: context, request: request, routing: routing, authority: authority,
+      promptContract: promptContract, renderedContext: renderedContext,
+      capturedSources: capturedSources).first else { throw BoomError.invalid("Empty consultation round.") }
     return plan
   }
   static func consultationRound(
-    voices: [Voice?], history: [ChatMessage], instructions: String, context: String, request: String, routing: [String], authority: CapturedDocumentAuthority = .readOnly
+    voices: [Voice?], history: [ChatMessage], instructions: String, context: String, request: String, routing: [String], authority: CapturedDocumentAuthority = .readOnly,
+    promptContract: ConsultationPromptContract = .referenceHistoryV2,
+    renderedContext: RenderedReferenceContext? = nil, capturedSources: [SourceReference] = []
   ) throws -> [ConsultationPlan] {
     let turns = history.filter { $0.state == .complete }.map { message in
       PromptTurn(role: message.role.rawValue, text: message.text,
-        speaker: message.speaker ?? Speaker(name: message.role == .user ? "Human" : "Bloom"))
+        speaker: message.speaker ?? Speaker(name: message.role == .user ? "Human" : "Bloom"),
+        context: message.consultationPromptContract == .referenceHistoryV2
+          || message.consultationPromptContract == .referenceBindingsV3 ? message.context : nil,
+        routing: message.consultationRouting, promptContract: message.consultationPromptContract)
     }
     let compiled: CompactConsultation = try call(["op": "compile_consultation_compact", "authority": object(authority),
       "voices": try voices.map { try $0.map { try object($0) } ?? NSNull() },
-      "history": object(turns), "instructions": instructions, "context": context, "request": request, "routing": routing])
-    guard compiled.schema == 1, compiled.plans.count == voices.count else {
+      "history": object(turns), "instructions": instructions, "context": context, "request": request,
+      "routing": routing, "promptContract": promptContract.rawValue,
+      "renderedContext": try renderedContext.map { try object($0) } ?? NSNull(),
+      "capturedSources": try object(capturedSources)])
+    let expectedContract: ConsultationPromptContract? = promptContract == .textHistoryV1 ? nil : promptContract
+    guard compiled.schema == 1, compiled.plans.count == voices.count,
+      compiled.promptContract == expectedContract else {
       throw BoomError.invalid("Inconsistent consultation reply.")
     }
     return try compiled.plans.map { plan in
@@ -148,7 +172,7 @@ enum ProductCore {
           throw BoomError.invalid("Invalid consultation role.")
         }
         return ConsultationPlan.Message(role: message.role, content: try compiled.text(message.content))
-      }, rawPrompt: try compiled.text(plan.rawPrompt))
+      }, rawPrompt: try compiled.text(plan.rawPrompt), promptContract: compiled.promptContract)
     }
   }
   private struct CompactConsultation: Decodable {
@@ -158,6 +182,7 @@ enum ProductCore {
       let rawPrompt: [Int]
     }
     let schema: Int
+    let promptContract: ConsultationPromptContract?
     let texts: [String]
     let plans: [Plan]
     func text(_ references: [Int]) throws -> String {
@@ -209,9 +234,17 @@ enum ProductCore {
       "controlTokenIds": controls, "tokenizerEos": tokenizerEOS.map { $0 as Any } ?? NSNull(),
       "prefillTokens": prefillTokens.map { $0 as Any } ?? NSNull()])
   }
-  static func admitGenerationPolicy(_ captured: ModelGenerationPolicy?, loaded: ModelGenerationPolicy) throws {
-    let _: Bool = try call(["op": "admit_generation_policy",
+  static func resolvedGenerationPolicy(_ captured: ModelGenerationPolicy?,
+    loaded: ModelGenerationPolicy) throws -> ModelGenerationPolicy {
+    try call(["op": "resolve_execution_policy",
       "captured": try captured.map { try object($0) } ?? NSNull(), "loaded": object(loaded)])
+  }
+  /// This checks compatibility. Execution must use resolvedGenerationPolicy's
+  /// returned policy rather than the runner's current default.
+  static func admitGenerationPolicy(_ captured: ModelGenerationPolicy?, loaded: ModelGenerationPolicy) throws {
+    let effective = try resolvedGenerationPolicy(captured, loaded: loaded)
+    let _: Bool = try call(["op": "admit_generation_policy",
+      "captured": try captured.map { try object($0) } ?? NSNull(), "loaded": object(effective)])
   }
   static func validateWritingRecipe(_ recipe: CompletionRecipe) throws {
     let _: Bool = try call(["op": "validate_writing_recipe", "recipe": object(recipe)])
@@ -278,11 +311,27 @@ enum ProductCore {
       "status": response.statusCode, "contentRange": response.value(forHTTPHeaderField: "Content-Range") as Any? ?? NSNull(),
       "contentLength": length.flatMap(UInt64.init) as Any? ?? NSNull()])
   }
+  static func incrementalKVAdmission(application: UInt64, used: UInt64, reserve: UInt64,
+    layers: [ActiveNativeKVAllocation]) throws -> IncrementalKVAdmission {
+    try call(["op": "incremental_kv_admission", "applicationBytes": application,
+      "usedBytes": used, "workingReserveBytes": reserve, "layers": try object(layers)])
+  }
+  static func incrementalKVReadmission(application: UInt64, used: UInt64, reserve: UInt64,
+    allocation: UInt64) throws -> IncrementalKVAdmission {
+    try call(["op": "incremental_kv_readmission", "applicationBytes": application,
+      "usedBytes": used, "workingReserveBytes": reserve, "allocationBytesUpperBound": allocation])
+  }
   static func contextCapacity(configuration: Data, available: UInt64, width: Int,
     prefill: PrefillGeometry? = nil) throws -> Int {
     try call(["op": "context_capacity", "configuration": JSONSerialization.jsonObject(with: configuration),
       "availableBytes": available, "width": width, "prefill": try prefill.map { try object($0) } ?? NSNull()])
   }
+}
+struct IncrementalKVAdmission: Codable, Sendable {
+  let admitted: Bool
+  let additionalBytesUpperBound: UInt64
+  let requiredBytes: UInt64
+  let scope: String
 }
 struct FullContextInputs: Codable, Sendable {
   let contextTokens: Int
@@ -363,6 +412,9 @@ struct PromptTurn: Codable, Sendable {
   let role: String
   let text: String
   let speaker: Speaker
+  var context: String? = nil
+  var routing: [String]? = nil
+  var promptContract: ConsultationPromptContract? = nil
 }
 private struct PinnableTurn: Codable {
   let role: String
@@ -426,16 +478,34 @@ struct WritingEvaluationGroup: Codable, Sendable {
   let replayOf: String?
 }
 struct WritingCandidate: Codable, Identifiable, Sendable {
+  private enum CodingKeys: String, CodingKey {
+    case id, seed, text, state, promptTokens, outputTokens, tokenIDs, stopReason
+    case stopTokenID, batch, executionOrigin
+  }
+  /// The candidate owns this local display identity, including its empty-state text.
+  /// It is never encoded or used as generation, source or replay authority.
+  private(set) var readingVersion = UUID()
   let id: UUID
   let seed: UInt64
-  var text: String
-  var state: MessageState
+  var text: String { didSet { readingVersion = UUID() } }
+  var state: MessageState { didSet { readingVersion = UUID() } }
   var promptTokens: Int
   var outputTokens: Int
   var tokenIDs: [Int]
   var stopReason: String?
   var stopTokenID: Int? = nil
   var batch: WritingBatchExecution? = nil
+  var executionOrigin: GenerationExecutionOrigin? = nil
+
+  init(id: UUID, seed: UInt64, text: String, state: MessageState,
+    promptTokens: Int, outputTokens: Int, tokenIDs: [Int], stopReason: String?,
+    stopTokenID: Int? = nil, batch: WritingBatchExecution? = nil,
+    executionOrigin: GenerationExecutionOrigin? = nil) {
+    self.id = id; self.seed = seed; self.text = text; self.state = state
+    self.promptTokens = promptTokens; self.outputTokens = outputTokens; self.tokenIDs = tokenIDs
+    self.stopReason = stopReason; self.stopTokenID = stopTokenID
+    self.batch = batch; self.executionOrigin = executionOrigin
+  }
 }
 struct CandidateBundle: Codable, Identifiable, Sendable {
   let id: UUID
@@ -475,6 +545,7 @@ struct ConsultationPlan: Codable, Sendable {
   struct Message: Codable, Sendable { let role: String; let content: String }
   let messages: [Message]
   let rawPrompt: String
+  var promptContract: ConsultationPromptContract? = nil
 }
 struct ConsultationReceipt: Codable, Sendable {
   let operationID: UUID
@@ -496,6 +567,7 @@ struct ConsultationReceipt: Codable, Sendable {
   var previousAttemptID: UUID? = nil
   var responseID: UUID? = nil
   var media: [WritingMediaReference]? = nil
+  var executionOrigin: GenerationExecutionOrigin? = nil
 }
 
 struct WritingPrompt: Codable { let prompt: String; let digest: String; let totalCharacters: Int; let omittedCharacters: Int }

@@ -542,11 +542,6 @@ struct ChatPane: View {
   private func needsSpeakerName(_ message: ChatMessage) -> Bool {
     message.speaker?.voiceID != nil || (model.selectedChat?.messages.contains { $0.speaker?.voiceID != nil } ?? false)
   }
-  private func visibleMessageText(_ message: ChatMessage) -> String {
-    if message.state == .pending { return message.text.isEmpty ? "…" : message.text }
-    if message.text.isEmpty, let failure = message.failure { return failure }
-    return message.text
-  }
   @ViewBuilder private func messageView(_ message: ChatMessage) -> some View {
     if model.editingChatMessage == message.id, let chat = model.selectedChat {
       VStack(alignment: .leading, spacing: 6) {
@@ -568,7 +563,7 @@ struct ChatPane: View {
               InlineAttachmentView(model: model, record: record)
             }
           }
-          NativeText(text: visibleMessageText(message), mediaModel: model)
+          NativeText(message: message, mediaModel: model)
         }
           .padding(.horizontal, 12).padding(.vertical, 9)
           .background(Color.primary.opacity(0.065), in: RoundedRectangle(cornerRadius: 12))
@@ -586,7 +581,7 @@ struct ChatPane: View {
             }
           }
         }
-        NativeText(text: visibleMessageText(message), mediaModel: model)
+        NativeText(message: message, mediaModel: model)
         ForEach(model.state.proposals.filter { $0.messageID == message.id }) { proposal in
           ProposalCard(model: model, proposal: proposal)
         }

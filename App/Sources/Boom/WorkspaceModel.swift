@@ -25,6 +25,8 @@ struct ConsultationReplay {
   let voice: Voice?
   let attachmentIDs: [UUID]
   let previousAttemptID: UUID?
+  let generationPolicy: ModelGenerationPolicy?
+  let promptContract: ConsultationPromptContract
 }
 
 enum AttachmentDestination {
@@ -104,6 +106,10 @@ struct CompletionSegment {
   private var searchEpoch: UInt64 = 0
   private var searchTask: Task<Void, Never>?
   let store: WorkspaceStore
+  let inferenceCacheNamespace = UUID()
+  private var joinedRetentionEpoch = UUID()
+  private var joinedRetentionClosed = false
+  private var joinedRetentionGrants: [UUID: JoinedKVRetentionAuthorization] = [:]
   private(set) var mlxRunner: MLXGemmaRunner?
   private(set) var baseRunner: MLXGemmaRunner?
   private var modelDirectories: [ModelPurpose: URL] = [:]
@@ -186,6 +192,70 @@ struct CompletionSegment {
   }
   private func cancelInputCompletions() {
     for input in inputCompletions { input.value?.invalidateGhost() }
+  }
+  func makeJoinedRetentionRequest(owner: PromptCacheOwner?, runner: MLXGemmaRunner,
+    policy: ModelGenerationPolicy, operationID: UUID) throws -> JoinedKVRetentionRequest? {
+    guard let owner, !joinedRetentionClosed, owner.namespace == inferenceCacheNamespace,
+      joinedRetentionOwnerIsLive(owner),
+      let binding = try runner.joinedRetentionBinding(owner: owner, workspaceEpoch: joinedRetentionEpoch,
+        operationID: operationID, policy: policy) else { return nil }
+    let auth = JoinedKVRetentionAuthorization(binding: binding)
+    joinedRetentionGrants[auth.id] = auth
+    return JoinedKVRetentionRequest(authorization: auth, checkpointIsDurable: true,
+      authorizeAfterJoin: { [weak self] in
+        guard let owner = self else { return false }
+        return await owner.authorizeJoinedRetention(auth, runner: runner)
+      })
+  }
+  func finishJoinedRetentionRequest(_ request: JoinedKVRetentionRequest?) {
+    guard let auth = request?.authorization else { return }
+    auth.revoke()
+    if joinedRetentionGrants[auth.id] === auth { joinedRetentionGrants.removeValue(forKey: auth.id) }
+  }
+  private func joinedRetentionOwnerIsLive(_ owner: PromptCacheOwner) -> Bool {
+    switch owner.route {
+    case .consultation: return state.chats.contains { $0.id == owner.entity }
+    case .writing: return documents.contains { $0.id == owner.entity }
+    case .inputCompletion:
+      return inputCompletions.contains { $0.value?.id == owner.entity && $0.value?.joinedRetentionOwnerIsLive == true }
+    }
+  }
+  private func authorizeJoinedRetention(_ auth: JoinedKVRetentionAuthorization,
+    runner: MLXGemmaRunner) -> Bool {
+    let b = auth.binding
+    let current: MLXGemmaRunner?
+    switch b.owner.route {
+    case .consultation: current = mlxRunner
+    case .writing: current = baseRunner
+    case .inputCompletion: current = inputCompletionRunner
+    }
+    guard !joinedRetentionClosed, b.workspaceEpoch == joinedRetentionEpoch,
+      b.owner.namespace == inferenceCacheNamespace, joinedRetentionOwnerIsLive(b.owner),
+      joinedRetentionGrants[auth.id] === auth, current === runner,
+      b.runnerEpoch == runner.cacheRunnerEpoch, b.modelIdentity == runner.identity,
+      b.processorIdentity == runner.processorIdentity else { auth.revoke(); return false }
+    // This grants historical exact-token KV only. The old UI/source/checkpoint
+    // hooks still require the captured source, current flags, caret and UI epoch.
+    return auth.approve(binding: b)
+  }
+  private func revokeJoinedRetentions(runnerEpoch: UUID? = nil) {
+    let ids = joinedRetentionGrants.compactMap { id, grant in
+      runnerEpoch == nil || grant.binding.runnerEpoch == runnerEpoch ? id : nil
+    }
+    for id in ids { joinedRetentionGrants.removeValue(forKey: id)?.revoke() }
+    for runner in [mlxRunner, baseRunner, inputCompletionRunner].compactMap({ $0 })
+      where runnerEpoch == nil || runner.cacheRunnerEpoch == runnerEpoch {
+      runner.invalidatePromptCacheRetention(reason: "owner_or_model_revoked")
+    }
+  }
+  func revokeInputJoinedRetentions(_ id: UUID) {
+    let ids = joinedRetentionGrants.compactMap { key, grant in
+      grant.binding.owner.route == .inputCompletion && grant.binding.owner.entity == id ? key : nil
+    }
+    for key in ids { joinedRetentionGrants.removeValue(forKey: key)?.revoke() }
+    // Revoke this input's in-flight salvage grant, without discarding already
+    // valid historical KV owned by another input/document in this workspace.
+    // Full workspace, model, privacy and memory revocation still clear runners.
   }
   private var writingFlag: CancellationFlag?
   private var ghostFlag: CancellationFlag?
@@ -272,10 +342,12 @@ struct CompletionSegment {
     }
   }
   private func handleMemoryPressure(critical: Bool) {
+    revokeJoinedRetentions()
     if critical { cancel() }
     let inactive: ModelPurpose = writingFlag != nil ? .consultation : .writing
     Task {
       if critical || !writingUsesConsultation { await releaseRunner(inactive) }
+      await joinAndClearPromptCaches()
       await reclaimModelCache()
       await VideoPreparationCache.shared.release()
     }
@@ -426,7 +498,7 @@ struct CompletionSegment {
     let snapshot = state
     try await store.save(snapshot, documents: captured)
     if !librarySearch.isEmpty { refreshSearch() }
-    for saved in captured where documents.first(where: { $0.id == saved.id })?.revision == saved.revision {
+    for saved in captured where documents.first(where: { $0.id == saved.id })?.textVersion == saved.textVersion {
       dirty.remove(saved.id)
     }
   }
@@ -608,6 +680,7 @@ struct CompletionSegment {
     guard !targets.isEmpty, confirm(targets.count == 1 ? "Delete \(targets[0].title)?" : "Delete \(targets.count) documents?",
       message: "Encrypted records move to macOS Trash after the library change is saved. Captured chat sources and receipts stay."
         + (discardsDrafts ? " Their unsent text and pending attachment selection will be discarded." : "")) else { return }
+    revokeJoinedRetentions()
     finishComposition()
     work("Deleting documents…") { [weak self] _ in
       guard let self else { return }
@@ -644,6 +717,7 @@ struct CompletionSegment {
         message: "Their messages and pinned voices will be removed from the library. Captured voice revisions and edit receipts stay."
           + (discardsDrafts ? " Their unsent text and pending attachment selection will be discarded." : "")
       ) else { return }
+      revokeJoinedRetentions()
       retainComposerDraft()
       var next = state
       next.chats.removeAll { ids.contains($0.id) }
@@ -846,6 +920,8 @@ struct CompletionSegment {
     invalidateGhost()
   }
   func shutdown() async throws {
+    joinedRetentionClosed = true
+    revokeJoinedRetentions()
     speechOutput.stopSpeaking()
     speechSetupTask?.cancel()
     modelPickerTask?.cancel()
@@ -861,8 +937,7 @@ struct CompletionSegment {
     if let historyTask { await historyTask.value }
     if let foreground { await foreground.value }
     if let ghostTask { await ghostTask.value }
-    if let mlxRunner { await mlxRunner.join() }
-    if let baseRunner { await baseRunner.join() }
+    await joinAndClearPromptCaches()
     for operation in Array(exportTasks.values) { await operation.task.value }
     await VideoPreparationCache.shared.release()
     try await flush()
@@ -891,6 +966,7 @@ struct CompletionSegment {
       replay != nil || !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !pendingAttachments.isEmpty
     else { if !canInfer && !isBusy { prepareModels() }; return }
     let request = replay?.request ?? draft, interaction: InteractionMode = replay == nil ? mode : .propose, document = selectedDocument
+    let promptContract = replay?.promptContract ?? .referenceBindingsV3
     let selectedIDs = replay?.attachmentIDs ?? pendingAttachments, style = consultationStyle
     do {
       finishComposition()
@@ -925,12 +1001,20 @@ struct CompletionSegment {
         return
       }
       let attachmentSources = attachments.map(\.reference), sources = graph.sources + attachmentSources
-      let attachmentText = attachments.filter { !$0.text.isEmpty }.map {
+      let attachmentText = promptContract == .referenceBindingsV3 ? "" : attachments.filter { !$0.text.isEmpty }.map {
         "ATTACHMENT \($0.name)\nID \($0.id)\nDIGEST \($0.digest)\nCOVERAGE \($0.coverage)\n\($0.text)"
       }.joined(separator: "\n\n")
       let authority = CapturedDocumentAuthority(mode: interaction, target: interaction == .ask ? nil : document)
-      let documentContext = try DocumentTools.context(graph.documents, authority: authority)
-      let context = [documentContext, attachmentText].filter { !$0.isEmpty }.joined(separator: "\n\n")
+      let context: String, renderedContext: RenderedReferenceContext?, capturedContextSources: [SourceReference]
+      if promptContract == .referenceBindingsV3 {
+        let rendered = try DocumentTools.renderedContext(graph.documents, attachments: attachments, authority: authority)
+        renderedContext = rendered; context = rendered.prompt
+        capturedContextSources = graph.sources + attachments.filter { !$0.text.isEmpty }.map(\.reference)
+      } else {
+        let documentContext = try DocumentTools.context(graph.documents, authority: authority)
+        context = [documentContext, attachmentText].filter { !$0.isEmpty }.joined(separator: "\n\n")
+        renderedContext = nil; capturedContextSources = []
+      }
       guard context.utf8.count <= 524_288 else { throw BoomError.budget("Combined reference context exceeds 512 KiB.") }
       let instructions = chat.instructions ?? ""
       let targets: [Voice?] = voices.isEmpty ? [nil] : voices.map(Optional.some)
@@ -938,6 +1022,12 @@ struct CompletionSegment {
       work("Checking consultation context…") { [weak self] flag in
         guard let self else { return }
         let runner = try await self.runnerForGeneration(.consultation, flag: flag)
+        let executionPolicy = try ProductCore.resolvedGenerationPolicy(
+          replay?.generationPolicy ?? runner.generationPolicy, loaded: runner.generationPolicy)
+        // Exact replay starts cold; live turns may reuse only this chat's prefix.
+        let cacheOwner: PromptCacheOwner? = replay == nil
+          ? PromptCacheOwner(namespace: self.inferenceCacheNamespace, entity: chat.id, route: .consultation)
+          : nil
         let provider = runner.identity
         try await self.flush()
         try await self.revalidateResponseSources(graph.sources, attachments: attachmentSources, targetID: authority.target?.id)
@@ -946,9 +1036,18 @@ struct CompletionSegment {
         let reserves = targets.indices.map { index in
           style == .discuss ? outputLimit * (index + 1) + 256 * index : outputLimit
         }
+        let fitPairedAdmission = self.makePairedContextAdmission(runner: runner, purpose: .consultation,
+          owner: cacheOwner, flag: flag) { [weak self] in
+          guard let workspace = self else { throw CancellationError() }
+          try await workspace.validateConsultationAdmissionSource(chat: chat, sources: graph.sources,
+            attachments: attachmentSources, targetID: authority.target?.id,
+            requiredDocumentID: interaction == .ask ? nil : document?.id, flag: flag)
+        }
         let fitted = try await runner.fittedRound(voices: targets, history: chat.messages,
           instructions: instructions, context: context, request: request, routing: slugs,
-          images: images, media: media.media, reserves: reserves, flag: flag, authority: authority)
+          images: images, media: media.media, reserves: reserves, flag: flag, authority: authority, cacheOwner: cacheOwner,
+          pairedAdmission: fitPairedAdmission, promptContract: promptContract,
+          renderedContext: renderedContext, capturedSources: capturedContextSources)
         let plans = fitted.plans
         try flag.check()
         try await self.revalidateResponseSources(graph.sources, attachments: attachmentSources, targetID: authority.target?.id)
@@ -956,7 +1055,8 @@ struct CompletionSegment {
         let replyIDs = targets.map { _ in UUID() }
         if replay == nil {
           self.state.chats[index].messages.append(ChatMessage(role: .user, text: request,
-            context: context, sources: sources, speaker: Speaker(name: "Human"), directAttachments: selectedIDs))
+            context: context, sources: sources, speaker: Speaker(name: "Human"), directAttachments: selectedIDs,
+            consultationRouting: slugs, consultationPromptContract: promptContract))
         }
         for (offset, voice) in targets.enumerated() {
           self.state.chats[index].messages.append(ChatMessage(id: replyIDs[offset], role: .assistant,
@@ -980,7 +1080,9 @@ struct CompletionSegment {
             var plan: ConsultationPlan
             if style == .discuss, !round.isEmpty {
               plan = try ProductCore.prompt(voice: voice, history: fitted.history + round,
-                instructions: instructions, context: context, request: request, routing: slugs, authority: authority)
+                instructions: instructions, context: context, request: request, routing: slugs,
+                authority: authority, promptContract: promptContract,
+                renderedContext: renderedContext, capturedSources: capturedContextSources)
             } else { plan = plans[offset] }
             var responseAuthority = authority
             var sourceDocuments = graph.documents
@@ -997,7 +1099,7 @@ struct CompletionSegment {
               var receipt = ConsultationReceipt(operationID: flag.operationID, seed: seed, state: .pending,
                 failure: nil, model: provider, voice: voice, plan: plan, sources: attemptSources,
                 promptDigest: Digest.sha256(plan.rawPrompt), tokenIDs: [], stopReason: "pending",
-                firstTokenSeconds: nil, elapsedSeconds: 0, generationPolicy: runner.generationPolicy)
+                firstTokenSeconds: nil, elapsedSeconds: 0, generationPolicy: executionPolicy)
               let replyID = replyIDs[offset]
               receipt.media = media.media.isEmpty ? nil : media.media.map(\.reference)
               receipt.attemptID = attemptID; receipt.previousAttemptID = previousAttemptID; receipt.responseID = replyID
@@ -1010,10 +1112,43 @@ struct CompletionSegment {
               let generation = GenerationIdentity(kind: interaction == .ask ? .consultation : .documentResponse,
                 operationID: flag.operationID, recordID: replyID, attemptID: attemptID,
                 model: provider, seed: seed, requestDigest: Digest.sha256(plan.rawPrompt), maxTokens: outputLimit,
-                generationPolicy: runner.generationPolicy)
+                generationPolicy: executionPolicy)
               let deliveryTrace = PerformanceTrace.firstDelivery()
+              let cacheSources = sourceDocuments.map {
+                SourceReference(id: $0.id, title: $0.title, digest: $0.revision, kind: "document")
+              }
+              let cacheTargetID = responseAuthority.target?.id
+              guard let admissionChat = self.state.chats.first(where: { $0.id == chat.id }) else {
+                throw BoomError.stale("The captured chat was removed.")
+              }
+              let generationPairedAdmission = self.makePairedContextAdmission(runner: runner, purpose: .consultation,
+                owner: cacheOwner, flag: flag, sharingAttempt: fitPairedAdmission) { [weak self] in
+                guard let workspace = self else { throw CancellationError() }
+                try await workspace.validateConsultationAdmissionSource(chat: admissionChat, sources: cacheSources,
+                  attachments: attachmentSources, targetID: cacheTargetID,
+                  requiredDocumentID: interaction == .ask ? nil : document?.id, flag: flag)
+              }
+              let joinedRetention = try self.makeJoinedRetentionRequest(owner: cacheOwner,
+                runner: runner, policy: executionPolicy, operationID: flag.operationID)
+              defer { self.finishJoinedRetentionRequest(joinedRetention) }
               let result = try await runner.run(plan: plan, images: images, media: media.media, maxTokens: outputLimit,
-                seed: seed, flag: flag, onCheckpoint: { progress, stop, token in
+                seed: seed, flag: flag, cacheOwner: cacheOwner, executionPolicy: executionPolicy,
+                joinedRetention: joinedRetention,
+                beforeCachePublication: { [weak self] in
+                  guard let self else { throw CancellationError() }
+                  try await self.revalidateResponseSources(cacheSources,
+                    attachments: attachmentSources, targetID: cacheTargetID)
+                  try await MainActor.run {
+                    try flag.check()
+                    guard self.activeFlag === flag,
+                      self.state.chats.contains(where: { $0.id == chat.id }),
+                      interaction == .ask || self.state.selectedDocument == document?.id else {
+                      throw BoomError.stale("The request owner changed before prompt-cache publication.")
+                    }
+                  }
+                },
+                pairedAdmission: generationPairedAdmission,
+                onCheckpoint: { progress, stop, token in
                   try await checkpointStore.checkpoint(progress, identity: generation, stopReason: stop, stopTokenID: token)
                 }) { [weak self] text in
                   Task { @MainActor in
@@ -1033,6 +1168,7 @@ struct CompletionSegment {
               receipt.stopReason = result.stopReason; receipt.firstTokenSeconds = result.firstTokenSeconds
               receipt.stopTokenID = result.stopTokenID
               receipt.elapsedSeconds = result.elapsedSeconds
+              receipt.executionOrigin = result.executionOrigin
               if result.stopReason == "cancelled" { receipt.state = .cancelled }
               let emittedReceipt = receipt
               try await detachedWork {
@@ -1098,11 +1234,36 @@ struct CompletionSegment {
                   sourceDocuments = try ContextGraph.resolveChat(request: request,
                     attachedDocumentID: chat.attachedDocumentID, editingDocumentID: current.id,
                     all: self.documents).documents
-                  let recapturedContext = try DocumentTools.context(sourceDocuments, authority: responseAuthority)
-                  let fullContext = [recapturedContext, attachmentText].filter { !$0.isEmpty }.joined(separator: "\n\n")
+                  let fullContext: String, refreshedContext: RenderedReferenceContext?, refreshedSources: [SourceReference]
+                  if promptContract == .referenceBindingsV3 {
+                    let rendered = try DocumentTools.renderedContext(sourceDocuments, attachments: attachments, authority: responseAuthority)
+                    refreshedContext = rendered; fullContext = rendered.prompt
+                    refreshedSources = sourceDocuments.map { SourceReference(id: $0.id, title: $0.title, digest: $0.revision, kind: "document") }
+                      + attachments.filter { !$0.text.isEmpty }.map(\.reference)
+                  } else {
+                    let recapturedContext = try DocumentTools.context(sourceDocuments, authority: responseAuthority)
+                    fullContext = [recapturedContext, attachmentText].filter { !$0.isEmpty }.joined(separator: "\n\n")
+                    refreshedContext = nil; refreshedSources = []
+                  }
+                  guard let refitChat = self.state.chats.first(where: { $0.id == chat.id }) else {
+                    throw BoomError.stale("The captured chat was removed.")
+                  }
+                  let refitSources = sourceDocuments.map { SourceReference(id: $0.id, title: $0.title,
+                    digest: $0.revision, kind: "document") }
+                  let refitTargetID = responseAuthority.target?.id
+                  let refitPairedAdmission = self.makePairedContextAdmission(runner: runner, purpose: .consultation,
+                    owner: cacheOwner, flag: flag, sharingAttempt: fitPairedAdmission) { [weak self] in
+                    guard let workspace = self else { throw CancellationError() }
+                    try await workspace.validateConsultationAdmissionSource(chat: refitChat, sources: refitSources,
+                      attachments: attachmentSources, targetID: refitTargetID,
+                      requiredDocumentID: document?.id, flag: flag)
+                  }
                   let refreshed = try await runner.fittedRound(voices: [voice], history: fitted.history + round,
                     instructions: instructions, context: fullContext, request: request, routing: slugs,
-                    images: images, media: media.media, reserves: [outputLimit], flag: flag, authority: responseAuthority)
+                    images: images, media: media.media, reserves: [outputLimit], flag: flag,
+                    authority: responseAuthority, cacheOwner: cacheOwner,
+                    pairedAdmission: refitPairedAdmission, promptContract: promptContract,
+                    renderedContext: refreshedContext, capturedSources: refreshedSources)
                   guard let refreshedPlan = refreshed.plans.first else { throw BoomError.invalid("Missing captured response plan.") }
                   plan = refreshedPlan
                 }
@@ -1336,7 +1497,9 @@ struct CompletionSegment {
           vault.exists(.receipt, proposal.messageID) ? try vault.decode(ConsultationReceipt.self, kind: .receipt, id: proposal.messageID) : nil
         }
         let replay = ConsultationReplay(request: question.text, voice: receipt?.voice,
-          attachmentIDs: proposal.attachments.map(\.id), previousAttemptID: receipt?.attemptID)
+          attachmentIDs: proposal.attachments.map(\.id), previousAttemptID: receipt?.attemptID,
+          generationPolicy: receipt?.generationPolicy,
+          promptContract: receipt?.plan.promptContract ?? .textHistoryV1)
         self.status = "Preparing a fresh proposal…"
         let operation = self.foreground
         Task { @MainActor [weak self] in
@@ -1622,22 +1785,45 @@ struct CompletionSegment {
     let authored = try ProductCore.authoredPrefix(document, caret: offset)
     let mediaText = previous?.recipe.sourcePrompt ?? ([authored] + writingExampleIDs.compactMap { id in documents.first(where: { $0.id == id })?.text }).joined(separator: "\n\n")
     let media = try await writingMedia(in: mediaText, flag: flag)
+    let fitOwner: PromptCacheOwner? = replay == nil
+      ? PromptCacheOwner(namespace: inferenceCacheNamespace, entity: document.id, route: .writing) : nil
+    let capturedExamples = writingExampleIDs
+    let examples = try (previous == nil ? capturedExamples : []).map { id in
+      guard let value = documents.first(where: { $0.id == id }) else { throw BoomError.stale("An example was removed.") }
+      return value
+    }
+    let admissionSources = previous?.recipe.sources ?? (([document] + examples).map {
+      SourceReference(id: $0.id, title: $0.title, digest: $0.revision, kind: "document")
+    } + media.map { $0.reference.source })
+    let pairedAdmission = makePairedContextAdmission(runner: runner, purpose: .writing,
+      owner: fitOwner, flag: flag) { [weak self] in
+      guard let workspace = self else { throw CancellationError() }
+      try await workspace.validateWritingAdmissionSource(document: document, offset: offset,
+        examples: capturedExamples, sources: admissionSources, capturedEpoch: capturedEpoch, flag: flag)
+    }
     let recipe: CompletionRecipe
     if let previous { recipe = previous.recipe }
     else {
-      let examples = try writingExampleIDs.map { id in
-        guard let value = documents.first(where: { $0.id == id }) else { throw BoomError.stale("An example was removed.") }
-        return value
-      }
-      let sources = ([document] + examples).map { SourceReference(id: $0.id, title: $0.title, digest: $0.revision, kind: "document") } + media.map { $0.reference.source }
+      let sources = admissionSources
       try await revalidateOnDisk(sources, attachments: [])
       recipe = try await runner.completionRecipe(document: document, caret: offset,
         sources: sources, examples: examples.map(\.text), profile: profile,
-        maxTokens: maxTokens, flag: flag, batchWidth: seeds.count, media: media)
+        maxTokens: maxTokens, flag: flag, batchWidth: seeds.count, media: media,
+        cacheOwner: fitOwner, pairedAdmission: pairedAdmission)
     }
     try ProductCore.validateWritingRecipe(recipe)
     guard recipe.model == runner.identity else { throw BoomError.stale("Replay requires the original writing model.") }
-    try ProductCore.admitGenerationPolicy(recipe.generationPolicy, loaded: runner.generationPolicy)
+    let executionPolicy: ModelGenerationPolicy
+    if let replay {
+      executionPolicy = try replay.coldReplayPolicy(recipe: recipe,
+        loadedModel: runner.identity, loadedPolicy: runner.generationPolicy)
+    } else {
+      executionPolicy = try ProductCore.resolvedGenerationPolicy(recipe.generationPolicy, loaded: runner.generationPolicy)
+    }
+    // Only recorded cold attempts may replay until exact warm ancestry exists.
+    let cacheOwner: PromptCacheOwner? = replay == nil
+      ? PromptCacheOwner(namespace: inferenceCacheNamespace, entity: recipe.document.id, route: .writing)
+      : nil
     var bundle = CandidateBundle(id: replay == nil ? previous?.id ?? UUID() : UUID(), recipe: recipe,
       origin: previous?.origin ?? state.manuscriptOrigins[document.id],
       candidates: replay == nil ? previous?.candidates ?? [] : [],
@@ -1670,8 +1856,24 @@ struct CompletionSegment {
         guard let payload = media.first(where: { $0.reference == reference }) else { throw BoomError.stale(reference.name) }; return payload
       }
       let deliveryTrace = PerformanceTrace.firstDelivery()
+      let joinedRetention = try makeJoinedRetentionRequest(owner: cacheOwner,
+        runner: runner, policy: executionPolicy, operationID: flag.operationID)
+      defer { finishJoinedRetentionRequest(joinedRetention) }
       let results = try await runner.runBatch(rawPrompt: recipe.prompt, media: orderedMedia, maxTokens: recipe.maxTokens,
           settings: recipe.settings, seeds: seeds, flag: flag, background: maxTokens == 64 && !showingCandidates,
+          cacheOwner: cacheOwner, executionPolicy: executionPolicy, joinedRetention: joinedRetention,
+          beforeCachePublication: { [weak self] in
+            guard let self else { throw CancellationError() }
+            try await self.revalidateOnDisk(recipe.sources, attachments: [])
+            try await MainActor.run {
+              try flag.check()
+              guard self.writingFlag === flag, self.epoch == capturedEpoch,
+                self.state.selectedDocument == recipe.document.id else {
+                throw BoomError.stale("The writing source changed before prompt-cache publication.")
+              }
+            }
+          },
+          pairedAdmission: pairedAdmission,
           onCheckpoint: { [weak self] updates in
             for update in updates {
               try await checkpointStore.checkpoint(update.progress, identity: generations[update.lane],
@@ -1713,6 +1915,7 @@ struct CompletionSegment {
         bundle.candidates[index].tokenIDs = result.tokenIDs
         bundle.candidates[index].stopReason = result.stopReason
         bundle.candidates[index].stopTokenID = result.stopTokenID
+        bundle.candidates[index].executionOrigin = result.executionOrigin
       }
       if let current = candidates, current.id == bundle.id, bundle.candidates.indices.contains(current.selected) {
         bundle.selected = current.selected
@@ -1826,7 +2029,7 @@ struct CompletionSegment {
     if candidateIsCurrent { showCandidateGhost(bundle.candidates[index].text, recipe: bundle.recipe, epoch: epoch) }
   }
   func replayCandidate(_ index: Int) {
-    guard !isBusy, let bundle = candidates, bundle.recipe.document.id == state.selectedDocument,
+    guard canReplayCandidate(index), let bundle = candidates, bundle.recipe.document.id == state.selectedDocument,
       bundle.candidates.indices.contains(index) else { return }
     showingCandidates = true
     work("Replaying this seed…") { [weak self] flag in
@@ -1841,8 +2044,11 @@ struct CompletionSegment {
       bundle.candidates[index].state == .complete,
       bundle.recipe.model == (baseRunner?.identity ?? writingModelIdentity),
       let policy = baseRunner?.generationPolicy ?? writingGenerationPolicy else { return false }
-    do { try ProductCore.admitGenerationPolicy(bundle.recipe.generationPolicy, loaded: policy); return true }
-    catch { return false }
+    do {
+      _ = try bundle.candidates[index].coldReplayPolicy(recipe: bundle.recipe,
+        loadedModel: baseRunner?.identity ?? writingModelIdentity ?? "", loadedPolicy: policy)
+      return true
+    } catch { return false }
   }
   func acceptCandidateWord(_ index: Int) {
     guard !isBusy, candidateIsCurrent, let bundle = candidates, bundle.candidates.indices.contains(index),
@@ -2289,45 +2495,121 @@ struct CompletionSegment {
     updated.coverage = "Partial native transform"
     return updated
   }
-  private func releaseRunner(_ purpose: ModelPurpose) async {
-    if purpose == .consultation {
-      if let old = mlxRunner { await old.join() }
-      mlxRunner = nil; modelReady = false
-    } else {
-      if let old = baseRunner { await old.join() }
-      baseRunner = nil
+  @discardableResult
+  private func releaseRunner(_ purpose: ModelPurpose, expectedEpoch: UUID? = nil) async -> Bool {
+    let current = purpose == .consultation ? mlxRunner : baseRunner
+    guard let old = current else {
+      if expectedEpoch == nil {
+        if purpose == .consultation { mlxRunner = nil; modelReady = false } else { baseRunner = nil }
+        residentModelWeights.removeValue(forKey: purpose)
+      }
+      return false
     }
+    guard expectedEpoch == nil || old.cacheRunnerEpoch == expectedEpoch else { return false }
+    revokeJoinedRetentions(runnerEpoch: old.cacheRunnerEpoch)
+    if expectedEpoch != nil { await old.cancelAndJoin() } else { await old.join() }
+    guard (purpose == .consultation ? mlxRunner : baseRunner) === old else { return false }
+    await old.clearPromptCache()
+    guard (purpose == .consultation ? mlxRunner : baseRunner) === old else { return false }
+    if purpose == .consultation { mlxRunner = nil; modelReady = false }
+    else { baseRunner = nil }
     residentModelWeights.removeValue(forKey: purpose)
+    return true
   }
-  private func reclaimModelCache() async {
-    await GenerationCoordinator.shared.enter()
+  private func joinAndClearPromptCaches() async {
+    let consultation = mlxRunner, writing = baseRunner
+    if let consultation { await consultation.join(); await consultation.clearPromptCache() }
+    if let writing, writing !== consultation { await writing.join(); await writing.clearPromptCache() }
+  }
+  private func reclaimModelCache(background: Bool = false) async {
+    await GenerationCoordinator.shared.enter(background: background)
     // Releasing native Metal allocations may block. Retain the GPU lease,
     // but let the main actor continue handling manuscript input.
     await InferenceExecutor.shared.perform { _ in MLX.Memory.clearCache() }
     await GenerationCoordinator.shared.leave()
   }
-  private func releaseInactiveModel(for purpose: ModelPurpose) async {
-    // Return from releaseRunner before clearing the allocator: its local strong
-    // reference must be gone so discarded model weights can actually reclaim.
-    await releaseRunner(purpose == .consultation ? .writing : .consultation)
-    await reclaimModelCache()
+  @discardableResult
+  private func releaseInactiveModel(for purpose: ModelPurpose, expectedEpoch: UUID? = nil) async -> Bool {
+    // releaseRunner's last strong local must leave before allocator reclamation.
+    let released = await releaseRunner(purpose == .consultation ? .writing : .consultation,
+      expectedEpoch: expectedEpoch)
+    if released || expectedEpoch == nil { await reclaimModelCache(background: expectedEpoch != nil) }
+    return released
   }
-  private func pairHasContext() async throws -> Bool {
-    guard let writing = baseRunner, let consultation = mlxRunner else { return true }
-    if writing === consultation { return true }
-    return try ProductCore.retainResidentPair(writing: await writing.contextLength(batchWidth: 3),
-      consultation: await consultation.contextLength)
+  /// Only captured production callers opt in. A nil controller retains normal
+  /// admission, and a nil cache owner still uses actual cold admission.
+  func makePairedContextAdmission(runner: MLXGemmaRunner, purpose: ModelPurpose,
+    owner: PromptCacheOwner?, flag: CancellationFlag, sharingAttempt: PairedContextAdmission? = nil,
+    validateSource: @escaping @Sendable () async throws -> Void) -> PairedContextAdmission {
+    let workspaceEpoch = joinedRetentionEpoch
+    return PairedContextAdmission(sharingAttempt: sharingAttempt) { [weak self] request in
+      guard let workspace = self else { throw CancellationError() }
+      return try await workspace.reclaimPreparedPeer(request, runner: runner, purpose: purpose,
+        owner: owner, flag: flag, workspaceEpoch: workspaceEpoch, validateSource: validateSource)
+    }
   }
-  private func retainPairIfUseful(for purpose: ModelPurpose) async throws {
-    guard try await !pairHasContext() else { return }
-    await releaseInactiveModel(for: purpose)
-    status = "The inactive model was released to preserve context. It will reload when needed."
+  private func reclaimPreparedPeer(_ request: PreparedPairedAdmissionRequest,
+    runner: MLXGemmaRunner, purpose: ModelPurpose, owner: PromptCacheOwner?, flag: CancellationFlag,
+    workspaceEpoch: UUID, validateSource: @escaping @Sendable () async throws -> Void) async throws -> Bool {
+    func validateOwner() throws {
+      try flag.check()
+      do { try ModelResidency.check() }
+      catch { flag.cancel(); throw error }
+      guard !joinedRetentionClosed, joinedRetentionEpoch == workspaceEpoch,
+        (purpose == .consultation ? mlxRunner : baseRunner) === runner,
+        request.operationID == flag.operationID, request.runnerEpoch == runner.cacheRunnerEpoch,
+        request.modelIdentity == runner.identity, request.processorIdentity == runner.processorIdentity,
+        request.owner == owner, owner == nil || owner?.namespace == inferenceCacheNamespace,
+        owner == nil || joinedRetentionOwnerIsLive(owner!) else {
+        throw BoomError.stale("The captured request or loaded model changed before paired-model reclamation.")
+      }
+      _ = try ProductCore.resolvedGenerationPolicy(request.policy, loaded: runner.generationPolicy)
+    }
+    try validateOwner(); try await validateSource(); try validateOwner()
+    // Keep only scalar peer identity across release. Retaining its actor here
+    // would pin weights while its release function clears the allocator pool.
+    func inactiveEpoch() -> UUID? {
+      guard let inactive = purpose == .consultation ? baseRunner : mlxRunner,
+        inactive !== runner else { return nil }
+      return inactive.cacheRunnerEpoch
+    }
+    guard let peerEpoch = inactiveEpoch() else { return false }
+    // This callback is invoked only after the failing prepared operation has
+    // exited its executor/container/coordinator lease. cancelAndJoin never runs
+    // beneath the target lease, nor beneath a cache/admission lock.
+    let released = await releaseInactiveModel(for: purpose, expectedEpoch: peerEpoch)
+    try validateOwner(); try await validateSource(); try validateOwner()
+    if released { status = "The inactive model was released to preserve context. It will reload when needed." }
+    return released
+  }
+  private func validateConsultationAdmissionSource(chat: ChatRecord, sources: [SourceReference],
+    attachments: [SourceReference], targetID: UUID?, requiredDocumentID: UUID?, flag: CancellationFlag) async throws {
+    func check() throws {
+      try flag.check()
+      guard activeFlag === flag, state.selectedChat == chat.id,
+        state.chats.first(where: { $0.id == chat.id })?.contentVersion == chat.contentVersion,
+        requiredDocumentID == nil || state.selectedDocument == requiredDocumentID else {
+        throw BoomError.stale("The captured consultation changed before paired-model reclamation.")
+      }
+    }
+    try check(); try await revalidateResponseSources(sources, attachments: attachments, targetID: targetID); try check()
+  }
+  private func validateWritingAdmissionSource(document: DocumentSnapshot, offset: Int,
+    examples: [UUID], sources: [SourceReference], capturedEpoch: UInt64, flag: CancellationFlag) async throws {
+    func check() throws {
+      try flag.check()
+      guard epoch == capturedEpoch, state.selectedDocument == document.id,
+        selectedDocument?.textVersion == document.textVersion, caret == offset,
+        writingExampleIDs == examples else {
+        throw BoomError.stale("The captured writing source changed before paired-model reclamation.")
+      }
+    }
+    try check(); try await revalidateOnDisk(sources, attachments: []); try check()
   }
   func runnerForGeneration(_ purpose: ModelPurpose, flag: CancellationFlag) async throws -> MLXGemmaRunner {
     let trace = PerformanceTrace.begin("Request.ModelReady")
     defer { PerformanceTrace.end("Request.ModelReady", trace) }
     try flag.check()
-    try await retainPairIfUseful(for: purpose)
     if let runner = purpose == .consultation ? mlxRunner : baseRunner { return runner }
     if writingUsesConsultation {
       if purpose == .writing {
@@ -2491,7 +2773,6 @@ struct CompletionSegment {
     }
     residentModelWeights[purpose] = admission.weightBytes
     if purpose == .consultation && writingUsesConsultation { useConsultationForWriting(loaded) }
-    try await retainPairIfUseful(for: purpose)
     return loaded
   }
   func loadPack(_ url: URL, purpose: ModelPurpose) {
@@ -2530,10 +2811,12 @@ struct CompletionSegment {
   }
   func performBackup(_ request: BackupRequest, passphrase: String) {
     backupRequest = nil
+    if request.restoring { revokeJoinedRetentions(); joinedRetentionEpoch = UUID() }
     work(request.restoring ? "Restoring encrypted backup…" : "Encrypting complete backup…") { [weak self] _ in
       guard let self else { return }
       try await self.flush()
       if request.restoring {
+        await self.joinAndClearPromptCaches()
         let restored = try await self.store.restoreBackup(passphrase: passphrase, from: request.url)
         self.state = restored.0; self.documents = restored.1
         self.dirty.removeAll(); self.undoManagers.removeAll()

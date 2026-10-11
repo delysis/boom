@@ -162,7 +162,7 @@ final class GenerationJournalTests: XCTestCase {
     let small = try ProductCore.generationPolicy(vocabularySize: 16,
       configuration: Data(#"{"eos_token_id":1,"suppress_tokens":[15,14]}"#.utf8),
       controls: [0, 1, 3, 14, 15], tokenizerEOS: 1)
-    XCTAssertEqual(small.prefill, PrefillGeometry(chunking: "balanced_v1", tokenCeiling: 512))
+    XCTAssertEqual(small.prefill, PrefillGeometry(chunking: "fixed_v1", tokenCeiling: 512))
     for ceiling in [UInt32(256), UInt32(1024)] {
       let alternate = try ProductCore.generationPolicy(vocabularySize: 16,
         configuration: Data(#"{"eos_token_id":1,"suppress_tokens":[15,14]}"#.utf8),
@@ -176,7 +176,7 @@ final class GenerationJournalTests: XCTestCase {
       let recovered = try await fresh.generationCheckpoint(identity: f.writing)
       let journal = try XCTUnwrap(recovered)
       XCTAssertEqual(journal.identity.generationPolicy?.prefill,
-        PrefillGeometry(chunking: "balanced_v1", tokenCeiling: Int(ceiling)))
+        PrefillGeometry(chunking: "fixed_v1", tokenCeiling: Int(ceiling)))
       try ProductCore.admitGenerationPolicy(alternate, loaded: alternate)
       XCTAssertThrowsError(try ProductCore.admitGenerationPolicy(alternate, loaded: small))
       var unrecorded = small; unrecorded.prefill = nil
@@ -251,4 +251,63 @@ final class GenerationJournalTests: XCTestCase {
     } catch {}
     XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: wrong.root.path).isEmpty)
   }
+  func testColdAndWarmOriginsRecoverFromTerminalCheckpointsBeforeFinalRecordSave() async throws {
+    for cached in [0, 7] {
+      let f = try await fixture(); defer { try? FileManager.default.removeItem(at: f.root) }
+      let origin = GenerationExecutionOrigin(schema: 1, cacheAlgorithm: "resident-hybrid-prefix-v3",
+        cachedPromptTokens: cached, cacheMissReason: cached == 0 ? "no_owner" : nil)
+      var observed = progress("Complete Cafe\u{301} 👩🏽‍💻")
+      observed.executionOrigin = origin
+      try await f.store.checkpoint(observed, identity: f.writing, stopReason: "output_limit")
+      try await f.store.checkpoint(observed, identity: f.consultation, stopReason: nil)
+      let fresh = try WorkspaceStore(rootOverride: f.root, testKey: f.key)
+      _ = try await fresh.load().get()
+      let bundle = try fresh.vault.decode(CandidateBundle.self, kind: .candidate, id: f.bundle.id)
+      let receipt = try fresh.vault.decode(ConsultationReceipt.self, kind: .receipt, id: f.consultation.recordID)
+      XCTAssertEqual(bundle.candidates[0].state, .complete)
+      XCTAssertEqual(bundle.candidates[0].executionOrigin, origin)
+      XCTAssertEqual(receipt.executionOrigin, origin)
+      XCTAssertEqual(Data(bundle.candidates[0].text.utf8), Data(observed.text.utf8))
+      XCTAssertEqual(bundle.candidates[0].executionOrigin?.isConfirmedCold(promptTokens: 12), cached == 0)
+    }
+  }
+  func testOriginCannotBeRewrittenDowngradedOrInventedWithoutRetainingTheEncryptedJournal() async throws {
+    for initial in [nil, GenerationExecutionOrigin(schema: 1, cacheAlgorithm: "resident-hybrid-prefix-v3",
+      cachedPromptTokens: 7, cacheMissReason: nil)] as [GenerationExecutionOrigin?] {
+      let f = try await fixture(); defer { try? FileManager.default.removeItem(at: f.root) }
+      var before = progress(); before.executionOrigin = initial
+      try await f.store.checkpoint(before, identity: f.writing, stopReason: nil)
+      let path = f.store.vault.recordURL(.generationJournal, f.writing.attemptID)
+      let ciphertext = try Data(contentsOf: path)
+      var after = progress("Continues", tokens: [1, 2, 3], elapsed: 2)
+      after.executionOrigin = GenerationExecutionOrigin(schema: 1, cacheAlgorithm: "resident-hybrid-prefix-v3",
+        cachedPromptTokens: 0, cacheMissReason: "no_owner")
+      do { try await f.store.checkpoint(after, identity: f.writing, stopReason: nil)
+        XCTFail("Invented or rewritten origin was admitted") } catch {}
+      XCTAssertEqual(try Data(contentsOf: path), ciphertext)
+      if initial != nil {
+        after.executionOrigin = nil
+        do { try await f.store.checkpoint(after, identity: f.writing, stopReason: nil)
+          XCTFail("Origin downgrade was admitted") } catch {}
+        XCTAssertEqual(try Data(contentsOf: path), ciphertext)
+      }
+    }
+  }
+  func testFinalCandidateOriginMustAgreeWithItsAdmittedCheckpoint() async throws {
+    let f = try await fixture(); defer { try? FileManager.default.removeItem(at: f.root) }
+    var observed = progress()
+    observed.executionOrigin = GenerationExecutionOrigin(schema: 1, cacheAlgorithm: "resident-hybrid-prefix-v3",
+      cachedPromptTokens: 7, cacheMissReason: nil)
+    try await f.store.checkpoint(observed, identity: f.writing, stopReason: "output_limit")
+    var forged = f.bundle
+    forged.candidates[0].state = .complete
+    forged.candidates[0].retain(observed)
+    forged.candidates[0].executionOrigin = GenerationExecutionOrigin(schema: 1, cacheAlgorithm: "resident-hybrid-prefix-v3",
+      cachedPromptTokens: 0, cacheMissReason: "no_owner")
+    try f.store.vault.encode(forged, kind: .candidate, id: forged.id)
+    let path = f.store.vault.recordURL(.candidate, forged.id), ciphertext = try Data(contentsOf: path)
+    switch await f.store.load() { case .success: XCTFail("Contradictory origin was admitted"); case .failure: break }
+    XCTAssertEqual(try Data(contentsOf: path), ciphertext)
+  }
+
 }

@@ -171,10 +171,173 @@ pub fn context_capacity(
     Ok(low)
 }
 
+/// Caller-supplied native shape/capacity bytes at a joined, measured boundary.
+/// Existing source parents are already in used_bytes; no release credit exists.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncrementalKvAllocation {
+    destination_bytes: u64,
+    zero_extension_bytes: u64,
+    hydration_bytes: u64,
+    shared_prefill_bytes: u64,
+    grows: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncrementalKvAdmission {
+    pub admitted: bool,
+    pub additional_bytes_upper_bound: u64,
+    pub required_bytes: u64,
+    pub scope: &'static str,
+}
+
+pub fn incremental_kv_admission(
+    application: u64,
+    used: u64,
+    reserve: u64,
+    layers: &[IncrementalKvAllocation],
+) -> Result<IncrementalKvAdmission, Error> {
+    require(
+        application <= APPLICATION_CEILING
+            && reserve == WORKING_RESERVE
+            && (1..=256).contains(&layers.len()),
+        "Invalid incremental native KV admission boundary.",
+    )?;
+    let checked_add = |a: u64, b: u64| {
+        a.checked_add(b)
+            .ok_or_else(|| Error("Native KV allocation bound overflowed.".into()))
+    };
+    let mut additional = 0;
+    for layer in layers {
+        require(
+            layer.destination_bytes > 0
+                && layer.zero_extension_bytes <= layer.destination_bytes
+                && layer.shared_prefill_bytes <= layer.destination_bytes,
+            "Invalid native KV allocation dimensions.",
+        )?;
+        // No-growth SliceUpdate may need a complete destination COW. Growth
+        // may hold zero extension + concatenate output + SliceUpdate output.
+        let update = if layer.grows {
+            checked_add(
+                checked_add(layer.destination_bytes, layer.destination_bytes)?,
+                layer.zero_extension_bytes,
+            )?
+        } else {
+            layer.destination_bytes
+        };
+        additional = checked_add(
+            additional,
+            checked_add(
+                checked_add(update, layer.hydration_bytes)?,
+                layer.shared_prefill_bytes,
+            )?,
+        )?;
+    }
+    incremental_kv_readmission(application, used, reserve, additional)
+}
+
+/// Scalar envelope was derived from actual native layers before graph creation.
+/// At an existing submission boundary, used includes queued Metal allocations.
+/// No source release, donation or prior GPU completion is credited.
+pub fn incremental_kv_readmission(
+    application: u64,
+    used: u64,
+    reserve: u64,
+    additional: u64,
+) -> Result<IncrementalKvAdmission, Error> {
+    require(
+        application <= APPLICATION_CEILING && reserve == WORKING_RESERVE && additional > 0,
+        "Invalid native KV readmission envelope.",
+    )?;
+    let required = used
+        .checked_add(additional)
+        .and_then(|v| v.checked_add(reserve))
+        .ok_or_else(|| Error("Native KV allocation bound overflowed.".into()))?;
+    Ok(IncrementalKvAdmission {
+        admitted: required <= application,
+        additional_bytes_upper_bound: additional,
+        required_bytes: required,
+        scope: "measured_submitted_boundary_allocation_horizon_with_operation_memory_watch",
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn incremental_admission_keeps_full_cow_and_true_parent_usage() -> Result<(), Error> {
+        let layer = IncrementalKvAllocation {
+            destination_bytes: 64,
+            zero_extension_bytes: 0,
+            hydration_bytes: 0,
+            shared_prefill_bytes: 0,
+            grows: false,
+        };
+        let used = 24 * GIB - WORKING_RESERVE - 64;
+        let fits = incremental_kv_admission(24 * GIB, used, WORKING_RESERVE, &[layer])?;
+        assert!(fits.admitted);
+        assert_eq!(fits.additional_bytes_upper_bound, 64);
+        let layer = IncrementalKvAllocation {
+            destination_bytes: 64,
+            zero_extension_bytes: 0,
+            hydration_bytes: 0,
+            shared_prefill_bytes: 0,
+            grows: false,
+        };
+        assert!(!incremental_kv_admission(24 * GIB, used + 1, WORKING_RESERVE, &[layer])?.admitted);
+        Ok(())
+    }
+    #[test]
+    fn incremental_growth_includes_extension_and_both_destinations() -> Result<(), Error> {
+        let layer = IncrementalKvAllocation {
+            destination_bytes: 96,
+            zero_extension_bytes: 32,
+            hydration_bytes: 16,
+            shared_prefill_bytes: 48,
+            grows: true,
+        };
+        let result = incremental_kv_admission(24 * GIB, 0, WORKING_RESERVE, &[layer])?;
+        assert_eq!(result.additional_bytes_upper_bound, 2 * 96 + 32 + 16 + 48);
+        Ok(())
+    }
+    #[test]
+    fn incremental_native_math_rejects_overflow_and_unsupported_bounds() {
+        let layer = IncrementalKvAllocation {
+            destination_bytes: u64::MAX,
+            zero_extension_bytes: 0,
+            hydration_bytes: 0,
+            shared_prefill_bytes: 0,
+            grows: true,
+        };
+        assert!(incremental_kv_admission(24 * GIB, 0, WORKING_RESERVE, &[layer]).is_err());
+        assert!(incremental_kv_admission(u64::MAX, 0, WORKING_RESERVE, &[]).is_err());
+        assert!(incremental_kv_admission(24 * GIB, 0, 0, &[]).is_err());
+        let layer = IncrementalKvAllocation {
+            destination_bytes: 0,
+            zero_extension_bytes: 0,
+            hydration_bytes: 0,
+            shared_prefill_bytes: 0,
+            grows: false,
+        };
+        assert!(incremental_kv_admission(24 * GIB, 0, WORKING_RESERVE, &[layer]).is_err());
+    }
+    #[test]
+    fn native_readmission_counts_prior_queued_allocations_without_release_credit()
+    -> Result<(), Error> {
+        let allowance = 128;
+        let used = 24 * GIB - WORKING_RESERVE - allowance;
+        assert!(incremental_kv_readmission(24 * GIB, used, WORKING_RESERVE, allowance)?.admitted);
+        assert!(
+            !incremental_kv_readmission(24 * GIB, used + 1, WORKING_RESERVE, allowance)?.admitted
+        );
+        assert!(
+            incremental_kv_readmission(24 * GIB, u64::MAX, WORKING_RESERVE, allowance).is_err()
+        );
+        assert!(incremental_kv_readmission(24 * GIB, 0, WORKING_RESERVE, 0).is_err());
+        Ok(())
+    }
     #[test]
     fn paired_weights_cannot_take_the_active_context_budget() -> Result<(), Error> {
         let config = gemma();
