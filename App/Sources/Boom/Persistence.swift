@@ -146,12 +146,20 @@ final class Vault: @unchecked Sendable {
     FileManager.default.fileExists(atPath: url(kind, id).path)
   }
   func put(_ data: Data, kind: Kind, id: UUID) throws {
+    let trace = PerformanceTrace.begin("Storage.Put")
+    defer { PerformanceTrace.end("Storage.Put", trace) }
     guard data.count <= ([Kind.workspace, .saveJournal].contains(kind) ? Self.workspaceLimit : 1_100_000_000) else {
       throw BoomError.budget("Private record exceeds its bound.")
     }
+    let lockTrace = PerformanceTrace.begin("Storage.LockWait")
     lock.lock()
+    PerformanceTrace.end("Storage.LockWait", lockTrace)
     defer { lock.unlock() }
-    let encrypted = try AES.GCM.seal(data, using: key, authenticating: aad(kind, id))
+    let encrypted = try {
+      let trace = PerformanceTrace.begin("Storage.Encrypt")
+      defer { PerformanceTrace.end("Storage.Encrypt", trace) }
+      return try AES.GCM.seal(data, using: key, authenticating: aad(kind, id))
+    }()
     guard let combined = encrypted.combined else {
       throw BoomError.invalid("Could not encode the authenticated record.")
     }
@@ -162,6 +170,8 @@ final class Vault: @unchecked Sendable {
         throw BoomError.invalid("Refusing a symlink in private storage.")
       }
     }
+    let writeTrace = PerformanceTrace.begin("Storage.AtomicWrite")
+    defer { PerformanceTrace.end("Storage.AtomicWrite", writeTrace) }
     try combined.write(to: target, options: .atomic)
     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
   }
@@ -178,6 +188,8 @@ final class Vault: @unchecked Sendable {
     return data
   }
   func encode<T: Encodable>(_ value: T, kind: Kind, id: UUID) throws {
+    let trace = PerformanceTrace.begin("Storage.Encode")
+    defer { PerformanceTrace.end("Storage.Encode", trace) }
     let encoder = PropertyListEncoder(); encoder.outputFormat = .binary
     try put(encoder.encode(value), kind: kind, id: id)
   }
@@ -567,6 +579,8 @@ actor WorkspaceStore {
     try vault.remove(.saveJournal, id: Vault.workspaceID)
   }
   func save(_ state: WorkspaceState, documents: [DocumentSnapshot]) throws {
+    let trace = PerformanceTrace.begin("Storage.Save")
+    defer { PerformanceTrace.end("Storage.Save", trace) }
     try recoverSave()
     guard state.schema == 1, Set(documents.map(\.id)).count == documents.count,
       Set(state.documents.map(\.id)).count == state.documents.count,

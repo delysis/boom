@@ -779,7 +779,8 @@ struct ChatPane: View {
           onFocus: { model.noteInputFocus(.chat) },
           onContentHeight: { composerHeight = min(140, max(36, $0)) },
           completionModel: model, completionTarget: TextInputTarget(chatID: model.state.selectedChat,
-            documentID: model.state.selectedDocument)
+            documentID: model.state.selectedDocument), textVersion: model.draftVersion,
+          currentTextVersion: { model.draftVersion }
         ).frame(height: composerHeight)
         composerControls
       }.padding(WorkspaceGeometry.inputInset)

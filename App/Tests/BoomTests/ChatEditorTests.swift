@@ -177,7 +177,7 @@ final class ChatEditorTests: XCTestCase {
       XCTAssertLessThanOrEqual(layout.usedRect(for: container).maxX, 221)
     }
   }
-  @MainActor func testManuscriptReflowsAndProbesPreserveSelectionUndoAndLiveLayout() async throws {
+  @MainActor func testManuscriptViewportReflowsPreserveSelectionUndoAndLiveLayout() async throws {
     _ = NSApplication.shared
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-document-resize-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
@@ -198,12 +198,6 @@ final class ChatEditorTests: XCTestCase {
       window.setContentSize(NSSize(width: width, height: 640)); settle(window)
       layout.ensureLayout(for: container)
       XCTAssertLessThanOrEqual(layout.usedRect(for: container).maxY + view.textContainerInset.height * 2, view.bounds.height + 1)
-      let size = container.size, frame = view.frame, displayed = layout.usedRect(for: container)
-      _ = view.manuscriptSize(width: 240, minimumHeight: 180)
-      _ = view.manuscriptSize(width: 760, minimumHeight: 180)
-      layout.ensureLayout(for: container)
-      XCTAssertEqual(container.size, size); XCTAssertEqual(view.frame, frame)
-      XCTAssertEqual(layout.usedRect(for: container), displayed)
       XCTAssertEqual(view.selectedRange(), selection); XCTAssertEqual(view.string, source)
       XCTAssertEqual(view.undoManager?.canUndo, canUndo)
     }

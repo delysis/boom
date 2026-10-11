@@ -183,6 +183,8 @@ struct ChatComposer: NSViewRepresentable {
   var showsEditingActions = false
   var completionModel: WorkspaceModel? = nil
   var completionTarget: TextInputTarget? = nil
+  var textVersion: UUID? = nil
+  var currentTextVersion: (() -> UUID)? = nil
 
   func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
 
@@ -237,6 +239,8 @@ struct ChatComposer: NSViewRepresentable {
     MarkdownStyle.apply(to: view, bodyFont: NSFont.systemFont(ofSize: 14), lineSpacing: lineSpacing)
     context.coordinator.lineSpacing = lineSpacing
     context.coordinator.view = view
+    context.coordinator.currentTextVersion = currentTextVersion
+    context.coordinator.acknowledge(text, version: currentTextVersion?() ?? textVersion)
     configureCompletion(view, coordinator: context.coordinator)
 
     let scroll = NSScrollView()
@@ -252,22 +256,30 @@ struct ChatComposer: NSViewRepresentable {
     guard let view = input.scroll.documentView as? ChatTextView else { return }
     view.setMedia(model: completionModel)
     context.coordinator.text = $text
+    context.coordinator.currentTextVersion = currentTextVersion
+    let styleChanged = context.coordinator.lineSpacing != lineSpacing
     context.coordinator.lineSpacing = lineSpacing
     context.coordinator.onContentHeight = onContentHeight
     view.onSend = onSend
     view.onCancel = onCancel
     view.onAttachments = onAttachments
     view.onFocus = onFocus
-    if view.string != text, !view.nativeEditInProgress, !view.hasMarkedText() {
-      view.endGhostBoundary(); context.coordinator.completion?.invalidateGhost()
-      view.string = text
-      MarkdownStyle.apply(to: view, bodyFont: NSFont.systemFont(ofSize: 14), lineSpacing: lineSpacing)
-      view.setSelectedRange(NSRange(location: (text as NSString).length, length: 0))
-      view.needsDisplay = true
+    let source = context.coordinator.text.wrappedValue
+    let version = currentTextVersion?() ?? textVersion
+    if !view.nativeEditInProgress, !view.hasMarkedText() {
+      if !context.coordinator.displays(source, version: version) {
+        view.endGhostBoundary(); context.coordinator.completion?.invalidateGhost()
+        view.string = source
+        MarkdownStyle.apply(to: view, bodyFont: NSFont.systemFont(ofSize: 14), lineSpacing: lineSpacing)
+        view.setSelectedRange(NSRange(location: (source as NSString).length, length: 0))
+        view.needsDisplay = true
+      } else if styleChanged {
+        MarkdownStyle.apply(to: view, bodyFont: NSFont.systemFont(ofSize: 14), lineSpacing: lineSpacing)
+      }
+      context.coordinator.acknowledge(source, version: version)
     }
     view.reportContentHeight()
     configureCompletion(view, coordinator: context.coordinator)
-    context.coordinator.updateCompletion()
     context.coordinator.completion?.refresh()
     if focusRequest != context.coordinator.appliedFocusRequest {
       context.coordinator.appliedFocusRequest = focusRequest
@@ -306,13 +318,32 @@ struct ChatComposer: NSViewRepresentable {
     var onContentHeight: ((CGFloat) -> Void)?
     var completion: TextInputCompletion?
     var completionTarget: TextInputTarget?
+    var currentTextVersion: (() -> UUID)?
     private var measuredHeight: CGFloat = -1
+    private var acknowledgedText: String?
+    private var acknowledgedTextVersion: UUID?
+    private var acknowledgedNativeVersion: UUID?
     init(text: Binding<String>) { self.text = text }
+    func acknowledge(_ source: String, version: UUID?) {
+      acknowledgedText = source; acknowledgedTextVersion = version
+      acknowledgedNativeVersion = view?.sourceVersion
+    }
+    func displays(_ source: String, version: UUID?) -> Bool {
+      guard let view, acknowledgedNativeVersion == view.sourceVersion else { return false }
+      if let version { return acknowledgedTextVersion == version }
+      // Generic bindings have no external change identity. Compare their last
+      // acknowledged immutable value exactly, never the live native buffer or
+      // canonical String equality. Versioned status updates skip this boundary.
+      guard let acknowledgedText else { return false }
+      return (acknowledgedText as NSString).isEqual(to: source)
+    }
     func textDidChange(_ notification: Notification) {
       guard let view else { return }
       if !view.movingGhostBoundary { view.endGhostBoundary() }
       if !view.hasMarkedText() { MarkdownStyle.apply(to: view, bodyFont: NSFont.systemFont(ofSize: 14), lineSpacing: lineSpacing) }
-      text.wrappedValue = view.string
+      let source = view.string
+      text.wrappedValue = source
+      acknowledge(source, version: currentTextVersion?())
       view.needsDisplay = true
       view.reportContentHeight()
       updateCompletion()
@@ -324,7 +355,7 @@ struct ChatComposer: NSViewRepresentable {
     }
     func updateCompletion() {
       guard let view, let completionTarget else { return }
-      completion?.update(text: view.string, selection: view.selectedRange(),
+      completion?.update(selection: view.selectedRange(),
         marked: view.hasMarkedText(), target: completionTarget)
     }
     func measure(_ height: CGFloat) {

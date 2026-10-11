@@ -316,7 +316,8 @@ do not qualify actual focused mouse/keyboard behavior or typing latency.
 AppKit/TextKit owns prose rendering, selection and editing. SwiftUI owns pane,
 row and command layout. `NativeText.swift` is the only read-only prose bridge;
 `NativeTextMeasurement.swift` supplies isolated proposed-size measurement to
-both reading rows and the manuscript editor. `NativeTextStyle.swift` projects Rust Markdown spans onto native text storage for
+reading rows. The manuscript uses a native scrolling viewport and does not
+measure the whole document to determine its pane height. `NativeTextStyle.swift` projects Rust Markdown spans onto native text storage for
 both reading and editing. Keep labels and buttons in SwiftUI. Do not add another
 prose renderer or a per-surface Markdown parser.
 
@@ -326,8 +327,8 @@ an isolated TextKit container with the same attributed source and geometry as
 the display container. Speculative measurement cannot mutate the live renderer.
 Invalidate size when source or styling changes, including the first empty-to-text
 update; synchronize the display container only with the actual assigned width.
-The direct manuscript view also takes its frame from SwiftUI and uses that same
-isolated measurement helper. The chat input owns a native scrolling document;
+SwiftUI assigns the manuscript viewport's frame; AppKit owns its inner scrolling
+document and caret scrolling. The chat input owns a native scrolling document;
 AppKit controls that inner document's frame and reports content height through
 its live native layout. Preserve Undo and IME composition in both. These are
 explicit layout contracts over the same engine, not interchangeable controls.

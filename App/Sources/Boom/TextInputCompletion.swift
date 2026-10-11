@@ -46,6 +46,8 @@ struct TextInputCapture: Codable, Sendable {
   let id = UUID()
   private(set) var target: TextInputTarget
   private(set) var completionDocument: DocumentSnapshot?
+  private var documentSourceVersion: UUID?
+  private var stampedDocumentVersion: UUID?
   private(set) var ghostStamp: GhostStamp?
   private(set) var ghostText = ""
   private var epoch: UInt64 = 0
@@ -61,17 +63,23 @@ struct TextInputCapture: Codable, Sendable {
     contextDigest = try? model.inputContextDigest(target)
     model.registerInputCompletion(self)
   }
-  func update(text: String, selection: NSRange, marked: Bool, target: TextInputTarget) {
-    let next = DocumentSnapshot(id: id, title: "Chat input", text: text)
-    let changed = self.target != target || completionDocument?.revision != next.revision || caret != selection.location
-    self.target = target; completionDocument = next; caret = selection.location
+  func update(selection: NSRange, marked: Bool, target: TextInputTarget) {
+    guard let view else { invalidateGhost(); return }
+    let sourceVersion = view.sourceVersion
+    let sourceChanged = completionDocument == nil || documentSourceVersion != sourceVersion
+    let changed = self.target != target || sourceChanged || caret != selection.location
+    if sourceChanged {
+      completionDocument = DocumentSnapshot(id: id, title: "Chat input", text: view.string)
+      documentSourceVersion = sourceVersion
+    }
+    self.target = target; caret = selection.location
     if changed || marked || selection.length != 0 {
       invalidateGhost()
-      if view?.movingGhostBoundary != true {
-        bundle = nil; contextDigest = try? model?.inputContextDigest(target); view?.endGhostBoundary()
+      if !view.movingGhostBoundary {
+        bundle = nil; contextDigest = try? model?.inputContextDigest(target); view.endGhostBoundary()
       }
     }
-    if !marked, selection.length == 0, view?.movingGhostBoundary != true { schedule() }
+    if !marked, selection.length == 0, !view.movingGhostBoundary { schedule() }
   }
   func refresh() {
     guard let model, let digest = try? model.inputContextDigest(target) else {
@@ -87,15 +95,15 @@ struct TextInputCapture: Codable, Sendable {
   func invalidateGhost() {
     epoch &+= 1; flag?.cancel(); task?.cancel()
     flag = nil
-    ghostStamp = nil; ghostText = ""; view?.clearGhost()
+    ghostStamp = nil; stampedDocumentVersion = nil; ghostText = ""; view?.clearGhost()
   }
   func join() async { invalidateGhost(); if let task { await task.value } }
   private var eligible: Bool {
     guard let model, !model.isBusy, model.state.autocomplete, model.inputCompletionRunner != nil,
       let view, view.window?.firstResponder === view, !view.hasMarkedText(),
-      view.selectedRange().length == 0, caret > 0, let document = completionDocument,
-      let prefix = try? ProductCore.authoredPrefix(document, caret: caret) else { return false }
-    return !prefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      view.selectedRange().length == 0, caret > 0, completionDocument != nil,
+      view.sourceVersion == documentSourceVersion else { return false }
+    return true
   }
   func schedule(delay: Duration = .milliseconds(650)) {
     guard eligible, ghostStamp == nil, flag == nil, view?.hasGhostBoundary != true else { return }
@@ -114,6 +122,10 @@ struct TextInputCapture: Codable, Sendable {
         try await Task.sleep(for: delay)
         try operation.check()
         guard let self, let model, self.epoch == capturedEpoch, self.eligible else { return }
+        // Full-prefix validation belongs to this captured operation, after the
+        // debounce, not every status, selection or native layout callback.
+        let prefix = try ProductCore.authoredPrefix(document, caret: capturedCaret)
+        guard !prefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         let digest = try model.inputContextDigest(target)
         self.contextDigest = digest
         let capture = TextInputCapture(chatID: target.chatID, messageID: target.messageID,
@@ -123,7 +135,8 @@ struct TextInputCapture: Codable, Sendable {
         let result = try await model.generateInputCandidates(document: compiled, capture: capture,
           count: count, previous: previous, flag: operation) { [weak self] bundle in
             guard let self, self.epoch == capturedEpoch, !operation.isCancelled,
-              self.completionDocument?.revision == document.revision, self.caret == capturedCaret,
+              self.completionDocument?.textVersion == document.textVersion,
+              self.view?.sourceVersion == self.documentSourceVersion, self.caret == capturedCaret,
               self.target == target, (try? self.model?.inputContextDigest(target)) == digest,
               self.view?.hasMarkedText() == false else { operation.cancel(); return }
             var displayed = bundle
@@ -139,9 +152,17 @@ struct TextInputCapture: Codable, Sendable {
     }
   }
   private func present(_ text: String) {
-    guard let document = completionDocument, let view, !text.isEmpty,
-      view.string == document.text, view.selectedRange() == NSRange(location: caret, length: 0),
-      let stamp = try? GhostStamp(document: document, caretUTF16: caret, epoch: epoch) else { return }
+    guard let document = completionDocument, let view, !text.isEmpty, !view.hasMarkedText(),
+      view.sourceVersion == documentSourceVersion,
+      view.selectedRange() == NSRange(location: caret, length: 0) else { return }
+    let stamp: GhostStamp
+    if let current = ghostStamp, stampedDocumentVersion == document.textVersion,
+      current.caretUTF16 == caret, current.epoch == epoch {
+      stamp = current
+    } else {
+      guard let captured = try? GhostStamp(document: document, caretUTF16: caret, epoch: epoch) else { return }
+      stamp = captured; stampedDocumentVersion = document.textVersion
+    }
     ghostText = text; ghostStamp = stamp; view.showGhost(text, stamp: stamp)
   }
   func takeGhost(documentID: UUID, caret: Int) -> String? {
@@ -190,8 +211,12 @@ extension WorkspaceModel {
     let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
     guard let chat = selectedChat else { return Digest.sha256("null") }
     let digest: String
-    if let cached = inputContextCache, cached.0 == chat { digest = cached.1 }
-    else { digest = Digest.sha256(try encoder.encode(chat)); inputContextCache = (chat, digest) }
+    if let cached = inputContextCache, cached.id == chat.id, cached.version == chat.contentVersion {
+      digest = cached.digest
+    } else {
+      digest = Digest.sha256(try encoder.encode(chat))
+      inputContextCache = (id: chat.id, version: chat.contentVersion, digest: digest)
+    }
     let pending = target.messageID == nil && !target.instructions ? pendingAttachments : []
     return Digest.sha256(digest + pending.compactMap { id in state.attachments.first(where: { $0.id == id }).map { $0.id.uuidString + $0.rootDigest } }.joined())
   }

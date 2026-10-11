@@ -84,6 +84,8 @@ final class NativeReadingTextView: NativeMediaTextView {
   private let measurement = NativeTextMeasurement()
   private var presentation = NativeText.Presentation.markdown
   private var pointSize: CGFloat = 14
+  private var acknowledgedSource: String?
+  private var acknowledgedSourceVersion: UUID?
 
   override init(frame: NSRect, textContainer: NSTextContainer? = nil) {
     let container = textContainer ?? NSTextContainer(size: NSSize(width: frame.width, height: .greatestFiniteMagnitude))
@@ -104,9 +106,11 @@ final class NativeReadingTextView: NativeMediaTextView {
   required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
   func setSource(_ source: String, presentation: NativeText.Presentation = .markdown, pointSize: CGFloat = 14) {
-    guard string != source || self.presentation != presentation || self.pointSize != pointSize else { return }
+    let sourceChanged = acknowledgedSourceVersion != sourceVersion
+      || (acknowledgedSource.map { !($0 as NSString).isEqual(to: source) } ?? true)
+    guard sourceChanged || self.presentation != presentation || self.pointSize != pointSize else { return }
     self.presentation = presentation; self.pointSize = pointSize
-    string = source
+    if sourceChanged { string = source; acknowledgedSource = source }
     if presentation == .markdown {
       MarkdownStyle.apply(to: self, bodyFont: NSFont.systemFont(ofSize: pointSize), lineSpacing: 3, reading: true)
     } else {
@@ -119,6 +123,7 @@ final class NativeReadingTextView: NativeMediaTextView {
       if presentation == .removed { attributes[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
       textStorage?.setAttributes(attributes, range: NSRange(location: 0, length: source.utf16.count))
     }
+    acknowledgedSourceVersion = sourceVersion
     // Representables may be measured before updateNSView supplies their text.
     // Invalidate that initial empty measurement as well as subsequent edits.
     invalidateIntrinsicContentSize()

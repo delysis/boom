@@ -6,35 +6,6 @@ import XCTest
 @testable import Boom
 
 final class ManuscriptSizingTests: XCTestCase {
-  @MainActor private final class SizingDelegate: NSObject, NSTextViewDelegate {
-    weak var view: MarkdownTextView?
-    var measured: CGSize?
-    var nativeEditWasOpen = false
-    func textDidChange(_ notification: Notification) {
-      guard let view else { return }
-      nativeEditWasOpen = view.nativeEditInProgress
-      measured = view.manuscriptSize(width: 380, minimumHeight: 100)
-    }
-  }
-  @MainActor func testLiveEditSizingKeepsStableFrameUntilNativeEditFinishes() throws {
-    _ = NSApplication.shared
-    let view = MarkdownTextView(frame: .zero)
-    view.isRichText = false; view.isVerticallyResizable = false; view.isHorizontallyResizable = false
-    view.font = NSFont.systemFont(ofSize: 15)
-    let original = "The harbor was quiet.\n"
-    view.string = original
-    let stable = try XCTUnwrap(view.manuscriptSize(width: 380, minimumHeight: 100))
-    view.setFrameSize(stable)
-    let delegate = SizingDelegate(); delegate.view = view; view.delegate = delegate
-    let added = String(repeating: "More public prose.\n", count: 60)
-    view.insertText(added, replacementRange: NSRange(location: 0, length: 0))
-    XCTAssertTrue(delegate.nativeEditWasOpen, "Exercise the actual native text-change callback.")
-    XCTAssertEqual(delegate.measured, stable,
-      "Speculative sizing during a native edit must keep the stable frame until its deferred invalidation.")
-    let finished = try XCTUnwrap(view.manuscriptSize(width: 380, minimumHeight: 100))
-    XCTAssertGreaterThan(finished.height, stable.height)
-    XCTAssertEqual(view.string, added + original)
-  }
   @MainActor func testFullReplacementAfterUndoAndDocumentSwitchKeepsGlyphsValid() async throws {
     _ = NSApplication.shared
     let url = try XCTUnwrap(Bundle.module.url(forResource: "ManuscriptSizing", withExtension: "json", subdirectory: "Fixtures"))
@@ -196,30 +167,4 @@ final class ManuscriptSizingTests: XCTestCase {
       "Measurement must preserve the exact text of its source.")
   }
 
-  @MainActor func testUnchangedSizingReusesLayoutAndChangesStillMeasure() throws {
-    let storage = NSTextStorage(), layout = Layout(), container = NSTextContainer()
-    storage.addLayoutManager(layout); layout.addTextContainer(container)
-    let view = MarkdownTextView(frame: .zero, textContainer: container)
-    view.textContainerInset = NSSize(width: 28, height: 28)
-    view.string = String(repeating: "The harbor was quiet.\n", count: 800)
-    MarkdownStyle.apply(to: view)
-    view.setSelectedRange(NSRange(location: 3, length: 0))
-    let first = try XCTUnwrap(view.manuscriptSize(width: 480, minimumHeight: 100))
-    let firstGeometry = layout.geometryChanges
-    for _ in 0..<10 {
-      XCTAssertEqual(view.manuscriptSize(width: 480, minimumHeight: 100), first)
-    }
-    XCTAssertEqual(layout.geometryChanges, firstGeometry, "Status and streaming updates must not invalidate unchanged geometry.")
-    XCTAssertEqual(view.manuscriptSize(width: 480, minimumHeight: first.height + 100)?.height, first.height + 100)
-    XCTAssertEqual(layout.geometryChanges, firstGeometry, "A viewport-height change needs no geometry invalidation.")
-    _ = view.manuscriptSize(width: 320, minimumHeight: 100)
-    XCTAssertEqual(layout.geometryChanges, firstGeometry,
-      "A proposed width must not change the displayed text container.")
-    storage.replaceCharacters(in: NSRange(location: 0, length: 0), with: "🙂 added prose\n")
-    let changed = try XCTUnwrap(view.manuscriptSize(width: 320, minimumHeight: 100))
-    MarkdownStyle.apply(to: view, bodyFont: NSFont.systemFont(ofSize: 24), lineSpacing: 12)
-    let styled = try XCTUnwrap(view.manuscriptSize(width: 320, minimumHeight: 100))
-    XCTAssertGreaterThan(styled.height, changed.height)
-    XCTAssertEqual(view.string, "🙂 added prose\n" + String(repeating: "The harbor was quiet.\n", count: 800))
-  }
 }

@@ -44,6 +44,8 @@ extension WorkspaceStore {
   // final result after cancellation or the next attempt.
   func checkpoint(_ progress: GenerationProgress, identity: GenerationIdentity,
     stopReason: String?, stopTokenID: Int? = nil) throws {
+    let trace = PerformanceTrace.begin("Storage.Checkpoint")
+    defer { PerformanceTrace.end("Storage.Checkpoint", trace) }
     let previous = try generationCheckpoint(identity: identity)
     let next = try ProductCore.generationCheckpoint(
       GenerationCheckpoint(schema: 1, identity: identity, progress: progress, stopReason: stopReason, stopTokenID: stopTokenID),
@@ -51,6 +53,8 @@ extension WorkspaceStore {
     try vault.encode(next, kind: .generationJournal, id: identity.attemptID)
   }
   func generationCheckpoint(identity: GenerationIdentity) throws -> GenerationCheckpoint? {
+    let trace = PerformanceTrace.begin("Storage.CheckpointRead")
+    defer { PerformanceTrace.end("Storage.CheckpointRead", trace) }
     guard vault.exists(.generationJournal, identity.attemptID) else { return nil }
     return try ProductCore.generationCheckpoint(
       vault.decode(GenerationCheckpoint.self, kind: .generationJournal, id: identity.attemptID),

@@ -99,12 +99,18 @@ public struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
   public var promptText: String { context.isEmpty ? text : context + "\n\nUSER REQUEST\n" + text }
 }
 public struct ChatRecord: Codable, Equatable, Sendable, Identifiable {
+  private enum CodingKeys: String, CodingKey {
+    case id, title, messages, attachedDocumentID, instructions, messageVersions
+  }
   public let id: UUID
-  public var title: String
-  public var messages: [ChatMessage]
-  public var attachedDocumentID: UUID?
-  public var instructions: String?
-  public var messageVersions: [ChatMessage]?
+  public var title: String { didSet { contentVersion = UUID() } }
+  public var messages: [ChatMessage] { didSet { contentVersion = UUID() } }
+  public var attachedDocumentID: UUID? { didSet { contentVersion = UUID() } }
+  public var instructions: String? { didSet { contentVersion = UUID() } }
+  public var messageVersions: [ChatMessage]? { didSet { contentVersion = UUID() } }
+  /// Local ownership for cached context. Copies retain it; encoded-field edits
+  /// and decoding create a fresh identity. Never substitute it for a digest.
+  public private(set) var contentVersion = UUID()
   public init(
     id: UUID = UUID(), title: String = "New chat", messages: [ChatMessage] = [],
     attachedDocumentID: UUID? = nil, instructions: String? = nil
@@ -114,6 +120,16 @@ public struct ChatRecord: Codable, Equatable, Sendable, Identifiable {
     self.messages = messages
     self.attachedDocumentID = attachedDocumentID
     self.instructions = instructions
+  }
+  public static func == (left: Self, right: Self) -> Bool {
+    guard left.id == right.id else { return false }
+    if left.contentVersion == right.contentVersion { return true }
+    // Keep value equality after decoding, including Swift String's canonical
+    // semantics. Exact context ownership uses contentVersion and encoded SHA,
+    // never this independently constructed value fallback.
+    return left.title == right.title && left.messages == right.messages
+      && left.attachedDocumentID == right.attachedDocumentID
+      && left.instructions == right.instructions && left.messageVersions == right.messageVersions
   }
   public func branch(at messageID: UUID, includeMessage: Bool) throws -> ChatRecord {
     guard let index = messages.firstIndex(where: { $0.id == messageID }) else {

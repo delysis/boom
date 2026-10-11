@@ -52,6 +52,12 @@ actor GenerationCoordinator {
 
 /// Mutable model state is confined to this actor and ModelContainer.
 actor MLXGemmaRunner {
+  /// Time the existing fence without introducing another GPU wait.
+  private nonisolated static func synchronizeGPU() {
+    let trace = PerformanceTrace.begin("Model.FinalFence")
+    defer { PerformanceTrace.end("Model.FinalFence", trace) }
+    Stream.defaultStream.synchronize()
+  }
   struct PrefillProgress: Sendable {
     let operationID: UUID
     let processedPositions: Int
@@ -118,6 +124,8 @@ actor MLXGemmaRunner {
     struct Added: Decodable { let id: Int; let special: Bool }
   }
   static func load(admission: ModelPacks.Admission, prefillTokens: UInt32? = nil) async throws -> MLXGemmaRunner {
+    let trace = PerformanceTrace.begin("Model.Load")
+    defer { PerformanceTrace.end("Model.Load", trace) }
     let directory = admission.directory
     await GenerationCoordinator.shared.enter()
     do {
@@ -349,6 +357,8 @@ actor MLXGemmaRunner {
     request: String, routing: [String], images: [Data], media: [WritingMediaData] = [], reserves: [Int], flag: CancellationFlag,
     authority: CapturedDocumentAuthority = .readOnly
   ) async throws -> (plans: [ConsultationPlan], history: [ChatMessage], omittedHistory: Int) {
+    let trace = PerformanceTrace.begin("Request.ContextFit")
+    defer { PerformanceTrace.end("Request.ContextFit", trace) }
     guard voices.count == reserves.count else { throw BoomError.invalid("Every participant needs an output reservation.") }
     var retained = history.filter { $0.state == .complete }
     let originalCount = retained.count
@@ -371,6 +381,8 @@ actor MLXGemmaRunner {
   func completionRecipe(document: DocumentSnapshot, caret: Int, sources: [SourceReference],
     examples: [String], profile: SamplingProfile, maxTokens: Int, flag: CancellationFlag, batchWidth: Int = 1, media: [WritingMediaData] = []
   ) async throws -> CompletionRecipe {
+    let trace = PerformanceTrace.begin("Request.ContextFit")
+    defer { PerformanceTrace.end("Request.ContextFit", trace) }
     let capacity = try availableContext(batchWidth: batchWidth) - maxTokens
     let (selected, _) = try await writingContext(document: document, caret: caret, examples: examples,
       capacity: capacity, flag: flag, media: media)
@@ -472,14 +484,26 @@ actor MLXGemmaRunner {
     let capacity = try availableContext(batchWidth: seeds.count), policy = generationPolicy
     let prefill = try prefillParameters(onPrefill, operationID: flag.operationID)
     let controls = Set(policy.controlTokenIDs), ends = Set(policy.eosTokenIDs)
+    let containerTrace = PerformanceTrace.begin("Model.ContainerWait")
     return try await container.perform { (context: ModelContext) async throws -> [Output] in
-      try await InferenceExecutor.shared.perform { _ in
-        defer { Stream.defaultStream.synchronize() }
-        let input = try RawWritingInput.prepare(raw, media: media, context: context)
-        let promptIDs = input.text.tokens.asArray(Int.self)
-        try ProductCore.admitWritingBatch(width: seeds.count, prompt: promptIDs.count,
-          output: maxTokens, capacity: capacity)
-        let digest = Digest.sha256(try JSONEncoder().encode(promptIDs))
+      PerformanceTrace.end("Model.ContainerWait", containerTrace)
+      let executorTrace = PerformanceTrace.begin("Model.ExecutorWait")
+      return try await InferenceExecutor.shared.perform { _ in
+        PerformanceTrace.end("Model.ExecutorWait", executorTrace)
+        defer { Self.synchronizeGPU() }
+        let input = try {
+          let trace = PerformanceTrace.begin("Model.InputPrepare")
+          defer { PerformanceTrace.end("Model.InputPrepare", trace) }
+          return try RawWritingInput.prepare(raw, media: media, context: context)
+        }()
+        let (promptIDs, digest) = try {
+          let trace = PerformanceTrace.begin("Model.PromptReceipt")
+          defer { PerformanceTrace.end("Model.PromptReceipt", trace) }
+          let ids = input.text.tokens.asArray(Int.self)
+          try ProductCore.admitWritingBatch(width: seeds.count, prompt: ids.count,
+            output: maxTokens, capacity: capacity)
+          return (ids, Digest.sha256(try JSONEncoder().encode(ids)))
+        }()
         let parameters = GenerateParameters(maxTokens: maxTokens, temperature: settings.temperature,
           topP: settings.topP, topK: settings.topK, minP: settings.minP, repetitionPenalty: nil,
           prefill: prefill)
@@ -531,6 +555,8 @@ actor MLXGemmaRunner {
         var stops = Array<Int?>(repeating: nil, count: seeds.count)
         var elapsed = Array(repeating: 0.0, count: seeds.count)
         var decodePasses = 0
+        var firstTokenMarked = false
+        var firstTextMarked = false
         // Finished rows remain inert occupants of the original shape. They never
         // sample again or emit another checkpoint, and cannot affect other rows.
         let inertToken = policy.eosTokenIDs[0]
@@ -556,7 +582,13 @@ actor MLXGemmaRunner {
             if controls.contains(token) {
               reasons[lane] = ends.contains(token) ? "eos" : "model_control"; stops[lane] = token
             } else {
-              if first[lane] == nil { first[lane] = started.duration(to: clock.now).timeInterval }
+              if first[lane] == nil {
+                first[lane] = started.duration(to: clock.now).timeInterval
+                if !firstTokenMarked {
+                  firstTokenMarked = true
+                  PerformanceTrace.event("Model.FirstToken")
+                }
+              }
               tokens[lane].append(token)
               if tokens[lane].count == maxTokens { reasons[lane] = "output_limit" }
             }
@@ -569,7 +601,18 @@ actor MLXGemmaRunner {
               texts[lane] = decoded
             }
           }
-          if !updates.isEmpty { try await onCheckpoint?(updates) }
+          if !updates.isEmpty {
+            let firstText = !firstTextMarked && updates.contains { !$0.progress.text.isEmpty }
+            if firstText {
+              firstTextMarked = true
+              PerformanceTrace.event("Model.FirstDecodedText")
+            }
+            if let onCheckpoint {
+              let trace = firstText ? PerformanceTrace.begin("Model.FirstCheckpoint") : nil
+              defer { PerformanceTrace.end("Model.FirstCheckpoint", trace) }
+              try await onCheckpoint(updates)
+            }
+          }
           if reasons.contains(nil), !flag.isCancelled, !Task.isCancelled {
             logits = try autoreleasepool {
               let output = context.model(LMInput.Text(tokens: MLXArray(sampled).reshaped([seeds.count, 1])),
@@ -618,19 +661,30 @@ actor MLXGemmaRunner {
     let capacity = try availableContext(), policy = generationPolicy
     let prefill = try prefillParameters(onPrefill, operationID: flag.operationID)
     let controls = Set(policy.controlTokenIDs), ends = Set(policy.eosTokenIDs)
+    let containerTrace = PerformanceTrace.begin("Model.ContainerWait")
     return try await container.perform { (context: ModelContext) async throws -> Output in
-      try await InferenceExecutor.shared.perform { _ in
-        defer { Stream.defaultStream.synchronize() }
-        let input: LMInput
-        if let plan { input = try await Self.chatInput(plan, images: images, media: media, context: context) }
-        else if let raw { input = try RawWritingInput.prepare(raw, media: media, context: context) }
-        else { throw BoomError.invalid("No compiled model input.") }
-        let promptIDs = input.text.tokens.asArray(Int.self)
-        guard promptIDs.count + maxTokens <= capacity else { throw BoomError.budget("The request exceeds available context.") }
+      PerformanceTrace.end("Model.ContainerWait", containerTrace)
+      let executorTrace = PerformanceTrace.begin("Model.ExecutorWait")
+      return try await InferenceExecutor.shared.perform { _ in
+        PerformanceTrace.end("Model.ExecutorWait", executorTrace)
+        defer { Self.synchronizeGPU() }
+        let input: LMInput = try await {
+          let trace = PerformanceTrace.begin("Model.InputPrepare")
+          defer { PerformanceTrace.end("Model.InputPrepare", trace) }
+          if let plan { return try await Self.chatInput(plan, images: images, media: media, context: context) }
+          if let raw { return try RawWritingInput.prepare(raw, media: media, context: context) }
+          throw BoomError.invalid("No compiled model input.")
+        }()
+        let (promptIDs, preparedDigest) = try {
+          let trace = PerformanceTrace.begin("Model.PromptReceipt")
+          defer { PerformanceTrace.end("Model.PromptReceipt", trace) }
+          let ids = input.text.tokens.asArray(Int.self)
+          guard ids.count + maxTokens <= capacity else { throw BoomError.budget("The request exceeds available context.") }
+          return (ids, Digest.sha256(try JSONEncoder().encode(ids)))
+        }()
         let parameters = GenerateParameters(maxTokens: maxTokens, temperature: settings.temperature,
           topP: settings.topP, topK: settings.topK, minP: settings.minP, repetitionPenalty: nil,
           prefill: prefill, seed: seed)
-        let preparedDigest = Digest.sha256(try JSONEncoder().encode(promptIDs))
         // TokenIterator performs prompt prefill during task construction.
         // Start before it so first-token and elapsed time include that work.
         let clock = ContinuousClock(), started = clock.now
@@ -647,6 +701,7 @@ actor MLXGemmaRunner {
         var tokens: [Int] = [], text = "", ended = false, reason = "output_limit"
         var first: Double?; var stopToken: Int?
         var firstDeliveryQoS: UInt32?
+        var firstTextMarked = false
         do {
           for await event in stream {
             if flag.isCancelled || Task.isCancelled { task.cancel(); break }
@@ -667,11 +722,20 @@ actor MLXGemmaRunner {
               tokens.append(token)
               let decoded = context.tokenizer.decode(tokenIds: tokens)
               if !decoded.hasSuffix("\u{FFFD}"), decoded != text {
+                let firstText = !firstTextMarked && !decoded.isEmpty
+                if firstText {
+                  firstTextMarked = true
+                  PerformanceTrace.event("Model.FirstDecodedText")
+                }
                 // Every displayed update is durable before it reaches a view.
                 // Awaiting the store also bounds the checkpoint producer.
-                try await onCheckpoint?(GenerationProgress(text: decoded,
-                  tokenIDs: tokens, promptDigest: preparedDigest, promptTokens: promptIDs.count,
-                  firstTokenSeconds: first, elapsedSeconds: started.duration(to: clock.now).timeInterval), nil, nil)
+                if let onCheckpoint {
+                  let trace = firstText ? PerformanceTrace.begin("Model.FirstCheckpoint") : nil
+                  defer { PerformanceTrace.end("Model.FirstCheckpoint", trace) }
+                  try await onCheckpoint(GenerationProgress(text: decoded,
+                    tokenIDs: tokens, promptDigest: preparedDigest, promptTokens: promptIDs.count,
+                    firstTokenSeconds: first, elapsedSeconds: started.duration(to: clock.now).timeInterval), nil, nil)
+                }
                 text = decoded; onText(text)
               }
             case .info(let info):
@@ -685,11 +749,15 @@ actor MLXGemmaRunner {
           }
         } catch {
           task.cancel()
+          let joinTrace = PerformanceTrace.begin("Model.ProducerJoin")
           await task.value
+          PerformanceTrace.end("Model.ProducerJoin", joinTrace)
           throw error
         }
         if flag.isCancelled || Task.isCancelled { task.cancel() }
+        let joinTrace = PerformanceTrace.begin("Model.ProducerJoin")
         await task.value
+        PerformanceTrace.end("Model.ProducerJoin", joinTrace)
         // Joining must retain the producer's emitted tokens even on cancellation.
         // Callers persist this receipt before propagating their cancelled operation.
         if flag.isCancelled || Task.isCancelled { reason = "cancelled" }

@@ -45,7 +45,13 @@ struct CompletionSegment {
   @Published var selectedDocumentIDs: Set<UUID> = []
   @Published var selectedChatIDs: Set<UUID> = []
   @Published var composerFocusEpoch = 0
-  @Published var draft = "" { didSet { if draft != oldValue { retainComposerDraft() } } }
+  @Published var draft = "" {
+    didSet {
+      draftVersion = UUID()
+      retainComposerDraft()
+    }
+  }
+  private(set) var draftVersion = UUID()
   @Published var mode: InteractionMode = .ask
   @Published var pendingAttachments: [UUID] = [] { didSet { if pendingAttachments != oldValue { retainComposerDraft() } } }
   @Published var isBusy = false
@@ -173,7 +179,7 @@ struct CompletionSegment {
     init(_ value: TextInputCompletion) { self.value = value }
   }
   private var inputCompletions: [InputCompletionReference] = []
-  var inputContextCache: (ChatRecord, String)?
+  var inputContextCache: (id: UUID, version: UUID, digest: String)?
   func registerInputCompletion(_ input: TextInputCompletion) {
     inputCompletions.removeAll { $0.value == nil }
     inputCompletions.append(InputCompletionReference(input))
@@ -402,6 +408,8 @@ struct CompletionSegment {
     retainComposerDraft()
   }
   func flush() async throws {
+    let trace = PerformanceTrace.begin("Workspace.Flush")
+    defer { PerformanceTrace.end("Workspace.Flush", trace) }
     saveTask?.cancel()
     saveTask = nil
     retainComposerDraft(schedule: false)
@@ -670,6 +678,8 @@ struct CompletionSegment {
     do { try applyChat(chat) } catch { composerIssue = error.localizedDescription }
   }
   func updateDocument(_ text: String, id: UUID, caret: Int) {
+    let trace = PerformanceTrace.begin("Editor.Publish")
+    defer { PerformanceTrace.end("Editor.Publish", trace) }
     guard let index = documents.firstIndex(where: { $0.id == id }) else { return }
     invalidateGhost()
     documents[index].text = text
@@ -780,6 +790,7 @@ struct CompletionSegment {
   func work(_ label: String, after: (@MainActor () -> Void)? = nil,
     body: @escaping @MainActor (CancellationFlag) async throws -> Void) {
     guard !isBusy else { return }
+    let trace = PerformanceTrace.begin("Request.Work")
     cancelInputCompletions()
     invalidateGhost()
     let previousGhost = ghostTask
@@ -790,7 +801,12 @@ struct CompletionSegment {
     isBusy = true
     status = label
     foreground = Task { [weak self] in
-      if let previousGhost { await previousGhost.value }
+      defer { PerformanceTrace.end("Request.Work", trace) }
+      if let previousGhost {
+        let joinTrace = PerformanceTrace.begin("Request.PreviousProducerJoin")
+        await previousGhost.value
+        PerformanceTrace.end("Request.PreviousProducerJoin", joinTrace)
+      }
       guard let self else { return }
       var completed = false
       defer {
@@ -823,6 +839,7 @@ struct CompletionSegment {
     }
   }
   func cancel() {
+    PerformanceTrace.event("Request.CancelRequested")
     cancelInputCompletions()
     activeFlag?.cancel()
     foreground?.cancel()
@@ -866,6 +883,8 @@ struct CompletionSegment {
     }
   }
   func send(replay: ConsultationReplay? = nil) {
+    let captureTrace = PerformanceTrace.begin("Request.ConsultationCapture")
+    defer { PerformanceTrace.end("Request.ConsultationCapture", captureTrace) }
     if replay == nil { ensureChatForSend() }
     if replay == nil && authoredChatRole != nil { appendAuthoredChatMessage(); return }
     guard !isBusy, let chat = selectedChat, canInfer,
@@ -992,6 +1011,7 @@ struct CompletionSegment {
                 operationID: flag.operationID, recordID: replyID, attemptID: attemptID,
                 model: provider, seed: seed, requestDigest: Digest.sha256(plan.rawPrompt), maxTokens: outputLimit,
                 generationPolicy: runner.generationPolicy)
+              let deliveryTrace = PerformanceTrace.firstDelivery()
               let result = try await runner.run(plan: plan, images: images, media: media.media, maxTokens: outputLimit,
                 seed: seed, flag: flag, onCheckpoint: { progress, stop, token in
                   try await checkpointStore.checkpoint(progress, identity: generation, stopReason: stop, stopTokenID: token)
@@ -1005,6 +1025,7 @@ struct CompletionSegment {
                         self.state.chats[c].messages[m].state == .pending {
                         self.state.chats[c].messages[m].text = text
                       }
+                      deliveryTrace?.published()
                     }
                   }
                 }
@@ -1201,6 +1222,8 @@ struct CompletionSegment {
   }
   private func revalidateResponseSources(_ sources: [SourceReference], attachments: [SourceReference],
     targetID: UUID?) async throws {
+    let trace = PerformanceTrace.begin("Request.SourceValidation")
+    defer { PerformanceTrace.end("Request.SourceValidation", trace) }
     // The target's captured revision is checked by the Rust three-way merge.
     // Other sources, attachments and out-of-process disk writes remain guarded.
     let independent = sources.filter { $0.id != targetID }
@@ -1531,6 +1554,8 @@ struct CompletionSegment {
     if enabled { scheduleCompletion() }
   }
   func exploreWriting() {
+    let captureTrace = PerformanceTrace.begin("Request.WritingCapture")
+    defer { PerformanceTrace.end("Request.WritingCapture", captureTrace) }
     guard canExploreWriting, let document = selectedDocument else { return }
     let offset = caret, profile = samplingProfile
     writingIssue = nil; showingCandidates = true
@@ -1644,6 +1669,7 @@ struct CompletionSegment {
       let orderedMedia = try (recipe.media ?? []).map { reference -> WritingMediaData in
         guard let payload = media.first(where: { $0.reference == reference }) else { throw BoomError.stale(reference.name) }; return payload
       }
+      let deliveryTrace = PerformanceTrace.firstDelivery()
       let results = try await runner.runBatch(rawPrompt: recipe.prompt, media: orderedMedia, maxTokens: recipe.maxTokens,
           settings: recipe.settings, seeds: seeds, flag: flag, background: maxTokens == 64 && !showingCandidates,
           onCheckpoint: { [weak self] updates in
@@ -1671,6 +1697,7 @@ struct CompletionSegment {
                 }
               }
               owner.candidates = snapshot
+              if updates.contains(where: { !$0.progress.text.isEmpty }) { deliveryTrace?.published() }
               if owner.epoch == capturedEpoch, let selected = updates.first(where: { startIndex + $0.lane == snapshot.selected }) {
                 owner.showCandidateGhost(selected.progress.text, recipe: recipe, epoch: capturedEpoch)
               }
@@ -2201,6 +2228,8 @@ struct CompletionSegment {
     }
   }
   func consultationMedia(_ records: [AttachmentRecord], rawAudio: Bool, flag: CancellationFlag) async throws -> (images: [Data], media: [WritingMediaData]) {
+    let trace = PerformanceTrace.begin("Request.MediaInput")
+    defer { PerformanceTrace.end("Request.MediaInput", trace) }
     let readable = records.filter { !($0.kind == .audio && !rawAudio) }
     let links = readable.map { "[Attachment: media](boom-attachment:\($0.id))" }.joined(separator: "\n")
     let payloads = try await writingMedia(in: links, flag: flag)
@@ -2295,6 +2324,8 @@ struct CompletionSegment {
     status = "The inactive model was released to preserve context. It will reload when needed."
   }
   func runnerForGeneration(_ purpose: ModelPurpose, flag: CancellationFlag) async throws -> MLXGemmaRunner {
+    let trace = PerformanceTrace.begin("Request.ModelReady")
+    defer { PerformanceTrace.end("Request.ModelReady", trace) }
     try flag.check()
     try await retainPairIfUseful(for: purpose)
     if let runner = purpose == .consultation ? mlxRunner : baseRunner { return runner }

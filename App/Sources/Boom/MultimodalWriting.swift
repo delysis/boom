@@ -131,6 +131,8 @@ enum RawWritingInput {
 
 extension WorkspaceModel {
   func writingMedia(in text: String, flag: CancellationFlag) async throws -> [WritingMediaData] {
+    let trace = PerformanceTrace.begin("Request.MediaInput")
+    defer { PerformanceTrace.end("Request.MediaInput", trace) }
     let spans: [InlineMediaSpan] = try ProductCore.call(["op": "media_spans", "text": text])
     var records: [AttachmentRecord] = []
     for span in spans where !records.contains(where: { $0.id == span.id }) {

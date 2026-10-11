@@ -231,9 +231,13 @@ struct InlineMediaSpan: Decodable {
     refresh()
   }
   func refresh() {
+    let trace = PerformanceTrace.begin("Editor.MediaRefresh")
+    defer { PerformanceTrace.end("Editor.MediaRefresh", trace) }
     guard let view, let storage = view.textStorage else { return }
     let version = view.sourceVersion
     if parsedSourceVersion != version {
+      let trace = PerformanceTrace.begin("Editor.MediaParse")
+      defer { PerformanceTrace.end("Editor.MediaParse", trace) }
       spans = (try? ProductCore.call(["op": "media_spans", "text": storage.string])) ?? []
       parsedSourceVersion = version
     }
@@ -266,6 +270,8 @@ struct InlineMediaSpan: Decodable {
     project()
   }
   func project() {
+    let trace = PerformanceTrace.begin("Editor.MediaProject")
+    defer { PerformanceTrace.end("Editor.MediaProject", trace) }
     guard let view, let storage = view.textStorage else { return }
     let desired = spans.compactMap { span -> (NSRange, InlineMediaItem)? in
       guard NSMaxRange(span.range) <= storage.length, let item = items[span.id] else { return nil }
@@ -293,6 +299,8 @@ struct InlineMediaSpan: Decodable {
     positionViews()
   }
   func positionViews() {
+    let trace = PerformanceTrace.begin("Editor.MediaLayout")
+    defer { PerformanceTrace.end("Editor.MediaLayout", trace) }
     if spans.isEmpty {
       for host in hosts.values { host.removeFromSuperview() }
       hosts.removeAll()

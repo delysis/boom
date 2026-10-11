@@ -9,6 +9,7 @@ struct ChatTextEditor: View {
   var completionModel: WorkspaceModel? = nil
   var completionTarget: TextInputTarget? = nil
   @State private var text: String
+  @State private var textVersion = UUID()
   @State private var failure: String?
   @State private var contentHeight: CGFloat = 22
   init(label: String, text: String, completionModel: WorkspaceModel? = nil,
@@ -19,10 +20,12 @@ struct ChatTextEditor: View {
   }
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
-      ChatComposer(text: $text, focusRequest: 1, onSend: commit, onCancel: cancel,
+      ChatComposer(text: Binding(get: { text }, set: { text = $0; textVersion = UUID() }),
+        focusRequest: 1, onSend: commit, onCancel: cancel,
         placeholder: "", accessibilityLabel: label, lineSpacing: 3,
         onContentHeight: { contentHeight = $0 }, showsEditingActions: true,
-        completionModel: completionModel, completionTarget: completionTarget)
+        completionModel: completionModel, completionTarget: completionTarget, textVersion: textVersion,
+        currentTextVersion: { textVersion })
         .frame(height: min(240, max(22, contentHeight)) + 32)
       if let failure { Text(failure).font(.caption).foregroundStyle(.red) }
     }.padding(8)
@@ -168,6 +171,7 @@ struct WritingExamplesView: View {
   @State private var adding = false
   @State private var title = ""
   @State private var prose = ""
+  @State private var proseVersion = UUID()
   @State private var failure: String?
   var body: some View {
     VStack(alignment: .leading, spacing: 16) {
@@ -192,15 +196,17 @@ struct WritingExamplesView: View {
       if adding {
         TextField("Title", text: $title).accessibilityLabel("Example title")
           .help("The title is only for your library.")
-        ChatComposer(text: $prose, focusRequest: 0, onSend: {}, onCancel: {},
-          placeholder: "Prose", accessibilityLabel: "Example prose").frame(height: 180)
+        ChatComposer(text: Binding(get: { prose }, set: { prose = $0; proseVersion = UUID() }),
+          focusRequest: 0, onSend: {}, onCancel: {},
+          placeholder: "Prose", accessibilityLabel: "Example prose", textVersion: proseVersion,
+          currentTextVersion: { proseVersion }).frame(height: 180)
           .accessibilityLabel("Example prose")
         HStack {
           Spacer()
           Button("Add") {
             do {
               try model.addWritingExample(title: title, prose: prose, manuscriptID: request.manuscriptID)
-              title = ""; prose = ""; adding = false; failure = nil
+              title = ""; prose = ""; proseVersion = UUID(); adding = false; failure = nil
             } catch { failure = error.localizedDescription }
           }.disabled(prose.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }

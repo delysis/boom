@@ -42,6 +42,8 @@ private struct MarkdownSpan: Decodable {
       }
   }
   static func apply(to view: NSTextView, bodyFont: NSFont? = nil, lineSpacing: CGFloat = 4, reading: Bool = false) {
+    let trace = PerformanceTrace.begin("Editor.Style")
+    defer { PerformanceTrace.end("Editor.Style", trace) }
     guard let current = view.textStorage else { return }
     // Compute the same projection without invalidating the live text layout.
     // Most inserted prose already has its correct native typing attributes.
@@ -73,7 +75,11 @@ private struct MarkdownSpan: Decodable {
       guard let regex = try? NSRegularExpression(pattern: pattern) else { return }
       for result in regex.matches(in: storage.string, range: full) { action(result) }
     }
-    let spans: [MarkdownSpan] = (try? ProductCore.call(["op": "markdown_spans", "text": storage.string])) ?? []
+    let spans: [MarkdownSpan] = {
+      let trace = PerformanceTrace.begin("Editor.MarkdownParse")
+      defer { PerformanceTrace.end("Editor.MarkdownParse", trace) }
+      return (try? ProductCore.call(["op": "markdown_spans", "text": storage.string])) ?? []
+    }()
     for span in spans where span.kind != "syntax" {
       let range = NSRange(location: span.location, length: span.length)
       guard NSMaxRange(range) <= text.length else { continue }
@@ -142,6 +148,8 @@ private struct MarkdownSpan: Decodable {
     ]
   }
   private static func synchronize(_ desired: NSAttributedString, into current: NSTextStorage) {
+    let trace = PerformanceTrace.begin("Editor.StyleSynchronize")
+    defer { PerformanceTrace.end("Editor.StyleSynchronize", trace) }
     let owned: Set<NSAttributedString.Key> = [
       .font, .foregroundColor, .paragraphStyle, .backgroundColor,
       .strikethroughStyle, .underlineStyle,

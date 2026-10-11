@@ -26,19 +26,6 @@ import SwiftUI
   }
   private var searchRanges: [NSRange] = []
   private var searchIdentity: String?
-  private let measurement = NativeTextMeasurement()
-  func manuscriptSize(width: CGFloat, minimumHeight: CGFloat) -> CGSize? {
-    guard width.isFinite, width > 0, let storage = textStorage, let container = textContainer else { return nil }
-    // AppKit will invalidate sizing after the native edit closes. Measuring
-    // its intermediate storage here would replace the isolated glyph graph
-    // before that edit's incremental notification can update it.
-    guard prepareTextLayout() else {
-      return CGSize(width: width, height: max(minimumHeight, bounds.height))
-    }
-    return CGSize(width: width, height: max(minimumHeight,
-      measurement.height(of: storage, width: width, insets: textContainerInset,
-        fragmentPadding: container.lineFragmentPadding), completionDisplayHeight))
-  }
   override func completionDisplayDidChange() {
     super.completionDisplayDidChange()
     if isVerticallyResizable, prepareTextLayout() { sizeToFit() }
