@@ -25,12 +25,27 @@ import SwiftUI
       measurement.height(of: storage, width: width, insets: textContainerInset,
         fragmentPadding: container.lineFragmentPadding), completionDisplayHeight))
   }
-  override func completionDisplayDidChange() { super.completionDisplayDidChange(); invalidateIntrinsicContentSize() }
+  override func completionDisplayDidChange() {
+    super.completionDisplayDidChange()
+    if isVerticallyResizable, prepareTextLayout() { sizeToFit() }
+    invalidateIntrinsicContentSize()
+  }
+  override func sizeToFit() {
+    super.sizeToFit()
+    if isVerticallyResizable, hasVisibleGhost, prepareTextLayout() {
+      let height = max(minSize.height, completionDisplayHeight, frame.height)
+      if height != frame.height { setFrameSize(NSSize(width: frame.width, height: height)) }
+    }
+  }
   override func setFrameSize(_ newSize: NSSize) {
     let changed = frame.width != newSize.width
     super.setFrameSize(newSize)
-    textContainer?.size = NSSize(width: max(1, newSize.width - textContainerInset.width * 2),
-      height: .greatestFiniteMagnitude)
+    if let container = textContainer {
+      let width = max(1, newSize.width - textContainerInset.width * 2)
+      if container.size.width != width {
+        container.size = NSSize(width: width, height: .greatestFiniteMagnitude)
+      }
+    }
     if changed { invalidateIntrinsicContentSize() }
   }
   func highlightSearch(_ ranges: [NSRange], identity: String?) {
@@ -266,12 +281,42 @@ import SwiftUI
   }
 }
 
+/// The native text view owns scrolling and its actual document extent. SwiftUI
+/// proposes a viewport, never a speculative full-manuscript layout.
+@MainActor final class ManuscriptScrollView: NSScrollView {
+  let editor: MarkdownTextView
+  init(editor: MarkdownTextView) {
+    self.editor = editor
+    super.init(frame: .zero)
+    borderType = .noBorder
+    drawsBackground = false
+    hasVerticalScroller = true
+    autohidesScrollers = true
+    documentView = editor
+  }
+  required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+  override func layout() {
+    super.layout()
+    let viewport = contentView.bounds.size
+    guard viewport.width.isFinite, viewport.width > 0, viewport.height.isFinite else { return }
+    let inset = NSSize(width: 28 + max(0, viewport.width - WorkspaceGeometry.proseMaximumWidth) / 2,
+      height: 28)
+    let height = max(1, viewport.height)
+    let changed = editor.frame.width != viewport.width || editor.textContainerInset != inset
+      || editor.minSize.height != height
+    guard changed else { return }
+    editor.textContainerInset = inset
+    editor.minSize = NSSize(width: 0, height: height)
+    editor.setFrameSize(NSSize(width: viewport.width, height: max(height, editor.frame.height)))
+    if editor.prepareTextLayout() { editor.sizeToFit() }
+  }
+}
+
 struct MarkdownEditor: NSViewRepresentable {
   @ObservedObject var model: WorkspaceModel
   let document: DocumentSnapshot
-  let minimumHeight: CGFloat
   func makeCoordinator() -> Coordinator { Coordinator(model: model) }
-  func makeNSView(context: Context) -> MarkdownTextView {
+  func makeNSView(context: Context) -> ManuscriptScrollView {
     let storage = NSTextStorage()
     let layout = NSLayoutManager()
     layout.allowsNonContiguousLayout = true
@@ -291,7 +336,7 @@ struct MarkdownEditor: NSViewRepresentable {
     text.allowsUndo = true
     text.isEditable = true
     text.isSelectable = true
-    text.isVerticallyResizable = false
+    text.isVerticallyResizable = true
     text.isHorizontallyResizable = false
     text.autoresizingMask = [.width]
     text.minSize = NSSize(width: 0, height: 0)
@@ -318,9 +363,10 @@ struct MarkdownEditor: NSViewRepresentable {
     text.isEditable = !model.editingLocked
     update(text)
     updateSearch(text)
-    return text
+    return ManuscriptScrollView(editor: text)
   }
-  func updateNSView(_ text: MarkdownTextView, context: Context) {
+  func updateNSView(_ viewport: ManuscriptScrollView, context: Context) {
+    let text = viewport.editor
     let trace = PerformanceTrace.begin("Editor.Update")
     defer { PerformanceTrace.end("Editor.Update", trace) }
     model.editor = text
@@ -341,10 +387,11 @@ struct MarkdownEditor: NSViewRepresentable {
     view.highlightSearch(ranges, identity: model.librarySearch.isEmpty ? nil : document.id.uuidString + "\n" + model.librarySearch)
   }
   func sizeThatFits(
-    _ proposal: ProposedViewSize, nsView text: MarkdownTextView, context: Context
+    _ proposal: ProposedViewSize, nsView viewport: ManuscriptScrollView, context: Context
   ) -> CGSize? {
-    guard let width = proposal.width else { return nil }
-    return text.manuscriptSize(width: width, minimumHeight: minimumHeight)
+    guard let width = proposal.width, let height = proposal.height,
+      width.isFinite, height.isFinite, width > 0, height > 0 else { return nil }
+    return CGSize(width: width, height: height)
   }
   private func update(_ text: MarkdownTextView) {
     // A representable can carry a prior render's value during an AppKit edit.

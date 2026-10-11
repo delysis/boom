@@ -67,15 +67,8 @@ struct ManuscriptPane: View {
     GeometryReader { pane in
       VStack(spacing: 0) {
         if let document = model.selectedDocument {
-          GeometryReader { viewport in
-            ScrollView(.vertical) {
-              let width = min(WorkspaceGeometry.proseMaximumWidth, max(1, viewport.size.width))
-              MarkdownEditor(model: model, document: document,
-                minimumHeight: max(1, viewport.size.height))
-              .frame(width: width)
-              .frame(maxWidth: .infinity)
-            }
-          }
+          MarkdownEditor(model: model, document: document)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
           Color.clear.accessibilityLabel("No document selected")
             .frame(maxWidth: .infinity, maxHeight: .infinity)
