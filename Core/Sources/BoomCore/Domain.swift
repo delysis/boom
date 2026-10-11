@@ -17,14 +17,22 @@ public enum BoomError: Error, LocalizedError, Equatable {
   }
 }
 public struct DocumentSnapshot: Codable, Equatable, Identifiable, Sendable {
+  private enum CodingKeys: String, CodingKey { case id, title, text }
   public let id: UUID
   public var title: String
-  public var text: String
+  public var text: String { didSet { textVersion = UUID() } }
+  /// Local change identity for native synchronization. Never encoded or used
+  /// in place of the content digest for authorization, evidence or replay.
+  public private(set) var textVersion = UUID()
   public var revision: String { Digest.sha256(text) }
   public init(id: UUID = UUID(), title: String, text: String) {
     self.id = id
     self.title = title
     self.text = text
+  }
+  public static func == (left: Self, right: Self) -> Bool {
+    left.id == right.id && left.title == right.title
+      && (left.textVersion == right.textVersion || left.text.utf8.elementsEqual(right.text.utf8))
   }
 }
 public enum Role: String, Codable, Sendable { case user, assistant }

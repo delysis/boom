@@ -309,7 +309,8 @@ struct CompletionSegment {
             } ?? ""
             let title = try ProductCore.search(document.title + "\n" + importedPath, query: query)
             if matches.hasMatches || title.hasMatches {
-              documents[document.id] = DocumentSearchMatches(query: query, revision: document.revision, matches: matches)
+              documents[document.id] = DocumentSearchMatches(query: query, revision: document.revision,
+                textVersion: document.textVersion, matches: matches)
             }
           }
           for chat in capturedChats {

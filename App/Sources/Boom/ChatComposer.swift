@@ -93,7 +93,8 @@ func nativeEditEvent(_ event: String) {
     super.pasteAsPlainText(sender)
   }
   override func setAccessibilityValue(_ value: Any?) {
-    guard isEditable, !hasMarkedText(), let value = value as? String, value != string else { return }
+    guard isEditable, !hasMarkedText(), let value = value as? String,
+      !(string as NSString).isEqual(to: value) else { return }
     // Accessibility edits must take the same change/Undo path as typing, so
     // the displayed text and the bound draft cannot silently diverge.
     insertText(value, replacementRange: NSRange(location: 0, length: (string as NSString).length))

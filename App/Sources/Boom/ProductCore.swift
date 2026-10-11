@@ -333,6 +333,7 @@ struct SearchMatches: Codable, Sendable {
 struct DocumentSearchMatches: Sendable {
   let query: String
   let revision: String
+  let textVersion: UUID
   let matches: SearchMatches
 }
 struct VoiceExchange: Codable, Equatable, Sendable {

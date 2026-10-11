@@ -102,6 +102,28 @@ struct InlineMediaSpan: Decodable {
 
 @MainActor class NativeMediaTextView: NSTextView {
   let inlineMedia = NativeInlineMedia()
+  private weak var observedSource: NSTextStorage?
+  private var characterVersion = UUID()
+  /// Character edits invalidate source consumers; display attributes do not.
+  /// Rebinding a text container also starts a new source identity.
+  var sourceVersion: UUID {
+    if observedSource !== textStorage {
+      NotificationCenter.default.removeObserver(self, name: NSTextStorage.didProcessEditingNotification, object: nil)
+      observedSource = textStorage
+      characterVersion = UUID()
+      if let storage = textStorage {
+        NotificationCenter.default.addObserver(self, selector: #selector(sourceDidEdit(_:)),
+          name: NSTextStorage.didProcessEditingNotification, object: storage)
+      }
+    }
+    return characterVersion
+  }
+  @objc private func sourceDidEdit(_ notification: Notification) {
+    guard let storage = notification.object as? NSTextStorage, storage === observedSource,
+      storage.editedMask.contains(.editedCharacters) else { return }
+    characterVersion = UUID()
+  }
+  deinit { NotificationCenter.default.removeObserver(self) }
   private var deferredLayout = false
   private var nativeEditDepth = 0
   var nativeEditInProgress: Bool { nativeEditDepth > 0 }
@@ -202,7 +224,7 @@ struct InlineMediaSpan: Decodable {
   private var items: [UUID: InlineMediaItem] = [:]
   private var tasks: [UUID: Task<Void, Never>] = [:]
   private var hosts: [String: InlineMediaHost] = [:]
-  private var source: String?
+  private var parsedSourceVersion: UUID?
   func configure(model: WorkspaceModel?) {
     if self.model !== model { stop() }
     self.model = model
@@ -210,9 +232,10 @@ struct InlineMediaSpan: Decodable {
   }
   func refresh() {
     guard let view, let storage = view.textStorage else { return }
-    if source != storage.string {
-      source = storage.string
+    let version = view.sourceVersion
+    if parsedSourceVersion != version {
       spans = (try? ProductCore.call(["op": "media_spans", "text": storage.string])) ?? []
+      parsedSourceVersion = version
     }
     let records = model?.state.attachments ?? []
     let ids = Set(spans.map(\.id))

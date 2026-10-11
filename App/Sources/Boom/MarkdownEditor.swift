@@ -6,8 +6,22 @@ import SwiftUI
   weak var owner: WorkspaceModel? { didSet { completionClient = owner } }
   var documentUndo: UndoManager?
   var applyingExternal = false
+  private var documentTextVersion: UUID?
+  private var displayedSourceVersion: UUID?
+  func displays(_ document: DocumentSnapshot) -> Bool {
+    documentID == document.id && documentTextVersion == document.textVersion
+      && displayedSourceVersion == sourceVersion
+  }
+  /// Call only after assigning a captured model source or publishing a native
+  /// edit to that model. Status updates need no manuscript read or comparison.
+  func synchronized(with document: DocumentSnapshot) {
+    guard documentID == document.id else { return }
+    documentTextVersion = document.textVersion
+    displayedSourceVersion = sourceVersion
+  }
   override func setAccessibilityValue(_ value: Any?) {
-    guard isEditable, !hasMarkedText(), let value = value as? String, value != string else { return }
+    guard isEditable, !hasMarkedText(), let value = value as? String,
+      !(string as NSString).isEqual(to: value) else { return }
     insertText(value, replacementRange: NSRange(location: 0, length: string.utf16.count))
   }
   private var searchRanges: [NSRange] = []
@@ -314,7 +328,7 @@ import SwiftUI
 
 struct MarkdownEditor: NSViewRepresentable {
   @ObservedObject var model: WorkspaceModel
-  let document: DocumentSnapshot
+  let documentID: UUID
   func makeCoordinator() -> Coordinator { Coordinator(model: model) }
   func makeNSView(context: Context) -> ManuscriptScrollView {
     let storage = NSTextStorage()
@@ -328,8 +342,8 @@ struct MarkdownEditor: NSViewRepresentable {
     let text = MarkdownTextView(frame: .zero, textContainer: container)
     text.owner = model
     text.setMedia(model: model)
-    text.documentID = document.id
-    text.documentUndo = model.undoManager(document.id)
+    text.documentID = documentID
+    text.documentUndo = model.undoManager(documentID)
     text.delegate = context.coordinator
     text.isRichText = false
     text.importsGraphics = false
@@ -378,12 +392,13 @@ struct MarkdownEditor: NSViewRepresentable {
   private func updateSearch(_ view: MarkdownTextView) {
     let trace = PerformanceTrace.begin("Editor.SearchUpdate")
     defer { PerformanceTrace.end("Editor.SearchUpdate", trace) }
-    guard !view.nativeEditInProgress, let document = model.selectedDocument,
+    guard view.prepareTextLayout(), let document = model.selectedDocument,
       view.documentID == document.id else { return }
-    let found = model.documentSearch[document.id]
-    let valid = !view.hasMarkedText() && view.string == document.text && found?.revision == document.revision
-      && found?.query == model.librarySearch
-    let ranges = valid ? found?.matches.ranges.map(\.native) ?? [] : []
+    let ranges: [NSRange]
+    if let found = model.documentSearch[document.id], found.query == model.librarySearch,
+      found.textVersion == document.textVersion, !view.hasMarkedText(), view.displays(document) {
+      ranges = found.matches.ranges.map(\.native)
+    } else { ranges = [] }
     view.highlightSearch(ranges, identity: model.librarySearch.isEmpty ? nil : document.id.uuidString + "\n" + model.librarySearch)
   }
   func sizeThatFits(
@@ -397,10 +412,10 @@ struct MarkdownEditor: NSViewRepresentable {
     // A representable can carry a prior render's value during an AppKit edit.
     // AppKit publishes that edit through its delegate before another model
     // snapshot may replace it. Resolve the live document after that boundary.
-    guard !text.nativeEditInProgress, let document = model.selectedDocument else { return }
+    guard text.prepareTextLayout(), let document = model.selectedDocument else { return }
     // SwiftUI status/streaming updates must never overwrite in-flight marked text.
     if text.documentID == document.id, text.hasMarkedText() { return }
-    if text.documentID != document.id || text.string != document.text {
+    if !text.displays(document) {
       text.applyingExternal = true
       defer { text.applyingExternal = false }
       let changedDocument = text.documentID != document.id
@@ -414,6 +429,7 @@ struct MarkdownEditor: NSViewRepresentable {
       text.invalidateIntrinsicContentSize()
       text.setSelectedRange(
         NSRange(location: min(selection.location, (document.text as NSString).length), length: 0))
+      text.synchronized(with: document)
     }
   }
   @MainActor final class Coordinator: NSObject, NSTextViewDelegate {
@@ -441,6 +457,9 @@ struct MarkdownEditor: NSViewRepresentable {
       }
       MarkdownStyle.apply(to: view)
       model.updateDocument(view.string, id: view.documentID, caret: view.selectedRange().location)
+      if let document = model.documents.first(where: { $0.id == view.documentID }) {
+        view.synchronized(with: document)
+      }
       view.invalidateIntrinsicContentSize()
     }
     func textViewDidChangeSelection(_ notification: Notification) {

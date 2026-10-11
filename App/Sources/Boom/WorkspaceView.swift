@@ -66,8 +66,8 @@ struct ManuscriptPane: View {
   var body: some View {
     GeometryReader { pane in
       VStack(spacing: 0) {
-        if let document = model.selectedDocument {
-          MarkdownEditor(model: model, document: document)
+        if let documentID = model.state.selectedDocument, model.documents.contains(where: { $0.id == documentID }) {
+          MarkdownEditor(model: model, documentID: documentID)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
           Color.clear.accessibilityLabel("No document selected")
@@ -229,7 +229,8 @@ struct LibraryView: View {
           heading("Documents") {
             do { try model.newDocument() } catch { model.report(error) }
           }
-          ForEach(model.documents.filter { model.state.importedFiles?[$0.id]?.folderID == nil && model.documentMatchesSearch($0) }) { document in
+          ForEach(model.documents.filter { model.state.importedFiles?[$0.id]?.folderID == nil && model.documentMatchesSearch($0) }
+            .map { DocumentIndex(id: $0.id, title: $0.title) }, id: \.id) { document in
             Group {
               if renameTarget == .document(document.id) {
                 editableRow(symbol: "doc.text", selected: true)

@@ -4,7 +4,7 @@ import Foundation
 import BoomCore
 import Security
 
-struct DocumentIndex: Codable, Sendable {
+struct DocumentIndex: Codable, Equatable, Sendable {
   let id: UUID
   var title: String
 }
