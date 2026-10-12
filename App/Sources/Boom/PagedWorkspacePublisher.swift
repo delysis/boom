@@ -12,6 +12,7 @@ struct EncodedPagedWorkspace: Sendable {
   fileprivate let vault: Vault
   fileprivate let ownerID: UUID
   var partCount: Int { reference.partCount }
+  var plaintextBytes: Int { reference.plaintextBytes }
 }
 struct PreparedPagedWorkspace: Sendable {
   let reference: PagedWorkspaceObjectReference

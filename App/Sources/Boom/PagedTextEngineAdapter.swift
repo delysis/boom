@@ -1754,7 +1754,7 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
         let encoded = try await performStreamIO {
           guard !cancellation.isCancelled else { throw CancellationError() }
           let encoded = try publisher.encodeWorkspace(state)
-          guard encoded.reference.plaintextBytes <= PagedSQLPublicPreparedWorkspace.maximumEncodedBytes else {
+          guard encoded.plaintextBytes <= PagedSQLPublicPreparedWorkspace.maximumEncodedBytes else {
             throw BoomError.budget("Public publisher control exceeds its explicit 1MiB encoded fixture bound.")
           }
           return encoded
