@@ -1,5 +1,5 @@
 //! Bound requested buffer growth while JSON is being encoded.
-use serde_json::Value;
+use serde::Serialize;
 use std::io::{self, Write};
 
 pub(super) enum EncodingError {
@@ -46,7 +46,7 @@ impl Write for BoundedWriter {
     }
 }
 
-pub(super) fn encode(value: &Value, limit: usize) -> Result<Vec<u8>, EncodingError> {
+pub(super) fn encode(value: &impl Serialize, limit: usize) -> Result<Vec<u8>, EncodingError> {
     let mut writer = BoundedWriter {
         bytes: Vec::new(),
         limit,

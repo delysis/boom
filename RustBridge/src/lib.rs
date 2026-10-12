@@ -1,6 +1,6 @@
-//! In-process C boundary for the existing, authority-free attachment host.
-//! Unsafe code is confined to borrowed C slices and returning/freeing one Box<[u8]>.
-//! No filesystem paths, network handles, model handles or subprocess APIs exist here.
+//! In-process C boundaries for product policy, attachments and paged text.
+//! Paged I/O uses host-owned authenticated callbacks, separate from model policy.
+//! Unsafe code is confined to C buffers and those callbacks; no keys or paths cross.
 use attachment_native_host::{AttachmentHost, AttachmentHostConfig, ProvidedAttachment};
 use attachment_native_types::{DetectedFormat, MediaFamily, PreparedPart, TargetCapabilities};
 use serde_json::{json, Value};
@@ -11,6 +11,10 @@ use std::{
 };
 
 mod encoding;
+mod paged_text;
+pub use paged_text::{
+    bloom_text_close, bloom_text_create, bloom_text_request, BloomTextHost, BloomTextOperation,
+};
 
 const MAX_INPUT: usize = 64 * 1024 * 1024;
 const MAX_OUTPUT: usize = 8 * 1024 * 1024;

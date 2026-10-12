@@ -283,6 +283,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-text"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "bloom-tokenizer-reference"
 version = "0.1.0"
 dependencies = [
@@ -310,8 +321,11 @@ dependencies = [
  "attachment-native-host",
  "attachment-native-types",
  "bloom-core",
+ "bloom-text",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
+ "uuid",
 ]
 
 [[package]]

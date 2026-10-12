@@ -11,6 +11,28 @@ final class GeneratedTextTests: XCTestCase {
     XCTAssertEqual(try ProductCore.authoredPrefix(doc, caret: 10), "é🦋 before")
     XCTAssertThrowsError(try ProductCore.authoredPrefix(doc, caret: 2))
   }
+  @MainActor func testNativeWritingAvailabilityMatchesActualPrefixAcrossUnicodeCarets() {
+    for source in ["", " \t\n\r\u{00a0}\u{202f}", "  a🙂 after", "e\u{301} after",
+      "👩‍💻 after", "🇺🇸 after", "x\r\ny", "\u{200b} after"] {
+      let document = DocumentSnapshot(title: "Public", text: source)
+      for caret in [-1] + Array(0...source.utf16.count) + [Int.max] {
+        let expected = (try? ProductCore.authoredPrefix(document, caret: caret))
+          .map { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } ?? false
+        XCTAssertEqual(MarkdownTextView.hasAuthoredPrefix(document, caret: caret), expected,
+          "Source \(source.debugDescription), caret \(caret)")
+      }
+    }
+  }
+  @MainActor func testNativeWritingAvailabilityPreservesActualUTF8ManuscriptBudget() {
+    for source in [String(repeating: "a", count: 2_097_152),
+      String(repeating: "a", count: 2_097_153),
+      String(repeating: "€", count: 699_050), String(repeating: "€", count: 699_051)] {
+      let document = DocumentSnapshot(title: "Public", text: source)
+      let expected = (try? ProductCore.authoredPrefix(document, caret: 1))
+        .map { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } ?? false
+      XCTAssertEqual(MarkdownTextView.hasAuthoredPrefix(document, caret: 1), expected)
+    }
+  }
   func testCapturedVoiceRevisionAndSpeakerAttribution() throws {
     let first = try ProductCore.voice(VoiceDraft(slug: "sage", name: "Sage", instructions: "First approach"))
     var edited = first.draft; edited.instructions = "A new approach"; edited.name = "Renamed"

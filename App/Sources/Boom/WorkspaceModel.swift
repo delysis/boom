@@ -43,7 +43,8 @@ struct CompletionSegment {
 @MainActor final class WorkspaceModel: ObservableObject {
   enum InputPane: Equatable { case document, chat }
   @Published var state: WorkspaceState
-  @Published var documents: [DocumentSnapshot]
+  @Published private(set) var documents: [DocumentSnapshot]
+  @Published private(set) var documentIndices: [DocumentIndex] = []
   @Published var selectedDocumentIDs: Set<UUID> = []
   @Published var selectedChatIDs: Set<UUID> = []
   @Published var composerFocusEpoch = 0
@@ -307,6 +308,7 @@ struct CompletionSegment {
     let loaded = try await store.load().get()
     self.state = loaded.0
     self.documents = loaded.1
+    self.documentIndices = loaded.1.map { DocumentIndex(id: $0.id, title: $0.title) }
     selectedDocumentIDs = Set(state.selectedDocument.map { [$0] } ?? [])
     selectedChatIDs = Set(state.selectedChat.map { [$0] } ?? [])
     if layout.isAuthor && documents.isEmpty { try newDocument() }
@@ -353,8 +355,21 @@ struct CompletionSegment {
     }
     status = "Memory pressure released the inactive model. It will reload when needed."
   }
-  func documentMatchesSearch(_ document: DocumentSnapshot) -> Bool {
-    librarySearch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || searchedQuery != librarySearch || documentSearch[document.id] != nil
+  /// Stable published library value. Text callbacks never rebuild this array.
+  var selectedDocumentIndex: DocumentIndex? { documentIndices.first { $0.id == state.selectedDocument } }
+  func appendDocument(_ document: DocumentSnapshot) {
+    documents.append(document)
+    documentIndices.append(DocumentIndex(id: document.id, title: document.title))
+  }
+  private func updateDocumentIndexTitle(_ id: UUID, title: String) {
+    guard let index = documentIndices.firstIndex(where: { $0.id == id }), documentIndices[index].title != title else { return }
+    documentIndices[index].title = title
+  }
+  func documentMatchesSearch(_ document: DocumentIndex) -> Bool { documentMatchesSearch(id: document.id) }
+  func documentMatchesSearch(_ document: DocumentSnapshot) -> Bool { documentMatchesSearch(id: document.id) }
+  private func documentMatchesSearch(id: UUID) -> Bool {
+    librarySearch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      || searchedQuery != librarySearch || documentSearch[id] != nil
   }
   func chatMatchesSearch(_ chat: ChatRecord) -> Bool {
     librarySearch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || searchedQuery != librarySearch || matchingChatIDs.contains(chat.id)
@@ -494,7 +509,7 @@ struct CompletionSegment {
         retainVoice(revision)
       }
     }
-    state.documents = documents.map { DocumentIndex(id: $0.id, title: $0.title) }
+    state.documents = documentIndices
     let snapshot = state
     try await store.save(snapshot, documents: captured)
     if !librarySearch.isEmpty { refreshSearch() }
@@ -517,7 +532,7 @@ struct CompletionSegment {
     retainComposerDraft()
     let document = DocumentSnapshot(title: "Untitled", text: "")
     dirty.insert(document.id)
-    documents.append(document)
+    appendDocument(document)
     state.selectedDocument = document.id
     restoreComposerDraft()
     resetContinuationView()
@@ -686,6 +701,7 @@ struct CompletionSegment {
       guard let self else { return }
       try await self.flush()
       self.documents.removeAll { ids.contains($0.id) }
+      self.documentIndices.removeAll { ids.contains($0.id) }
       self.state.composerDrafts?.removeAll { $0.owner.kind == .document && ids.contains($0.owner.id) }
       self.writingExampleIDs.removeAll { ids.contains($0) }
       self.state.importedFiles = self.state.importedFiles?.filter { !ids.contains($0.key) }
@@ -742,6 +758,7 @@ struct CompletionSegment {
     guard !title.isEmpty else { return }
     cancel()
     documents[index].title = title
+    updateDocumentIndexTitle(id, title: title)
     refreshSearch(); scheduleSave()
   }
   func renameChat(_ id: UUID, to proposedTitle: String) {
@@ -1442,6 +1459,7 @@ struct CompletionSegment {
       registerDocumentUndo(current)
       if let index = documents.firstIndex(where: { $0.id == updated.id }) {
         documents[index] = updated
+        updateDocumentIndexTitle(updated.id, title: updated.title)
         dirty.remove(updated.id)
       }
     }
@@ -1474,6 +1492,7 @@ struct CompletionSegment {
         owner.dirty.insert(previous.id)
         owner.registerDocumentUndo(current)
         owner.documents[index] = previous
+        owner.updateDocumentIndexTitle(previous.id, title: previous.title)
         owner.invalidateGhost()
         owner.scheduleSave()
     }
@@ -1706,10 +1725,11 @@ struct CompletionSegment {
     }
   }
   var canExploreWriting: Bool {
+    let trace = PerformanceTrace.begin("Editor.WritingAvailability")
+    defer { PerformanceTrace.end("Editor.WritingAvailability", trace) }
     guard baseReady, !isBusy, let document = selectedDocument, caret > 0,
-      editor?.selectedRange().length == 0, editor?.hasMarkedText() != true,
-      let prefix = try? ProductCore.authoredPrefix(document, caret: caret) else { return false }
-    return !prefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      editor?.selectedRange().length == 0, editor?.hasMarkedText() != true else { return false }
+    return MarkdownTextView.hasAuthoredPrefix(document, caret: caret)
   }
   func setAutocomplete(_ enabled: Bool) {
     state.autocomplete = enabled
@@ -1743,7 +1763,7 @@ struct CompletionSegment {
     guard state.selectedDocument == manuscriptID, writingExampleIDs.count < 32 else { throw BoomError.stale("Choose the original manuscript and at most 32 examples.") }
     let validated = try ProductCore.writingExample(title: title, text: prose)
     let document = DocumentSnapshot(title: validated.title, text: validated.text)
-    documents.append(document); dirty.insert(document.id)
+    appendDocument(document); dirty.insert(document.id)
     writingExampleIDs.append(document.id)
     invalidateGhost(); scheduleSave()
   }
@@ -2074,7 +2094,7 @@ struct CompletionSegment {
       let document = DocumentSnapshot(title: snapshot.title + " · branch", text: text)
       state.manuscriptOrigins[document.id] = ManuscriptOrigin(documentID: snapshot.id, revision: snapshot.revision,
         bundleID: bundle.id, candidateID: bundle.candidates[index].id)
-      documents.append(document); dirty.insert(document.id); selectDocument(document.id)
+      appendDocument(document); dirty.insert(document.id); selectDocument(document.id)
       showingCandidates = false; scheduleSave()
     } catch { report(error) }
   }
@@ -2162,7 +2182,7 @@ struct CompletionSegment {
       self.state.importedFolders = (self.state.importedFolders ?? []) + [folder]
       for file in files {
         let title = URL(fileURLWithPath: file.path).deletingPathExtension().lastPathComponent
-        self.documents.append(DocumentSnapshot(id: file.id, title: title, text: file.text))
+        self.appendDocument(DocumentSnapshot(id: file.id, title: title, text: file.text))
         self.dirty.insert(file.id)
         self.state.importedFiles = self.state.importedFiles ?? [:]
         self.state.importedFiles?[file.id] = ImportedFile(folderID: folder.id, path: file.path,
@@ -2195,7 +2215,7 @@ struct CompletionSegment {
     for file in imported {
       let document = DocumentSnapshot(id: file.id,
         title: URL(fileURLWithPath: file.path).deletingPathExtension().lastPathComponent, text: file.text)
-      dirty.insert(document.id); documents.append(document)
+      dirty.insert(document.id); appendDocument(document)
       state.importedFiles?[file.id] = ImportedFile(folderID: nil, path: file.path, originalDigest: Digest.sha256(file.original))
     }
     if let first = imported.first { selectImportedDocument(first.id) }
@@ -2819,6 +2839,7 @@ struct CompletionSegment {
         await self.joinAndClearPromptCaches()
         let restored = try await self.store.restoreBackup(passphrase: passphrase, from: request.url)
         self.state = restored.0; self.documents = restored.1
+        self.documentIndices = restored.1.map { DocumentIndex(id: $0.id, title: $0.title) }
         self.dirty.removeAll(); self.undoManagers.removeAll()
         self.selectedDocumentIDs = Set(self.state.selectedDocument.map { [$0] } ?? [])
         self.selectedChatIDs = Set(self.state.selectedChat.map { [$0] } ?? [])

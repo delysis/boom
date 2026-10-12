@@ -29,6 +29,29 @@ enum ProductCore {
   struct MarkupProjection {
     let markdown: [MarkdownSpan]
     let media: [InlineMediaSpan]
+    let hasWikiMarker: Bool
+    let hasAttachmentMarker: Bool
+  }
+  private static let attachmentMarker: [UInt8] = Array("[Attachment: ".utf8)
+  /// Exact ASCII eligibility shares the parser's already contiguous input.
+  /// General NSString literal searches would revisit foreign storage twice.
+  private static func markupMarkers(_ bytes: UnsafeBufferPointer<UInt8>) -> (wiki: Bool, attachment: Bool) {
+    var wiki = false, attachment = false, index = 0
+    while index < bytes.count {
+      if bytes[index] == 91 {
+        if index + 1 < bytes.count, bytes[index + 1] == 91 { wiki = true }
+        if !attachment, bytes.count - index >= attachmentMarker.count {
+          var matches = true
+          for offset in attachmentMarker.indices where bytes[index + offset] != attachmentMarker[offset] {
+            matches = false; break
+          }
+          attachment = matches
+        }
+        if wiki && attachment { break }
+      }
+      index += 1
+    }
+    return (wiki, attachment)
   }
   /// Both parsers borrow one UTF-8 representation. Their independent parser
   /// options and failure behavior stay unchanged; the result retains no text.
@@ -39,6 +62,7 @@ enum ProductCore {
     let inputTrace = PerformanceTrace.begin("Bridge.InputUTF8")
     return source.withUTF8 { bytes in
       PerformanceTrace.end("Bridge.InputUTF8", inputTrace)
+      let markers = markupMarkers(bytes)
       let markdown: [MarkdownSpan] = {
         let trace = PerformanceTrace.begin("Editor.MarkdownParse")
         defer { PerformanceTrace.end("Editor.MarkdownParse", trace) }
@@ -49,7 +73,8 @@ enum ProductCore {
         defer { PerformanceTrace.end("Editor.MediaParse", trace) }
         return (try? parseBorrowedText(bytes, using: bloom_markdown_media_spans)) ?? []
       }()
-      return MarkupProjection(markdown: markdown, media: media)
+      return MarkupProjection(markdown: markdown, media: media,
+        hasWikiMarker: markers.wiki, hasAttachmentMarker: markers.attachment)
     }
   }
   private static func parseText<T: Decodable>(_ text: String,

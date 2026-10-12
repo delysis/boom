@@ -3,6 +3,22 @@ import BoomCore
 import SwiftUI
 
 @MainActor final class MarkdownTextView: NativeCompletionTextView, NSMenuDelegate, NativeTextStylingGuard {
+  /// Native command availability only. Writing still performs its actual
+  /// source, grapheme and budget admission when a request is captured.
+  static func hasAuthoredPrefix(_ document: DocumentSnapshot, caret: Int) -> Bool {
+    let text = document.text as NSString
+    let byteLimit = 2_097_152
+    guard caret > 0, caret <= text.length, text.length <= byteLimit else { return false }
+    // Each UTF-16 unit costs at most three UTF-8 bytes. Ordinary short sources
+    // need no whole-source encoding merely to decide whether a menu is enabled.
+    if text.length > byteLimit / 3, document.text.utf8.count > byteLimit { return false }
+    guard caret == text.length || text.rangeOfComposedCharacterSequence(at: caret).location == caret else {
+      return false
+    }
+    return text.rangeOfCharacter(from: CharacterSet.whitespacesAndNewlines.inverted, options: [],
+      range: NSRange(location: 0, length: caret)).location != NSNotFound
+  }
+
   weak var owner: WorkspaceModel? { didSet { completionClient = owner } }
   var documentUndo: UndoManager?
   var applyingExternal = false

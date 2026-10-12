@@ -1,0 +1,1275 @@
+use super::*;
+use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
+use std::io::{Seek, SeekFrom};
+use std::path::PathBuf;
+
+struct Row {
+    owner: Uuid,
+    document: Uuid,
+    kind: PageKind,
+    bytes: Vec<u8>,
+}
+// Plaintext structural fixture only; this is not an encrypted SQL provider.
+struct MemoryPages {
+    store: Uuid,
+    rows: BTreeMap<Uuid, Row>,
+}
+impl MemoryPages {
+    fn new() -> Self {
+        Self {
+            store: Uuid::new_v4(),
+            rows: BTreeMap::new(),
+        }
+    }
+}
+impl PageProvider for MemoryPages {
+    fn read(
+        &mut self,
+        owner: Uuid,
+        document: Uuid,
+        kind: PageKind,
+        page: &PageRef,
+        maximum_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        let row = self
+            .rows
+            .get(&page.locator.record_id())
+            .ok_or(Error::Storage("missing test page".into()))?;
+        if page.locator.store_id != self.store
+            || row.owner != owner
+            || row.document != document
+            || row.kind != kind
+            || row.bytes.len() > maximum_bytes
+        {
+            return Err(Error::Storage("test page binding".into()));
+        }
+        Ok(row.bytes.clone())
+    }
+    fn write_new(
+        &mut self,
+        owner: Uuid,
+        document: Uuid,
+        kind: PageKind,
+        bytes: &[u8],
+    ) -> Result<PageLocator> {
+        let record_id = Uuid::new_v4();
+        let locator = PageLocator {
+            storage: SQLiteStorage::V1,
+            store_id: self.store,
+            record_id,
+            ciphertext_bytes: bytes.len() as u32 + 28,
+        };
+        self.rows.insert(
+            record_id,
+            Row {
+                owner,
+                document,
+                kind,
+                bytes: bytes.to_vec(),
+            },
+        );
+        Ok(locator)
+    }
+}
+fn small(text: &str) -> Result<(TextEngine<MemoryPages>, Document)> {
+    let mut engine = TextEngine::with_cache_budget(MemoryPages::new(), 128 * 1024);
+    let imported = engine.import_utf8(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        &mut Cursor::new(text),
+        &mut || false,
+    )?;
+    assert_eq!(imported.whole_text_sha256, digest(text.as_bytes()));
+    Ok((engine, imported.document))
+}
+fn contents<S: PageProvider>(engine: &mut TextEngine<S>, document: &Document) -> Result<String> {
+    let mut bytes = Vec::new();
+    engine.export(document, document.revision(), &mut bytes, &mut || false)?;
+    String::from_utf8(bytes).map_err(|_| Error::Invalid("test export UTF8"))
+}
+
+struct SteppedReader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+    calls: usize,
+}
+impl Read for SteppedReader<'_> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        let limit = [1, 2, 3, 4096][self.calls % 4];
+        self.calls += 1;
+        let count = (self.bytes.len() - self.at).min(output.len()).min(limit);
+        output[..count].copy_from_slice(&self.bytes[self.at..self.at + count]);
+        self.at += count;
+        Ok(count)
+    }
+}
+struct SteppedWriter {
+    bytes: Vec<u8>,
+    calls: usize,
+}
+impl Write for SteppedWriter {
+    fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+        self.calls += 1;
+        let count = input.len().min(317);
+        self.bytes.extend_from_slice(&input[..count]);
+        Ok(count)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+struct CountingReader<R> {
+    reader: R,
+    calls: usize,
+}
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        self.calls += 1;
+        self.reader.read(output)
+    }
+}
+struct RejectedStream {
+    failure: Option<std::io::ErrorKind>,
+    calls: usize,
+}
+impl Read for RejectedStream {
+    fn read(&mut self, _output: &mut [u8]) -> std::io::Result<usize> {
+        self.calls += 1;
+        Err(std::io::Error::new(
+            self.failure.unwrap_or(std::io::ErrorKind::Other),
+            "Public read fixture rejected",
+        ))
+    }
+}
+impl Write for RejectedStream {
+    fn write(&mut self, _input: &[u8]) -> std::io::Result<usize> {
+        self.calls += 1;
+        match self.failure {
+            Some(kind) => Err(std::io::Error::new(kind, "Public write fixture rejected")),
+            None => Ok(0),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn stepped_import_finalizes_multiple_leaves_before_constant_work_finish() -> Result<()> {
+    // A small input that crosses a leaf boundary. It is generated and
+    // checked as a stream, without an additional whole-source string buffer.
+    let size = (FANOUT * TEXT_PAGE_BYTES + 17) as u64;
+    let pattern = b"abc".to_vec();
+    let mut reader = CountingReader {
+        reader: Repeated {
+            pattern: pattern.clone(),
+            position: 0,
+            remaining: size,
+        },
+        calls: 0,
+    };
+    let mut engine = TextEngine::new(MemoryPages::new());
+    let owner = Uuid::new_v4();
+    let doc = Uuid::new_v4();
+    let id = engine.import_begin(owner, doc, size)?;
+    let mut complete = false;
+    let mut finalization_steps = 0;
+    for _ in 0..100 {
+        let calls = reader.calls;
+        let before = engine.stats();
+        let progress = engine.import_step(owner, doc, id, &mut reader, &mut || false)?;
+        assert!(reader.calls - calls <= 1);
+        assert!(engine.stats().page_writes - before.page_writes <= u64::from(MAX_HEIGHT) + 2);
+        if reader.calls == calls {
+            finalization_steps += 1;
+        }
+        if progress.complete {
+            complete = true;
+            break;
+        }
+    }
+    assert!(complete);
+    assert_eq!(
+        reader.calls,
+        size.div_ceil(TEXT_PAGE_BYTES as u64) as usize + 1,
+        "Final EOF must be read even at the exact extent"
+    );
+    assert!(
+        finalization_steps >= 2,
+        "A ready result includes the final leaf and branch, not unfinished work"
+    );
+    let before = engine.stats();
+    let calls = reader.calls;
+    assert!(
+        engine
+            .import_step(owner, doc, id, &mut reader, &mut || false)?
+            .complete
+    );
+    assert_eq!(reader.calls, calls);
+    let imported = engine.import_finish(owner, doc, id, &mut || false)?;
+    let after = engine.stats();
+    assert_eq!(
+        (after.page_reads, after.page_writes, after.cache_hits),
+        (before.page_reads, before.page_writes, before.cache_hits),
+        "Ready step and finish perform no page I/O"
+    );
+    assert_eq!(
+        imported
+            .document
+            .revision()
+            .root
+            .as_ref()
+            .map(|root| root.height),
+        Some(1)
+    );
+    assert_eq!(imported.document.summary().bytes, size);
+    let mut checked = PatternOutput {
+        pattern,
+        position: 0,
+        hash: Sha256::new(),
+    };
+    let revision = imported.document.revision().clone();
+    let export = engine.export_begin(revision.clone())?;
+    let mut exported = false;
+    for _ in 0..200 {
+        if engine
+            .stream_step(&revision, export, Some(&mut checked), &mut || false)?
+            .complete
+        {
+            exported = true;
+            break;
+        }
+    }
+    assert!(exported);
+    assert_eq!(checked.position, size);
+    let expected = format!("{:x}", checked.hash.finalize());
+    assert_eq!(imported.whole_text_sha256, expected);
+    assert_eq!(
+        engine.stream_finish(&revision, export, &mut || false)?,
+        expected
+    );
+    assert_eq!(engine.active_bulk_operations(), 0);
+    Ok(())
+}
+
+#[test]
+fn bulk_io_failure_zero_write_and_cancellation_discard_owned_state() -> Result<()> {
+    let (mut engine, document) = small("abc")?;
+    let revision = document.revision().clone();
+    let import = engine.import_begin(revision.owner_id, revision.document_id, 3)?;
+    let mut rejected = RejectedStream {
+        failure: Some(std::io::ErrorKind::BrokenPipe),
+        calls: 0,
+    };
+    assert!(matches!(
+        engine.import_step(
+            revision.owner_id,
+            revision.document_id,
+            import,
+            &mut rejected,
+            &mut || false
+        ),
+        Err(Error::Io(_))
+    ));
+    assert_eq!(rejected.calls, 1);
+    assert!(matches!(
+        engine.import_finish(revision.owner_id, revision.document_id, import, &mut || {
+            false
+        }),
+        Err(Error::Stale)
+    ));
+    for failure in [Some(std::io::ErrorKind::BrokenPipe), None] {
+        let export = engine.export_begin(revision.clone())?;
+        let mut writer = RejectedStream { failure, calls: 0 };
+        assert!(matches!(
+            engine.stream_step(&revision, export, Some(&mut writer), &mut || false),
+            Err(Error::Io(_))
+        ));
+        assert_eq!(writer.calls, 1);
+        assert!(matches!(
+            engine.stream_finish(&revision, export, &mut || false),
+            Err(Error::Stale)
+        ));
+        assert!(engine.bulk_abort(revision.owner_id, revision.document_id, export)?);
+    }
+    let missing_writer = engine.export_begin(revision.clone())?;
+    assert!(
+        engine
+            .stream_step(&revision, missing_writer, None, &mut || false)
+            .is_err()
+    );
+    assert_eq!(engine.active_bulk_operations(), 0);
+    let hash = engine.hash_begin(revision.clone())?;
+    assert!(matches!(
+        engine.stream_step(&revision, hash, None, &mut || true),
+        Err(Error::Cancelled)
+    ));
+    assert!(matches!(
+        engine.stream_finish(&revision, hash, &mut || false),
+        Err(Error::Stale)
+    ));
+    // The final result is consumed on cancellation too; no ready root leaks
+    // through a cancelled finish, and a subsequent abort is a joined no-op.
+    let empty = engine.import_begin(revision.owner_id, revision.document_id, 0)?;
+    let mut complete = false;
+    for _ in 0..10 {
+        if engine
+            .import_step(
+                revision.owner_id,
+                revision.document_id,
+                empty,
+                &mut Cursor::new([]),
+                &mut || false,
+            )?
+            .complete
+        {
+            complete = true;
+            break;
+        }
+    }
+    assert!(complete);
+    assert!(matches!(
+        engine.import_finish(revision.owner_id, revision.document_id, empty, &mut || true),
+        Err(Error::Cancelled)
+    ));
+    assert!(engine.bulk_abort(revision.owner_id, revision.document_id, empty)?);
+    assert_eq!(engine.active_bulk_operations(), 0);
+    Ok(())
+}
+
+#[test]
+fn stepped_import_yields_for_other_document_edits_and_coalesces_short_reads() -> Result<()> {
+    let (mut engine, mut other) = small("alpha")?;
+    let owner = Uuid::new_v4();
+    let document = Uuid::new_v4();
+    let source = "Cafe\u{301} é 🙂\r\n".repeat(10_000);
+    let id = engine.import_begin(owner, document, source.len() as u64)?;
+    let mut reader = SteppedReader {
+        bytes: source.as_bytes(),
+        at: 0,
+        calls: 0,
+    };
+    let mut previous = BulkProgress {
+        processed_bytes: 0,
+        validated_bytes: 0,
+        complete: false,
+    };
+    for turn in 0..1000 {
+        let calls = reader.calls;
+        let writes = engine.stats().page_writes;
+        let progress = engine.import_step(owner, document, id, &mut reader, &mut || false)?;
+        assert!(
+            reader.calls - calls <= 1,
+            "Each step borrows at most one read callback"
+        );
+        assert!(engine.stats().page_writes - writes <= u64::from(MAX_HEIGHT) + 2);
+        assert!(progress.processed_bytes >= previous.processed_bytes);
+        assert!(progress.processed_bytes - previous.processed_bytes <= TEXT_PAGE_BYTES as u64);
+        assert!(progress.validated_bytes >= previous.validated_bytes);
+        assert!(progress.validated_bytes <= progress.processed_bytes);
+        assert!(progress.processed_bytes - progress.validated_bytes <= 3);
+        let expected = other.revision().clone();
+        let (old, new) = if turn % 2 == 0 {
+            (b"a".as_slice(), "b")
+        } else {
+            (b"b".as_slice(), "a")
+        };
+        engine.splice(&mut other, &expected, 0..1, Some(old), new, &mut || false)?;
+        let rendered = engine.window(&other, other.revision(), 0, WINDOW_BYTES)?;
+        assert_eq!(rendered.text.as_bytes()[0], new.as_bytes()[0]);
+        previous = progress;
+        if progress.complete {
+            break;
+        }
+    }
+    assert!(previous.complete);
+    assert_eq!(previous.processed_bytes, source.len() as u64);
+    let imported = engine.import_finish(owner, document, id, &mut || false)?;
+    assert_eq!(imported.whole_text_sha256, digest(source.as_bytes()));
+    assert_eq!(contents(&mut engine, &imported.document)?, source);
+    let pages: Vec<_> = engine
+        .provider
+        .rows
+        .values()
+        .filter(|row| row.document == document && row.kind == PageKind::Text)
+        .collect();
+    assert_eq!(
+        pages.iter().map(|row| row.bytes.len()).sum::<usize>(),
+        source.len()
+    );
+    assert!(
+        pages
+            .iter()
+            .filter(|row| row.bytes.len() < TEXT_PAGE_BYTES - 3)
+            .count()
+            <= 1,
+        "Short reads must not create tiny text records"
+    );
+    assert_eq!(engine.active_bulk_operations(), 0);
+    assert!(engine.stats().charged_bytes <= CACHE_BYTES);
+    Ok(())
+}
+
+#[test]
+fn bulk_budget_foreign_tokens_cancellation_and_eof_failures_release_exact_session() -> Result<()> {
+    let mut engine = TextEngine::new(MemoryPages::new());
+    let owner = Uuid::new_v4();
+    let doc = Uuid::new_v4();
+    let first = engine.import_begin(owner, doc, 0)?;
+    let second_doc = Uuid::new_v4();
+    let second = engine.import_begin(owner, second_doc, 3)?;
+    assert!(engine.import_begin(owner, Uuid::new_v4(), 0).is_err());
+    assert!(
+        engine
+            .import_step(
+                Uuid::new_v4(),
+                doc,
+                first,
+                &mut Cursor::new([]),
+                &mut || false
+            )
+            .is_err()
+    );
+    assert!(engine.bulk_abort(owner, second_doc, first).is_err());
+    assert_eq!(engine.active_bulk_operations(), 2);
+    assert!(matches!(
+        engine.import_step(owner, doc, first, &mut Cursor::new([]), &mut || true),
+        Err(Error::Cancelled)
+    ));
+    assert_eq!(engine.active_bulk_operations(), 1);
+    assert!(engine.bulk_abort(owner, doc, first)?);
+    let mut short = Cursor::new(b"ab");
+    assert!(
+        !engine
+            .import_step(owner, second_doc, second, &mut short, &mut || false)?
+            .complete
+    );
+    assert!(matches!(
+        engine.import_step(owner, second_doc, second, &mut short, &mut || false),
+        Err(Error::Stale)
+    ));
+    assert!(matches!(
+        engine.import_finish(owner, second_doc, second, &mut || false),
+        Err(Error::Stale)
+    ));
+    let oversized = engine.import_begin(owner, doc, 0)?;
+    assert!(matches!(
+        engine.import_step(owner, doc, oversized, &mut Cursor::new(b"x"), &mut || false),
+        Err(Error::Stale)
+    ));
+    let incomplete = engine.import_begin(owner, doc, 2)?;
+    let mut unicode = Cursor::new([0xf0, 0x9f]);
+    let progress = engine.import_step(owner, doc, incomplete, &mut unicode, &mut || false)?;
+    assert_eq!(progress.validated_bytes, 0);
+    assert!(
+        engine
+            .import_step(owner, doc, incomplete, &mut unicode, &mut || false)
+            .is_err()
+    );
+    let premature = engine.import_begin(owner, doc, 1)?;
+    assert!(
+        engine
+            .import_finish(owner, doc, premature, &mut || false)
+            .is_err()
+    );
+    assert_eq!(engine.active_bulk_operations(), 0);
+    assert!(engine.bulk_abort(owner, doc, premature)?);
+    // A malformed late suffix leaves its already-written encrypted staging
+    // records to host GC, but never returns an editable/publishable revision.
+    let mut bytes = vec![b'a'; TEXT_PAGE_BYTES];
+    bytes.push(0xff);
+    let bad = engine.import_begin(owner, doc, bytes.len() as u64)?;
+    let mut input = Cursor::new(bytes);
+    engine.import_step(owner, doc, bad, &mut input, &mut || false)?;
+    assert!(
+        engine
+            .import_step(owner, doc, bad, &mut input, &mut || false)
+            .is_err()
+    );
+    assert!(
+        engine
+            .provider
+            .rows
+            .values()
+            .any(|row| row.document == doc && row.kind == PageKind::Text)
+    );
+    assert!(matches!(
+        engine.import_finish(owner, doc, bad, &mut || false),
+        Err(Error::Stale)
+    ));
+    assert_eq!(engine.active_bulk_operations(), 0);
+    Ok(())
+}
+
+#[test]
+fn stepped_hash_export_short_writes_keep_the_captured_revision_during_edits() -> Result<()> {
+    let text = "a".to_string() + &"Cafe\u{301} é 🙂\r\n".repeat(10_000);
+    let (mut engine, mut document) = small(&text)?;
+    let captured = document.revision().clone();
+    let hash = engine.hash_begin(captured.clone())?;
+    let export = engine.export_begin(captured.clone())?;
+    engine.splice(&mut document, &captured, 0..1, Some(b"a"), "b", &mut || {
+        false
+    })?;
+    assert!(matches!(
+        engine.stream_step(document.revision(), hash, None, &mut || false),
+        Err(Error::Stale)
+    ));
+    assert!(
+        engine
+            .bulk_abort(Uuid::new_v4(), captured.document_id, export)
+            .is_err()
+    );
+    assert_eq!(engine.active_bulk_operations(), 2);
+    let mut writer = SteppedWriter {
+        bytes: Vec::new(),
+        calls: 0,
+    };
+    let mut hash_result = None;
+    let mut exported = false;
+    let mut previous = 0;
+    for _ in 0..2000 {
+        if hash_result.is_none()
+            && engine
+                .stream_step(&captured, hash, None, &mut || false)?
+                .complete
+        {
+            hash_result = Some(engine.stream_finish(&captured, hash, &mut || false)?);
+        }
+        let calls = writer.calls;
+        let progress = engine.stream_step(&captured, export, Some(&mut writer), &mut || false)?;
+        assert!(writer.calls - calls <= 1);
+        assert_eq!(progress.processed_bytes, writer.bytes.len() as u64);
+        assert_eq!(progress.validated_bytes, progress.processed_bytes);
+        assert!(progress.processed_bytes - previous <= TEXT_PAGE_BYTES as u64);
+        previous = progress.processed_bytes;
+        if progress.complete {
+            exported = true;
+            break;
+        }
+    }
+    assert!(exported);
+    assert_eq!(writer.bytes, text.as_bytes());
+    assert_eq!(hash_result, Some(digest(text.as_bytes())));
+    assert_eq!(
+        engine.stream_finish(&captured, export, &mut || false)?,
+        digest(text.as_bytes())
+    );
+    assert_eq!(
+        engine.window(&document, document.revision(), 0, 1)?.text,
+        "b"
+    );
+    assert_eq!(engine.active_bulk_operations(), 0);
+    assert!(engine.bulk_abort(captured.owner_id, captured.document_id, export)?);
+    Ok(())
+}
+
+#[test]
+fn tiny_piece_stream_yields_on_tree_work_before_filling_its_byte_budget() -> Result<()> {
+    let mut engine = TextEngine::new(MemoryPages::new());
+    let mut revision = Revision {
+        schema: 1,
+        owner_id: Uuid::new_v4(),
+        document_id: Uuid::new_v4(),
+        root: None,
+    };
+    let chunk = engine.write_page(&revision, PageKind::Text, &vec![b'a'; TEXT_PAGE_BYTES])?;
+    let piece = Piece {
+        chunk,
+        start: 0,
+        end: 1,
+        summary: TextSummary::of("a"),
+    };
+    let mut leaves = Vec::new();
+    for _ in 0..FANOUT {
+        leaves.push(engine.write_node(&revision, Node::Leaf(vec![piece.clone(); FANOUT]), 0)?);
+    }
+    revision.root = Some(engine.write_node(&revision, Node::Branch(leaves), 1)?);
+    let id = engine.hash_begin(revision.clone())?;
+    let mut progress = BulkProgress {
+        processed_bytes: 0,
+        validated_bytes: 0,
+        complete: false,
+    };
+    for step in 0..2000 {
+        let before = engine.stats();
+        progress = engine.stream_step(&revision, id, None, &mut || false)?;
+        let after = engine.stats();
+        assert!(
+            after.page_reads + after.cache_hits - before.page_reads - before.cache_hits
+                <= BULK_STEP_WORK as u64
+        );
+        if step == 0 {
+            assert!(!progress.complete);
+            assert!(progress.processed_bytes < revision.summary().bytes);
+        }
+        if progress.complete {
+            break;
+        }
+    }
+    assert!(progress.complete);
+    assert_eq!(progress.processed_bytes, (FANOUT * FANOUT) as u64);
+    assert_eq!(
+        engine.stream_finish(&revision, id, &mut || false)?,
+        digest(&vec![b'a'; FANOUT * FANOUT])
+    );
+    assert_eq!(engine.active_bulk_operations(), 0);
+    Ok(())
+}
+
+#[test]
+fn unicode_positions_windows_and_line_endings_remain_exact() -> Result<()> {
+    let text = "Cafe\u{301}\r\nCafé 🙂 👩🏽‍💻\n\n終\0";
+    let (mut engine, document) = small(text)?;
+    assert_eq!(document.summary(), TextSummary::of(text));
+    let window = engine.window(&document, document.revision(), 0, WINDOW_BYTES)?;
+    assert_eq!(window.text.as_bytes(), text.as_bytes());
+    for byte in text
+        .char_indices()
+        .map(|(at, _)| at)
+        .chain(std::iter::once(text.len()))
+    {
+        let units = text[..byte].encode_utf16().count() as u64;
+        assert_eq!(
+            engine.byte_at_utf16(&document, document.revision(), units)?,
+            byte as u64
+        );
+        if byte < text.len() {
+            let window =
+                engine.window(&document, document.revision(), byte as u64, WINDOW_BYTES)?;
+            assert_eq!(window.utf16_start, units);
+            assert_eq!(
+                window.lf_start,
+                text[..byte].bytes().filter(|b| *b == b'\n').count() as u64
+            );
+            assert_eq!(window.text.as_bytes(), &text.as_bytes()[byte..]);
+        }
+    }
+    let emoji = text.find('🙂').ok_or(Error::Invalid("test emoji"))?;
+    let half = text[..emoji].encode_utf16().count() as u64 + 1;
+    assert!(matches!(
+        engine.byte_at_utf16(&document, document.revision(), half),
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        engine.window(&document, document.revision(), emoji as u64 + 1, 20),
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(
+        contents(&mut engine, &document)?.as_bytes(),
+        text.as_bytes()
+    );
+    Ok(())
+}
+
+#[test]
+fn edits_and_retained_roots_match_a_small_string_oracle() -> Result<()> {
+    let (mut engine, mut document) = small("Cafe\u{301} 🙂\r\n")?;
+    let original = document.revision().clone();
+    let original_text = contents(&mut engine, &document)?;
+    let mut oracle = original_text.clone();
+    let insertions = ["a", "\n", "\r\n", "é", "e\u{301}", "🙂", "👩🏽‍💻", ""];
+    let mut state = 42_u64;
+    for turn in 0..160 {
+        let boundaries: Vec<_> = oracle
+            .char_indices()
+            .map(|(at, _)| at)
+            .chain(std::iter::once(oracle.len()))
+            .collect();
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let a = boundaries[(state as usize) % boundaries.len()];
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let b = boundaries[(state as usize) % boundaries.len()];
+        let start = a.min(b);
+        let end = a.max(b);
+        let revision = document.revision().clone();
+        let inserted = insertions[turn % insertions.len()];
+        engine.splice(
+            &mut document,
+            &revision,
+            start as u64..end as u64,
+            Some(&oracle.as_bytes()[start..end]),
+            inserted,
+            &mut || false,
+        )?;
+        oracle.replace_range(start..end, inserted);
+        assert_eq!(
+            contents(&mut engine, &document)?.as_bytes(),
+            oracle.as_bytes()
+        );
+        assert_eq!(document.summary(), TextSummary::of(&oracle));
+        assert_eq!(
+            engine.whole_text_sha256(&document, document.revision(), &mut || false)?,
+            digest(oracle.as_bytes())
+        );
+        assert!(engine.stats().charged_bytes <= 128 * 1024);
+    }
+    let last = document.revision().clone();
+    engine.checkout(&mut document, &last, original)?;
+    assert_eq!(
+        contents(&mut engine, &document)?.as_bytes(),
+        original_text.as_bytes()
+    );
+    let undo = document.revision().clone();
+    engine.checkout(&mut document, &undo, last)?;
+    assert_eq!(
+        contents(&mut engine, &document)?.as_bytes(),
+        oracle.as_bytes()
+    );
+    Ok(())
+}
+
+#[test]
+fn stale_wrong_bytes_cancel_and_half_scalar_do_not_publish_edits() -> Result<()> {
+    let (mut engine, mut document) = small("Café 🙂")?;
+    let before = document.revision().clone();
+    assert!(matches!(
+        engine.splice(&mut document, &before, 0..1, Some(b"x"), "z", &mut || false),
+        Err(Error::Stale)
+    ));
+    assert!(matches!(
+        engine.splice(&mut document, &before, 0..0, Some(b""), "x", &mut || true),
+        Err(Error::Cancelled)
+    ));
+    assert!(matches!(
+        engine.splice(&mut document, &before, 4..4, None, "x", &mut || false),
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(document.revision(), &before);
+    engine.splice(&mut document, &before, 0..1, Some(b"C"), "K", &mut || false)?;
+    assert!(matches!(
+        engine.window(&document, &before, 0, 20),
+        Err(Error::Stale)
+    ));
+    assert!(matches!(
+        engine.splice(&mut document, &before, 0..0, None, "x", &mut || false),
+        Err(Error::Stale)
+    ));
+    let current = document.revision().clone();
+    let mut foreign = current.clone();
+    foreign.document_id = Uuid::new_v4();
+    assert!(matches!(
+        engine.checkout(&mut document, &current, foreign),
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(document.revision(), &current);
+    Ok(())
+}
+
+#[test]
+fn chunk_edges_and_unequal_tree_joins_preserve_the_text() -> Result<()> {
+    let mut text = "a".repeat(TEXT_PAGE_BYTES - 1);
+    text.push_str("🙂\r\n");
+    text.push_str(&"b".repeat(TEXT_PAGE_BYTES * (FANOUT + 3)));
+    let (mut engine, mut document) = small(&text)?;
+    let original = document.revision().clone();
+    assert!(
+        document
+            .revision()
+            .root
+            .as_ref()
+            .is_some_and(|root| root.height >= 1)
+    );
+    for turn in 0..5 {
+        let start = match turn {
+            0 => 0,
+            1 => TEXT_PAGE_BYTES - 1,
+            2 => TEXT_PAGE_BYTES + 5,
+            3 => text.len() - 1,
+            _ => text.len(),
+        };
+        assert!(
+            text.is_char_boundary(start),
+            "The oracle must select a current scalar boundary"
+        );
+        let before = document.revision().clone();
+        engine.splice(
+            &mut document,
+            &before,
+            start as u64..start as u64,
+            Some(b""),
+            "終",
+            &mut || false,
+        )?;
+        text.insert(start, '終');
+        assert_eq!(
+            contents(&mut engine, &document)?.as_bytes(),
+            text.as_bytes()
+        );
+    }
+    let cut_end = text
+        .char_indices()
+        .next_back()
+        .ok_or(Error::Invalid("test final scalar"))?
+        .0;
+    assert!(text.is_char_boundary(3) && text.is_char_boundary(cut_end));
+    let before = document.revision().clone();
+    engine.splice(
+        &mut document,
+        &before,
+        3..cut_end as u64,
+        None,
+        "",
+        &mut || false,
+    )?;
+    text.replace_range(3..cut_end, "");
+    assert_eq!(
+        contents(&mut engine, &document)?.as_bytes(),
+        text.as_bytes()
+    );
+    let current = document.revision().clone();
+    engine.checkout(&mut document, &current, original)?;
+    assert_eq!(
+        document.summary().bytes,
+        (TEXT_PAGE_BYTES * (FANOUT + 4) + 5) as u64
+    );
+    Ok(())
+}
+
+#[test]
+fn missing_corrupt_cross_owner_pages_and_invalid_object_identities_fail_closed() -> Result<()> {
+    let (mut engine, document) = small("a public fixture")?;
+    let root = document
+        .revision()
+        .root
+        .clone()
+        .ok_or(Error::Invalid("test root"))?;
+    let mut bad_owner = document.revision().clone();
+    bad_owner.owner_id = Uuid::new_v4();
+    assert!(matches!(engine.open(bad_owner), Err(Error::Storage(_))));
+    let mut bad_identity = document.revision().clone();
+    let bad_root = bad_identity
+        .root
+        .as_mut()
+        .ok_or(Error::Invalid("test root"))?;
+    bad_root.page.locator.store_id = Uuid::nil();
+    assert!(matches!(engine.open(bad_identity), Err(Error::Invalid(_))));
+    engine.cache.clear();
+    engine.stats.charged_bytes = 0;
+    let row = engine
+        .provider
+        .rows
+        .get_mut(&root.page.locator.record_id())
+        .ok_or(Error::Invalid("test page"))?;
+    row.bytes.pop();
+    assert!(matches!(
+        engine.open(document.revision().clone()),
+        Err(Error::Invalid(_))
+    ));
+    engine.provider.rows.remove(&root.page.locator.record_id());
+    assert!(matches!(
+        engine.open(document.revision().clone()),
+        Err(Error::Storage(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn incomplete_utf8_import_and_cancellation_do_not_return_partial_documents() -> Result<()> {
+    let mut engine = TextEngine::new(MemoryPages::new());
+    assert!(matches!(
+        engine.import_utf8(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            &mut Cursor::new([b'a', 0xf0, 0x9f]),
+            &mut || false
+        ),
+        Err(Error::Invalid(_))
+    ));
+    let mut calls = 0;
+    assert!(matches!(
+        engine.import_utf8(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            &mut Cursor::new(vec![b'a'; TEXT_PAGE_BYTES * 4]),
+            &mut || {
+                calls += 1;
+                calls >= 5
+            }
+        ),
+        Err(Error::Cancelled)
+    ));
+    Ok(())
+}
+
+#[test]
+fn revision_wire_requires_explicit_root_and_rejects_malformed_empty_roots() -> Result<()> {
+    let empty = Revision {
+        schema: 1,
+        owner_id: Uuid::new_v4(),
+        document_id: Uuid::new_v4(),
+        root: None,
+    };
+    let wire =
+        serde_json::to_value(&empty).map_err(|_| Error::Invalid("test revision encoding"))?;
+    assert_eq!(wire.get("root"), Some(&serde_json::Value::Null));
+    let roundtrip: Revision = serde_json::from_value(wire.clone())
+        .map_err(|_| Error::Invalid("test revision decoding"))?;
+    assert_eq!(roundtrip, empty);
+    let mut engine = TextEngine::new(MemoryPages::new());
+    let document = engine.open(roundtrip)?;
+    assert_eq!(document.summary(), TextSummary::EMPTY);
+    assert!(
+        engine
+            .window(&document, document.revision(), 0, 1)?
+            .text
+            .is_empty()
+    );
+
+    let mut missing = wire.clone();
+    missing
+        .as_object_mut()
+        .ok_or(Error::Invalid("test revision object"))?
+        .remove("root");
+    assert!(serde_json::from_value::<Revision>(missing).is_err());
+    for value in [
+        serde_json::json!({}),
+        serde_json::json!([]),
+        serde_json::json!(""),
+    ] {
+        let mut malformed = wire.clone();
+        malformed["root"] = value;
+        assert!(serde_json::from_value::<Revision>(malformed).is_err());
+    }
+    let (mut engine, document) = small("a")?;
+    let mut empty_root = document.revision().clone();
+    empty_root
+        .root
+        .as_mut()
+        .ok_or(Error::Invalid("test root"))?
+        .summary = TextSummary::EMPTY;
+    assert!(matches!(
+        engine.open(empty_root),
+        Err(Error::Invalid("empty root page"))
+    ));
+    let mut zero_units = document.revision().clone();
+    zero_units
+        .root
+        .as_mut()
+        .ok_or(Error::Invalid("test root"))?
+        .summary
+        .utf16 = 0;
+    assert!(matches!(
+        engine.open(zero_units),
+        Err(Error::Invalid("inconsistent text summary"))
+    ));
+    Ok(())
+}
+
+#[test]
+fn diagnostic_counter_saturation_preserves_operations_and_exact_cache_charges() -> Result<()> {
+    let (mut engine, mut document) = small("abc")?;
+    engine.stats.page_reads = u64::MAX;
+    engine.stats.read_bytes = u64::MAX;
+    engine.stats.page_writes = u64::MAX;
+    engine.stats.cache_hits = u64::MAX;
+    assert_eq!(
+        engine.window(&document, document.revision(), 0, 20)?.text,
+        "abc"
+    );
+    let before = document.revision().clone();
+    engine.splice(&mut document, &before, 3..3, Some(b""), "終", &mut || {
+        false
+    })?;
+    assert_eq!(
+        contents(&mut engine, &document)?.as_bytes(),
+        "abc終".as_bytes()
+    );
+    let stats = engine.stats();
+    assert_eq!(
+        (
+            stats.page_reads,
+            stats.read_bytes,
+            stats.page_writes,
+            stats.cache_hits
+        ),
+        (u64::MAX, u64::MAX, u64::MAX, u64::MAX)
+    );
+    let exact_charge: usize = engine
+        .cache
+        .iter()
+        .map(|page| page.bytes.len() + size_of::<CachedPage>() + page.page.digest.len() + 32)
+        .sum();
+    assert_eq!(stats.charged_bytes, exact_charge);
+    assert!(stats.charged_bytes > 0 && stats.charged_bytes <= 128 * 1024);
+    Ok(())
+}
+
+// Public structural fixture only: plaintext records exercise tree disk paging.
+// Physical offsets stay private to this fixture; the exported locator is an
+// immutable object ID. The <=131,072-entry fixture index is additional fixture
+// memory, not part of the engine cache budget or SQL/native memory evidence.
+// Failed files remain at their public path; successful isolated fixtures may
+// delete only after all assertions. No encrypted SQL durability is claimed.
+struct DiskPages {
+    file: Option<File>,
+    path: PathBuf,
+    store: Uuid,
+    offsets: BTreeMap<Uuid, u64>,
+    next: u64,
+    successful: bool,
+}
+impl DiskPages {
+    fn new() -> Result<Self> {
+        let path =
+            std::env::temp_dir().join(format!("bloom-public-pager-{}.fixture", Uuid::new_v4()));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        Ok(Self {
+            file: Some(file),
+            path,
+            store: Uuid::new_v4(),
+            offsets: BTreeMap::new(),
+            next: 0,
+            successful: false,
+        })
+    }
+}
+impl Drop for DiskPages {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if self.successful {
+            if let Err(error) = std::fs::remove_file(&self.path) {
+                eprintln!("Public pager fixture cleanup failed: {error}; retained at {}", self.path.display());
+            }
+        } else {
+            eprintln!("Failed public pager fixture retained at {}", self.path.display());
+        }
+    }
+}
+impl PageProvider for DiskPages {
+    fn read(
+        &mut self,
+        owner: Uuid,
+        document: Uuid,
+        kind: PageKind,
+        page: &PageRef,
+        maximum_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        if page.locator.store_id != self.store {
+            return Err(Error::Storage("test object store".into()));
+        }
+        let offset = *self.offsets.get(&page.locator.record_id)
+            .ok_or(Error::Storage("missing fixture object".into()))?;
+        let file = self
+            .file
+            .as_mut()
+            .ok_or(Error::Invalid("test file closed"))?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut header = [0_u8; 64];
+        file.read_exact(&mut header)?;
+        let length = u32::from_le_bytes(
+            header[49..53]
+                .try_into()
+                .map_err(|_| Error::Invalid("test length"))?,
+        ) as usize;
+        if header[..16] != owner.as_bytes()[..]
+            || header[16..32] != document.as_bytes()[..]
+            || header[32..48] != page.locator.record_id().as_bytes()[..]
+            || header[48] != if kind == PageKind::Text { 0 } else { 1 }
+            || length > maximum_bytes
+            || page.locator.ciphertext_bytes() as usize != length + 28
+        {
+            return Err(Error::Storage("test frame binding".into()));
+        }
+        let mut bytes = vec![0; length];
+        file.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
+    fn write_new(
+        &mut self,
+        owner: Uuid,
+        document: Uuid,
+        kind: PageKind,
+        bytes: &[u8],
+    ) -> Result<PageLocator> {
+        if self.offsets.len() >= 131_072 {
+            return Err(Error::Invalid("public disk fixture object index bound"));
+        }
+        let record_id = Uuid::new_v4();
+        let locator = PageLocator {
+            storage: SQLiteStorage::V1,
+            store_id: self.store,
+            record_id,
+            ciphertext_bytes: bytes.len() as u32 + 28,
+        };
+        let offset = self.next;
+        let next = offset.checked_add(bytes.len() as u64 + 64)
+            .ok_or(Error::Invalid("public disk fixture extent"))?;
+        let mut header = [0_u8; 64];
+        header[..16].copy_from_slice(owner.as_bytes());
+        header[16..32].copy_from_slice(document.as_bytes());
+        header[32..48].copy_from_slice(record_id.as_bytes());
+        header[48] = if kind == PageKind::Text { 0 } else { 1 };
+        header[49..53].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+        let file = self
+            .file
+            .as_mut()
+            .ok_or(Error::Invalid("test file closed"))?;
+        file.seek(SeekFrom::Start(self.next))?;
+        file.write_all(&header)?;
+        file.write_all(bytes)?;
+        self.next = next;
+        self.offsets.insert(record_id, offset);
+        Ok(locator)
+    }
+}
+struct Repeated {
+    pattern: Vec<u8>,
+    position: u64,
+    remaining: u64,
+}
+impl Read for Repeated {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.remaining.min(bytes.len() as u64) as usize;
+        for (i, byte) in bytes[..n].iter_mut().enumerate() {
+            *byte = self.pattern[((self.position + i as u64) % self.pattern.len() as u64) as usize];
+        }
+        self.position += n as u64;
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+struct PatternOutput {
+    pattern: Vec<u8>,
+    position: u64,
+    hash: Sha256,
+}
+impl Write for PatternOutput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        for (i, byte) in bytes.iter().enumerate() {
+            if *byte
+                != self.pattern[((self.position + i as u64) % self.pattern.len() as u64) as usize]
+            {
+                return Err(std::io::Error::other("streamed fixture bytes differ"));
+            }
+        }
+        self.position += bytes.len() as u64;
+        self.hash.update(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+#[ignore = "Explicit real 1 GiB disk fixture; run after shared native capture joins"]
+fn real_gib_single_line_import_seek_export_and_huge_delete_use_bounded_cache() -> Result<()> {
+    let mut pattern = "Cafe\u{301} 🙂 終 ".as_bytes().to_vec();
+    pattern.resize(32, b'a');
+    let size = 1_u64 << 30;
+    let mut reader = Repeated {
+        pattern: pattern.clone(),
+        position: 0,
+        remaining: size,
+    };
+    let mut engine = TextEngine::new(DiskPages::new()?);
+    let imported =
+        engine.import_utf8(Uuid::new_v4(), Uuid::new_v4(), &mut reader, &mut || false)?;
+    let mut document = imported.document;
+    assert_eq!(document.summary().bytes, size);
+    assert_eq!(document.summary().lf_count, 0);
+    assert!(engine.stats().charged_bytes <= CACHE_BYTES);
+    let original = document.revision().clone();
+    let reads = engine.stats().page_reads;
+    let window = engine.window(
+        &document,
+        &original,
+        size - WINDOW_BYTES as u64,
+        WINDOW_BYTES,
+    )?;
+    assert_eq!(window.text.len(), WINDOW_BYTES);
+    assert!(
+        engine.stats().page_reads - reads < 16,
+        "Seek must not read the whole tree or source"
+    );
+    let mut output = PatternOutput {
+        pattern,
+        position: 0,
+        hash: Sha256::new(),
+    };
+    engine.export(&document, &original, &mut output, &mut || false)?;
+    assert_eq!(output.position, size);
+    assert_eq!(
+        format!("{:x}", output.hash.finalize()),
+        imported.whole_text_sha256
+    );
+    let reads = engine.stats().page_reads;
+    engine.splice(
+        &mut document,
+        &original,
+        TEXT_PAGE_BYTES as u64..size - TEXT_PAGE_BYTES as u64,
+        None,
+        "",
+        &mut || false,
+    )?;
+    assert_eq!(document.summary().bytes, 2 * TEXT_PAGE_BYTES as u64);
+    assert!(
+        engine.stats().page_reads - reads < 32,
+        "Large deletion must skip untouched subtrees"
+    );
+    assert!(engine.stats().charged_bytes <= CACHE_BYTES);
+    let after = document.revision().clone();
+    engine.checkout(&mut document, &after, original)?;
+    assert_eq!(document.summary().bytes, size);
+    eprintln!(
+        "Real GiB pager fixture complete: cache={} bytes, entries={}, page_reads={}",
+        engine.stats().charged_bytes,
+        engine.stats().entries,
+        engine.stats().page_reads
+    );
+    engine.provider.successful = true;
+    Ok(())
+}
+
+// Wire/identity controls, not database qualification. The single object format
+// must refuse old offsets, mixed keys and unknown markers before provider IO.
+#[test]
+fn sql_only_page_locator_rejects_legacy_mixed_missing_and_unknown_fields() -> Result<()> {
+    let store = Uuid::new_v4();
+    let record = Uuid::new_v4();
+    let valid = serde_json::json!({"storage":"sqlite_v1","storeId":store,
+        "recordId":record,"ciphertextBytes":28});
+    let locator: PageLocator = serde_json::from_value(valid.clone())
+        .map_err(|_| Error::Invalid("public valid locator fixture"))?;
+    assert_eq!(locator.store_id, store);
+    assert_eq!(locator.record_id, record);
+    assert_eq!(serde_json::to_value(locator).map_err(|_| Error::Invalid("public locator encoding"))?, valid);
+    let mut mixed = valid.clone(); mixed["offset"] = serde_json::json!(0);
+    let mut unknown_marker = valid.clone(); unknown_marker["storage"] = serde_json::json!("file_v1");
+    let mut unknown_field = valid.clone(); unknown_field["authenticated"] = serde_json::json!(true);
+    let mut missing = valid.clone(); missing.as_object_mut().ok_or(Error::Invalid("public object fixture"))?.remove("storeId");
+    let legacy = serde_json::json!({"containerId":store,"recordId":record,"offset":0,"ciphertextBytes":28});
+    for malformed in [mixed, unknown_marker, unknown_field, missing, legacy] {
+        assert!(serde_json::from_value::<PageLocator>(malformed).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn sql_only_page_identity_extent_and_store_substitution_fail_before_source_admission() -> Result<()> {
+    let (mut engine, document) = small("public object identity")?;
+    let original = document.revision().clone();
+    let root = original.root.clone().ok_or(Error::Invalid("public object root"))?;
+    for (store_id, record_id, ciphertext_bytes) in [
+        (Uuid::nil(), root.page.locator.record_id, root.page.locator.ciphertext_bytes),
+        (root.page.locator.store_id, Uuid::nil(), root.page.locator.ciphertext_bytes),
+        (root.page.locator.store_id, root.page.locator.record_id, 27),
+        (root.page.locator.store_id, root.page.locator.record_id, INDEX_PAGE_BYTES as u32 + 29),
+    ] {
+        let mut altered = original.clone();
+        let page = &mut altered.root.as_mut().ok_or(Error::Invalid("public object root"))?.page;
+        page.locator.store_id = store_id; page.locator.record_id = record_id; page.locator.ciphertext_bytes = ciphertext_bytes;
+        assert!(matches!(engine.open(altered), Err(Error::Invalid(_))));
+    }
+    let mut foreign = original.clone();
+    foreign.root.as_mut().ok_or(Error::Invalid("public object root"))?.page.locator.store_id = Uuid::new_v4();
+    assert!(matches!(engine.open(foreign), Err(Error::Storage(_))));
+    assert_eq!(contents(&mut engine, &document)?, "public object identity");
+    Ok(())
+}

@@ -84,11 +84,24 @@ final class MarkdownTransportTests: XCTestCase {
     let source = prefix + wiki + "\n" + attachment
     let display = try XCTUnwrap(MarkdownStyle.wikiDisplays(in: source).first)
     XCTAssertEqual(display.title, NSRange(location: prefix.utf16.count + 2, length: 4))
-    let view = NSTextView(); view.string = source; MarkdownStyle.apply(to: view)
+    let view = MarkdownTextView(frame: .zero); view.string = source; MarkdownStyle.apply(to: view)
     let storage = try XCTUnwrap(view.textStorage)
     let name = (source as NSString).range(of: "public.png")
     XCTAssertEqual(storage.attribute(.underlineStyle, at: name.location, effectiveRange: nil) as? Int,
       NSUnderlineStyle.single.rawValue)
     XCTAssertEqual(Data(view.string.utf8), Data(source.utf8))
+  }
+  func testSharedByteMarkersRequireExactASCIIAndFindLateForeignSource() {
+    let prefix = String(repeating: "Cafe\u{301} 👩🏽‍💻 public prose\n", count: 800)
+    for source in ["", prefix, "[", "［[", "[Attachment:", "[attachment: ", "[Attachment: "] {
+      let projection = ProductCore.markupProjection(source)
+      XCTAssertFalse(projection.hasWikiMarker)
+      XCTAssertFalse(projection.hasAttachmentMarker)
+    }
+    let foreign = NSMutableString(string: prefix)
+    foreign.append("[[Café]]\n[Attachment: public.png](boom-attachment:884646c1-14b4-490d-be8c-8953af793315)")
+    let projection = ProductCore.markupProjection(foreign as String)
+    XCTAssertTrue(projection.hasWikiMarker)
+    XCTAssertTrue(projection.hasAttachmentMarker)
   }
 }

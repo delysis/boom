@@ -1,5 +1,6 @@
 import AppKit
 import CryptoKit
+import Darwin
 import Foundation
 import BoomCore
 import Security
@@ -110,7 +111,7 @@ struct WorkspaceState: Codable, Sendable {
 
 /// One current format. Decryption/schema failure NEVER becomes an empty workspace.
 final class Vault: @unchecked Sendable {
-  enum Kind: String, Sendable { case workspace, document, attachment, receipt, candidate, editJournal, saveJournal, generationJournal }
+  enum Kind: String, Sendable { case workspace, document, attachment, receipt, candidate, editJournal, saveJournal, generationJournal, workspaceIdentity }
   static let workspaceLimit = 134_217_728
   static let workspaceID = UUID(uuidString: "726B3A82-2EB1-493B-9D8E-F17C7A6E4B8A")!
   let root: URL
@@ -186,6 +187,73 @@ final class Vault: @unchecked Sendable {
       using: key, authenticating: aad(kind, id))
     guard data.count <= limit else { throw BoomError.budget("Private record exceeds its read bound.") }
     return data
+  }
+  /// A one-time, bounded bootstrap under the existing Vault key. Creation
+  /// refuses replacement; both file and parent are synchronized before SQL
+  /// may create any content. A partial creation remains an explicit failure.
+  func createWorkspaceIdentity(_ data: Data) throws {
+    guard !Thread.isMainThread, data.count <= 512 else {
+      throw BoomError.invalid("Workspace identity creation must be bounded and off Main.")
+    }
+    lock.lock(); defer { lock.unlock() }
+    let box = try AES.GCM.seal(data, using: key, authenticating: aad(.workspaceIdentity, Self.workspaceID))
+    guard let bytes = box.combined else { throw BoomError.invalid("Could not encode workspace identity.") }
+    let target = url(.workspaceIdentity, Self.workspaceID)
+    let descriptor = Darwin.open(target.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
+    guard descriptor >= 0 else { throw BoomError.unavailable("Workspace identity already exists or could not be created; records retained.") }
+    let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+    var closeAttempted = false
+    do {
+      try handle.write(contentsOf: bytes)
+      try handle.synchronize()
+      closeAttempted = true
+      try handle.close()
+    } catch {
+      let original = error
+      if !closeAttempted {
+        do { try handle.close() }
+        catch { throw BoomError.unavailable("Workspace identity write failed: \(original.localizedDescription). Close also failed: \(error.localizedDescription)") }
+      }
+      throw original
+    }
+    try synchronizeWorkspaceIdentity()
+  }
+  /// A valid bootstrap left before SQL creation may be resumed only after
+  /// synchronizing its existing file and namespace again. No record is rewritten.
+  func synchronizeWorkspaceIdentity() throws {
+    guard !Thread.isMainThread else { throw BoomError.invalid("Workspace identity sync must run off Main.") }
+    for (target, directory) in [(url(.workspaceIdentity, Self.workspaceID), false), (root, true)] {
+      let descriptor = Darwin.open(target.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | (directory ? O_DIRECTORY : 0))
+      guard descriptor >= 0 else { throw BoomError.unavailable("Workspace identity could not be synchronized; records retained.") }
+      var info = stat()
+      let admitted = fstat(descriptor, &info) == 0 && info.st_mode & S_IFMT == (directory ? S_IFDIR : S_IFREG)
+      let syncCode = admitted ? fsync(descriptor) : -1, syncErrno = errno
+      let closeCode = Darwin.close(descriptor), closeErrno = errno
+      guard admitted, syncCode == 0, closeCode == 0 else {
+        throw BoomError.unavailable("Workspace identity did not join: sync \(syncCode)/\(syncErrno), close \(closeCode)/\(closeErrno); records retained.")
+      }
+    }
+  }
+  // New SQL object format; shipped private Vault and backup crypto bytes
+  // stay unchanged. No new key owner, actor, cipher or plaintext store.
+  func sealPagedSQLiteObject(_ bytes: Data, binding: PagedSQLiteBinding) throws -> Data {
+    guard !Thread.isMainThread, bytes.count == binding.plaintextBytes else {
+      throw BoomError.invalid("SQLite encryption must match its admitted bounded object.")
+    }
+    let box = try AES.GCM.seal(bytes, using: key, authenticating: binding.authenticatedData)
+    guard let combined = box.combined, combined.count == bytes.count + 28 else {
+      throw BoomError.invalid("Could not encode the bounded SQLite object.")
+    }
+    return combined
+  }
+  func openPagedSQLiteObject(_ ciphertext: Data, binding: PagedSQLiteBinding) throws -> Data {
+    guard !Thread.isMainThread, ciphertext.count == binding.plaintextBytes + 28 else {
+      throw BoomError.invalid("SQLite ciphertext differs from its admitted object extent.")
+    }
+    let bytes = try AES.GCM.open(AES.GCM.SealedBox(combined: ciphertext),
+      using: key, authenticating: binding.authenticatedData)
+    guard bytes.count == binding.plaintextBytes else { throw BoomError.invalid("SQLite plaintext length changed.") }
+    return bytes
   }
   func encode<T: Encodable>(_ value: T, kind: Kind, id: UUID) throws {
     let trace = PerformanceTrace.begin("Storage.Encode")
@@ -291,6 +359,7 @@ actor WorkspaceStore {
   nonisolated let root: URL
   nonisolated let vault: Vault
   private var diskRevisions: [UUID: String] = [:]
+  private var admittedLegacyDocuments: [UUID: LegacyWorkspaceDocumentDescriptor] = [:]
   init(rootOverride: URL? = nil, testKey: SymmetricKey? = nil, session: VaultSession = .shared) throws {
     #if BOOM_UI_TEST
     let path = ProcessInfo.processInfo.environment["BOOM_UI_TEST_ROOT"]
@@ -320,69 +389,130 @@ actor WorkspaceStore {
   }
   func load() -> Result<(WorkspaceState, [DocumentSnapshot]), Error> {
     Result {
-      try recoverSave()
-      var state: WorkspaceState
-      let hasIndex = vault.exists(.workspace, Vault.workspaceID)
-      if hasIndex {
-        state = try vault.decode(
-          WorkspaceState.self, kind: .workspace, id: Vault.workspaceID, limit: Vault.workspaceLimit)
-      } else {
-        state = WorkspaceState()
-      }
-      guard state.schema == 1 else {
-        throw BoomError.invalid("Unknown workspace schema. Existing data was retained.")
-      }
-      guard Set(state.chats.map(\.id)).count == state.chats.count,
-        Set(state.voices.map(\.slug)).count == state.voices.count,
-        Set(state.voices.map(\.id)).count == state.voices.count
-      else { throw BoomError.invalid("Duplicate identities in workspace index.") }
-      try state.validateRetainedInput()
-      try vault.validateInventory(state, hasIndex: hasIndex)
-      for voice in state.voices + state.voiceVersions {
-        guard try ProductCore.voice(voice.draft).revision == voice.revision else {
-          throw BoomError.invalid("Voice revision changed; encrypted record retained.")
+      try loadLegacyWorkspace { item, bytes in
+        guard let text = String(data: bytes, encoding: .utf8) else {
+          throw BoomError.invalid("Document is not valid UTF-8; original bytes were retained.")
         }
+        let document = DocumentSnapshot(id: item.id, title: item.title, text: text)
+        return (document, document.revision, nil)
       }
-      var documents: [DocumentSnapshot] = []
-      for item in state.documents {
-        guard FileManager.default.fileExists(atPath: documentURL(item.id).path) else {
-          throw BoomError.invalid("An indexed encrypted document is missing. Workspace retained.")
+    }
+  }
+
+  /// Ordinary library/open can consume this catalog without retaining every
+  /// live manuscript String. Historical recovery/proposal evidence keeps its
+  /// existing format. Legacy AEAD/UTF-8 admission remains complete and bounded;
+  /// paged workspaces use the separate engine/publisher catalog route below.
+  func loadDocumentCatalog() -> Result<(WorkspaceState, [WorkspaceDocumentDescriptor]), Error> {
+    Result {
+      try loadLegacyWorkspace { item, bytes in
+        let legacy = LegacyWorkspaceDocumentDescriptor(index: item,
+          plaintextSha256: Digest.sha256(bytes), summary: try LegacyWorkspaceDocumentDescriptor.summary(of: bytes))
+        return (WorkspaceDocumentDescriptor.legacy(legacy), nil, legacy)
+      }
+    }
+  }
+
+  private func loadLegacyWorkspace<Capture>(
+    capture: (DocumentIndex, Data) throws
+      -> (value: Capture, legacyTextRevision: String?, catalogDescriptor: LegacyWorkspaceDocumentDescriptor?)
+  ) throws -> (WorkspaceState, [Capture]) {
+    admittedLegacyDocuments.removeAll()
+    try recoverSave()
+    var state: WorkspaceState
+    let hasIndex = vault.exists(.workspace, Vault.workspaceID)
+    if hasIndex {
+      state = try vault.decode(
+        WorkspaceState.self, kind: .workspace, id: Vault.workspaceID, limit: Vault.workspaceLimit)
+    } else {
+      state = WorkspaceState()
+    }
+    guard state.schema == 1 else {
+      throw BoomError.invalid("Unknown workspace schema. Existing data was retained.")
+    }
+    guard Set(state.chats.map(\.id)).count == state.chats.count,
+      Set(state.voices.map(\.slug)).count == state.voices.count,
+      Set(state.voices.map(\.id)).count == state.voices.count
+    else { throw BoomError.invalid("Duplicate identities in workspace index.") }
+    try state.validateRetainedInput()
+    try vault.validateInventory(state, hasIndex: hasIndex)
+    for voice in state.voices + state.voiceVersions {
+      guard try ProductCore.voice(voice.draft).revision == voice.revision else {
+        throw BoomError.invalid("Voice revision changed; encrypted record retained.")
+      }
+    }
+    var documents: [Capture] = []
+    var loadedIDs = Set<UUID>(), loadedTextRevisions: [UUID: String] = [:]
+    var admittedCatalog: [UUID: LegacyWorkspaceDocumentDescriptor] = [:]
+    for item in state.documents {
+      guard FileManager.default.fileExists(atPath: documentURL(item.id).path) else {
+        throw BoomError.invalid("An indexed encrypted document is missing. Workspace retained.")
+      }
+      let captured = try autoreleasepool {
+        let bytes = try readLegacyDocumentBytes(item.id)
+        let captured = try capture(item, bytes)
+        // Raw AEAD plaintext identity cannot silently replace the revision of
+        // the existing String decoder. Open/snapshot still uses that decoder.
+        if let descriptor = captured.catalogDescriptor {
+          admittedCatalog[item.id] = descriptor
         }
-        let text = try readDocument(item.id)
-        diskRevisions[item.id] = Digest.sha256(text)
-        documents.append(DocumentSnapshot(id: item.id, title: item.title, text: text))
-      }
-      try ProductCore.validateOriginals(state)
-      let files = state.importedFiles ?? [:]
-      for (id, file) in files {
-        guard vault.exists(.attachment, id),
-          try Digest.sha256(vault.get(.attachment, id: id, limit: 2_097_152)) == file.originalDigest else {
-          throw BoomError.invalid("An imported original is missing or changed; encrypted records retained.")
+        if let revision = captured.legacyTextRevision {
+          diskRevisions[item.id] = revision; loadedTextRevisions[item.id] = revision
         }
+        return captured.value
       }
-      for index in state.proposals.indices where state.proposals[index].status == "pending" {
-        let proposal = state.proposals[index]
-        guard vault.exists(.editJournal, proposal.id) else { continue }
-        let journal = try vault.decode(
-          DocumentEditJournal.self, kind: .editJournal, id: proposal.id)
-        guard journal.schema == 1, journal.proposalID == proposal.id,
-          journal.documentID == proposal.document.id,
-          (journal.capturedRevision ?? journal.beforeRevision) == proposal.document.revision,
-          ["prepared", "file_written"].contains(journal.phase)
-        else { throw BoomError.invalid("Unknown or inconsistent edit journal; evidence retained.") }
-        if let actual = documents.first(where: { $0.id == journal.documentID }),
-          actual.revision == journal.afterRevision
-        {
-          state.proposals[index].status = "recovered content present"
-        } else if journal.phase == "file_written"
-          || documents.first(where: { $0.id == journal.documentID })?.revision
-            != journal.beforeRevision
-        {
-          state.proposals[index].status = "recovery needs review"
-        }
+      loadedIDs.insert(item.id)
+      documents.append(captured)
+    }
+    try ProductCore.validateOriginals(state)
+    let files = state.importedFiles ?? [:]
+    for (id, file) in files {
+      guard vault.exists(.attachment, id),
+        try Digest.sha256(vault.get(.attachment, id: id, limit: 2_097_152)) == file.originalDigest else {
+        throw BoomError.invalid("An imported original is missing or changed; encrypted records retained.")
       }
-      try recoverGenerations(&state)
-      return (state, documents)
+    }
+    for index in state.proposals.indices where state.proposals[index].status == "pending" {
+      let proposal = state.proposals[index]
+      guard vault.exists(.editJournal, proposal.id) else { continue }
+      let journal = try vault.decode(
+        DocumentEditJournal.self, kind: .editJournal, id: proposal.id)
+      guard journal.schema == 1, journal.proposalID == proposal.id,
+        journal.documentID == proposal.document.id,
+        (journal.capturedRevision ?? journal.beforeRevision) == proposal.document.revision,
+        ["prepared", "file_written"].contains(journal.phase)
+      else { throw BoomError.invalid("Unknown or inconsistent edit journal; evidence retained.") }
+      let actualRevision: String?
+      if !loadedIDs.contains(journal.documentID) { actualRevision = nil }
+      else if let captured = loadedTextRevisions[journal.documentID] { actualRevision = captured }
+      else {
+        // Historical legacy recovery is an explicit bounded text consumer.
+        // Preserve its exact decoder/revision semantics; do not fake a SHA.
+        actualRevision = Digest.sha256(try readDocument(journal.documentID))
+      }
+      if actualRevision == journal.afterRevision {
+        state.proposals[index].status = "recovered content present"
+      } else if journal.phase == "file_written" || actualRevision != journal.beforeRevision {
+        state.proposals[index].status = "recovery needs review"
+      }
+    }
+    try recoverGenerations(&state)
+    admittedLegacyDocuments = admittedCatalog
+    return (state, documents)
+  }
+  /// Selection/draft-only publication does not change document admission.
+  /// Source writes still invalidate their own descriptor. Titles use exact
+  /// bytes; duplicate metadata refuses any retained admission without a trap.
+  private func retainLegacyCatalog(matching documents: [DocumentIndex]) {
+    var titles: [UUID: String] = [:]
+    for document in documents {
+      guard titles.updateValue(document.title, forKey: document.id) == nil else {
+        admittedLegacyDocuments.removeAll(); return
+      }
+    }
+    admittedLegacyDocuments = admittedLegacyDocuments.filter { entry in
+      guard let title = titles[entry.key] else { return false }
+      return title.utf8.elementsEqual(entry.value.title.utf8)
     }
   }
   nonisolated func documentURL(_ id: UUID) -> URL { vault.recordURL(.document, id) }
@@ -481,16 +611,35 @@ actor WorkspaceStore {
     return SavedWritingHistory(explorations: plan.explorations.map { SavedExploration(id: $0,
       preview: previews[$0] ?? "No prose retained") }, latest: plan.latest)
   }
-  func readDocument(_ id: UUID) throws -> String {
+  private func readLegacyDocumentBytes(_ id: UUID) throws -> Data {
     let u = documentURL(id)
     let v = try u.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
     guard v.isRegularFile == true, v.isSymbolicLink != true, (v.fileSize ?? Int.max) <= 2_097_152 + 64
     else { throw BoomError.invalid("Document is not a bounded regular UTF-8 file.") }
-    let data = try vault.get(.document, id: id, limit: 2_097_152)
+    return try vault.get(.document, id: id, limit: 2_097_152)
+  }
+  func readDocument(_ id: UUID) throws -> String {
+    let data = try readLegacyDocumentBytes(id)
     guard let text = String(data: data, encoding: .utf8) else {
       throw BoomError.invalid("Document is not valid UTF-8; original bytes were retained.")
     }
     return text
+  }
+  /// A selected legacy source is materialized only by this explicit bounded
+  /// request, against the descriptor actually admitted during catalog load.
+  func readDocument(_ descriptor: LegacyWorkspaceDocumentDescriptor) throws -> DocumentSnapshot {
+    guard admittedLegacyDocuments[descriptor.id] == descriptor else {
+      throw BoomError.stale("Legacy document capture no longer matches its admitted catalog.")
+    }
+    let bytes = try readLegacyDocumentBytes(descriptor.id)
+    guard Digest.sha256(bytes) == descriptor.plaintextSha256,
+      try LegacyWorkspaceDocumentDescriptor.summary(of: bytes) == descriptor.summary,
+      let text = String(data: bytes, encoding: .utf8) else {
+      throw BoomError.stale("Legacy document changed after catalog admission; encrypted records retained.")
+    }
+    let document = DocumentSnapshot(id: descriptor.id, title: descriptor.title, text: text)
+    diskRevisions[descriptor.id] = document.revision
+    return document
   }
   func checkDisk(_ id: UUID) throws {
     guard let expected = diskRevisions[id] else { return }
@@ -520,6 +669,7 @@ actor WorkspaceStore {
         }
         try vault.put(Data(document.text.utf8), kind: .document, id: document.id)
         self.diskRevisions[document.id] = document.revision
+        self.admittedLegacyDocuments.removeValue(forKey: document.id)
       } catch { failure = error }
     }
     if let failure { throw failure }
@@ -528,15 +678,18 @@ actor WorkspaceStore {
   func trashDocument(_ id: UUID) throws {
     guard FileManager.default.fileExists(atPath: documentURL(id).path) else {
       diskRevisions.removeValue(forKey: id)
+      admittedLegacyDocuments.removeValue(forKey: id)
       return
     }
     try checkDisk(id)
     try FileManager.default.trashItem(at: documentURL(id), resultingItemURL: nil)
     diskRevisions.removeValue(forKey: id)
+    admittedLegacyDocuments.removeValue(forKey: id)
   }
   func persist(_ state: WorkspaceState) throws {
     try state.validateRetainedInput()
     try vault.encode(state, kind: .workspace, id: Vault.workspaceID)
+    retainLegacyCatalog(matching: state.documents)
   }
   struct SaveJournal: Codable {
     let schema: Int
@@ -602,6 +755,7 @@ actor WorkspaceStore {
     try vault.put(journalBytes, kind: .saveJournal, id: Vault.workspaceID)
     for document in documents { try saveDocument(document) }
     try vault.put(indexBytes, kind: .workspace, id: Vault.workspaceID)
+    retainLegacyCatalog(matching: state.documents)
     try vault.remove(.saveJournal, id: Vault.workspaceID)
   }
 }
@@ -630,7 +784,9 @@ extension WorkspaceStore {
     // The stage now holds the previous workspace. Retain it if rollback fails.
     discardStage = false
     let beforeRevisions = diskRevisions
+    let beforeCatalog = admittedLegacyDocuments
     diskRevisions.removeAll()
+    admittedLegacyDocuments.removeAll()
     do {
       let restored = try load().get()
       discardStage = true
@@ -641,8 +797,212 @@ extension WorkspaceStore {
         throw BoomError.unavailable("Restore rollback failed. Both encrypted directories were retained: \(error.localizedDescription)")
       }
       diskRevisions = beforeRevisions
+      admittedLegacyDocuments = beforeCatalog
       discardStage = true
       throw error
     }
   }
 }
+
+extension WorkspaceStore {
+  /// Separate bounded opening. A page and settings are actual values, never a
+  /// synthesized empty WorkspaceState; the ordinary Model must port explicitly.
+  func loadPagedMetadataOpening(engine: PagedTextEngineAdapter,
+    publisher: PagedWorkspacePublisher) async throws -> WorkspaceBoundedOpening {
+    try admitMetadataOwners(engine, publisher: publisher)
+    let settings = try await engine.loadWorkspaceSettingsRetaining(publisher)
+    let settingsValue = settings.value
+    try await finishMetadataRead(settings.lease, engine: engine)
+    let documents = try await engine.loadDocumentIndexPageRetaining(publisher, expectedHead: settingsValue.head)
+    let documentValue = documents.value
+    try await finishMetadataRead(documents.lease, engine: engine)
+    let chats = try await engine.loadWorkspaceEntityPageRetaining(publisher, kind: .chat,
+      parentID: Vault.workspaceID, expectedHead: settingsValue.head)
+    let chatValue = chats.value
+    try await finishMetadataRead(chats.lease, engine: engine)
+    var selected: WorkspaceDocumentDescriptor?
+    if let id = settingsValue.settings.selectedDocument {
+      let document = try await engine.loadWorkspaceDocumentRetaining(publisher, documentID: id, expectedHead: settingsValue.head)
+      selected = .paged(document.value.record)
+      try await finishMetadataRead(document.lease, engine: engine)
+    }
+    return WorkspaceBoundedOpening(head: settingsValue.head, settings: settingsValue.settings,
+      documents: documentValue.records.map(WorkspaceDocumentDescriptor.paged), nextDocumentOrdinal: documentValue.nextOrdinal,
+      chats: chatValue.entities, nextChatOrdinal: chatValue.nextOrdinal, selectedDocument: selected)
+  }
+  /// Hydrates ONE actual selected input owner under its existing2 MiB UI
+  /// envelope. Header + at most one64 KiB Root window are held at a time.
+  /// The resulting active draft is receiver-owned memory, not a Root window or
+  /// all-owner metadata-memory qualification. Model must check its focus/input
+  /// epoch before adopting this asynchronous result.
+  func loadPagedComposerDraft(_ owner: ComposerOwner, engine: PagedTextEngineAdapter,
+    publisher: PagedWorkspacePublisher) async throws -> ComposerDraft? {
+    try admitMetadataOwners(engine, publisher: publisher)
+    let capture = try await engine.loadWorkspaceDraftRetaining(publisher, owner: owner)
+    var headerReleaseAttempted = false
+    do {
+      guard let value = capture.value else { headerReleaseAttempted = true; try await finishMetadataRead(capture.lease, engine: engine); return nil }
+      guard value.header.draftOwner == owner, let body = value.header.bodies["text"], body.encoding == .utf8,
+        body.bytes <= 2_097_152 else { throw BoomError.denied("Selected draft differs from its actual bounded owner/body.") }
+      var bytes = Data(); bytes.reserveCapacity(body.bytes)
+      for part in 0..<body.partCount {
+        let window = try await engine.loadWorkspaceEntityBodyPartRetaining(publisher,
+          reference: value.reference, field: "text", part: part)
+        bytes.append(window.value)
+        do { try await engine.abandonJoinedRootOutput(window.lease) }
+        catch { throw PagedTextCustodyFailure(original: error, lease: window.lease) }
+      }
+      let draft = try value.header.hydratedDraft(bytes: bytes)
+      headerReleaseAttempted = true
+      try await finishMetadataRead(capture.lease, engine: engine)
+      return draft
+    } catch {
+      let original = error
+      if headerReleaseAttempted { throw original }
+      headerReleaseAttempted = true
+      do { try await finishMetadataRead(capture.lease, engine: engine) }
+      catch { throw PagedTextCustodyHandoffFailure(original: original, handoff: error, lease: capture.lease) }
+      throw original
+    }
+  }
+  func savePagedSettingsRetaining(_ settings: WorkspaceSettings,
+    engine: PagedTextEngineAdapter, publisher: PagedWorkspacePublisher,
+    expectedHead: PagedWorkspaceHead) async throws -> PagedTextCustodiedValue<WorkspaceMetadataPublication> {
+    try admitMetadataOwners(engine, publisher: publisher)
+    let input = try WorkspaceMetadataInput(settings: settings)
+    return try await engine.publishWorkspaceMetadataRetaining(publisher, input: input, expectedHead: expectedHead)
+  }
+  func savePagedComposerDraftRetaining(_ draft: ComposerDraft,
+    expected: WorkspaceEntityReference?, engine: PagedTextEngineAdapter,
+    publisher: PagedWorkspacePublisher, expectedHead: PagedWorkspaceHead) async throws -> PagedTextCustodiedValue<WorkspaceMetadataPublication> {
+    try admitMetadataOwners(engine, publisher: publisher)
+    let entity = try WorkspaceEntityInput.draft(draft, expected: expected)
+    let input = try WorkspaceMetadataInput(entities: [entity])
+    return try await engine.publishWorkspaceMetadataRetaining(publisher, input: input, expectedHead: expectedHead)
+  }
+  /// Same immutable metadata input, SQL executor and final transaction. The
+  /// selected native graph must actually close/detach before rename or trash.
+  /// No legacy whole-state save, file trash, body decode or silent retry occurs.
+  func savePagedDocumentChangesRetaining(_ changes: [WorkspaceDocumentMutation],
+    settings: WorkspaceSettings? = nil, entities: [WorkspaceEntityInput] = [],
+    removals: [WorkspaceEntityRemoval] = [], engine: PagedTextEngineAdapter,
+    publisher: PagedWorkspacePublisher, expectedHead: PagedWorkspaceHead)
+    async throws -> PagedTextCustodiedValue<WorkspaceMetadataPublication> {
+    try admitMetadataOwners(engine, publisher: publisher)
+    let input = try WorkspaceMetadataInput(settings: settings, entities: entities,
+      removals: removals, documentChanges: changes)
+    return try await engine.publishWorkspaceMetadataRetaining(publisher, input: input, expectedHead: expectedHead)
+  }
+  /// Normal owning-store receiving, then actual explicit output disposal.
+  /// Caller retains the carrier on any refusal; no source/native ACK is made.
+  func finishPagedMetadataPublication(_ output: PagedTextCustodiedValue<WorkspaceMetadataPublication>,
+    engine: PagedTextEngineAdapter, publisher: PagedWorkspacePublisher) async throws -> PagedWorkspaceHead {
+    try admitMetadataOwners(engine, publisher: publisher)
+    let head = try await engine.finishWorkspaceMetadataPublication(output, publisher: publisher)
+    do { try await engine.abandonJoinedRootOutput(output.lease) }
+    catch { throw PagedTextCustodyFailure(original: error, lease: output.lease) }
+    return head
+  }
+  private func finishMetadataRead(_ lease: PagedTextRootLease, engine: PagedTextEngineAdapter) async throws {
+    do { try await engine.abandonJoinedRootOutput(lease) }
+    catch { throw PagedTextCustodyFailure(original: error, lease: lease) }
+  }
+  private func admitMetadataOwners(_ engine: PagedTextEngineAdapter,
+    publisher: PagedWorkspacePublisher) throws {
+    guard engine.belongs(to: vault), publisher.belongs(to: vault) else { throw BoomError.denied("Metadata belongs to another actual WorkspaceStore Vault owner.") }
+  }
+}
+
+#if BLOOM_PAGED_SQL_PUBLIC_CONTROL
+/// One immutable caller-owned public source value, not a lease, durable ACK,
+/// key owner or migration authority. The existing validator admitted the actual
+/// legacy directory BEFORE the new SQL subdirectory exists.
+struct PublicWorkspaceMetadataSource: Sendable {
+  fileprivate let vault: Vault
+  fileprivate let plaintextSHA256: String
+  fileprivate let state: WorkspaceState
+  fileprivate let legacyNames: Set<String>
+}
+extension WorkspaceStore {
+  func publicFixtureMetadataSource(plaintextSHA256: String) throws -> PublicWorkspaceMetadataSource {
+    guard !Thread.isMainThread, root.lastPathComponent.hasPrefix("bloom-metadata-public-"),
+      UUID(uuidString: String(root.lastPathComponent.dropFirst("bloom-metadata-public-".count))) != nil,
+      PagedWorkspaceObjectReference.isDigest(plaintextSHA256) else { throw BoomError.denied("Conversion is limited to the exact disposable public fixture namespace.") }
+    let names = try publicFixtureLegacyNames()
+    guard names.count <= 64 else { throw BoomError.budget("Public conversion source inventory exceeds64 fixed names.") }
+    let original = try vault.get(.workspace, id: Vault.workspaceID, limit: 1_048_576)
+    guard Digest.sha256(original) == plaintextSHA256 else { throw BoomError.denied("Authenticated public source differs from its exact captured SHA.") }
+    let state = try PropertyListDecoder().decode(WorkspaceState.self, from: original)
+    _ = try WorkspaceMetadataInput.admitPublicFixture(state)
+    let encoder = PropertyListEncoder(); encoder.outputFormat = .binary
+    let roundTrip = try encoder.encode(state)
+    guard roundTrip.count <= 1_048_576,
+      let before = try PropertyListSerialization.propertyList(from: original, options: [], format: nil) as? NSDictionary,
+      let after = try PropertyListSerialization.propertyList(from: roundTrip, options: [], format: nil) as? NSDictionary,
+      before.isEqual(after) else {
+      throw BoomError.invalid("Unknown/changed compatibility fields cannot be dropped during conversion; original retained.")
+    }
+    // Never filter/relax the shipped inventory validator to accept a SQL dir.
+    try vault.validateInventory(state, hasIndex: true)
+    try ProductCore.validateOriginals(state)
+    for (id, file) in state.importedFiles ?? [:] {
+      guard vault.exists(.attachment, id),
+        try Digest.sha256(vault.get(.attachment, id: id, limit: 2_097_152)) == file.originalDigest else {
+        throw BoomError.invalid("Public imported original is missing or changed; original encrypted fixture retained.")
+      }
+    }
+    return PublicWorkspaceMetadataSource(vault: vault, plaintextSHA256: plaintextSHA256,
+      state: state, legacyNames: names)
+  }
+  func publicFixtureMetadataInput(_ source: PublicWorkspaceMetadataSource,
+    engine: PagedTextEngineAdapter, publisher: PagedWorkspacePublisher,
+    documents: [PagedDocumentRootRecord]) async throws -> WorkspaceMetadataInput {
+    try admitMetadataOwners(engine, publisher: publisher)
+    guard source.vault === vault, try publicFixtureLegacyNames() == source.legacyNames.union(["paged-sqlite-v3"]),
+      try Digest.sha256(vault.get(.workspace, id: Vault.workspaceID, limit: 1_048_576)) == source.plaintextSHA256 else {
+      throw BoomError.stale("The same public conversion source/namespace changed after authenticated preparation.")
+    }
+    let input = try WorkspaceMetadataInput.publicFixture(source.state, documents: documents)
+    // Compare each actual imported tree against the authenticated shipped
+    // document, one legacy <=2 MiB value and one <=64 KiB window at a time.
+    // A matching id/title projection or caller-supplied digest cannot prove
+    // that the text itself was converted without loss.
+    guard documents.count <= WorkspaceMetadataInput.maximumEntities else { throw BoomError.budget("Public document conversion exceeds its small complete fixture envelope.") }
+    for record in documents {
+      let originalDocument = try readLegacyDocumentBytes(record.document.id)
+      guard record.document.revision.summary.bytes == UInt64(originalDocument.count) else { throw BoomError.denied("Public converted source extent differs from the original authenticated document.") }
+      var offset = 0
+      while offset < originalDocument.count {
+        let captured = try await engine.windowRetaining(record.document.revision,
+          byteStart: UInt64(offset), maximumBytes: 65_536)
+        let count = captured.value.text.utf8.count
+        let matches = captured.value.byteStart == UInt64(offset) && count > 0
+          && count <= originalDocument.count - offset
+          && captured.value.text.utf8.elementsEqual(originalDocument[offset..<(offset + count)])
+        // Always join disposal of the actual returned read before refusing a
+        // comparison; do not strand a producer merely because bytes differ.
+        do { try await engine.abandonJoinedRootOutput(captured.lease) }
+        catch { throw PagedTextCustodyFailure(original: error, lease: captured.lease) }
+        guard matches else { throw BoomError.denied("Public converted source differs from the original authenticated UTF8 bytes.") }
+        offset += count
+      }
+      guard Digest.sha256(try readLegacyDocumentBytes(record.document.id)) == Digest.sha256(originalDocument) else { throw BoomError.stale("Original public source changed while its actual imported windows joined.") }
+    }
+    guard try publicFixtureLegacyNames() == source.legacyNames.union(["paged-sqlite-v3"]),
+      try Digest.sha256(vault.get(.workspace, id: Vault.workspaceID, limit: 1_048_576)) == source.plaintextSHA256 else {
+      throw BoomError.stale("Public conversion source changed while its actual tree reads joined.")
+    }
+    return input
+  }
+  private func publicFixtureLegacyNames() throws -> Set<String> {
+    let names = Set(try FileManager.default.contentsOfDirectory(at: vault.root,
+      includingPropertiesForKeys: nil).map(\.lastPathComponent))
+    for name in names {
+      guard !["editJournal-", "saveJournal-", "generationJournal-"].contains(where: { name.hasPrefix($0) }) else {
+        throw BoomError.unavailable("Public conversion requires the original journal owner to join first.")
+      }
+    }
+    return names
+  }
+}
+#endif

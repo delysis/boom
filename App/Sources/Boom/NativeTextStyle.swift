@@ -24,11 +24,11 @@ struct MarkdownSpan: Decodable {
     let title: NSRange
     let hidden: [NSRange]
   }
-  static func wikiDisplays(in source: String, excluding literalRanges: [NSRange] = []) -> [WikiDisplay] {
+  static func wikiDisplays(in source: String, excluding literalRanges: [NSRange] = [], hasMarker: Bool? = nil) -> [WikiDisplay] {
     guard let pattern = wikiPattern
     else { return [] }
     let text = source as NSString
-    guard text.range(of: "[[", options: .literal).location != NSNotFound else { return [] }
+    guard hasMarker ?? (text.range(of: "[[", options: .literal).location != NSNotFound) else { return [] }
     return pattern.matches(in: source, range: NSRange(location: 0, length: text.length))
       .compactMap { match in
         guard !literalRanges.contains(where: { NSIntersectionRange($0, match.range).length > 0 }) else {
@@ -72,18 +72,23 @@ struct MarkdownSpan: Decodable {
       .font: bodyFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: paragraph,
     ]
     let spans: [MarkdownSpan]
+    let projection: ProductCore.MarkupProjection?
     if let native = view as? NativeMediaTextView {
-      spans = native.markupProjection.markdown
+      let captured = native.markupProjection
+      projection = captured
+      spans = captured.markdown
     } else {
+      projection = nil
       let trace = PerformanceTrace.begin("Editor.MarkdownParse")
       defer { PerformanceTrace.end("Editor.MarkdownParse", trace) }
       spans = (try? ProductCore.markdownSpans(source)) ?? []
     }
     let literalRanges = spans.filter { $0.kind == "code" }
       .map { NSRange(location: $0.location, length: $0.length) }
-    let wikis = wikiDisplays(in: source, excluding: literalRanges)
-    let attachments = text.range(of: "[Attachment: ", options: .literal).location == NSNotFound
-      ? [] : (attachmentPattern?.matches(in: source, range: full) ?? [])
+    let wikis = wikiDisplays(in: source, excluding: literalRanges, hasMarker: projection?.hasWikiMarker)
+    let hasAttachment = projection?.hasAttachmentMarker
+      ?? (text.range(of: "[Attachment: ", options: .literal).location != NSNotFound)
+    let attachments = hasAttachment ? (attachmentPattern?.matches(in: source, range: full) ?? []) : []
     view.typingAttributes = base
     defer {
       (view as? NativeMediaTextView)?.inlineMedia.refresh()

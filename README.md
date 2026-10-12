@@ -48,6 +48,8 @@ Model-cache reclamation retains the generation coordinator's lease and releases 
 
 Use an Apple Silicon Mac, macOS 15 or later, Xcode with Swift 6, and Rust.
 
+Standalone Core checks support Linux with Swift 6.1 or later. Core keeps Swift language mode 5 and uses Swift Crypto for SHA-256; on macOS, that package forwards to system CryptoKit.
+
 ```sh
 scripts/bootstrap.sh
 scripts/check-portable.sh

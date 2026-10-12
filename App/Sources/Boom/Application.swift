@@ -15,6 +15,28 @@ import SwiftUI
 
 @main @MainActor enum BoomMain {
   static func main() {
+    #if BLOOM_DEVELOPER_STACK_DIAGNOSTICS
+    // This branch precedes every ordinary workspace, Keychain and model path.
+    // Malformed diagnostic arguments must never fall through to a normal launch.
+    if CommandLine.arguments.contains("--developer-stack-public-fixture")
+      || CommandLine.arguments.contains("--developer-stack-recipe") {
+      guard CommandLine.arguments.count == 4,
+        CommandLine.arguments[1] == "--developer-stack-public-fixture",
+        CommandLine.arguments[2] == "--developer-stack-recipe",
+        CommandLine.arguments[3].hasPrefix("/") else {
+        fputs("Public editor diagnostic arguments refused.\n", stderr); exit(1)
+      }
+      do { try DeveloperStackDiagnostics.startOwnedEntryLifetime() }
+      catch { fputs("Public editor lifetime admission refused.\n", stderr); exit(1) }
+      let recipe = URL(fileURLWithPath: CommandLine.arguments[3])
+      let app = NSApplication.shared; app.setActivationPolicy(.prohibited)
+      Task {
+        do { try await DeveloperEditorFixture.run(recipe: recipe); exit(0) }
+        catch { fputs("Public editor diagnostic failed: \(error.localizedDescription)\n", stderr); exit(1) }
+      }
+      app.run(); return
+    }
+    #endif
     if CommandLine.arguments.contains("--video-storyboard-smoke") {
       let app = NSApplication.shared; app.setActivationPolicy(.prohibited)
       Task {

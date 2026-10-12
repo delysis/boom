@@ -52,12 +52,13 @@ let package = Package(
       .product(name: "MLXHuggingFace", package: "MLXSwiftLM"),
       .product(name: "Tokenizers", package: "swift-transformers"),
     ], resources: [.process("Resources")]),
+    .systemLibrary(name: "CSQLite"),
     .target(name: "CAttachment", publicHeadersPath: "include", cSettings: rustArchiveSettings),
     .executableTarget(
       name: "Boom",
       dependencies: [
         .product(name: "BoomCore", package: "core"),
-        "CAttachment",
+        "CAttachment", "CSQLite",
         .product(name: "MLXLMCommon", package: "MLXSwiftLM"),
         .product(name: "MLXVLM", package: "MLXSwiftLM"),
         .product(name: "MLXHuggingFace", package: "MLXSwiftLM"),
@@ -77,6 +78,10 @@ let package = Package(
         .linkedFramework("SystemConfiguration"),
         .linkedFramework("AVFoundation"), .linkedFramework("Speech"),
       ]),
-    .testTarget(name: "BoomTests", dependencies: ["Boom"], resources: [.copy("Fixtures")]),
+    .testTarget(name: "BoomTests", dependencies: ["Boom"], exclude: [
+      "PagedTextContainerTests.swift",
+      "PagedTextRootStoreTests.swift",
+      "PagedTextVaultTests.swift",
+    ], resources: [.copy("Fixtures")]),
   ], swiftLanguageModes: [.v5]
 )

@@ -66,7 +66,7 @@ struct ManuscriptPane: View {
   var body: some View {
     GeometryReader { pane in
       VStack(spacing: 0) {
-        if let documentID = model.state.selectedDocument, model.documents.contains(where: { $0.id == documentID }) {
+        if let documentID = model.state.selectedDocument, model.documentIndices.contains(where: { $0.id == documentID }) {
           MarkdownEditor(model: model, documentID: documentID)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
@@ -175,7 +175,7 @@ struct LibraryView: View {
   }
   private func chooseDocument(_ id: UUID) {
     if renameTarget != nil { commitRename() }
-    let visible = model.documents.filter { model.documentMatchesSearch($0) }.map(\.id)
+    let visible = model.documentIndices.filter { model.documentMatchesSearch($0) }.map(\.id)
     let modifiers = NSApp.currentEvent?.modifierFlags ?? []
     var selection = LibrarySelection(ids: model.selectedDocumentIDs, anchor: documentAnchor)
     let result = selection.click(
@@ -186,7 +186,7 @@ struct LibraryView: View {
     case .none: break
     case .open: model.selectDocument(id, preservingSelection: true)
     case .rename:
-      if let document = model.documents.first(where: { $0.id == id }) {
+      if let document = model.documentIndices.first(where: { $0.id == id }) {
         beginRename(.document(id), title: document.title)
       }
     }
@@ -229,8 +229,7 @@ struct LibraryView: View {
           heading("Documents") {
             do { try model.newDocument() } catch { model.report(error) }
           }
-          ForEach(model.documents.filter { model.state.importedFiles?[$0.id]?.folderID == nil && model.documentMatchesSearch($0) }
-            .map { DocumentIndex(id: $0.id, title: $0.title) }, id: \.id) { document in
+          ForEach(model.documentIndices.filter { model.state.importedFiles?[$0.id]?.folderID == nil && model.documentMatchesSearch($0) }, id: \.id) { document in
             Group {
               if renameTarget == .document(document.id) {
                 editableRow(symbol: "doc.text", selected: true)
@@ -367,7 +366,7 @@ struct ChatPane: View {
             Button("Detach document") { model.attachDocument(nil, to: chat.id) }
             Divider()
           }
-          ForEach(model.documents.map { DocumentIndex(id: $0.id, title: $0.title) }, id: \.id) { document in
+          ForEach(model.documentIndices, id: \.id) { document in
             Button(document.title) { model.attachDocument(document.id, to: chat.id) }
           }
         }
@@ -434,7 +433,7 @@ struct ChatPane: View {
       Button("New chat") {
         do { try model.newChat() } catch { model.report(error) }
       }
-      if let document = model.selectedDocument {
+      if let document = model.selectedDocumentIndex {
         Button("New chat about \(document.title)") {
           do { try model.newChat(about: document.id) } catch { model.report(error) }
         }
@@ -461,7 +460,7 @@ struct ChatPane: View {
         Button("New chat") {
           do { try model.newChat() } catch { model.report(error) }
         }
-        if let document = model.selectedDocument {
+        if let document = model.selectedDocumentIndex {
           Button("New chat about \(document.title)") {
             do { try model.newChat(about: document.id) } catch { model.report(error) }
           }
@@ -678,7 +677,7 @@ struct ChatPane: View {
         if let chat = model.selectedChat, let documentID = chat.attachedDocumentID {
           HStack(spacing: 5) {
             Image(systemName: "doc.text")
-            Text("About " + (model.documents.first { $0.id == documentID }?.title ?? "missing document"))
+            Text("About " + (model.documentIndices.first { $0.id == documentID }?.title ?? "missing document"))
               .lineLimit(1)
             Button {
               model.attachDocument(nil, to: chat.id)
