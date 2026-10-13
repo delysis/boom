@@ -23,6 +23,9 @@ private struct MetadataSQLCleanupFailure: Error {
   let vault: Vault
   let ownerID = UUID(), storeID = UUID()
   var engine: PagedTextEngineAdapter?
+  // One actual retired source owner, still holding its unresolved input/outcome.
+  // This retained-terminal case must never delete its public scratch evidence.
+  var retiredEngine: PagedTextEngineAdapter?
   var publisher: PagedWorkspacePublisher?
   var identity: PagedSQLPublicControlIdentity?
   var source: PublicWorkspaceMetadataSource?
@@ -116,6 +119,17 @@ private struct MetadataSQLCleanupFailure: Error {
     do {
       try await body(held)
       guard (testRun?.failureCount ?? 0) == failures else { throw BoomError.invalid("A substantive assertion failed; originals/owners/files retained.") }
+      if let retired = held.retiredEngine {
+        let retained = retired.custodySnapshot
+        guard held.engine == nil, held.closed, held.file == nil, held.backend == nil,
+          !held.leases.isEmpty, !held.originals.isEmpty, retained.closing, retained.jobs == 0,
+          retained.items.allSatisfy({ $0.producerJoined && !$0.bulkActive }),
+          retained.items.contains(where: { $0.phase == .unresolved && $0.sqlReceivingJoined == false }) else {
+          throw BoomError.stale("The actual failed owner/input or joined cold close was lost.")
+        }
+        print("Retained terminal metadata owner/input/original at \(root.path); physical SQL/Rust resources retired and separate cold owner closed. No old receiving ACK or scratch deletion.")
+        return
+      }
       try await held.closeSource()
       guard held.closed else { throw BoomError.stale("Actual source close did not join.") }
       try await Task.detached { try FileManager.default.removeItem(at: root) }.value
@@ -304,10 +318,13 @@ private struct MetadataSQLCleanupFailure: Error {
     }
   }
 
-  func testActualAfterCommitNameFailureRequiresCheckpointAndRealMetadataReceiving() async throws {
-    try await fixture("testActualAfterCommitNameFailureRequiresCheckpointAndRealMetadataReceiving", faultNamespace: true) { held in
+  func testActualNameFailureRetainsUnresolvedOwnerAndColdReopenAuthenticatesCommittedSettings() async throws {
+    try await fixture("testActualNameFailureRetainsUnresolvedOwnerAndColdReopenAuthenticatesCommittedSettings", faultNamespace: true) { held in
       let before = try await self.emptySeed(held), engine = try XCTUnwrap(held.engine), publisher = try XCTUnwrap(held.publisher)
-      var changed = WorkspaceSettings(); changed.autocomplete = false
+      let oldConnection = (try await engine.nativeSQLMaintenanceSnapshot()).storage.identity
+      var changed = WorkspaceSettings(); changed.autocomplete = false; changed.showChat = false
+      changed.theme = "dark"; changed.preferredModels = ["writing": "public-model"]
+      changed.presentOptionalCollections = ["preferredModels", "composerDrafts"]
       let settingsValue = changed
       let input = try await Task.detached { try WorkspaceMetadataInput(settings: settingsValue) }.value
       try await engine._publicSQLControlArmCommitFault(identity: XCTUnwrap(held.identity), fault: .moveDatabaseName)
@@ -317,21 +334,56 @@ private struct MetadataSQLCleanupFailure: Error {
         try held.keep(unexpected.lease)
       } catch let actual as PagedTextCustodyFailure { refused = actual; try held.keep(actual.lease); try held.preserve(actual.original) }
       let failure = try XCTUnwrap(refused)
-      XCTAssertTrue(engine.custodySnapshot.items.contains { $0.id == failure.lease.id && $0.sqlOperationID == input.inputID && $0.producerJoined && $0.sqlReceivingJoined == false })
+      let failedSnapshot = engine.custodySnapshot
+      let failedItem = try XCTUnwrap(failedSnapshot.items.first { $0.id == failure.lease.id })
+      XCTAssertEqual(failedItem.phase, .unresolved); XCTAssertEqual(failedItem.sqlOperationID, input.inputID)
+      XCTAssertTrue(failedItem.producerJoined); XCTAssertFalse(failedItem.bulkActive)
+      XCTAssertEqual(failedItem.sqlReceivingJoined, false); XCTAssertEqual(failedSnapshot.jobs, 0)
+      // Restore only the same scratch name/inode. Apple VNODE has no documented
+      // same-live-connection reset; do not inspect/retry/checkpoint old outcome.
       try await engine._publicSQLControlRestoreDatabaseName(identity: XCTUnwrap(held.identity))
-      let repaired = try await engine.resolveSQLiteOutputRetaining(failure.lease, publisher: publisher)
-      guard case .metadata(let actual) = repaired.value else { throw BoomError.invalid("Actual durability repair did not return its retained normal AFTER output.") }
-      XCTAssertEqual(repaired.lease, failure.lease); XCTAssertEqual(actual.head.generation, before.generation + 1)
-      let fenced = try await engine.nativeSQLMaintenanceSnapshot()
-      XCTAssertEqual(fenced.storage.failedOperationID, input.inputID)
-      XCTAssertEqual(fenced.storage.lastCheckpoint?.code, 0)
-      let output = PagedTextCustodiedValue(value: actual, lease: repaired.lease)
-      let joined = try await engine.finishWorkspaceMetadataPublication(output, publisher: publisher)
-      XCTAssertEqual(joined, actual.head)
-      XCTAssertTrue(engine.custodySnapshot.items.contains { $0.id == failure.lease.id && $0.sqlReceivingJoined == true })
-      try await held.release(output.lease)
-      let receiving = try await engine.nativeSQLMaintenanceSnapshot(); XCTAssertNil(receiving.storage.failedOperationID)
-      let loaded = try await self.settings(held); XCTAssertFalse(loaded.settings.autocomplete)
+      do {
+        try await engine.close()
+        throw BoomError.invalid("Normal close discarded the actual unresolved input/outcome.")
+      } catch BoomError.unavailable { } // The unchanged normal close guard.
+      try await engine.retireFailedSourceResources()
+      held.retiredEngine = engine // Preserve actual owner, lease, original and scratch.
+      held.engine = nil; held.publisher = nil; held.identity = nil
+      // A NEW authoritative connection/engine, never a scalar rebind or old ACK.
+      try await held.open(.existing(storeID: held.storeID))
+      let cold = try XCTUnwrap(held.engine)
+      let coldConnection = (try await cold.nativeSQLMaintenanceSnapshot()).storage.identity
+      XCTAssertEqual(coldConnection.ownerID, oldConnection.ownerID)
+      XCTAssertEqual(coldConnection.storeID, oldConnection.storeID)
+      XCTAssertNotEqual(coldConnection.engineIncarnation, oldConnection.engineIncarnation)
+      XCTAssertNotEqual(coldConnection.connectionIncarnation, oldConnection.connectionIncarnation)
+      let loaded = try await self.settings(held)
+      XCTAssertEqual(loaded.head.ownerID, before.ownerID); XCTAssertEqual(loaded.head.storeID, before.storeID)
+      XCTAssertEqual(loaded.head.generation, before.generation + 1)
+      let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+      XCTAssertEqual(try encoder.encode(loaded.settings), try encoder.encode(settingsValue))
+      let after = engine.custodySnapshot
+      let stillFailed = try XCTUnwrap(after.items.first { $0.id == failure.lease.id })
+      XCTAssertTrue(after.closing); XCTAssertEqual(after.jobs, 0)
+      XCTAssertEqual(after.items.map(\.id), failedSnapshot.items.map(\.id))
+      XCTAssertEqual(after.reservedPayloadBytes, failedSnapshot.reservedPayloadBytes)
+      XCTAssertEqual(after.metadataEnvelopeBytes, failedSnapshot.metadataEnvelopeBytes)
+      XCTAssertEqual(stillFailed.phase, failedItem.phase); XCTAssertEqual(stillFailed.claims, failedItem.claims)
+      XCTAssertEqual(stillFailed.payloadReservation, failedItem.payloadReservation)
+      XCTAssertEqual(stillFailed.sqlOperationID, failedItem.sqlOperationID)
+      XCTAssertEqual(stillFailed.sqlReceivingJoined, false)
+      XCTAssertTrue(held.leases.contains(failure.lease)); XCTAssertEqual(held.originals.count, 1)
+      do {
+        try await cold.abandonJoinedRootOutput(failure.lease)
+        throw BoomError.invalid("Fresh cold authority consumed another engine's unresolved lease.")
+      } catch BoomError.denied { }
+      // The cold read output actually joined independently. Close ONLY its real
+      // empty owner; the old receiving intent and failed evidence remain held.
+      XCTAssertTrue(cold.custodySnapshot.items.isEmpty)
+      let maintenance = try await cold.joinScheduledWALMaintenance()
+      if let failure = maintenance.failure { throw failure }
+      try await cold.close()
+      held.engine = nil; held.publisher = nil; held.identity = nil; held.closed = true
     }
   }
 }

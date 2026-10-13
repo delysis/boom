@@ -325,13 +325,14 @@ private actor SQLDurabilityLostACKForwarder: PagedNativeSQLDurabilityStorage {
     }
   }
 
-  func testActualPostCommitNameFailureRequiresBarrierThenInstalledHistoryFinish() async throws {
-    try await fixture("testActualPostCommitNameFailureRequiresBarrierThenInstalledHistoryFinish") { held in
-      let (native, prepared) = try await self.failedUndo(held, fault: .moveDatabaseName)
+  // Public protection admission fault; actual Apple live recovery remains unqualified.
+  func testActualPostCommitProtectionFailureRequiresBarrierThenInstalledHistoryFinish() async throws {
+    try await fixture("testActualPostCommitProtectionFailureRequiresBarrierThenInstalledHistoryFinish") { held in
+      let (native, prepared) = try await self.failedUndo(held, fault: .changeProtection)
       let engine = try XCTUnwrap(held.engine), identity = try XCTUnwrap(held.identity)
       let writes = (try await engine.nativeSQLMaintenanceSnapshot()).storage.failedOperationID
       XCTAssertEqual(writes, prepared.preparationID)
-      try await engine._publicSQLControlRestoreDatabaseName(identity: identity)
+      try await engine._publicSQLControlRestoreDatabaseProtection(identity: identity)
       guard case .conflict = try await native.session.inspectHistoryRecovery() else { throw BoomError.invalid("Authenticated visible after improperly granted durable native installation.") }
       guard case .published(let acknowledgement) = try await native.session.repairHistoryDurability() else {
         throw BoomError.invalid("Actual committed publication did not repair its same operation/full records.")
@@ -357,7 +358,7 @@ private actor SQLDurabilityLostACKForwarder: PagedNativeSQLDurabilityStorage {
   func testActualOrdinaryAfterRepairKeepsLaterAcceptedCharactersAndOrderedHistory() async throws {
     try await fixture("testActualOrdinaryAfterRepairKeepsLaterAcceptedCharactersAndOrderedHistory") { held in
       let native = try await self.native(held), engine = try XCTUnwrap(held.engine)
-      try await engine._publicSQLControlArmCommitFault(identity: try XCTUnwrap(held.identity), fault: .moveDatabaseName)
+      try await engine._publicSQLControlArmCommitFault(identity: try XCTUnwrap(held.identity), fault: .changeProtection)
       try native.replaceFirst("b")
       try await self.requireActualRefusal(held, message: "The actual post-COMMIT ordinary fault unexpectedly joined.") {
         _ = try await native.seal()
@@ -366,7 +367,7 @@ private actor SQLDurabilityLostACKForwarder: PagedNativeSQLDurabilityStorage {
       try native.replaceFirst("c") // actually accepted while the b prefix failed
       XCTAssertEqual(native.session.generation, 2)
       XCTAssertEqual(Data(native.view.string.utf8), Data("c public🙂\n".utf8))
-      try await engine._publicSQLControlRestoreDatabaseName(identity: try XCTUnwrap(held.identity))
+      try await engine._publicSQLControlRestoreDatabaseProtection(identity: try XCTUnwrap(held.identity))
       let acknowledgement = try await native.session.repairCommitDurability()
       XCTAssertEqual(acknowledgement.lastSequence, 1)
       XCTAssertEqual(Data(acknowledgement.sealedWindow.text.utf8), Data("b public🙂\n".utf8))
@@ -385,7 +386,7 @@ private actor SQLDurabilityLostACKForwarder: PagedNativeSQLDurabilityStorage {
       let failure = try XCTUnwrap(held.setupFailure), originalEngine = failure.engine
       XCTAssertTrue(held.engine === originalEngine)
       XCTAssertEqual(originalEngine.custodySnapshot.items.count, 1)
-      try await originalEngine._publicSQLControlRestoreFailedSetupName(failure)
+      try await originalEngine._publicSQLControlRestoreFailedSetupProtection(failure)
       let result = try await originalEngine.repairFailedSetupOpening(failure)
       guard case .opened(let returned, _) = result else { throw BoomError.invalid("Actual visible committed format did not join opening.") }
       XCTAssertTrue(returned === originalEngine)
@@ -440,14 +441,14 @@ private actor SQLDurabilityLostACKForwarder: PagedNativeSQLDurabilityStorage {
       // read through the same outcome, then released only by actual finish.
       let forwarder = try XCTUnwrap(held.lostACKForwarder)
       try await forwarder.armNextActualReplyLoss()
-      try await engine._publicSQLControlArmCommitFault(identity: try XCTUnwrap(held.identity), fault: .moveDatabaseName)
+      try await engine._publicSQLControlArmCommitFault(identity: try XCTUnwrap(held.identity), fault: .changeProtection)
       try native.replaceFirst("d")
-      try await self.requireActualRefusal(held, message: "Actual post-COMMIT source name failure was not entered.") {
+      try await self.requireActualRefusal(held, message: "Actual post-COMMIT protection admission failure was not entered.") {
         _ = try await native.seal()
       }
       let originalFailure = try await engine.nativeSQLMaintenanceSnapshot()
       let failedOperation = try XCTUnwrap(originalFailure.storage.failedOperationID)
-      try await engine._publicSQLControlRestoreDatabaseName(identity: try XCTUnwrap(held.identity))
+      try await engine._publicSQLControlRestoreDatabaseProtection(identity: try XCTUnwrap(held.identity))
       try await self.requireActualRefusal(held, message: "The real repaired ACK reply was not lost.") {
         _ = try await native.session.repairCommitDurability()
       }
@@ -555,16 +556,16 @@ private actor SQLDurabilityLostACKForwarder: PagedNativeSQLDurabilityStorage {
       var state = WorkspaceState()
       state.documents = [DocumentIndex(id: record.document.id, title: record.document.title)]
       state.selectedDocument = nil // real metadata change, same immutable source
-      try await engine._publicSQLControlArmCommitFault(identity: try XCTUnwrap(held.identity), fault: .moveDatabaseName)
+      try await engine._publicSQLControlArmCommitFault(identity: try XCTUnwrap(held.identity), fault: .changeProtection)
       var original: PagedTextCustodyFailure?
       var unexpected: PagedTextCustodiedValue<PagedWorkspaceSnapshot>?
       do { unexpected = try await engine.publishWorkspaceRetaining(publisher, state: state,
         documents: [record], expectedHead: expectedHead) }
       catch let failure as PagedTextCustodyFailure { original = failure; try held.preserve(failure.original) }
-      guard unexpected == nil else { throw BoomError.invalid("Whole metadata missed the actual post-COMMIT name failure; actual output retained.") }
+      guard unexpected == nil else { throw BoomError.invalid("Whole metadata missed the actual post-COMMIT protection admission failure; actual output retained.") }
       let failed = try XCTUnwrap(original)
       XCTAssertEqual(native.session.canonicalHistory?.record, record)
-      try await engine._publicSQLControlRestoreDatabaseName(identity: try XCTUnwrap(held.identity))
+      try await engine._publicSQLControlRestoreDatabaseProtection(identity: try XCTUnwrap(held.identity))
       let resolved = try await engine.resolveSQLiteOutputRetaining(failed.lease, publisher: publisher)
       guard case .workspace(let snapshot) = resolved.value else { throw BoomError.invalid("Whole metadata did not return its actual normal AFTER snapshot.") }
       XCTAssertEqual(resolved.lease, failed.lease); XCTAssertEqual(snapshot.documents, [record])

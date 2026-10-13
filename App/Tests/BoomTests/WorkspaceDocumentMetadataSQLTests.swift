@@ -357,17 +357,18 @@ private struct DocumentMetadataSQLCleanupFailure: Error {
     }
   }
 
-  func testActualInsertCommitNameFailureKeepsBothInputsThroughCheckpointAndReceiving() async throws {
-    try await fixture("testActualInsertCommitNameFailureKeepsBothInputsThroughCheckpointAndReceiving", faultNamespace: true) { held in
+  // Public protection admission fault; actual Apple live recovery remains unqualified.
+  func testActualInsertCommitProtectionFailureKeepsBothInputsThroughCheckpointAndReceiving() async throws {
+    try await fixture("testActualInsertCommitProtectionFailureKeepsBothInputsThroughCheckpointAndReceiving", faultNamespace: true) { held in
       let before = try await self.emptySeed(held), engine = try XCTUnwrap(held.engine), publisher = try XCTUnwrap(held.publisher)
       let mutation = try await self.imported(held), input = try await self.input(mutation)
-      try await engine._publicSQLControlArmCommitFault(identity: XCTUnwrap(held.identity), fault: .moveDatabaseName)
+      try await engine._publicSQLControlArmCommitFault(identity: XCTUnwrap(held.identity), fault: .changeProtection)
       var refused: PagedTextCustodyFailure?
       do { let unexpected = try await engine.publishWorkspaceMetadataRetaining(publisher, input: input, expectedHead: before); try held.keep(unexpected.lease) }
       catch let failure as PagedTextCustodyFailure { refused = failure; try held.keep(failure.lease); try held.preserve(failure.original) }
       let failure = try XCTUnwrap(refused)
       for lease in input.producerLeases { XCTAssertTrue(engine.custodySnapshot.items.contains { $0.id == lease.id }) }
-      try await engine._publicSQLControlRestoreDatabaseName(identity: XCTUnwrap(held.identity))
+      try await engine._publicSQLControlRestoreDatabaseProtection(identity: XCTUnwrap(held.identity))
       let actual = try await engine.resolveSQLiteOutputRetaining(failure.lease, publisher: publisher)
       guard case .metadata(let publication) = actual.value else { throw BoomError.invalid("Genuine checkpoint did not preserve the original insert output.") }
       XCTAssertEqual(publication.documents.first?.after, mutation.after)

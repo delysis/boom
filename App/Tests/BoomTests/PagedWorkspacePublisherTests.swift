@@ -368,6 +368,7 @@ private struct PublicPublisherFileFailure: Error {
     }
   }
 
+  // Public protection admission fault; actual Apple live recovery remains unqualified.
   func testBeforeAndAfterHeadRecoveryAndExactWholeHeadConflictRetention() async throws {
     try await withFixture(terminalCase: "testBeforeAndAfterHeadRecoveryAndExactWholeHeadConflictRetention") { f in
       let record = try await f.document("Public")
@@ -387,10 +388,10 @@ private struct PublicPublisherFileFailure: Error {
       // scope. Its operation/original caller input remain retained until an
       // explicit receiving disposition; the fixture must not claim close.
       let afterPrepared = try await f.prepare(f.state([record.value], theme: "latest"))
-      try await f.engine._publicSQLControlArmCommitFault(identity: f.identity, fault: .moveDatabaseName)
+      try await f.engine._publicSQLControlArmCommitFault(identity: f.identity, fault: .changeProtection)
       let afterError = try await self.refusal({ _ = try await f.metadata(afterPrepared.value, records: [record.value], expectedHead: before.head) }, accepts: { _ in true })
       let afterFailure = try XCTUnwrap(afterError as? PagedTextCustodyFailure)
-      try await f.engine._publicSQLControlRestoreDatabaseName(identity: f.identity)
+      try await f.engine._publicSQLControlRestoreDatabaseProtection(identity: f.identity)
       let afterResolution = try await f.resolved(afterFailure)
       guard case .workspace(let after) = afterResolution.value else { throw BoomError.invalid("Actual whole-workspace SQL outcome did not resolve AFTER.") }
       XCTAssertEqual(afterResolution.lease, afterFailure.lease)
@@ -623,14 +624,14 @@ private struct PublicPublisherFileFailure: Error {
   func testExplicitInitialJournalRecoveryAndMetadataBounds() async throws {
     try await withFixture { f in
       let prepared = try await f.prepare(WorkspaceState())
-      try await f.engine._publicSQLControlArmCommitFault(identity: f.identity, fault: .moveDatabaseName)
+      try await f.engine._publicSQLControlArmCommitFault(identity: f.identity, fault: .changeProtection)
       let original = try await self.refusal({ _ = try await f.initialize(prepared.value, records: []) }, accepts: { _ in true })
       let failure = try XCTUnwrap(original as? PagedTextCustodyFailure)
       let blocked = try await f.engine.nativeSQLMaintenanceSnapshot()
       XCTAssertNotNil(blocked.storage.failedOperationID)
-      try await f.engine._publicSQLControlRestoreDatabaseName(identity: f.identity)
+      try await f.engine._publicSQLControlRestoreDatabaseProtection(identity: f.identity)
       let resolved = try await f.resolved(failure)
-      guard case .workspace(let actual) = resolved.value else { throw BoomError.invalid("Actual namespace repair did not resolve initial AFTER.") }
+      guard case .workspace(let actual) = resolved.value else { throw BoomError.invalid("Actual protection restoration did not resolve initial AFTER.") }
       XCTAssertEqual(resolved.lease, failure.lease); XCTAssertEqual(actual.head.workspace, prepared.value.reference)
       XCTAssertEqual(actual.head.generation, 0); XCTAssertTrue(actual.documents.isEmpty)
       XCTAssertTrue(f.engine.custodySnapshot.items.contains { $0.id == failure.lease.id && $0.sqlReceivingJoined == false })

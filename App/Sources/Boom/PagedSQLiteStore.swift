@@ -131,7 +131,7 @@ private struct PagedSQLiteCleanupFailure: Error, LocalizedError {
 #if BLOOM_PAGED_SQL_PUBLIC_CONTROL
 /// Real SQLite/OS faults, public nominated scratch only. No forged SQLite code,
 /// fake ACK, VFS, replacement DB owner or success-returning test backend.
-enum PagedSQLitePublicCommitFault: Sendable { case veto, moveDatabaseName }
+enum PagedSQLitePublicCommitFault: Sendable { case veto, changeProtection, moveDatabaseName }
 
 struct PagedSQLPublicImmutableKeyRefusal: Error, Sendable {
   let operationID: UUID
@@ -203,6 +203,9 @@ final class PagedSQLiteStore: @unchecked Sendable {
 #if BLOOM_PAGED_SQL_PUBLIC_CONTROL
   private var publicCommitFault: (fault: PagedSQLitePublicCommitFault, publicationsOnly: Bool)?
   private var publicDatabaseNameMoved = false
+  // One public-only original mode, on this exact Store/operation. No file bytes,
+  // descriptor, second resource owner or durability/receiving receipt is added.
+  private var publicDatabaseProtection: (mode: mode_t, uid: uid_t, operationID: UUID)?
   private var publicDiagnosticOpenFlags: Int32?
   private var publicDiagnosticDuringConfigure = false
 #endif
@@ -375,6 +378,26 @@ final class PagedSQLiteStore: @unchecked Sendable {
     let code = sqlite3_close(db)
     guard code == SQLITE_OK else { throw PagedSQLiteCode(code: code) }
     self.db = nil
+  }
+  /// Terminal physical retirement, not source/durability/receiving admission.
+  /// Joined statements may report their preceding evaluation error on finalize.
+  /// An unresolved read rollback marker or open SQL transaction need not be
+  /// reset on a poisoned connection: checked close destroys it and rolls back
+  /// any still-open transaction. Keep every logical outcome marker unchanged.
+  func closeFailedResource(expectedOperationID: UUID) throws {
+    try requireQueue()
+    guard refusedOperationID == expectedOperationID, transactionState == nil,
+      statements == 0, inspectionDepth == 0, preflightFD == -1,
+      preflightCloseFailure == nil else {
+      throw BoomError.unavailable("Failed SQL resource has an entered producer, statement or setup descriptor.")
+    }
+    if case .some(.active(_)) = readSnapshotOwner {
+      throw BoomError.unavailable("An actual read snapshot producer has not joined.")
+    }
+    guard let connection = db else { throw BoomError.unavailable("The actual failed SQL resource is closed.") }
+    let code = sqlite3_close(connection)
+    guard code == SQLITE_OK else { throw PagedSQLiteCode(code: code) }
+    db = nil // Resource destruction only; no outcome fence or receiving state changes.
   }
   func requireSourceAdmission() throws {
     try requireQueue()
@@ -694,13 +717,13 @@ final class PagedSQLiteStore: @unchecked Sendable {
     fault: PagedSQLitePublicCommitFault) throws {
     try identity.admitConnection(self)
     guard vault.root.lastPathComponent.hasPrefix("public-sql-durability-"), publicCommitFault == nil,
-      !publicDatabaseNameMoved, refusedOperationID == nil else { throw BoomError.denied("Actual public scratch fault admission refused.") }
+      !publicDatabaseNameMoved, publicDatabaseProtection == nil, refusedOperationID == nil else { throw BoomError.denied("Actual public scratch fault admission refused.") }
     try withReadSnapshot { try self.publicControlReadAdmission() }
     publicCommitFault = (fault, true) // only the actual publication transaction; no SQL mutation
   }
   func _publicArmSetupFault(_ fault: PagedSQLitePublicCommitFault) throws {
     dispatchPrecondition(condition: .onQueue(queue))
-    guard freshOpening, !openingStarted, publicCommitFault == nil,
+    guard freshOpening, !openingStarted, publicCommitFault == nil, publicDatabaseProtection == nil,
       vault.root.lastPathComponent.hasPrefix("public-sql-durability-") else { throw BoomError.denied("Fresh public setup fault requires exact unexposed scratch.") }
     publicCommitFault = (fault, false)
   }
@@ -710,6 +733,39 @@ final class PagedSQLiteStore: @unchecked Sendable {
   func _publicRestoreFailedSetupName() throws {
     guard freshOpening, !connectionPolicyAdmitted else { throw BoomError.denied("Setup name restoration cannot target exposed source.") }
     try restorePublicDatabaseName()
+  }
+  func _publicRestoreDatabaseProtection(identity: PagedSQLPublicControlIdentity) throws {
+    try identity.admitConnection(self); try restorePublicDatabaseProtection()
+  }
+  func _publicRestoreFailedSetupProtection() throws {
+    guard freshOpening, !connectionPolicyAdmitted else { throw BoomError.denied("Setup protection restoration cannot target exposed source.") }
+    try restorePublicDatabaseProtection()
+  }
+  private func restorePublicDatabaseProtection() throws {
+    try requireQueue()
+    guard let original = publicDatabaseProtection, refusedOperationID == original.operationID,
+      !publicDatabaseNameMoved, statements == 0, transactionState == nil,
+      inspectionDepth == 0, readSnapshotOwner == nil else {
+      throw BoomError.stale("Public protection restoration has another original failed SQL operation.")
+    }
+    try admitPublicProtectionFile(mode: original.mode | mode_t(0o040), uid: original.uid)
+    guard fchmodat(directoryFD, "store.sqlite", original.mode, AT_SYMLINK_NOFOLLOW) == 0 else {
+      throw BoomError.unavailable("Actual public protection restoration refused, errno \(errno).")
+    }
+    try admitPublicProtectionFile(mode: original.mode, uid: original.uid)
+    publicDatabaseProtection = nil // ONLY after actual same-inode/original-mode restoration.
+    // Exact SQL fence/Root outcome remain for real checkpoint and receiving.
+  }
+  private func admitPublicProtectionFile(mode: mode_t, uid: uid_t) throws {
+    try Self.admitDirectory(rootFD); try Self.admitDirectory(directoryFD)
+    var file = stat()
+    guard vault.root.lastPathComponent.hasPrefix("public-sql-durability-"),
+      fstatat(directoryFD, "store.sqlite", &file, AT_SYMLINK_NOFOLLOW) == 0,
+      file.st_mode & S_IFMT == S_IFREG, file.st_nlink == 1,
+      file.st_uid == uid, uid == getuid(), file.st_mode & 0o7777 == mode,
+      (UInt64(truncatingIfNeeded: file.st_dev), UInt64(file.st_ino)) == identity else {
+      throw BoomError.stale("Public protection change has another symlink/inode/UID/mode.")
+    }
   }
   private func restorePublicDatabaseName() throws {
     try requireQueue()
@@ -1334,6 +1390,28 @@ final class PagedSQLiteStore: @unchecked Sendable {
       throw BoomError.invalid("Actual SQLite unexpectedly accepted a vetoed COMMIT.")
     }
     try exec("COMMIT")
+    if case .changeProtection? = fault {
+      try Self.admitDirectory(rootFD); try Self.admitDirectory(directoryFD)
+      var original = stat()
+      guard vault.root.lastPathComponent.hasPrefix("public-sql-durability-"),
+        publicDatabaseProtection == nil, !publicDatabaseNameMoved,
+        let operationID = transactionState?.operationID,
+        fstatat(directoryFD, "store.sqlite", &original, AT_SYMLINK_NOFOLLOW) == 0,
+        Self.privateFile(original),
+        (UInt64(truncatingIfNeeded: original.st_dev), UInt64(original.st_ino)) == identity else {
+        throw BoomError.stale("Public post-COMMIT protection fault has another exact scratch inode.")
+      }
+      let mode = original.st_mode & 0o7777, changed = mode | mode_t(0o040)
+      // Descriptor-relative/no-follow: no raw DB descriptor open/close can
+      // cancel SQLite's locks. Keep owner access, name, inode and bytes intact.
+      guard fchmodat(directoryFD, "store.sqlite", changed, AT_SYMLINK_NOFOLLOW) == 0 else {
+        throw BoomError.unavailable("Actual public post-COMMIT protection change refused, errno \(errno).")
+      }
+      publicDatabaseProtection = (mode, original.st_uid, operationID)
+      try admitPublicProtectionFile(mode: changed, uid: original.st_uid)
+      // The existing mandatory post-COMMIT admit() must actually reject its
+      // now nonprivate mode. No forged SQL error/outcome or success is returned.
+    }
     if case .moveDatabaseName? = fault {
       var original = stat(), destination = stat()
       guard fstatat(directoryFD, "store.sqlite", &original, AT_SYMLINK_NOFOLLOW) == 0,

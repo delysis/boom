@@ -625,7 +625,7 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
 #if BLOOM_PAGED_SQL_PUBLIC_CONTROL
           if store.openingOperationID != nil,
             ProcessInfo.processInfo.environment["BLOOM_PAGED_SQL_DURABILITY_PUBLIC_CASE"] == "testActualFreshFormatFailureRetainsSameOwnerUntilExplicitRepair" {
-            try store._publicArmSetupFault(.moveDatabaseName)
+            try store._publicArmSetupFault(.changeProtection)
           }
 #endif
           if let operationID = store.openingOperationID {
@@ -949,6 +949,51 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
       }
       if let context = self.hostContext { Unmanaged<PagedTextPageRouter>.fromOpaque(context).release() }
       self.hostContext = nil
+    }
+  }
+  /// Retire only the physical resources of a joined, retained SQL failure.
+  /// Root intents, source claims, original errors and unreceived outputs remain
+  /// on this SAME owner. This is neither normal close, persistence acceptance,
+  /// an old-ACK transfer nor a grant to drop Model/Session/input state.
+  func retireFailedSourceResources() async throws {
+    let retained = rootCustody.snapshot
+    guard retained.jobs == 0, retained.items.allSatisfy({ $0.producerJoined && !$0.bulkActive }),
+      retained.items.contains(where: { $0.phase == .unresolved && $0.sqlOperationID != nil && $0.sqlReceivingJoined == false }) else {
+      throw BoomError.unavailable("Terminal SQL retirement requires an actual joined unresolved source owner.")
+    }
+    rootCustody.beginClose() // No new Root input after the first yield.
+    try await executor.beginClose()
+    defer { executor.endCloseAttempt() }
+    try await onQueue(priority: .lifecycle) {
+      let joined = self.rootCustody.snapshot
+      guard joined.closing, joined.jobs == 0,
+        joined.items.allSatisfy({ $0.producerJoined && !$0.bulkActive }),
+        self.inFlightWitness == 0, self.executor.snapshot.bulkOperations == 0,
+        let store = self.router.sqlite, let operationID = store.failedOperationID,
+        joined.items.contains(where: { $0.phase == .unresolved && $0.sqlOperationID == operationID && $0.sqlReceivingJoined == false }) else {
+        throw BoomError.unavailable("Actual failed SQL owner has an entered source/cleanup producer or another outcome.")
+      }
+#if BLOOM_PAGED_SQL_PUBLIC_CONTROL
+      guard self.publicSQLWitness == nil, self.publicSQLPublisherWitness == nil, self.publicSQLPreparedWitness == nil else {
+        throw BoomError.unavailable("An actual public SQL mutation remains owned; retirement refused.")
+      }
+#endif
+      if !self.sqlClosedForShutdown {
+        try store.closeFailedResource(expectedOperationID: operationID)
+        self.sqlClosedForShutdown = true // Only real sqlite3_close success.
+      }
+      // Hold Rust's actual singleton/context until SQLite released its locks.
+      // A Rust refusal retains them, with only the proven SQL-close phase set.
+      if self.handle != 0 {
+        guard bloom_text_close(self.handle) == 1 else {
+          throw BoomError.unavailable("Failed paged engine did not join; host context and outcomes retained.")
+        }
+        self.handle = 0
+      }
+      if let context = self.hostContext { Unmanaged<PagedTextPageRouter>.fromOpaque(context).release() }
+      self.hostContext = nil
+      // Keep the Store wrapper, including its exact fence/read-rollback marker,
+      // attached to the retained owner. No producer or receiving entry is removed.
     }
   }
   func makeWorkspacePublisher() async throws -> PagedWorkspacePublisher {
@@ -1706,6 +1751,20 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
     guard failure.engine === self else { throw BoomError.denied("Failed public setup belongs to another actual engine.") }
     try await onQueue(priority: .cleanup, custody: failure.lease) {
       try self.router.database()._publicRestoreFailedSetupName()
+    }
+  }
+  func _publicSQLControlRestoreDatabaseProtection(identity: PagedSQLPublicControlIdentity) async throws {
+    try await onQueue(priority: .cleanup) {
+      guard identity.engine === self, identity.engineIncarnation == self.custodyIncarnation else {
+        throw BoomError.denied("Public protection restoration has another actual engine.")
+      }
+      try self.router.database()._publicRestoreDatabaseProtection(identity: identity)
+    }
+  }
+  func _publicSQLControlRestoreFailedSetupProtection(_ failure: PagedTextSetupCustodyFailure) async throws {
+    guard failure.engine === self else { throw BoomError.denied("Failed public setup belongs to another actual engine.") }
+    try await onQueue(priority: .cleanup, custody: failure.lease) {
+      try self.router.database()._publicRestoreFailedSetupProtection()
     }
   }
   func _publicSQLControlIdentity(expectedVault: Vault, expectedStoreID: UUID) async throws -> PagedSQLPublicControlIdentity {
