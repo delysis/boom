@@ -3051,7 +3051,7 @@ extension PagedTextEngineAdapter {
   func loadWorkspaceDocumentRetaining(_ publisher: PagedWorkspacePublisher, documentID: UUID,
     expectedHead: PagedWorkspaceHead) async throws -> PagedTextCustodiedValue<WorkspaceDocumentRead> {
     try await rootOutput(claims: [.workspace], payloadBytes: 20_480,
-      outputClaims: { _ in [.workspace] }, outputBytes: { _ in 20_480 }) {
+      outputClaims: { [.workspace, .record($0.record)] }, outputBytes: { _ in 20_480 }) {
       try self.admit(publisher)
       let value = try publisher.documentRead(documentID, expectedHead: expectedHead)
       try value.record.validate(); try self.admit(value.record.document.revision)

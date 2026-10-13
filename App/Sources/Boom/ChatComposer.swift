@@ -63,6 +63,15 @@ func nativeEditEvent(_ event: String) {
     return super.resignFirstResponder()
   }
 
+  override func insertText(_ insertString: Any, replacementRange: NSRange) {
+    guard isEditable else { return }
+    super.insertText(insertString, replacementRange: replacementRange)
+  }
+  override func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+    guard isEditable else { return }
+    super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
+  }
+
   override func keyDown(with event: NSEvent) {
     if event.keyCode == 36, event.modifierFlags.contains(.command), !hasMarkedText() {
       onSend?()
@@ -170,6 +179,7 @@ func nativeEditEvent(_ event: String) {
 }
 
 struct ChatComposer: NSViewRepresentable {
+  @Environment(\.isEnabled) private var isEnabled
   @Binding var text: String
   let focusRequest: Int
   let onSend: () -> Void
@@ -210,7 +220,7 @@ struct ChatComposer: NSViewRepresentable {
     view.drawsBackground = false
     view.isRichText = false
     view.allowsUndo = true
-    view.isEditable = true
+    view.isEditable = isEnabled
     view.isSelectable = true
     view.isVerticallyResizable = true
     view.isHorizontallyResizable = false
@@ -225,10 +235,10 @@ struct ChatComposer: NSViewRepresentable {
     view.isAutomaticSpellingCorrectionEnabled = false
     view.writingToolsBehavior = .none
     view.delegate = context.coordinator
-    view.onSend = onSend
-    view.onCancel = onCancel
-    view.onAttachments = onAttachments
-    view.onFocus = onFocus
+    view.onSend = isEnabled ? onSend : nil
+    view.onCancel = isEnabled ? onCancel : nil
+    view.onAttachments = isEnabled ? onAttachments : nil
+    view.onFocus = isEnabled ? onFocus : nil
     context.coordinator.onContentHeight = onContentHeight
     view.onContentHeight = { [weak coordinator = context.coordinator] height in coordinator?.measure(height) }
     view.registerForDraggedTypes(AttachmentInput.draggingTypes)
@@ -249,21 +259,27 @@ struct ChatComposer: NSViewRepresentable {
     scroll.hasVerticalScroller = true
     scroll.autohidesScrollers = true
     scroll.documentView = view
-    return ChatInputView(scroll: scroll, editing: showsEditingActions, target: context.coordinator)
+    let input = ChatInputView(scroll: scroll, editing: showsEditingActions, target: context.coordinator)
+    input.saveButton?.isEnabled = isEnabled
+    input.cancelButton?.isEnabled = isEnabled
+    return input
   }
 
   func updateNSView(_ input: ChatInputView, context: Context) {
     guard let view = input.scroll.documentView as? ChatTextView else { return }
+    view.isEditable = isEnabled
+    input.saveButton?.isEnabled = isEnabled
+    input.cancelButton?.isEnabled = isEnabled
     view.setMedia(model: completionModel)
     context.coordinator.text = $text
     context.coordinator.currentTextVersion = currentTextVersion
     let styleChanged = context.coordinator.lineSpacing != lineSpacing
     context.coordinator.lineSpacing = lineSpacing
     context.coordinator.onContentHeight = onContentHeight
-    view.onSend = onSend
-    view.onCancel = onCancel
-    view.onAttachments = onAttachments
-    view.onFocus = onFocus
+    view.onSend = isEnabled ? onSend : nil
+    view.onCancel = isEnabled ? onCancel : nil
+    view.onAttachments = isEnabled ? onAttachments : nil
+    view.onFocus = isEnabled ? onFocus : nil
     let source = context.coordinator.text.wrappedValue
     let version = currentTextVersion?() ?? textVersion
     if !view.nativeEditInProgress, !view.hasMarkedText() {
@@ -281,17 +297,19 @@ struct ChatComposer: NSViewRepresentable {
     view.reportContentHeight()
     configureCompletion(view, coordinator: context.coordinator)
     context.coordinator.completion?.refresh()
-    if focusRequest != context.coordinator.appliedFocusRequest {
+    if isEnabled, focusRequest != context.coordinator.appliedFocusRequest {
       context.coordinator.appliedFocusRequest = focusRequest
-      DispatchQueue.main.async { [weak view] in
-        guard let view, let window = view.window else { return }
+      let request = focusRequest
+      DispatchQueue.main.async { [weak view, weak coordinator = context.coordinator] in
+        guard let view, view.isEditable, coordinator?.appliedFocusRequest == request,
+          let window = view.window else { return }
         window.makeFirstResponder(view)
       }
     }
   }
 
   private func configureCompletion(_ view: ChatTextView, coordinator: Coordinator) {
-    if let completionModel, let completionTarget {
+    if isEnabled, let completionModel, let completionTarget {
       if coordinator.completion?.model !== completionModel {
         coordinator.completion?.invalidateGhost()
         coordinator.completion = TextInputCompletion(model: completionModel, target: completionTarget)
@@ -338,7 +356,7 @@ struct ChatComposer: NSViewRepresentable {
       return (acknowledgedText as NSString).isEqual(to: source)
     }
     func textDidChange(_ notification: Notification) {
-      guard let view else { return }
+      guard let view, view.isEditable else { return }
       if !view.movingGhostBoundary { view.endGhostBoundary() }
       if !view.hasMarkedText() { MarkdownStyle.apply(to: view, bodyFont: NSFont.systemFont(ofSize: 14), lineSpacing: lineSpacing) }
       let source = view.string

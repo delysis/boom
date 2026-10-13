@@ -100,7 +100,16 @@ private struct PagedSQLiteCheckpointFailure: Error, LocalizedError {
 
 private struct PagedSQLiteCode: Error, LocalizedError {
   let code: Int32
-  var errorDescription: String? { "SQLite storage returned code \(code)." }
+#if BLOOM_PAGED_SQL_PUBLIC_CONTROL
+  // Supplementary observation only; code remains the original API result.
+  var publicObservation: [String: String]? = nil
+#endif
+  var errorDescription: String? {
+#if BLOOM_PAGED_SQL_PUBLIC_CONTROL
+    if let publicObservation { return "SQLite storage returned code \(code). Public observation: \(publicObservation)" }
+#endif
+    return "SQLite storage returned code \(code)."
+  }
 }
 
 private struct PagedSQLiteRollbackAdmissionFailure: Error, LocalizedError {
@@ -194,6 +203,8 @@ final class PagedSQLiteStore: @unchecked Sendable {
 #if BLOOM_PAGED_SQL_PUBLIC_CONTROL
   private var publicCommitFault: (fault: PagedSQLitePublicCommitFault, publicationsOnly: Bool)?
   private var publicDatabaseNameMoved = false
+  private var publicDiagnosticOpenFlags: Int32?
+  private var publicDiagnosticDuringConfigure = false
 #endif
   private let freshOperationID = UUID()
   var openingOperationID: UUID? { freshOpening ? freshOperationID : nil }
@@ -281,9 +292,12 @@ final class PagedSQLiteStore: @unchecked Sendable {
     identity = (UInt64(truncatingIfNeeded: before.st_dev), UInt64(before.st_ino))
     // The actual pointer is stored BEFORE interpreting the return code. There
     // is no local `opened` pointer, ignored defer or close_v2 ownership gap.
-    let code = sqlite3_open_v2(path, &db,
-      SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_PRIVATECACHE | SQLITE_OPEN_NOFOLLOW, nil)
-    guard code == SQLITE_OK else { throw PagedSQLiteCode(code: code) }
+    let sqliteOpenFlags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_PRIVATECACHE | SQLITE_OPEN_NOFOLLOW
+#if BLOOM_PAGED_SQL_PUBLIC_CONTROL
+    publicDiagnosticOpenFlags = sqliteOpenFlags
+#endif
+    let code = sqlite3_open_v2(path, &db, sqliteOpenFlags, nil)
+    guard code == SQLITE_OK else { throw sqliteFailure(code, stage: "open") }
     guard db != nil else { throw BoomError.invalid("SQLite open returned success without its actual connection.") }
     var after = stat()
     guard fstatat(directoryFD, "store.sqlite", &after, AT_SYMLINK_NOFOLLOW) == 0,
@@ -1172,10 +1186,96 @@ final class PagedSQLiteStore: @unchecked Sendable {
       throw BoomError.budget("WAL admission requires exact owned maintenance; source records retained.")
     }
   }
+  /// Only augments an already failing API result. No statement text, body,
+  /// database open/close, storage mutation, input/root disposition or retry.
+  private func sqliteFailure(_ code: Int32, stage: StaticString) -> PagedSQLiteCode {
+    var failure = PagedSQLiteCode(code: code)
+#if BLOOM_PAGED_SQL_PUBLIC_CONTROL
+    // This diagnostic is deliberately narrower than the public SQL controls:
+    // exactly the first metadata case and its actual UUID scratch namespace.
+    let fixtureName = vault.root.deletingLastPathComponent().lastPathComponent
+    let prefix = "bloom-metadata-public-"
+    guard !Thread.isMainThread,
+      ProcessInfo.processInfo.environment["BLOOM_METADATA_SQL_PUBLIC_CASE"] == "testPublicConversionLazyDraftNativeReuseAndEncryptedReopen",
+      vault.root.lastPathComponent == "Private", fixtureName.hasPrefix(prefix),
+      UUID(uuidString: String(fixtureName.dropFirst(prefix.count))) != nil else { return failure }
+    // Read the connection's error immediately, before filesystem observation
+    // or statement finalization can obscure the original extended result.
+    let extended = db.map { sqlite3_extended_errcode($0) }
+    var observation: [String: String] = [
+      "stage": String(describing: stage),
+      "context": publicDiagnosticDuringConfigure ? "configure" : "outside_configure",
+      "primaryCode": String(code), "extendedCode": extended.map(String.init) ?? "unresolved_no_connection",
+      "runtimeVersion": String(sqlite3_libversion_number()),
+      "openFlags": publicDiagnosticOpenFlags.map(String.init) ?? "unobserved",
+      "storeID": storeID.uuidString, "engineIncarnation": engineIncarnation.uuidString,
+      "connectionIncarnation": connectionIncarnation.uuidString,
+      "preflightDevice": String(identity.0), "preflightInode": String(identity.1)
+    ]
+    if let sourceID = sqlite3_sourceid() {
+      let length = strnlen(sourceID, 256)
+      if length < 256 {
+        let bytes = UnsafeBufferPointer(start: UnsafeRawPointer(sourceID).assumingMemoryBound(to: UInt8.self), count: length)
+        observation["runtimeSourceID"] = String(decoding: bytes, as: UTF8.self)
+      } else { observation["runtimeSourceID"] = "unresolved_source_id_bound" }
+    }
+    if path.utf8.count <= Int(MAXPATHLEN) {
+      observation["passedFilename"] = path // the exact String passed to open_v2; no Foundation re-resolution
+      let physical: (String?, Int32) = path.withCString { input in
+        withUnsafeTemporaryAllocation(of: CChar.self, capacity: Int(MAXPATHLEN)) { buffer in
+          guard let destination = buffer.baseAddress else { return (nil, 0) }
+          let result = Darwin.realpath(input, destination)
+          let savedErrno = errno
+          guard result != nil else { return (nil, savedErrno) }
+          return (String(validatingCString: destination), 0)
+        }
+      }
+      observation["physicalFilename"] = physical.0 ?? "unresolved"
+      observation["realpathErrno"] = String(physical.1)
+      var named = stat()
+      let result = path.withCString { lstat($0, &named) }
+      let savedErrno = errno
+      observation["namedStatCode"] = String(result)
+      observation["namedStatErrno"] = String(result == 0 ? 0 : savedErrno)
+      if result == 0 {
+        observation["namedDevice"] = String(UInt64(truncatingIfNeeded: named.st_dev))
+        observation["namedInode"] = String(UInt64(named.st_ino))
+        observation["namedMode"] = String(UInt32(named.st_mode))
+        observation["namedUID"] = String(named.st_uid)
+        observation["namedLinks"] = String(named.st_nlink)
+        observation["namedBytes"] = String(named.st_size)
+      }
+    } else { observation["passedFilename"] = "unresolved_filename_bound" }
+    if directoryFD >= 0 {
+      var directory = stat()
+      let result = fstat(directoryFD, &directory), savedErrno = errno
+      observation["ownedDirectoryStatCode"] = String(result)
+      observation["ownedDirectoryStatErrno"] = String(result == 0 ? 0 : savedErrno)
+      if result == 0 {
+        observation["ownedDirectoryDevice"] = String(UInt64(truncatingIfNeeded: directory.st_dev))
+        observation["ownedDirectoryInode"] = String(UInt64(directory.st_ino))
+      }
+    } else { observation["ownedDirectoryStatCode"] = "unobserved_no_descriptor" }
+    // All keys are fixed and strings have explicit bounds. Capacity refusal
+    // preserves the original primary result instead of returning false success.
+    if observation.reduce(0, { $0 + $1.key.utf8.count + $1.value.utf8.count }) <= 4_096 {
+      failure.publicObservation = observation
+    } else {
+      failure.publicObservation = ["stage": String(describing: stage), "primaryCode": String(code),
+        "extendedCode": extended.map(String.init) ?? "unresolved_no_connection", "observation": "refused_4096_byte_bound"]
+    }
+#endif
+    return failure
+  }
+
   private func configure() throws {
+#if BLOOM_PAGED_SQL_PUBLIC_CONTROL
+    publicDiagnosticDuringConfigure = true
+    defer { publicDiagnosticDuringConfigure = false }
+#endif
     guard let db else { throw BoomError.unavailable("SQLite is closed.") }
     let extended = sqlite3_extended_result_codes(db, 1), busy = sqlite3_busy_timeout(db, 0)
-    guard extended == SQLITE_OK, busy == SQLITE_OK else { throw PagedSQLiteCode(code: extended != SQLITE_OK ? extended : busy) }
+    guard extended == SQLITE_OK, busy == SQLITE_OK else { throw sqliteFailure(extended != SQLITE_OK ? extended : busy, stage: "configure") }
     sqlite3_limit(db, SQLITE_LIMIT_LENGTH, 65_664)
     sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, 16_384)
     sqlite3_limit(db, SQLITE_LIMIT_COLUMN, 16)
@@ -1247,13 +1347,17 @@ final class PagedSQLiteStore: @unchecked Sendable {
   }
 
   private func exec(_ sql: String) throws {
-    let code = sqlite3_exec(db, sql, nil, nil, nil); guard code == SQLITE_OK else { throw PagedSQLiteCode(code: code) }
+    let code = sqlite3_exec(db, sql, nil, nil, nil); guard code == SQLITE_OK else { throw sqliteFailure(code, stage: "exec") }
   }
   private func statement<T>(_ text: String, _ body: (OpaquePointer) throws -> T) throws -> T {
     guard statements < 8, let db else { throw BoomError.budget("SQLite statement ownership is bounded.") }
     var sql: OpaquePointer?
     let code = sqlite3_prepare_v3(db, text, -1, 0, &sql, nil)
-    guard code == SQLITE_OK, let sql else { if let sql { sqlite3_finalize(sql) }; throw PagedSQLiteCode(code: code) }
+    guard code == SQLITE_OK, let sql else {
+      let original = sqliteFailure(code, stage: "prepare") // capture before the existing finalize changes connection error state
+      if let sql { sqlite3_finalize(sql) }
+      throw original
+    }
     statements += 1; defer { statements -= 1 }
     let result: T
     do { result = try body(sql) }
@@ -1294,7 +1398,7 @@ final class PagedSQLiteStore: @unchecked Sendable {
   }
   private func row(_ sql: OpaquePointer) throws -> Bool {
     let code = sqlite3_step(sql)
-    if code == SQLITE_ROW { return true }; if code == SQLITE_DONE { return false }; throw PagedSQLiteCode(code: code)
+    if code == SQLITE_ROW { return true }; if code == SQLITE_DONE { return false }; throw sqliteFailure(code, stage: "step")
   }
   private func done(_ sql: OpaquePointer) throws { guard try row(sql) == false else { throw BoomError.invalid("SQL mutation returned unexpected rows.") } }
   private func end(_ sql: OpaquePointer) throws { try done(sql) }

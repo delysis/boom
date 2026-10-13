@@ -282,12 +282,16 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
       }
       let backgroundCheck = isNativeCheck && arguments.contains("--native-check-background")
       let noModels = isNativeCheck && arguments.contains("--native-check-no-models")
-      let model = try await WorkspaceModel(storeOverride: override, loadModels: !noModels)
+      // Public ordinary-window source gate only. Private/legacy routing and
+      // migration remain explicit until the bounded consumer is qualified.
+      let boundedPublic = isNativeCheck && ProcessInfo.processInfo.environment["BLOOM_PAGED_WORKSPACE_PUBLIC"] == "1"
+      let model = try await WorkspaceModel(storeOverride: override, loadModels: !noModels,
+        storageRoute: boundedPublic ? .boundedSQL : .legacy)
       self.model = model
       if isNativeCheck, let index = arguments.firstIndex(of: "--native-check-theme"), index + 1 < arguments.count {
         guard ["light", "dark"].contains(arguments[index + 1]) else { throw BoomError.invalid("Native appearance check requires light or dark.") }
         model.setTheme(arguments[index + 1])
-      } else { model.setTheme(model.state.theme) }
+      } else { model.setTheme(model.themeName) }
       #if BOOM_UI_TEST
       let initialWidth: CGFloat = 340
       #else
@@ -314,8 +318,14 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
         window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
       }
       refreshToolbar()
+      if model.usesPagedStorage, model.showsDocument, let id = model.selectedDocumentID { model.focusEditor(id) }
       nativeEvidence?.observe(window: window, model: model)
     } catch {
+      if let failure = error as? WorkspacePagedStartupFailure {
+        // Preserve the actual existing Model and all entered storage/source
+        // owners. Merely dropping a thrown startup error is not a resource join.
+        self.model = failure.model
+      }
       let alert = NSAlert()
       alert.messageText = "Bloom could not open its local workspace"
       alert.informativeText = error.localizedDescription
@@ -550,21 +560,21 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
     case #selector(pinChat):
       menuItem.title = model.selectedChat.flatMap { model.chatVoice($0.id) } == nil ? "Pin as voice" : "Unpin voice"
       return model.showsChat && model.selectedChat != nil && !model.isBusy
-    case #selector(importVoice): return !model.isBusy
-    case #selector(exportBackup), #selector(restoreBackup): return !model.isBusy
-    case #selector(exportDocument): return model.selectedDocument != nil
+    case #selector(importVoice): return !model.usesPagedStorage && !model.isBusy
+    case #selector(exportBackup), #selector(restoreBackup): return !model.usesPagedStorage && !model.isBusy
+    case #selector(exportDocument): return model.hasSelectedDocument
     case #selector(toggleLibrary): menuItem.state = model.showsLibrary ? .on : .off
     case #selector(toggleDocument): menuItem.state = model.showsDocument ? .on : .off
     case #selector(toggleChat): menuItem.state = model.showsChat ? .on : .off
     case #selector(exploreWriting): return model.showsDocument && model.canExploreWriting
     case #selector(showContinuations): menuItem.title = model.showingCandidates ? "Hide continuations" : "Show continuations"; return model.showsDocument && model.canShowContinuations
-    case #selector(writingExamples): return model.showsDocument && model.selectedDocument != nil && !model.isBusy
+    case #selector(writingExamples): return !model.usesPagedStorage && model.showsDocument && model.hasSelectedDocument && !model.isBusy
     case #selector(changeVariation): menuItem.state = (menuItem.representedObject as? String) == model.samplingProfile.rawValue ? .on : .off
-    case #selector(toggleCompletion): menuItem.state = model.state.autocomplete ? .on : .off
+    case #selector(toggleCompletion): menuItem.state = model.autocompleteEnabled ? .on : .off
     case #selector(changeTheme(_:)):
-      menuItem.state = (menuItem.representedObject as? String) == model.state.theme ? .on : .off
-    case #selector(attachDocument): return !model.isBusy && model.selectedDocument != nil
-    case #selector(attachChat): return !model.isBusy
+      menuItem.state = (menuItem.representedObject as? String) == model.themeName ? .on : .off
+    case #selector(attachDocument): return !model.usesPagedStorage && !model.isBusy && model.hasSelectedDocument
+    case #selector(attachChat): return !model.usesPagedStorage && !model.isBusy
     default: break
     }
     return true
@@ -587,10 +597,10 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
   @objc private func newDocument() {
     do { try model?.newDocument() } catch { model?.report(error) }
   }
-  @objc private func newChat() { do { try model?.newChat(about: model?.layout.isAuthor == true ? model?.state.selectedDocument : nil) } catch { model?.report(error) } }
-  @objc private func chatInstructions() { if let id = model?.state.selectedChat { model?.openChatInstructions(id) } }
+  @objc private func newChat() { do { try model?.newChat(about: model?.layout.isAuthor == true ? model?.selectedDocumentID : nil) } catch { model?.report(error) } }
+  @objc private func chatInstructions() { if let id = model?.selectedChatID { model?.openChatInstructions(id) } }
   @objc private func pinChat() {
-    guard let model, let id = model.state.selectedChat else { return }
+    guard let model, let id = model.selectedChatID else { return }
     if model.chatVoice(id) == nil { model.pinChat(id) } else { model.unpinChat(id) }
   }
   @objc private func writeQuestion() { model?.authorChatMessage(.user) }
@@ -647,7 +657,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
   }
   @objc private func toggleCompletion() {
     guard let model else { return }
-    model.setAutocomplete(!model.state.autocomplete)
+    model.setAutocomplete(!model.autocompleteEnabled)
   }
   @objc private func changeTheme(_ sender: NSMenuItem) {
     if let value = sender.representedObject as? String { model?.setTheme(value) }
