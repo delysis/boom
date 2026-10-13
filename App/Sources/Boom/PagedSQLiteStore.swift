@@ -221,7 +221,11 @@ final class PagedSQLiteStore: @unchecked Sendable {
     self.vault = vault; self.ownerID = ownerID; self.engineIncarnation = engineIncarnation
     storeID = id; self.queue = queue; freshOpening = fresh
     rootFD = -1; directoryFD = -1
-    path = vault.root.appendingPathComponent("paged-sqlite-v3/store.sqlite").path
+    // SQLite NOFOLLOW rejects ancestor aliases such as macOS /var -> /private/var.
+    // Resolve the already-existing Vault root, keeping the no-follow open and
+    // the descriptor/private-mode/database-inode admission below unchanged.
+    path = vault.root.resolvingSymlinksInPath()
+      .appendingPathComponent("paged-sqlite-v3/store.sqlite").path
   }
   var isSourceAdmitted: Bool {
     dispatchPrecondition(condition: .onQueue(queue)); return connectionPolicyAdmitted
