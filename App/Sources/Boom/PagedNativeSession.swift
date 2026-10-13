@@ -454,7 +454,8 @@ struct PagedNativeReceivingCheckpoint: Sendable, Equatable {
   /// Capture actual local selection coordinates while they still belong to
   /// this source, before yielding to flush/window. Later input invalidates it.
   func navigationSelection(_ range: NSRange) throws -> PagedNativeNavigationSelection {
-    try requireSourceTransition()
+    // Coordinates observe the installed working arena. A pending file/history
+    // acknowledgment cannot make its already installed selection unreadable.
     _ = try working.selection(range)
     let offset = working.sealedWindow.utf16Start.addingReportingOverflow(UInt64(range.location))
     guard !offset.overflow else { throw BoomError.budget("Native global selection overflows its coordinate bound.") }
@@ -640,7 +641,6 @@ struct PagedNativeReceivingCheckpoint: Sendable, Equatable {
   }
 
   func nativeSelection(_ range: NSRange) throws -> PagedWorkingSelection {
-    try requireSourceTransition()
     if let owner = managedArenaOwner, owner.activeView?.selectedRange() == range {
       let selection = try owner.currentDocumentSelection()
       return try working.selection(range, focusAtEnd: selection.focusAtEnd, affinity: selection.affinity)
@@ -648,7 +648,6 @@ struct PagedNativeReceivingCheckpoint: Sendable, Equatable {
     return try working.selection(range)
   }
   func nativeLocalBytes(_ range: NSRange) throws -> Range<Int> {
-    try requireSourceTransition()
     return try working.localBytes(for: working.selection(range))
   }
 
