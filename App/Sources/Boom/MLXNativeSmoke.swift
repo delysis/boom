@@ -1,6 +1,5 @@
 import BoomCore
 import AppKit
-import CryptoKit
 import Foundation
 import Metal
 import MLX
@@ -357,7 +356,7 @@ enum MLXNativeSmoke {
           "max_ops_override": ProcessInfo.processInfo.environment["MLX_MAX_OPS_PER_BUFFER"] ?? "unset",
           "max_mb_override": ProcessInfo.processInfo.environment["MLX_MAX_MB_PER_BUFFER"] ?? "unset",
           "cache_limit_bytes": Memory.cacheLimit, "memory_limit_bytes": Memory.memoryLimit] as [String: Any]
-        receipt["scope"] = "application runner, GPU lease, preflight, executor, production token stream and completed response; no UI or encrypted checkpoint workload"
+        receipt["scope"] = "application runner, GPU lease, preflight, executor, production token stream and completed response; no UI or file checkpoint workload"
         try persist()
         let warmup = try await runner.run(plan: warmFixture.plan, images: [], maxTokens: 16, seed: 99,
           flag: CancellationFlag(), executionPolicy: warmFixture.generation_policy, onText: { _ in })
@@ -414,16 +413,13 @@ enum MLXNativeSmoke {
   }
   @MainActor private static func checkDocumentEdit(_ text: String, document: DocumentSnapshot,
     mode: InteractionMode, expectsEdit: Bool, evidence: URL) async throws -> Any {
-    // This explicit public diagnostic exercises encrypted admission and Undo,
-    // using an ephemeral key. It does not qualify real Keychain authorization.
-    let store = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("encrypted-workspace"),
-      testKey: SymmetricKey(size: .bits256))
+    // This explicit public diagnostic exercises actual file source admission and Undo.
+    let store = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("public-workspace"))
     var state = WorkspaceState()
     let chat = ChatRecord(title: "Public edit diagnostic", attachedDocumentID: document.id)
     state.documents = [DocumentIndex(id: document.id, title: document.title)]
     state.chats = [chat]; state.selectedDocument = document.id; state.selectedChat = chat.id
-    try await store.save(state, documents: [document])
-    let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    let model = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: [document])
     var mountedWindow: NSWindow?
     if model.layout.isAuthor {
       model.state.showChat = false
@@ -432,8 +428,8 @@ enum MLXNativeSmoke {
       window.isReleasedWhenClosed = false; window.contentView = host
       mountedWindow = window; host.layoutSubtreeIfNeeded()
       let deadline = ContinuousClock.now + .seconds(2)
-      while model.editor == nil && ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
-      guard let editor = model.editor, editor.documentID == document.id, editor.string == document.text,
+      while model.pagedInput?.activeView == nil && ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+      guard let editor = model.pagedInput?.activeView, editor.session.sourceBaseRevision.documentID == document.id, editor.string == document.text,
         !window.isVisible, window.makeFirstResponder(editor) else {
         throw BoomError.invalid("The public document diagnostic could not mount its actual native editor.")
       }
@@ -448,16 +444,16 @@ enum MLXNativeSmoke {
     let sources = try ContextGraph.resolveChat(request: "", attachedDocumentID: document.id,
       editingDocumentID: document.id, all: [document]).sources
     let message = try await model.finishConsultationResponse(text, pending: pending, chatID: chat.id,
-      authority: CapturedDocumentAuthority(mode: mode, target: document), documentSources: sources, attachments: [])
+      authority: CapturedDocumentAuthority(mode: mode, target: document, capture: try await model.captureDocument(document.id)), documentSources: sources, attachments: [])
     if !expectsEdit {
       guard message.state == .complete, model.selectedDocument == document,
-        model.editor.map({ $0.string == document.text }) ?? true,
-        model.state.proposals.isEmpty, !model.undoManager(document.id).canUndo,
+        model.pagedInput?.activeView.map({ $0.string == document.text }) ?? true,
+        model.state.proposals.isEmpty, !model.pagedCommands!.manager.canUndo,
         model.status == "No document changes" else {
         throw BoomError.invalid("The no-change response changed document state or reported a proposal.")
       }
       try await model.flush()
-      let persisted = try await store.load().get().1.first { $0.id == document.id }
+      let persisted = try await NativeCheckEvidence.readPublicDocuments(model: model).first { $0.id == document.id }
       guard persisted == document else { throw BoomError.invalid("The no-change response altered persisted bytes.") }
       try await model.shutdown()
       return ["mode": mode.rawValue, "status": "No document changes", "expected_text": document.text,
@@ -468,10 +464,10 @@ enum MLXNativeSmoke {
     if mode == .propose {
       guard model.selectedDocument == document, let proposal = model.state.proposals.last,
         proposal.status == "pending", model.status == "Proposal ready for review",
-        !model.undoManager(document.id).canUndo else {
+        !model.pagedCommands!.manager.canUndo else {
         throw BoomError.invalid("The model proposal was missing or applied without acceptance.")
       }
-      let preview = try await store.load().get().1.first { $0.id == document.id }
+      let preview = try await NativeCheckEvidence.readPublicDocuments(model: model).first { $0.id == document.id }
       guard preview == document else { throw BoomError.invalid("An unaccepted proposal changed persisted bytes.") }
       model.accept(proposal.id)
       let deadline = ContinuousClock.now + .seconds(3)
@@ -480,18 +476,20 @@ enum MLXNativeSmoke {
     }
     let expected = "The harbor was bright."
     guard model.selectedDocument?.text == expected, model.state.proposals.last?.status == "applied",
-      model.editor.map({ $0.string == expected && $0.isEditable }) ?? true,
+      model.pagedInput?.activeView.map({ $0.string == expected && $0.isEditable }) ?? true,
       model.status == "Document edited" else {
       throw BoomError.invalid("Real model did not produce and commit the requested exact edit.")
     }
     try await model.flush()
-    let persisted = try await store.load().get().1.first(where: { $0.id == document.id })
+    let persisted = try await NativeCheckEvidence.readPublicDocuments(model: model).first(where: { $0.id == document.id })
     guard persisted?.text == expected else { throw BoomError.invalid("Edited bytes did not persist.") }
-    model.undoManager(document.id).undo()
+    model.pagedCommands!.manager.undo()
+    try await model.pagedCommands?.joinPendingCommand()
+    _ = try await model.captureDocument(document.id)
     guard model.selectedDocument?.text == document.text,
-      model.editor.map({ $0.string == document.text }) ?? true else { throw BoomError.invalid("Native Undo did not restore the original bytes.") }
+      model.pagedInput?.activeView.map({ $0.string == document.text }) ?? true else { throw BoomError.invalid("Native Undo did not restore the original bytes.") }
     try await model.flush()
-    let undone = try await store.load().get().1.first { $0.id == document.id }
+    let undone = try await NativeCheckEvidence.readPublicDocuments(model: model).first { $0.id == document.id }
     guard undone == document else { throw BoomError.invalid("Native Undo did not restore persisted document bytes.") }
     try await model.shutdown()
     return ["mode": mode.rawValue, "status": "Document edited", "proposal_required_acceptance": mode == .propose,

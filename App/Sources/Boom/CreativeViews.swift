@@ -114,8 +114,10 @@ struct WritingAlternatives: View {
         .background(Color.primary.opacity(0.025))
         .popover(isPresented: $showingContext) {
           VStack(alignment: .leading, spacing: 10) {
-            Text(bundle.recipe.omittedPrefixCharacters == 0 ? "Complete preceding manuscript" : "\(bundle.recipe.omittedPrefixCharacters) earlier characters omitted")
+            Text((bundle.recipe.capture?.window.byteStart ?? 0) > 0 ? "Captured prefix"
+              : bundle.recipe.omittedPrefixCharacters == 0 ? "Complete preceding manuscript" : "\(bundle.recipe.omittedPrefixCharacters) earlier characters omitted")
               .font(.headline)
+            if let capture = bundle.recipe.capture { Text(capture.coverage).font(.caption.monospaced()) }
             Text("Text after the captured cursor was not supplied.").font(.caption)
             Text("Seed \(bundle.candidates[bundle.selected].seed) · \(bundle.recipe.profile.title)").font(.caption).foregroundStyle(.secondary)
             ScrollView { NativeText(text: bundle.recipe.prompt, presentation: .literal, pointSize: 12).frame(maxWidth: .infinity, alignment: .leading) }
@@ -167,6 +169,8 @@ struct WritingExamplesView: View {
   let request: WritingExamplesRequest
   @State private var previewID: UUID?
   @State private var previewHasProse = false
+  @State private var previewCapture: BoundedDocumentCapture?
+  @State private var preview: DocumentSnapshot?
   @State private var adding = false
   @State private var importing = false
   @State private var title = ""
@@ -175,20 +179,17 @@ struct WritingExamplesView: View {
   @State private var failure: String?
   @State private var showingFailure = false
 
-  private var included: [DocumentSnapshot] {
-    model.writingExampleIDs.compactMap { id in model.documents.first { $0.id == id } }
+  private var included: [DocumentIndex] {
+    model.writingExampleIDs.compactMap { id in model.documentIndices.first { $0.id == id } }
   }
-  private var available: [DocumentSnapshot] {
-    model.documents.filter {
-      $0.id != request.manuscriptID && !model.writingExampleIDs.contains($0.id) && !$0.text.isEmpty
+  private var available: [DocumentIndex] {
+    model.documentIndices.filter {
+      $0.id != request.manuscriptID && !model.writingExampleIDs.contains($0.id)
     }
-  }
-  private var preview: DocumentSnapshot? {
-    model.documents.first { $0.id == previewID }
   }
   private var canChange: Bool {
     !model.isBusy && !model.editingLocked && model.state.selectedDocument == request.manuscriptID
-      && model.documents.contains { $0.id == request.manuscriptID }
+      && model.documentIndices.contains { $0.id == request.manuscriptID }
   }
   private var canAdd: Bool {
     canChange && model.writingExampleIDs.count < 32 && prose.contains { !$0.isWhitespace }
@@ -247,9 +248,17 @@ struct WritingExamplesView: View {
     }
     .frame(width: 640, height: adding || !included.isEmpty || !available.isEmpty ? 400 : 176)
     .onAppear { previewID = model.writingExampleIDs.first ?? available.first?.id }
-    .onChange(of: preview?.textVersion, initial: true) { _, _ in
-      // A local source identity avoids rescanning every document on status updates.
-      previewHasProse = preview?.text.contains { !$0.isWhitespace } ?? false
+    .task(id: previewID) {
+      previewCapture = nil; preview = nil; previewHasProse = false
+      guard let id = previewID else { return }
+      do {
+        let capture = try await model.previewDocument(id)
+        try Task.checkCancellation()
+        guard previewID == id else { return }
+        previewCapture = capture
+        preview = capture.modelSnapshot
+        previewHasProse = capture.window.text.contains { !$0.isWhitespace }
+      } catch is CancellationError {} catch { failure = error.localizedDescription }
     }
     .onChange(of: model.writingExampleIDs) { _, ids in
       if previewID == nil { previewID = ids.first ?? available.first?.id }
@@ -270,23 +279,27 @@ struct WritingExamplesView: View {
       if !included.isEmpty {
         Section("Included") {
           ForEach(Array(included.enumerated()), id: \.element.id) { index, document in
-            HStack(spacing: 8) {
-              Text("\(index + 1)").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                .frame(width: 18, alignment: .trailing)
-              Text(document.title).lineLimit(1)
-            }.tag(document.id).help(document.title)
-              .accessibilityLabel("Example \(index + 1), \(document.title)")
+            includedRow(document, at: index)
           }
         }
       }
       if !available.isEmpty {
         Section("Documents") {
-          ForEach(available) { document in
+          ForEach(available, id: \.id) { document in
             Text(document.title).lineLimit(1).tag(document.id).help(document.title)
           }
         }
       }
     }.listStyle(.sidebar).accessibilityLabel("Writing examples and documents")
+  }
+
+  private func includedRow(_ document: DocumentIndex, at index: Int) -> some View {
+    HStack(spacing: 8) {
+      Text("\(index + 1)").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+        .frame(width: 18, alignment: .trailing)
+      Text(document.title).lineLimit(1)
+    }.tag(document.id).help(document.title)
+      .accessibilityLabel("Example \(index + 1), \(document.title)")
   }
 
   @ViewBuilder private var passagePreview: some View {
@@ -312,6 +325,7 @@ struct WritingExamplesView: View {
           }
         }.buttonStyle(.borderless).controlSize(.small)
         WritingExamplePassage(document: document)
+          .help(previewCapture?.coverage ?? "")
           .accessibilityLabel("Example prose").frame(maxWidth: .infinity, maxHeight: .infinity)
       }.padding(16)
     } else {
@@ -341,17 +355,23 @@ struct WritingExamplesView: View {
   private func include(_ document: DocumentSnapshot) {
     guard canChange, document.id != request.manuscriptID,
       !model.writingExampleIDs.contains(document.id), model.writingExampleIDs.count < 32,
-      model.documents.contains(where: { $0.id == document.id && $0.textVersion == document.textVersion }),
+      model.documentIndices.contains(where: { $0.id == document.id }),
+      previewCapture?.textDigest == document.revision,
       document.text.contains(where: { !$0.isWhitespace }) else { return }
     model.toggleWritingExample(document.id)
   }
   private func addExample() {
     guard canAdd else { return }
-    do {
-      try model.addWritingExample(title: title, prose: prose, manuscriptID: request.manuscriptID)
-      previewID = model.writingExampleIDs.last
-      title = ""; prose = ""; proseVersion = UUID(); adding = false; failure = nil
-    } catch { failure = error.localizedDescription }
+    let enteredTitle = title, enteredProse = prose, enteredVersion = proseVersion
+    model.work("Adding example…") { flag in
+      do {
+        try flag.check()
+        try await model.addWritingExample(title: enteredTitle, prose: enteredProse, manuscriptID: request.manuscriptID)
+        previewID = model.writingExampleIDs.last
+        if proseVersion == enteredVersion { title = ""; prose = ""; proseVersion = UUID(); adding = false }
+        failure = nil
+      } catch { failure = error.localizedDescription; throw error }
+    }
   }
   private func importExamples() {
     guard canChange, model.writingExampleIDs.count < 32 else { return }
@@ -378,41 +398,5 @@ private struct WritingExamplePassage: NSViewRepresentable {
     context.coordinator.documentID = document.id; context.coordinator.textVersion = document.textVersion
     if ownerChanged { view.contentView.scroll(to: .zero); view.reflectScrolledClipView(view.contentView) }
     view.needsLayout = true
-  }
-}
-
-struct BackupRequest: Identifiable {
-  let id = UUID()
-  let url: URL
-  let restoring: Bool
-}
-struct BackupPassphraseView: View {
-  @ObservedObject var model: WorkspaceModel
-  let request: BackupRequest
-  @State private var passphrase = ""
-  @State private var confirmation = ""
-  var body: some View {
-    VStack(alignment: .leading, spacing: 16) {
-      Text(request.restoring ? "Restore" : "Backup").font(.title2)
-        .help("Documents, chats, voices, branches, continuations, originals and receipts are included. Model weights are kept separately.")
-        .accessibilityHint("Documents, chats, voices, branches, continuations, originals and receipts are included. Model weights are kept separately.")
-      SecureField("Passphrase", text: $passphrase)
-        .accessibilityLabel("Backup passphrase")
-        .help(request.restoring ? "Restore requires a fresh workspace. Existing authored data is retained." : "Keep this passphrase safe. It is independent of this Mac's Keychain key.")
-        .accessibilityHint(request.restoring ? "Restore requires a fresh workspace. Existing authored data is retained." : "Keep this passphrase safe. It is independent of this Mac's Keychain key.")
-      if !request.restoring {
-        SecureField("Repeat", text: $confirmation).accessibilityLabel("Repeat passphrase")
-      }
-      HStack {
-        Spacer()
-        Button("Cancel") { model.backupRequest = nil }.keyboardShortcut(.cancelAction)
-        Button(request.restoring ? "Restore" : "Export") {
-          model.performBackup(request, passphrase: passphrase)
-          passphrase = ""; confirmation = ""
-        }.accessibilityLabel(request.restoring ? "Restore" : "Export backup")
-          .disabled(passphrase.utf8.count < 8 || (!request.restoring && passphrase != confirmation))
-          .keyboardShortcut(.defaultAction)
-      }
-    }.padding(24).frame(width: 470)
   }
 }

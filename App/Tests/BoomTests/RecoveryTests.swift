@@ -1,5 +1,4 @@
 import BoomCore
-import CryptoKit
 import XCTest
 @testable import Boom
 
@@ -10,64 +9,18 @@ final class RecoveryTests: XCTestCase {
     addTeardownBlock { try? FileManager.default.removeItem(at: url) }
     return url
   }
-  func testInterruptedBatchFinishesEveryDocumentBeforePublishingIndex() async throws {
-    let root = try root(), key = SymmetricKey(size: .bits256)
-    let store = try WorkspaceStore(rootOverride: root, testKey: key)
-    let a = DocumentSnapshot(title: "A", text: "Before A"), b = DocumentSnapshot(title: "B", text: "Before B")
-    var state = WorkspaceState(); state.documents = [a, b].map { DocumentIndex(id: $0.id, title: $0.title) }
-    try await store.save(state, documents: [a, b])
-    let afterA = DocumentSnapshot(id: a.id, title: a.title, text: "After A"), afterB = DocumentSnapshot(id: b.id, title: b.title, text: "After B")
-    let journal = WorkspaceStore.SaveJournal(schema: 1, state: state, documents: [afterA, afterB], before: [a.id: a.revision, b.id: b.revision])
-    try store.vault.encode(journal, kind: .saveJournal, id: Vault.workspaceID)
-    try store.vault.put(Data(afterA.text.utf8), kind: .document, id: a.id)
-    let restarted = try WorkspaceStore(rootOverride: root, testKey: key)
-    let loaded = try await restarted.load().get()
-    XCTAssertEqual(loaded.1, [afterA, afterB])
-    XCTAssertFalse(restarted.vault.exists(.saveJournal, Vault.workspaceID))
-    try await restarted.save(state, documents: [DocumentSnapshot(id: b.id, title: b.title, text: "Next B")])
-  }
-  func testConflictingCrashJournalRepairsNothingAndRetainsEvidence() async throws {
-    let root = try root(), key = SymmetricKey(size: .bits256)
-    let store = try WorkspaceStore(rootOverride: root, testKey: key)
-    let a = DocumentSnapshot(title: "A", text: "Before A"), b = DocumentSnapshot(title: "B", text: "Before B")
-    var state = WorkspaceState(); state.documents = [a, b].map { DocumentIndex(id: $0.id, title: $0.title) }
-    try await store.save(state, documents: [a, b])
-    let journal = WorkspaceStore.SaveJournal(schema: 1, state: state,
-      documents: [DocumentSnapshot(id: a.id, title: a.title, text: "After A"), DocumentSnapshot(id: b.id, title: b.title, text: "After B")],
-      before: [a.id: a.revision, b.id: b.revision])
-    try store.vault.encode(journal, kind: .saveJournal, id: Vault.workspaceID)
-    try store.vault.put(Data("Conflicting B".utf8), kind: .document, id: b.id)
-    let retained = try Data(contentsOf: store.vault.recordURL(.saveJournal, Vault.workspaceID))
-    switch await store.load() { case .success: XCTFail("Conflict was ignored"); case .failure: break }
-    XCTAssertEqual(try store.vault.get(.document, id: a.id), Data(a.text.utf8))
-    XCTAssertEqual(try Data(contentsOf: store.vault.recordURL(.saveJournal, Vault.workspaceID)), retained)
-  }
   func testInterruptedRepliesKeepCapturedSpeakerAndPartialText() async throws {
-    let store = try WorkspaceStore(rootOverride: root(), testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root())
     let speaker = Speaker(name: "Original name", voiceID: UUID(), voiceRevision: "captured-revision")
     var chat = ChatRecord(title: "Consultation")
     chat.messages = [ChatMessage(role: .user, text: "Question"), ChatMessage(role: .assistant, text: "Partial answer", state: .pending, speaker: speaker)]
     var state = WorkspaceState(); state.chats = [chat]
-    try await store.save(state, documents: [])
-    let loaded = try await store.load().get().0.chats[0].messages[1]
+    try await store.saveState(state)
+    let loaded = try await store.loadState().chats[0].messages[1]
     XCTAssertEqual(loaded.state, .cancelled); XCTAssertEqual(loaded.text, "Partial answer"); XCTAssertEqual(loaded.speaker, speaker)
   }
-  func testProcessSessionSharesSuccessAndDenialWithoutRetry() async throws {
-    let success = VaultSession(loader: { _ in SymmetricKey(data: Data(repeating: 7, count: 32)) })
-    await withTaskGroup(of: Bool.self) { group in
-      for _ in 0..<16 { group.addTask { (try? success.unlock(existingRecords: true)) != nil } }
-      for await result in group { XCTAssertTrue(result) }
-    }
-    XCTAssertEqual(success.lookupCount, 1)
-    let denied = VaultSession(loader: { _ in throw BoomError.denied("Denied") })
-    await withTaskGroup(of: Bool.self) { group in
-      for _ in 0..<16 { group.addTask { (try? denied.unlock(existingRecords: false)) == nil } }
-      for await result in group { XCTAssertTrue(result) }
-    }
-    XCTAssertEqual(denied.lookupCount, 1)
-  }
   func testInterruptedGenerationFinishesDurableReceiptsAndCandidates() async throws {
-    let store = try WorkspaceStore(rootOverride: root(), testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root())
     let document = DocumentSnapshot(title: "Manuscript", text: "At the shore, ")
     let prompt = try ProductCore.writingPrompt(document, caret: document.text.utf16.count, examples: [], retaining: Int.max)
     let recipe = CompletionRecipe(document: document, caretUTF16: document.text.utf16.count, sources: [],
@@ -86,8 +39,9 @@ final class RecoveryTests: XCTestCase {
     try store.vault.encode(receipt, kind: .receipt, id: message.id)
     var state = WorkspaceState(); state.documents = [DocumentIndex(id: document.id, title: document.title)]
     state.chats = [chat]; state.candidateIDs = [bundle.id]
-    try await store.save(state, documents: [document])
-    _ = try await store.load().get()
+    try await PagedFileEngineControlOutputs.seed(store, documents: [document])
+    try await store.saveState(state)
+    _ = try await store.loadState()
     let recovered = try store.vault.decode(CandidateBundle.self, kind: .candidate, id: bundle.id)
     XCTAssertEqual(recovered.candidates[0].state, .cancelled)
     XCTAssertEqual(recovered.candidates[0].stopReason, "interrupted")
@@ -98,7 +52,7 @@ final class RecoveryTests: XCTestCase {
     XCTAssertEqual(stopped.stopReason, "interrupted")
   }
   func testInterruptedRetryKeepsFailedAttemptAndCancelsOnlyTheActiveAttempt() async throws {
-    let store = try WorkspaceStore(rootOverride: root(), testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root())
     let document = DocumentSnapshot(title: "Public retry fixture", text: "Same.\nSame.")
     let message = ChatMessage(role: .assistant, text: "", state: .pending)
     var chat = ChatRecord(attachedDocumentID: document.id); chat.messages = [message]
@@ -124,10 +78,12 @@ final class RecoveryTests: XCTestCase {
     try await store.checkpoint(GenerationProgress(text: "Incomplete public fixture", tokenIDs: [2, 3],
       promptDigest: Digest.sha256(plan.rawPrompt), promptTokens: 100, firstTokenSeconds: 1, elapsedSeconds: 2),
       identity: identity, stopReason: nil)
-    try await store.save(state, documents: [document])
-    let recovered = try await store.load().get()
-    XCTAssertEqual(recovered.1[0].text, document.text)
-    XCTAssertEqual(recovered.0.chats[0].messages[0].state, .cancelled)
+    try await PagedFileEngineControlOutputs.seed(store, documents: [document])
+    try await store.saveState(state)
+    let recovered = try await store.loadState()
+    let documents = try await NativeCheckEvidence.readPublicDocuments(store: store)
+    XCTAssertEqual(documents[0].text, document.text)
+    XCTAssertEqual(recovered.chats[0].messages[0].state, .cancelled)
     let stopped = try store.vault.decode(ConsultationReceipt.self, kind: .receipt, id: message.id)
     let archived = try store.vault.decode(ConsultationReceipt.self, kind: .receipt, id: activeID)
     XCTAssertEqual(stopped.state, .cancelled); XCTAssertEqual(archived.state, .cancelled)
@@ -138,12 +94,12 @@ final class RecoveryTests: XCTestCase {
   }
 
   func testCorruptCapturedGenerationNeverBecomesEmptyState() async throws {
-    let store = try WorkspaceStore(rootOverride: root(), testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root())
     let id = UUID(); var state = WorkspaceState(); state.candidateIDs = [id]
     try store.vault.put(Data("incompatible candidate".utf8), kind: .candidate, id: id)
-    try await store.save(state, documents: [])
+    try await store.saveState(state)
     let before = try Data(contentsOf: store.vault.recordURL(.workspace, Vault.workspaceID))
-    switch await store.load() { case .success: XCTFail("Invalid captured attempt was ignored"); case .failure: break }
+    do { _ = try await store.loadState(); XCTFail("Invalid captured attempt was ignored") } catch {}
     XCTAssertEqual(try Data(contentsOf: store.vault.recordURL(.workspace, Vault.workspaceID)), before)
     XCTAssertEqual(try store.vault.get(.candidate, id: id), Data("incompatible candidate".utf8))
   }

@@ -11,16 +11,16 @@ import XCTest
   private func capture(_ text: String, previous: PagedTextWindow? = nil) -> PagedTextWindow {
     let summary = PagedTextSummary(bytes: UInt64(text.utf8.count), utf16: UInt64(text.utf16.count),
       lfCount: UInt64(text.utf8.filter { $0 == 10 }.count))
-    let page = PagedTextPageRef(locator: PagedTextPageLocator(storeID: UUID(), recordID: UUID(),
-      ciphertextBytes: 128), digest: String(repeating: "a", count: 64))
+    let page = PagedTextPageRef(locator: PagedTextPageLocator(storeID: UUID(), offset: 0,
+      bytes: 128), digest: String(repeating: "a", count: 64))
     let revision = PagedTextRevision(schema: 1, ownerID: ownerID, documentID: documentID,
       root: text.isEmpty ? nil : PagedTextTreeRef(page: page, summary: summary, height: 0))
     return PagedTextWindow(revision: revision, windowID: UUID(), byteStart: previous?.byteStart ?? 0,
       utf16Start: previous?.utf16Start ?? 0, lfStart: previous?.lfStart ?? 0, text: text)
   }
   private func record(_ window: PagedTextWindow, generation: UInt64 = 0) -> PagedDocumentRootRecord {
-    let page = PagedTextPageRef(locator: PagedTextPageLocator(storeID: UUID(), recordID: UUID(),
-      ciphertextBytes: 128), digest: String(repeating: "b", count: 64))
+    let page = PagedTextPageRef(locator: PagedTextPageLocator(storeID: UUID(), offset: 0,
+      bytes: 128), digest: String(repeating: "b", count: 64))
     return PagedDocumentRootRecord(document: PagedDocumentDescriptor(id: documentID,
       title: "Unit fixture", revision: window.revision), historyPage: page, historyGeneration: generation)
   }

@@ -1,21 +1,63 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import Foundation
 import XCTest
 @testable import Boom
 
-// SOURCE ONLY: this SQL fixture port and its exact composed dependencies are
+/// Actual SDK application bootstrap for the existing staged/managed fixtures.
+/// It never overrides key-window state or substitutes physical key acceptance.
+@MainActor enum PagedNativeFixtureApplication {
+  private static var finishedLaunching = false
+  static func bootstrap() throws {
+    let application = NSApplication.shared
+    guard application.setActivationPolicy(.regular) else {
+      throw BoomError.unavailable("The public SDK fixture could not acquire regular application policy.")
+    }
+    if !finishedLaunching {
+      application.finishLaunching()
+      finishedLaunching = true
+    }
+  }
+  static func scratchRoot(prefix: String) throws -> URL {
+    guard let path = ProcessInfo.processInfo.environment["TMPDIR"], !path.isEmpty, path.hasPrefix("/") else {
+      throw BoomError.invalid("The public SDK fixture requires its caller's absolute TMPDIR.")
+    }
+    var directory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: path, isDirectory: &directory), directory.boolValue else {
+      throw BoomError.invalid("The public SDK fixture TMPDIR is not an existing directory.")
+    }
+    return URL(fileURLWithPath: path, isDirectory: true).appendingPathComponent(prefix + UUID().uuidString)
+  }
+  static func focus(_ view: PagedNativeTextView, in window: NSWindow) async throws {
+    try bootstrap(); try Task.checkCancellation()
+    let becameKey = window.isKeyWindow ? nil : XCTNSNotificationExpectation(
+      name: NSWindow.didBecomeKeyNotification, object: window)
+    window.makeKeyAndOrderFront(nil)
+    NSApplication.shared.activate(ignoringOtherApps: true)
+    if let becameKey {
+      guard await XCTWaiter.fulfillment(of: [becameKey], timeout: 10) == .completed else {
+        throw BoomError.unavailable("The actual SDK window did not receive its key-window notification.")
+      }
+    }
+    try Task.checkCancellation()
+    guard view.window === window, window.isKeyWindow,
+      window.makeFirstResponder(view), window.firstResponder === view else {
+      throw BoomError.unavailable("The actual SDK fixture did not retain its mounted key-window responder.")
+    }
+  }
+}
+
+// SOURCE ONLY: this file fixture port and its exact composed dependencies are
 // unparsed, uncompiled and unrun. Guard omission supplies no qualification.
 
-/// Scheduling only: every successful value comes from the actual encrypted
+/// Scheduling only: every successful value comes from the actual file
 /// backend. Calls and timers are retained and joined, including failed calls.
 // Shared only by the authored staged/managed XCTest controls in this module.
-// Scheduling gates always forward the actual encrypted backend.
-actor PagedStagedControlledStorage: PagedNativeHistorySessionStorage, PagedNativeCommitInstallationStorage, PagedNativeDocumentNavigationStorage {
+// Scheduling gates always forward the actual file backend.
+actor PagedStagedControlledStorage: PagedNativeHistorySessionStorage, PagedNativeCommitInstallationStorage, PagedNativeDocumentNavigationStorage, PagedNativeCapturedEditingStorage {
   enum Point: Hashable, Sendable {
     case commitBefore, commitAfter, commitInstallationBefore, commitInstallationAfter,
-      prepareAfter, historyBefore, historyAfter, historyInstallationBefore, windowAfter, conflictAfter
+      prepareAfter, historyBefore, historyAfter, historyInstallationBefore, windowAfter, conflictAfter, capturedBefore, capturedAfter
   }
   struct Ticket: Sendable { let id: UUID }
   struct Snapshot: Sendable {
@@ -162,6 +204,56 @@ actor PagedStagedControlledStorage: PagedNativeHistorySessionStorage, PagedNativ
       throw BoomError.unavailable("Public control deliberately lost the joined real ACK custody completion reply.")
     }
   }
+  func graphemeBoundary(expected: PagedTextRevision, utf16Offset: UInt64,
+    forward: Bool) async throws -> PagedTextSummary {
+    let backend = backend
+    return try await self.forward {
+      try await backend.graphemeBoundary(expected: expected, utf16Offset: utf16Offset, forward: forward)
+    }
+  }
+  func paragraphBounds(expected: PagedTextRevision, utf16Offset: UInt64,
+    includeLineEndings: Bool) async throws -> PagedTextParagraphBounds {
+    let backend = backend
+    return try await forward {
+      try await backend.paragraphBounds(expected: expected, utf16Offset: utf16Offset,
+        includeLineEndings: includeLineEndings)
+    }
+  }
+  func commitCapturedEdits(expected: PagedDocumentRootRecord, edits: [PagedTextLocalEdit],
+    sessionID: UUID, commandID: UUID, groupID: UUID, sequence: UInt64,
+    beforeCursor: PagedSealedCursor, afterSelection: PagedNativeNavigationSelection?) async throws -> PagedCapturedEditResult {
+    let backend = backend
+    return try await forward(before: .capturedBefore, after: .capturedAfter) {
+      try await backend.commitCapturedEdits(expected: expected, edits: edits, sessionID: sessionID,
+        commandID: commandID, groupID: groupID, sequence: sequence,
+        beforeCursor: beforeCursor, afterSelection: afterSelection)
+    }
+  }
+  func commitUserReplacement(expected: PagedDocumentRootRecord, selection: PagedNativeNavigationSelection,
+    replacement: Data, sessionID: UUID, commandID: UUID, groupID: UUID, sequence: UInt64,
+    beforeCursor: PagedSealedCursor) async throws -> PagedCapturedEditResult {
+    let backend = backend
+    return try await forward(before: .capturedBefore, after: .capturedAfter) {
+      try await backend.commitUserReplacement(expected: expected, selection: selection,
+        replacement: replacement, sessionID: sessionID, commandID: commandID,
+        groupID: groupID, sequence: sequence, beforeCursor: beforeCursor)
+    }
+  }
+  func commitLinePrefix(expected: PagedDocumentRootRecord, selection: PagedNativeNavigationSelection,
+    prefix: String, sessionID: UUID, commandID: UUID, groupID: UUID, sequence: UInt64,
+    beforeCursor: PagedSealedCursor) async throws -> PagedCapturedEditResult {
+    let backend = backend
+    return try await forward(before: .capturedBefore, after: .capturedAfter) {
+      try await backend.commitLinePrefix(expected: expected, selection: selection,
+        prefix: prefix, sessionID: sessionID, commandID: commandID, groupID: groupID,
+        sequence: sequence, beforeCursor: beforeCursor)
+    }
+  }
+  func finishCapturedEditInstallation(_ result: PagedCapturedEditResult) async throws {
+    let backend = backend
+    try await forward { try await backend.finishCapturedEditInstallation(result) }
+  }
+
   func documentPosition(expected: PagedTextRevision, utf16Offset: UInt64,
     forward: Bool) async throws -> PagedTextSummary {
     let backend = backend
@@ -254,7 +346,7 @@ actor PagedStagedControlledStorage: PagedNativeHistorySessionStorage, PagedNativ
 struct PagedStagedSetup: Sendable {
   let root: URL
   let ownerID: UUID
-  let vault: Vault
+  let store: WorkspaceStore
   let engine: PagedTextEngineAdapter
   let publisher: PagedWorkspacePublisher
   let record: PagedDocumentRootRecord
@@ -262,14 +354,12 @@ struct PagedStagedSetup: Sendable {
   let backend: PagedNativeStorageBackend
 }
 
-#if BLOOM_PAGED_SQL_PUBLIC_CONTROL
 
 /// This fixture joins every known component call before its explicit exact
 /// root transfer. It does not claim a physical input-method callback drain or
 /// activate the ordinary product route.
 @MainActor private final class PagedStagedFixture {
   let setup: PagedStagedSetup
-  private let sqlIdentity: PagedSQLPublicControlIdentity
   let route: PagedStagedControlledStorage
   let session: PagedNativeSession
   let inputOwner: PagedNativeInputOwner?
@@ -279,17 +369,16 @@ struct PagedStagedSetup: Sendable {
   private var notificationTokens: [NSObjectProtocol] = []
   private var admittedCommands: [UUID] = []
   private var readOutputs: [PagedTextRootLease] = []
-  private var joinedWAL: PagedTextSQLMaintenanceSnapshot?
   private(set) var historyJoinFailures: [UUID: Error] = [:]
   private var preparationSelection: PagedNativeSelectionObservation?
   private(set) var preparationPrefix: PagedNativePrefixReservation?
   private(set) var closures: [PagedNativeGroupClosureReceipt] = []
   var afterClosure: ((PagedNativeGroupClosureReceipt) -> Void)?
 
-  init(_ setup: PagedStagedSetup, managed: Bool, sqlIdentity: PagedSQLPublicControlIdentity) throws {
+  init(_ setup: PagedStagedSetup, managed: Bool) throws {
     let route = PagedStagedControlledStorage(setup.backend)
     let session = try PagedNativeSession(window: setup.window, rootRecord: setup.record, storage: route)
-    self.setup = setup; self.sqlIdentity = sqlIdentity; self.route = route; self.session = session
+    self.setup = setup; self.route = route; self.session = session
     if managed {
       inputOwner = try PagedNativeInputOwner(frame: NSRect(x: 0, y: 0, width: 640, height: 320), session: session)
       prototypeView = nil
@@ -331,9 +420,9 @@ struct PagedStagedSetup: Sendable {
   }
   func snapshot() async throws -> PagedWorkspaceSnapshot {
     guard readOutputs.count < 32 else { throw BoomError.budget("Public staged read-output custody exceeds its bound.") }
-    let result = try await setup.engine.loadWorkspaceRetaining(setup.publisher)
+    let result = try await setup.engine.loadWorkspaceCatalogRetaining(setup.publisher)
     readOutputs.append(result.lease)
-    return result.value
+    return result.value.snapshot
   }
   func sourceWindow(_ record: PagedDocumentRootRecord) async throws -> PagedTextWindow {
     guard readOutputs.count < 32 else { throw BoomError.budget("Public staged read-output custody exceeds its bound.") }
@@ -342,8 +431,8 @@ struct PagedStagedSetup: Sendable {
     return result.value
   }
   func history(_ record: PagedDocumentRootRecord) async throws -> PagedRootHistory {
-    guard readOutputs.count < 32 else { throw BoomError.budget("Public staged SQL history custody exceeds its fixed bound.") }
-    let result = try await setup.engine._publicSQLControlHistoryRetaining(identity: sqlIdentity, record: record)
+    guard readOutputs.count < 32 else { throw BoomError.budget("Public staged file history custody exceeds its fixed bound.") }
+    let result = try await setup.engine.rootHistoryRetaining(setup.publisher, expected: record)
     readOutputs.append(result.lease)
     return result.value
   }
@@ -370,7 +459,7 @@ struct PagedStagedSetup: Sendable {
     return admission
   }
   /// Failure cleanup only joins the actual forwarded calls/waiters/timers.
-  /// It cannot retry SQL maintenance, release roots, detach or close the engine.
+  /// It cannot retry file maintenance, release roots, detach or close the engine.
   func joinCallsPreservingFailure() async {
     afterClosure = nil
     session.didFail = nil
@@ -429,23 +518,11 @@ struct PagedStagedSetup: Sendable {
     // controller is this exact session. Refusal keeps its files and custody.
     try await setup.backend.detachJoinedController(sessionID: session.sessionID,
       sequence: session.generation, record: record)
-    try await joinWALAfterSource()
     try await setup.engine.close()
+    try await setup.store.releaseExclusiveWorkspace()
     return false
   }
-  /// Explicit bounded maintenance AFTER the real native/source/receiving joins.
-  /// A failed operation keeps its original Store fence and whole fixture; this
-  /// never repairs an uncertain COMMIT or repeats source publication.
-  private func joinWALAfterSource() async throws {
-    let joined = try await setup.engine.joinScheduledWALMaintenance()
-    joinedWAL = joined
-    if let failure = joined.failure { throw failure }
-    guard joined.storage.failedOperationID == nil,
-      joined.storage.observedWALBytes <= PagedSQLiteStore.walAdmissionBytes,
-      setup.engine.custodySnapshot.jobs == 0 else {
-      throw BoomError.stale("Actual WAL/source work remains owned; fixture close refused.")
-    }
-  }
+
 }
 
 /// Actual Foundation notifications and synchronous inverse registration. The
@@ -484,7 +561,7 @@ struct PagedStagedSetup: Sendable {
 }
 
 /// Source-bound real-backend/native component controls, authored only. No
-/// successful ACK is synthesized; all storage values come from the encrypted
+/// successful ACK is synthesized; all storage values come from the file
 /// engine, publisher, backend and their actual retained/joined calls.
 @MainActor final class PagedNativeStagedInstallationTests: XCTestCase {
   /// Successful managed physical clients retire through the actual owner API.
@@ -500,25 +577,24 @@ struct PagedStagedSetup: Sendable {
     if expectPersistenceRefusal {
       guard let isolatedCase,
         ProcessInfo.processInfo.environment["BLOOM_PAGED_STAGED_ISOLATED_CASE"] == isolatedCase else {
-        throw BoomError.denied("Terminal staged SQL control requires its exact separately owned disposable process; no fixture entered.")
+        throw BoomError.denied("Terminal staged file control requires its exact separately owned disposable process; no fixture entered.")
       }
     }
     guard Self.retainedSetupRoot == nil, Self.retainedSetupEngine == nil,
       Self.retainedSetup == nil, Self.terminalFixture == nil else {
       throw BoomError.denied("A prior failed/terminal fixture still owns this process.")
     }
-    _ = NSApplication.shared
+    try PagedNativeFixtureApplication.bootstrap()
     let initialFailures = testRun?.failureCount ?? 0
-    let root = FileManager.default.temporaryDirectory.appendingPathComponent("public-native-staged-" + UUID().uuidString)
+    let root = try PagedNativeFixtureApplication.scratchRoot(prefix: "public-native-staged-")
     Self.retainedSetupRoot = root
-    print("Public staged SQL setup: \(root.path)")
-    let created = try await Task.detached {
-      let ownerID = UUID(), storeID = UUID(), vault = try Vault(root: root, testKey: SymmetricKey(data: Data(repeating: 0x73, count: 32)))
-      let engine = try await PagedTextEngineAdapter.create(vault: vault, ownerID: ownerID, sqliteOpening: .fresh(storeID: storeID))
-      return (ownerID: ownerID, storeID: storeID, vault: vault, engine: engine)
-    }.value
-    Self.retainedSetupEngine = created.engine // Identity/receiving refusal preserves the actual joined opening.
-    let identity = try await created.engine._publicSQLControlIdentity(expectedVault: created.vault, expectedStoreID: created.storeID)
+    print("Public staged file setup: \(root.path)")
+    let store = try WorkspaceStore(rootOverride: root)
+    try await store.acquireExclusiveWorkspace()
+    let identity = try await store.storageIdentity()
+    let actualEngine = try await PagedTextEngineAdapter.create(root: store.root, ownerID: identity.ownerID, storeID: identity.storeID)
+    let created = (ownerID: identity.ownerID, store: store, engine: actualEngine)
+    Self.retainedSetupEngine = actualEngine
     let setup = try await Task.detached {
       let engine = created.engine
       let source = root.appendingPathComponent("public-input.utf8")
@@ -536,28 +612,22 @@ struct PagedStagedSetup: Sendable {
       catch { throw PagedTextCustodyFailure(original: error, lease: imported.lease) }
       let document = PagedDocumentDescriptor(id: imported.value.revision.documentID, title: "Public café", revision: imported.value.revision)
       let rootOutput = try await engine.initialNativeRecordRetaining(document)
-      let record = rootOutput.value
       let publisher = try await engine.makeWorkspacePublisher()
+      let record = try await engine.publishInitialDocumentRetaining(publisher, imported: imported, initialized: rootOutput)
       var state = WorkspaceState(); state.documents = [DocumentIndex(id: document.id, title: document.title)]
       state.selectedDocument = document.id
-      let workspace = try await engine.initializeWorkspaceRetaining(publisher, state: state, documents: [record])
-      try await engine.finishWorkspacePublication(workspace, publisher: publisher)
-      // Actual strict head admission transfers the real joined import/history
-      // outputs. A constructor or metadata callback cannot substitute for it.
-      try await engine.transferJoinedRootToHead(imported.lease, publisher: publisher, expected: record)
-      try await engine.transferJoinedRootToHead(rootOutput.lease, publisher: publisher, expected: record)
-      try await engine.abandonJoinedRootOutput(workspace.lease)
+      try await created.store.saveState(state)
       let backend = try await engine.makeNativeStorage(publisher, expected: record)
       let window = try await backend.window(expected: record.document.revision, utf16Anchor: 0,
         maximumBytes: PagedWorkingWindow.targetBytes)
-      return PagedStagedSetup(root: root, ownerID: created.ownerID, vault: created.vault, engine: engine,
+      return PagedStagedSetup(root: root, ownerID: created.ownerID, store: created.store, engine: engine,
         publisher: publisher, record: record, window: window, backend: backend)
     }.value
     Self.retainedSetup = setup
     let fixture: PagedStagedFixture
-    do { fixture = try PagedStagedFixture(setup, managed: managed, sqlIdentity: identity) }
+    do { fixture = try PagedStagedFixture(setup, managed: managed) }
     catch {
-      XCTFail("Public staged constructor refused; actual setup and encrypted evidence retained at \(root.path): \(error)")
+      XCTFail("Public staged constructor refused; actual setup and file evidence retained at \(root.path): \(error)")
       throw error
     }
     Self.retainedSetup = nil; Self.retainedSetupEngine = nil; Self.retainedSetupRoot = nil
@@ -570,7 +640,6 @@ struct PagedStagedSetup: Sendable {
       if retained {
         Self.terminalFixture = fixture
         let status = await fixture.route.snapshot
-        let sql = try await setup.engine.nativeSQLMaintenanceSnapshot() // Read-only; terminal receipt retirement stays owned.
         let custody = setup.engine.custodySnapshot
         guard status.activeCalls == 0, status.startedCalls == status.finishedCalls, custody.jobs == 0 else {
           throw BoomError.stale("Public terminal receipt preceded real staged source joins.")
@@ -581,20 +650,17 @@ struct PagedStagedSetup: Sendable {
           "started-component-calls": String(status.startedCalls), "finished-component-calls": String(status.finishedCalls),
           "active-component-calls": String(status.activeCalls), "history-join-failures": String(fixture.historyJoinFailures.count),
           "live-root-custody-entries": String(custody.items.count),
-          "sqlite-wal-bytes": String(sql.storage.observedWALBytes),
-          "sqlite-failed-operation": sql.storage.failedOperationID?.uuidString ?? "none",
-          "sqlite-maintenance": "retained-no-terminal-checkpoint",
           "engine": "retained-no-detach-no-close-no-delete"]
         try await Task.detached {
           let bytes = try JSONEncoder().encode(receipt)
           guard bytes.count <= 16_384 else { throw BoomError.budget("Public staged terminal receipt exceeds its fixed evidence cap.") }
           try bytes.write(to: root.appendingPathComponent("retained-component-boundary.json"), options: .withoutOverwriting)
         }.value
-        print("Public retained staged SQL refusal evidence: \(root.path)")
+        print("Public retained staged file refusal evidence: \(root.path)")
         return
       }
       if preserveOnSuccess {
-        print("Public preserved staged SQL finish-refusal/recovery evidence: \(root.path)")
+        print("Public preserved staged file finish-refusal/recovery evidence: \(root.path)")
         return
       }
       try await Task.detached { try FileManager.default.removeItem(at: root) }.value
@@ -602,7 +668,7 @@ struct PagedStagedSetup: Sendable {
       let original = error
       Self.terminalFixture = fixture
       await fixture.joinCallsPreservingFailure() // No repeated retirement, source write, detach or engine close.
-      XCTFail("Public staged control failed; actual source/input owners and encrypted evidence retained at \(root.path): \(original)")
+      XCTFail("Public staged control failed; actual source/input owners and file evidence retained at \(root.path): \(original)")
       throw original
     }
   }
@@ -1059,7 +1125,8 @@ struct PagedStagedSetup: Sendable {
       let beforeStaleFinish = try await fixture.snapshot()
       await assertStaleAsync { try await fixture.route.finishCommitInstallation(pending) }
       let afterStaleFinish = try await fixture.snapshot()
-      XCTAssertEqual(afterStaleFinish, beforeStaleFinish)
+      XCTAssertEqual(afterStaleFinish.head, beforeStaleFinish.head)
+      XCTAssertEqual(afterStaleFinish.documents, beforeStaleFinish.documents)
     }
   }
 
@@ -1316,5 +1383,3 @@ struct PagedStagedSetup: Sendable {
     }
   }
 }
-
-#endif

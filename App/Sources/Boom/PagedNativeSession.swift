@@ -40,9 +40,9 @@ protocol PagedNativeHistorySessionStorage: PagedNativeSessionStorage {
     admission: PagedNativeHistoryAdmission) async throws
 }
 
-/// Real SQL routes explicitly opt in. Prototype histories receive no fabricated
+/// File storage routes explicitly opt in. Prototype histories receive no fabricated
 /// default repair/ACK. Main owns only the existing command/commit task lane.
-protocol PagedNativeSQLDurabilityStorage: PagedNativeHistorySessionStorage, PagedNativeCommitInstallationStorage {
+protocol PagedNativeFileDurabilityStorage: PagedNativeHistorySessionStorage, PagedNativeCommitInstallationStorage {
   func repairHistoryDurability(_ prepared: PagedNativePreparedHistoryMove) async throws -> PagedNativeHistoryRecovery
   func repairCommitDurability(_ batch: PagedNativeCommitBatch) async throws -> PagedNativeCommitAcknowledgement
   func inspectCommitRecovery(_ batch: PagedNativeCommitBatch) async throws -> PagedNativeCommitRecovery
@@ -98,6 +98,7 @@ struct PagedNativeUnpreparedHistoryDispositionReceipt: Sendable {
   fileprivate enum State: Equatable { case staged, cancelled, consumed }
   let admission: PagedNativeHistoryAdmission
   let localCaretUTF16: Int
+  let documentSelection: PagedNativeNavigationSelection
   var sessionID: UUID { admission.sessionID }
   var provisionalArenaID: UUID { admission.provisionalArenaID }
   var commandID: UUID { admission.commandID }
@@ -117,6 +118,9 @@ struct PagedNativeUnpreparedHistoryDispositionReceipt: Sendable {
     route: any PagedNativeHistorySessionStorage) {
     self.owner = owner; self.prepared = prepared; self.admission = admission
     localCaretUTF16 = prepared.localCaretUTF16; self.candidate = candidate; self.route = route
+    documentSelection = PagedNativeNavigationSelection(utf16Offset: prepared.cursor.utf16Offset,
+      utf16Length: prepared.cursor.selectionLengthUTF16, focusAtEnd: prepared.cursor.focusAtEnd,
+      affinity: prepared.cursor.affinity)
   }
   fileprivate func releaseBacking() { prepared = nil; candidate = nil; route = nil }
 }
@@ -151,6 +155,15 @@ struct PagedNativeUnpreparedHistoryDispositionReceipt: Sendable {
 struct PagedNativeNavigationSelection: Sendable, Equatable {
   let utf16Offset: UInt64
   let utf16Length: UInt64
+  let focusAtEnd: Bool
+  let affinity: PagedSelectionAffinity
+  init(utf16Offset: UInt64, utf16Length: UInt64, focusAtEnd: Bool = false,
+    affinity: PagedSelectionAffinity = .downstream) {
+    self.utf16Offset = utf16Offset; self.utf16Length = utf16Length; self.focusAtEnd = focusAtEnd
+    self.affinity = affinity
+  }
+  var focusUTF16: UInt64 { focusAtEnd ? utf16Offset + utf16Length : utf16Offset }
+  var anchorUTF16: UInt64 { focusAtEnd ? utf16Offset : utf16Offset + utf16Length }
 }
 
 /// One bounded projection prepared without changing the active working arena.
@@ -164,12 +177,14 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
   let provisionalArenaID: UUID
   let localSelection: NSRange
   let selectionAffinity: NSSelectionAffinity
+  let documentSelection: PagedNativeNavigationSelection?
   fileprivate let sourceWindowID: UUID
   fileprivate let sourceRecord: PagedDocumentRootRecord
   fileprivate weak var owner: PagedNativeSession?
   fileprivate weak var inputOwner: PagedNativeInputOwner?
   fileprivate var state = State.staged
   fileprivate var candidate: PagedWorkingWindow?
+  fileprivate let capturedEdit: PagedCapturedEditResult?
   var isAwaitingAdoption: Bool { state == .staged }
   var wasConsumed: Bool { state == .consumed }
   var window: PagedTextWindow {
@@ -178,13 +193,18 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
   }
   fileprivate init(owner: PagedNativeSession, inputOwner: PagedNativeInputOwner,
     candidate: PagedWorkingWindow, sourceArenaID: UUID, sourceWindowID: UUID,
-    localSelection: NSRange, selectionAffinity: NSSelectionAffinity) {
+    localSelection: NSRange, selectionAffinity: NSSelectionAffinity,
+    sourceGeneration: UInt64? = nil, sourceRecord: PagedDocumentRootRecord? = nil,
+    capturedEdit: PagedCapturedEditResult? = nil,
+    documentSelection: PagedNativeNavigationSelection? = nil) {
     operationID = UUID(); self.owner = owner; self.inputOwner = inputOwner
     self.candidate = candidate; self.sourceArenaID = sourceArenaID
     self.sourceWindowID = sourceWindowID; self.localSelection = localSelection
     self.selectionAffinity = selectionAffinity
-    sessionID = candidate.sessionID; sourceGeneration = candidate.generation
-    provisionalArenaID = candidate.arenaID; sourceRecord = candidate.sealedRootRecord
+    sessionID = candidate.sessionID; self.sourceGeneration = sourceGeneration ?? candidate.generation
+    provisionalArenaID = candidate.arenaID; self.sourceRecord = sourceRecord ?? candidate.sealedRootRecord
+    self.capturedEdit = capturedEdit
+    self.documentSelection = documentSelection
   }
   fileprivate func releaseBacking() { candidate = nil; inputOwner = nil }
 }
@@ -286,6 +306,9 @@ struct PagedNativeReceivingCheckpoint: Sendable, Equatable {
   private var stagedInstallation: PagedNativeHistoryInstallationTicket?
   private var stagedNavigation: PagedNativeNavigationInstallationTicket?
   private var adoptingNavigation = false
+  private var capturedEditCommandID: UUID?
+  private var capturedEditExpectedRecord: PagedDocumentRootRecord?
+  private var capturedEditResult: PagedCapturedEditResult?
   private weak var managedArenaOwner: PagedNativeInputOwner?
   private var adoptingHistory = false
   private var notifyingNativeGroup = false
@@ -348,19 +371,36 @@ struct PagedNativeReceivingCheckpoint: Sendable, Equatable {
   var isProvisionalHistory: Bool { working.hasProvisionalHistory }
   var activeNavigationOperationCount: Int { navigationOperations.count }
 
+  /// Read-only scrolling needs stable physical bytes, not a durable ACK or a
+  /// joined writer. IME and retained unrelated source failures can coexist.
+  func captureScrollSnapshot() throws -> PagedNativeScrollSnapshot {
+    guard characterTransactionDepth == 0, canonicalOpening == nil,
+      stagedInstallation == nil, stagedNavigation == nil, !adoptingNavigation,
+      !adoptingHistory, !installingHistory else {
+      throw BoomError.stale("Native display is installing a different physical source.")
+    }
+    return try working.captureScrollSnapshot()
+  }
+  func isCurrent(_ snapshot: PagedNativeScrollSnapshot) -> Bool {
+    snapshot.sessionID == working.sessionID && snapshot.arenaID == working.arenaID
+      && snapshot.generation == working.generation && canonicalOpening == nil
+      && stagedInstallation == nil && stagedNavigation == nil && !adoptingNavigation
+      && !adoptingHistory && !installingHistory && characterTransactionDepth == 0
+  }
+
   private var coordinateWindow: (id: UUID, utf16: Int)?
   /// Pure bounded presentation metadata. It never labels unsealed input with
   /// a sealed source digest or advances the immutable Root summary/history.
   func documentCoordinates() throws -> PagedNativeDocumentCoordinates {
-    let window = working.sealedWindow, record = working.sealedRootRecord
+    let window = working.projectionWindow, record = working.sealedRootRecord
     if coordinateWindow?.id != window.windowID {
       coordinateWindow = (window.windowID, window.text.utf16.count)
     }
     guard let original = coordinateWindow?.utf16,
-      UInt64(original) <= record.document.revision.summary.utf16 else {
+      UInt64(original) <= window.revision.summary.utf16 else {
       throw BoomError.invalid("Native projected extent differs from its actual bounded window.")
     }
-    let outside = record.document.revision.summary.utf16 - UInt64(original)
+    let outside = window.revision.summary.utf16 - UInt64(original)
     let projected = outside.addingReportingOverflow(UInt64(working.localUTF16Count))
     guard !projected.overflow else { throw BoomError.budget("Native projected document extent overflowed.") }
     return PagedNativeDocumentCoordinates(record: record, sessionID: sessionID, arenaID: arenaID,
@@ -374,7 +414,7 @@ struct PagedNativeReceivingCheckpoint: Sendable, Equatable {
   private var sourceTransitionIsFenced: Bool {
     stagedInstallation != nil || stagedNavigation != nil || adoptingNavigation
       || adoptingHistory || installingHistory || notifyingNativeGroup
-      || nativeGroupHookTransition || notifyingCanonicalHistory
+      || nativeGroupHookTransition || notifyingCanonicalHistory || capturedEditCommandID != nil
   }
   private func requireSourceTransition(allowCanonicalOpening: Bool = false) throws {
     guard !sourceTransitionIsFenced, allowCanonicalOpening || canonicalOpening == nil else {
@@ -564,6 +604,12 @@ struct PagedNativeReceivingCheckpoint: Sendable, Equatable {
       throw BoomError.stale("Published native ACK lacks its actual canonical metadata owner and prefix.")
     }
     switch receipt {
+    case .capturedEdit(let result):
+      guard incoming.scope == .capturedEdit(sessionID: result.sessionID,
+        commandID: result.commandID, sequence: result.sequence),
+        incoming.beforeRecord == result.beforeRecord, incoming.record == result.record else {
+        throw BoomError.stale("Captured edit history differs from its published source.")
+      }
     case .native(let ack):
       guard case .nativeBatch(let session, let batch, _, let last) = incoming.scope,
         session == ack.sessionID, batch == ack.batchID, last == ack.lastSequence,
@@ -595,6 +641,10 @@ struct PagedNativeReceivingCheckpoint: Sendable, Equatable {
 
   func nativeSelection(_ range: NSRange) throws -> PagedWorkingSelection {
     try requireSourceTransition()
+    if let owner = managedArenaOwner, owner.activeView?.selectedRange() == range {
+      let selection = try owner.currentDocumentSelection()
+      return try working.selection(range, focusAtEnd: selection.focusAtEnd, affinity: selection.affinity)
+    }
     return try working.selection(range)
   }
   func nativeLocalBytes(_ range: NSRange) throws -> Range<Int> {
@@ -603,9 +653,9 @@ struct PagedNativeReceivingCheckpoint: Sendable, Equatable {
   }
 
   @discardableResult
-  func beginComposition() -> Bool {
+  func beginComposition(groupID: UUID? = nil) -> Bool {
     guard !sourceTransitionIsFenced, canonicalOpening == nil else { return false }
-    working.beginComposition()
+    working.beginComposition(groupID: groupID)
     return true
   }
   @discardableResult
@@ -638,13 +688,25 @@ struct PagedNativeReceivingCheckpoint: Sendable, Equatable {
   /// Call after the character transaction closes. IME commits are explicitly
   /// unmarked before pumping; attribute-only updates do not enqueue mutations.
   @discardableResult
-  func nativeCharacterTransactionDidClose() -> Bool {
+  func nativeCharacterTransactionDidClose(capturingSelectionFrom view: PagedNativeTextView? = nil) -> Bool {
     guard !sourceTransitionIsFenced, canonicalOpening == nil else { return false }
     guard characterTransactionDepth > 0 else {
       fail(BoomError.invalid("Native character transaction close is unmatched.")); return false
     }
     characterTransactionDepth -= 1
     if characterTransactionDepth == 0 {
+      if working.hasOpenNativeGroup, let view {
+        do {
+          guard let owner = managedArenaOwner, owner.activeView === view,
+            view.session === self, view.inputBinding?.owner === owner,
+            view.inputBinding?.state == .active else {
+            throw BoomError.stale("Native after-selection belongs to another physical source.")
+          }
+          // AppKit has returned from the outer view operation. Capture before
+          // close/requestCommit synchronously freezes the actual worker batch.
+          try working.captureNativeAfterSelection(nativeSelection(view.selectedRange()))
+        } catch { fail(error); return false }
+      }
       if !working.isPinned { emitGroupClosure(working.closeNativeGroup()) }
       requestCommit()
     }
@@ -764,7 +826,7 @@ struct PagedNativeReceivingCheckpoint: Sendable, Equatable {
       let batch = working.failedBatchRetained, persistenceFailure != nil,
       !persistenceFailureSerialExhausted, failedCommitDurabilityBatchID == batch.batchID,
       failedCommitDurabilityFailureSerial == persistenceFailureSerial,
-      let route = storage as? any PagedNativeSQLDurabilityStorage else { throw BoomError.stale("No actual failed input can enter outcome inspection.") }
+      let route = storage as? any PagedNativeFileDurabilityStorage else { throw BoomError.stale("No actual failed input can enter outcome inspection.") }
     let serial = persistenceFailureSerial
     verifiedCommitBefore = nil // a prior exact permit cannot survive a new refused inspection
     inspectingCommitRecovery = true; defer { inspectingCommitRecovery = false }
@@ -792,8 +854,8 @@ struct PagedNativeReceivingCheckpoint: Sendable, Equatable {
       let batch = working.failedBatchRetained, let original = persistenceFailure,
       !persistenceFailureSerialExhausted, failedCommitDurabilityBatchID == batch.batchID,
       failedCommitDurabilityFailureSerial == persistenceFailureSerial,
-      let route = storage as? any PagedNativeSQLDurabilityStorage else {
-      throw BoomError.stale("No actual failed ordinary SQL batch can enter durability receiving.")
+      let route = storage as? any PagedNativeFileDurabilityStorage else {
+      throw BoomError.stale("No actual failed file batch can enter durability receiving.")
     }
     let serial = persistenceFailureSerial
     if let verificationID {
@@ -1277,8 +1339,8 @@ struct PagedNativeReceivingCheckpoint: Sendable, Equatable {
     guard historyTask == nil, !inspectingHistory, let intent = historyIntent,
       let prepared = intent.prepared, intent.admission != nil, historyFailure != nil,
       !persistenceFailureSerialExhausted, failedHistoryDurabilityFailureSerial == persistenceFailureSerial,
-      let route = storage as? any PagedNativeSQLDurabilityStorage else {
-      throw BoomError.stale("No joined admitted SQL history intent owns durability repair.")
+      let route = storage as? any PagedNativeFileDurabilityStorage else {
+      throw BoomError.stale("No joined admitted file history intent owns durability repair.")
     }
     lastDurabilityRepairOriginalFailure = historyFailure
     inspectingHistory = true; defer { inspectingHistory = false }
@@ -1429,7 +1491,7 @@ struct PagedNativeReceivingCheckpoint: Sendable, Equatable {
   /// Real flush/window calls join with old working and physical view intact.
   /// Only the joined, unchanged source receives the one staged reservation.
   func prepareNavigationInstallation(owner: PagedNativeInputOwner, toUTF16 anchor: UInt64,
-    selection: PagedNativeNavigationSelection, affinity: NSSelectionAffinity,
+    selection: PagedNativeNavigationSelection,
     roundGeneratedAnchor: Bool = false) async throws -> PagedNativeNavigationInstallationTicket {
     guard managedArenaOwner === owner, owner.session === self else {
       throw BoomError.denied("Navigation has another actual physical owner.")
@@ -1443,22 +1505,210 @@ struct PagedNativeReceivingCheckpoint: Sendable, Equatable {
     let end = selection.utf16Offset.addingReportingOverflow(selection.utf16Length)
     let extent = candidate.sealedWindow.utf16Start.addingReportingOverflow(UInt64(candidate.localUTF16Count))
     guard !end.overflow, !extent.overflow,
-      selection.utf16Offset >= candidate.sealedWindow.utf16Start, end.partialValue <= extent.partialValue,
-      let location = Int(exactly: selection.utf16Offset - candidate.sealedWindow.utf16Start),
-      let length = Int(exactly: selection.utf16Length) else {
-      throw BoomError.stale("Requested selection does not fit the actual bounded navigation window.")
+      end.partialValue <= candidate.sealedWindow.revision.summary.utf16,
+      selection.focusUTF16 >= candidate.sealedWindow.utf16Start,
+      selection.focusUTF16 <= extent.partialValue else {
+      throw BoomError.stale("Requested selection focus is outside its actual bounded navigation window.")
     }
+    let start = max(selection.utf16Offset, candidate.sealedWindow.utf16Start)
+    let finish = min(end.partialValue, extent.partialValue)
+    let location = Int(start - candidate.sealedWindow.utf16Start), length = Int(max(start, finish) - start)
     let local = NSRange(location: location, length: length)
     _ = try candidate.selection(local) // scalar boundaries, before any physical/source adoption
     let ticket = PagedNativeNavigationInstallationTicket(owner: self, inputOwner: owner,
       candidate: candidate, sourceArenaID: working.arenaID, sourceWindowID: working.sealedWindow.windowID,
-      localSelection: local, selectionAffinity: affinity)
+      localSelection: local, selectionAffinity: selection.affinity.native, documentSelection: selection)
     stagedNavigation = ticket
     return ticket
   }
 
   func windowForStagedNavigationInstallation(_ ticket: PagedNativeNavigationInstallationTicket) throws -> PagedTextWindow {
     try requireStagedNavigation(ticket); return ticket.window
+  }
+
+  /// Explicit edits use the same session, physical input queue and immutable
+  /// history as typing. Only a joined source prefix can enter the file writer.
+  func beginCapturedEdit(expected: PagedDocumentRootRecord, commandID: UUID)
+    throws -> any PagedNativeCapturedEditingStorage {
+    _ = try windowForNativeInstallation()
+    guard working.sealedRootRecord == expected, capturedEditCommandID == nil,
+      let route = storage as? any PagedNativeCapturedEditingStorage else {
+      throw BoomError.stale("The explicit edit no longer names this joined source.")
+    }
+    capturedEditCommandID = commandID; capturedEditExpectedRecord = expected
+    return route
+  }
+
+  func preparePublishedEditInstallation(_ result: PagedCapturedEditResult,
+    owner: PagedNativeInputOwner) throws -> PagedNativeNavigationInstallationTicket {
+    let next = working.generation.addingReportingOverflow(1)
+    guard managedArenaOwner === owner, owner.session === self,
+      capturedEditCommandID == result.commandID,
+      capturedEditExpectedRecord == result.beforeRecord,
+      working.sealedRootRecord == result.beforeRecord,
+      working.generation == working.sealedGeneration,
+      result.sessionID == sessionID, !next.overflow, result.sequence == next.partialValue,
+      stagedNavigation == nil, stagedInstallation == nil, !working.isPinned,
+      characterTransactionDepth == 0, commitTask == nil, historyTask == nil,
+      pendingCommitInstallation == nil, historyIntent == nil, working.reservedPrefix == nil,
+      let currentHistory = canonicalHistory,
+      persistenceFailure == nil, historyFailure == nil else {
+      throw BoomError.stale("Published edit lost its exact sealed native source.")
+    }
+    try result.canonicalHistory.admit(record: result.record, sessionID: sessionID,
+      engineIncarnation: currentHistory.producer.engineIncarnation,
+      scope: .capturedEdit(sessionID: sessionID, commandID: result.commandID, sequence: result.sequence))
+    let candidate = try PagedWorkingWindow(window: result.window, rootRecord: result.record,
+      sessionID: sessionID, generation: result.sequence)
+    let selection = PagedNativeNavigationSelection(utf16Offset: result.cursor.utf16Offset,
+      utf16Length: result.cursor.selectionLengthUTF16, focusAtEnd: result.cursor.focusAtEnd,
+      affinity: result.cursor.affinity)
+    guard result.localCaretUTF16 >= 0, result.localCaretUTF16 <= candidate.localUTF16Count,
+      selection.utf16Offset <= result.record.document.revision.summary.utf16,
+      selection.utf16Length <= result.record.document.revision.summary.utf16 - selection.utf16Offset else {
+      throw BoomError.invalid("Published edit selection exceeds its actual source.")
+    }
+    let windowStart = candidate.sealedWindow.utf16Start
+    let windowEnd = windowStart + UInt64(candidate.localUTF16Count)
+    let start = min(windowEnd, max(windowStart, selection.utf16Offset))
+    let finish = min(windowEnd, max(start, selection.utf16Offset + selection.utf16Length))
+    let local = NSRange(location: Int(start - windowStart), length: Int(finish - start))
+    _ = try candidate.selection(local)
+    let ticket = PagedNativeNavigationInstallationTicket(owner: self, inputOwner: owner,
+      candidate: candidate, sourceArenaID: arenaID, sourceWindowID: working.sealedWindow.windowID,
+      localSelection: local, selectionAffinity: selection.affinity.native, sourceGeneration: generation,
+      sourceRecord: working.sealedRootRecord, capturedEdit: result, documentSelection: selection)
+    capturedEditResult = result; stagedNavigation = ticket
+    return ticket
+  }
+
+  func finishCapturedEditInstallation(_ result: PagedCapturedEditResult) async throws {
+    guard capturedEditCommandID == result.commandID,
+      capturedEditResult?.record == result.record,
+      working.sealedRootRecord == result.record, generation == result.sequence,
+      canonicalHistory?.record == result.record,
+      let route = storage as? any PagedNativeCapturedEditingStorage else {
+      throw BoomError.stale("The explicit edit has another receiving source.")
+    }
+    try await route.finishCapturedEditInstallation(result)
+    capturedEditCommandID = nil; capturedEditExpectedRecord = nil; capturedEditResult = nil
+    emitNativeSeal(result.window)
+  }
+
+  func recordCapturedEditFailure(_ error: Error) { fail(error) }
+
+  func completeUnchangedCapturedEdit(_ result: PagedCapturedEditUnchanged) throws {
+    guard capturedEditCommandID == result.commandID,
+      capturedEditExpectedRecord == result.record, working.sealedRootRecord == result.record,
+      capturedEditResult == nil, stagedNavigation == nil else {
+      throw BoomError.stale("Neutral editing has another source or an entered publication.")
+    }
+    capturedEditCommandID = nil; capturedEditExpectedRecord = nil
+  }
+
+  func sealedParagraphBounds(atUTF16 offset: UInt64,
+    includeLineEndings: Bool = false) async throws -> PagedTextParagraphBounds {
+    try Task.checkCancellation(); try requireSourceTransition()
+    guard working.generation == working.sealedGeneration, !working.isPinned,
+      let route = storage as? any PagedNativeDocumentNavigationStorage else {
+      throw BoomError.stale("Paragraph movement requires its joined source.")
+    }
+    let record = working.sealedRootRecord, arena = arenaID, sequence = generation
+    let result = try await route.paragraphBounds(expected: record.document.revision,
+      utf16Offset: offset, includeLineEndings: includeLineEndings)
+    try Task.checkCancellation(); try requireSourceTransition()
+    guard working.sealedRootRecord == record, arenaID == arena, generation == sequence,
+      working.generation == working.sealedGeneration, !working.isPinned else {
+      throw BoomError.stale("Paragraph movement changed its source while seeking.")
+    }
+    try result.validate(in: record.document.revision, originUTF16: offset)
+    return result
+  }
+
+  func sealedGraphemeBoundary(atUTF16 offset: UInt64, forward: Bool) async throws -> UInt64 {
+    try requireSourceTransition()
+    guard working.generation == working.sealedGeneration, !working.isPinned,
+      let route = storage as? any PagedNativeDocumentNavigationStorage else {
+      throw BoomError.stale("Grapheme movement requires its joined source.")
+    }
+    let record = working.sealedRootRecord, arena = arenaID, sequence = generation
+    let result = try await route.graphemeBoundary(expected: record.document.revision,
+      utf16Offset: offset, forward: forward)
+    guard working.sealedRootRecord == record, arenaID == arena, generation == sequence else {
+      throw BoomError.stale("Grapheme movement changed its source while seeking.")
+    }
+    return result.utf16
+  }
+
+  /// Cocoa can jump over several logical positions in a bidi run. Preserve
+  /// that observed target, rounding only a fragment of a full-source cluster.
+  func sealedGraphemeBoundary(atNativeUTF16 target: UInt64, forward: Bool) async throws -> UInt64 {
+    try Task.checkCancellation(); try requireSourceTransition()
+    guard working.generation == working.sealedGeneration, !working.isPinned,
+      let route = storage as? any PagedNativeDocumentNavigationStorage else {
+      throw BoomError.stale("Visual movement requires its joined source.")
+    }
+    let record = working.sealedRootRecord, arena = arenaID, sequence = generation
+    let extent = record.document.revision.summary.utf16
+    guard target <= extent else { throw BoomError.stale("Native visual target exceeds its full source.") }
+    if target == 0 || target == extent { return target }
+    // Start just inside the cluster on the observed approach side. Position
+    // rounds a possible surrogate midpoint; the source seek resolves the
+    // entire cluster rather than trusting the native window's truncated edge.
+    let point = try await route.documentPosition(expected: record.document.revision,
+      utf16Offset: forward ? target - 1 : target + 1, forward: !forward)
+    try Task.checkCancellation(); try requireSourceTransition()
+    guard working.sealedRootRecord == record, arenaID == arena, generation == sequence,
+      working.generation == working.sealedGeneration, !working.isPinned else {
+      throw BoomError.stale("Visual movement changed source while positioning its target.")
+    }
+    let result = try await route.graphemeBoundary(expected: record.document.revision,
+      utf16Offset: point.utf16, forward: forward)
+    try Task.checkCancellation(); try requireSourceTransition()
+    guard working.sealedRootRecord == record, arenaID == arena, generation == sequence,
+      working.generation == working.sealedGeneration, !working.isPinned,
+      result.utf16 <= extent, (forward ? result.utf16 >= target : result.utf16 <= target) else {
+      throw BoomError.stale("Visual movement returned another source or grapheme target.")
+    }
+    return result.utf16
+  }
+
+  func sealedCursor(for selection: PagedNativeNavigationSelection) async throws -> PagedSealedCursor {
+    try requireSourceTransition()
+    guard working.generation == working.sealedGeneration, !working.isPinned,
+      selection.utf16Offset <= working.sealedRootRecord.document.revision.summary.utf16,
+      selection.utf16Length <= working.sealedRootRecord.document.revision.summary.utf16 - selection.utf16Offset,
+      let route = storage as? any PagedNativeDocumentNavigationStorage else {
+      throw BoomError.stale("Selection has another sealed source.")
+    }
+    let record = working.sealedRootRecord, arena = arenaID, sequence = generation
+    let point = try await route.documentPosition(expected: record.document.revision,
+      utf16Offset: selection.utf16Offset, forward: false)
+    guard working.sealedRootRecord == record, arenaID == arena, generation == sequence,
+      point.utf16 == selection.utf16Offset else {
+      throw BoomError.stale("Selection changed while its exact byte coordinate loaded.")
+    }
+    return PagedSealedCursor(byteOffset: point.bytes, utf16Offset: point.utf16,
+      selectionLengthUTF16: selection.utf16Length, focusAtEnd: selection.focusAtEnd, affinity: selection.affinity)
+  }
+
+  /// Small endpoint reads for formatting; this never adopts a new native
+  /// window or converts the selected document to a resident String.
+  func sealedTextWindow(atUTF16 offset: UInt64, maximumBytes: Int) async throws -> PagedTextWindow {
+    try requireSourceTransition()
+    guard working.generation == working.sealedGeneration, !working.isPinned,
+      offset <= working.sealedRootRecord.document.revision.summary.utf16,
+      maximumBytes >= 4, maximumBytes <= 64 else {
+      throw BoomError.stale("Delimiter reading requires its joined bounded source.")
+    }
+    let record = working.sealedRootRecord, arena = arenaID, sequence = generation
+    let window = try await storage.window(expected: record.document.revision,
+      utf16Anchor: offset, maximumBytes: maximumBytes)
+    guard working.sealedRootRecord == record, arenaID == arena, generation == sequence,
+      window.revision == record.document.revision, window.utf16Start == offset else {
+      throw BoomError.stale("Delimiter reading returned another document source.")
+    }
+    return window
   }
   private func requireStagedNavigation(_ ticket: PagedNativeNavigationInstallationTicket) throws {
     guard stagedNavigation === ticket, ticket.owner === self, ticket.state == .staged,
@@ -1498,6 +1748,7 @@ struct PagedNativeReceivingCheckpoint: Sendable, Equatable {
     working = candidate
     installing(window, ticket.provisionalArenaID, ticket.localSelection)
     stagedNavigation = nil; adoptingNavigation = false
+    if let result = ticket.capturedEdit { try installCanonicalHistory(.capturedEdit(result)) }
     return window
   }
 

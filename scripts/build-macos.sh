@@ -110,4 +110,4 @@ otool -L "$APP/Contents/MacOS/Bloom" > "$OUT/dynamic-dependencies.txt"
 shasum -a 256 "$APP/Contents/MacOS/Bloom" > "$OUT/executable.sha256"
 du -sk "$APP" > "$OUT/bundle-size-kib.txt"
 echo "Built $APP ($SIGN_PROFILE profile)"
-echo 'Build success is not UI, Keychain, download, media, or real-weight acceptance. Run the documented native gates.'
+echo 'Build success is not UI, download, media, large-file performance, or real-weight acceptance. Run the documented native gates.'

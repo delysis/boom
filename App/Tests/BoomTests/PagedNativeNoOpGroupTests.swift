@@ -4,15 +4,14 @@ import Foundation
 import XCTest
 @testable import Boom
 
-/// Authored, unrun coordinator controls. These synthetic bounded root refs
-/// carry no AEAD/current-head authority; the real encrypted backend controls
-/// separately qualify source/history publication with the native primitive.
+/// These synthetic bounded roots qualify coordinator behavior only. Actual
+/// file-backed source/history publication is covered by integration checks.
 @MainActor final class PagedNativeNoOpGroupTests: XCTestCase {
   private let owner = UUID(), document = UUID()
 
   private func window(_ text: String) -> PagedTextWindow {
-    let page = PagedTextPageRef(locator: PagedTextPageLocator(storeID: UUID(), recordID: UUID(),
-      ciphertextBytes: 128), digest: String(repeating: "a", count: 64))
+    let page = PagedTextPageRef(locator: PagedTextPageLocator(storeID: UUID(), offset: 0,
+      bytes: 128), digest: String(repeating: "a", count: 64))
     let summary = PagedTextSummary(bytes: UInt64(text.utf8.count), utf16: UInt64(text.utf16.count),
       lfCount: UInt64(text.utf8.filter { $0 == 10 }.count))
     let revision = PagedTextRevision(schema: 1, ownerID: owner, documentID: document,
@@ -21,8 +20,8 @@ import XCTest
   }
   private func working(_ text: String) throws -> PagedWorkingWindow {
     let captured = window(text)
-    let page = PagedTextPageRef(locator: PagedTextPageLocator(storeID: UUID(), recordID: UUID(),
-      ciphertextBytes: 128), digest: String(repeating: "b", count: 64))
+    let page = PagedTextPageRef(locator: PagedTextPageLocator(storeID: UUID(), offset: 0,
+      bytes: 128), digest: String(repeating: "b", count: 64))
     let record = PagedDocumentRootRecord(document: PagedDocumentDescriptor(id: document,
       title: "Unit fixture", revision: captured.revision), historyPage: page, historyGeneration: 0)
     return try PagedWorkingWindow(window: captured, rootRecord: record)
@@ -54,6 +53,82 @@ import XCTest
     XCTAssertEqual(arena.queuedDeltaCount, 0); XCTAssertEqual(arena.chargedGroupBytes, 0)
     XCTAssertEqual(try arena.localBytes(for: selection), 1..<4)
     XCTAssertNil(try arena.takeCommitBatch())
+  }
+
+  func testAdjacentCommandChunksKeepOneTypingGroupAndOriginalSelection() async throws {
+    var arena = try working("abc")
+    let group = UUID(), selected = try arena.selection(NSRange(location: 1, length: 1))
+    try arena.replace(NSRange(location: 1, length: 1), with: "x", groupID: group, beforeSelection: selected)
+    XCTAssertNotNil(arena.closeNativeGroup())
+    for _ in 0..<140 {
+      try arena.replace(NSRange(location: arena.localUTF16Count, length: 0), with: "y", groupID: group)
+      XCTAssertNotNil(arena.closeNativeGroup())
+      limits(arena)
+    }
+    let batch = try XCTUnwrap(arena.takeCommitBatch())
+    XCTAssertNil(batch.historyBaseline)
+    XCTAssertEqual(batch.groupCheckpoints.count, 1)
+    let checkpoint = try XCTUnwrap(batch.groupCheckpoints.first)
+    XCTAssertEqual(checkpoint.firstSequence, 1); XCTAssertEqual(checkpoint.lastSequence, 141)
+    XCTAssertEqual(checkpoint.beforeCursor.utf16Offset, 1)
+    XCTAssertEqual(checkpoint.beforeCursor.selectionLengthUTF16, 1)
+    assertExactCoverage(batch)
+    let plan = try await Task.detached { try PagedNativeCommitPlan(batch) }.value
+    XCTAssertEqual(plan.steps.filter { $0.kind == .nativeGroup }.count, 1)
+  }
+
+  func testClosedChunksReturningToOriginalTextResolveWithoutAnUndoSlot() async throws {
+    var arena = try working("a")
+    let group = UUID()
+    try arena.replace(NSRange(location: 1, length: 0), with: "x", groupID: group)
+    XCTAssertNotNil(arena.closeNativeGroup())
+    try arena.replace(NSRange(location: 1, length: 1), with: "", groupID: group)
+    XCTAssertNotNil(arena.closeNativeGroup())
+    let batch = try XCTUnwrap(arena.takeCommitBatch())
+    XCTAssertEqual(batch.afterBytes, Data("a".utf8))
+    let plan = try await Task.detached { try PagedNativeCommitPlan(batch) }.value
+    XCTAssertEqual(plan.steps.count, 1)
+    let checkpoint = try XCTUnwrap(batch.groupCheckpoints.first)
+    let cursor = PagedSealedCursor(byteOffset: 1, utf16Offset: 1)
+    var history = try PagedRootHistory(revision: batch.expected.revision, cursor: cursor)
+    var lineage = PagedNativeHistorySlotLineage(history)
+    try history.record(batch.expected.revision, cursor: cursor, beforeCursor: cursor, groupID: group)
+    try lineage.nativeRecord(priorRevision: batch.expected.revision, priorActive: nil,
+      priorUndoCount: 0, beforeCursor: cursor, after: history, checkpoint: checkpoint)
+    XCTAssertTrue(history.undo.isEmpty)
+    XCTAssertNil(try lineage.resolutions(history).first?.undoIndex)
+  }
+
+  func testCapturedAfterSelectionKeepsUnicodeEndpointsDirectionAndAffinityAcrossChunks() async throws {
+    var arena = try working("ae\u{301}🙂")
+    let group = UUID()
+    let before = try arena.selection(NSRange(location: 1, length: 2), focusAtEnd: true, affinity: .downstream)
+    try arena.replace(NSRange(location: 1, length: 2), with: "é", groupID: group, beforeSelection: before)
+    let firstAfter = try arena.selection(NSRange(location: 1, length: 3), focusAtEnd: false, affinity: .upstream)
+    try arena.captureNativeAfterSelection(firstAfter)
+    XCTAssertNotNil(arena.closeNativeGroup())
+    let stale = try arena.selection(NSRange(location: 1, length: 3), focusAtEnd: false, affinity: .upstream)
+    try arena.replace(NSRange(location: 4, length: 0), with: "x", groupID: group, beforeSelection: stale)
+    XCTAssertThrowsError(try arena.captureNativeAfterSelection(stale))
+    XCTAssertEqual(arena.generation, 2); XCTAssertEqual(arena.bytes, Data("aé🙂x".utf8))
+    let final = try arena.selection(NSRange(location: 1, length: 4), focusAtEnd: true, affinity: .upstream)
+    try arena.captureNativeAfterSelection(final)
+    XCTAssertNotNil(arena.closeNativeGroup()); limits(arena)
+    let prefix = try arena.reservePrefix(), batch = try XCTUnwrap(arena.takeCommitBatch())
+    XCTAssertEqual(batch.lastSequence, prefix.generation); XCTAssertEqual(batch.groupCheckpoints.count, 1)
+    let checkpoint = try XCTUnwrap(batch.groupCheckpoints.first)
+    XCTAssertEqual(checkpoint.beforeCursor.utf16Offset, 1); XCTAssertEqual(checkpoint.beforeCursor.selectionLengthUTF16, 2)
+    XCTAssertTrue(checkpoint.beforeCursor.focusAtEnd); XCTAssertEqual(checkpoint.beforeCursor.affinity, .downstream)
+    XCTAssertEqual(checkpoint.caretUTF16, 1); XCTAssertEqual(checkpoint.afterSelectionLengthUTF16, 4)
+    XCTAssertTrue(checkpoint.afterFocusAtEnd); XCTAssertEqual(checkpoint.afterAffinity, .upstream)
+    XCTAssertEqual(batch.finalCaretUTF16, 1); XCTAssertEqual(batch.finalSelectionLengthUTF16, 4)
+    XCTAssertTrue(batch.finalFocusAtEnd); XCTAssertEqual(batch.finalAffinity, .upstream)
+    assertExactCoverage(batch)
+    let plan = try await Task.detached { try PagedNativeCommitPlan(batch) }.value
+    let step = try XCTUnwrap(plan.steps.last)
+    XCTAssertEqual(step.localCursorByte, 1); XCTAssertEqual(step.localCursorUTF16, 1)
+    XCTAssertEqual(step.localSelectionLengthUTF16, 4); XCTAssertTrue(step.localFocusAtEnd)
+    XCTAssertEqual(step.localAffinity, .upstream)
   }
 
   func testManyGenuineNetZeroGroupsKeepExactSequencesWithoutExpiringUndo() async throws {

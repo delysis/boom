@@ -1,4 +1,3 @@
-import CryptoKit
 import XCTest
 @testable import Boom
 
@@ -30,8 +29,7 @@ final class SpeechPreparationTests: XCTestCase {
   @MainActor func testWorkspaceShutdownJoinsAnActivePreparation() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-speech-lifecycle-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: root,
-      testKey: SymmetricKey(size: .bits256)), loadModels: false)
+    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: root), loadModels: false)
     var started = false, joined = false
     let preparation = Task {
       try await VoiceInput.prepareOnDeviceSpeech {

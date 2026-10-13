@@ -15,6 +15,7 @@ final class PagedNativeTextStorage: NSTextStorage {
   private let installationAttributes: [NSAttributedString.Key: Any]
   private var editingDepth = 0
   private var characterGateOpen = false
+  @MainActor var hasOpenCharacterTransaction: Bool { characterGateOpen }
   private var nativeGroupID = UUID()
   fileprivate var performanceEvent: UInt64 = 0
   private(set) var mutationFailure: Error?
@@ -87,14 +88,18 @@ final class PagedNativeTextStorage: NSTextStorage {
   }
   override func replaceCharacters(in range: NSRange, with replacement: String) {
     precondition(Thread.isMainThread)
-    guard MainActor.assumeIsolated({ inputBinding?.state != .retired }) else { return }
+    // Staged and retired projections never receive character edits. Late
+    // framework callbacks on them cannot affect the current editor.
+    guard MainActor.assumeIsolated({ inputBinding == nil || inputBinding?.state == .active }) else { return }
+    let beforeGeneration = MainActor.assumeIsolated { session.generation }
     do {
       // Scalar and reserve admission precede both source and Cocoa mutation.
       do {
         let trace = PerformanceTrace.begin("Editor.ManagedAdmission", event: performanceEvent)
         defer { PerformanceTrace.end("Editor.ManagedAdmission", trace) }
+        // The live storage primitive is the edit boundary. View command
+        // scopes supply grouping and selection, not permission to type.
         try MainActor.assumeIsolated { try admits(range, replacement: replacement) }
-        try MainActor.assumeIsolated { try inputBinding?.admitsInput(in: session, requiresCommand: true) }
       }
       let ownsTransaction = editingDepth == 0
       if ownsTransaction { beginEditing() }
@@ -125,14 +130,25 @@ final class PagedNativeTextStorage: NSTextStorage {
         edited(.editedCharacters, range: range, changeInLength: insertedUnits - range.length)
       }
     } catch {
-      mutationFailure = error
-      MainActor.assumeIsolated { inputBinding?.recordRefusal(error); didRejectMutation?(error) }
+      if MainActor.assumeIsolated({ session.generation != beforeGeneration }) {
+        // The source accepted characters before this failure. Retain the
+        // inconsistent projection; a later callback cannot erase it.
+        if mutationFailure == nil { mutationFailure = error }
+        MainActor.assumeIsolated { inputBinding?.recordRefusal(error); didRejectMutation?(error) }
+      } else {
+        // Admission precedes both source and backing mutation. A malformed
+        // or obsolete callback leaves the current editor usable.
+        PerformanceTrace.event("Editor.ManagedAdmission")
+      }
     }
   }
 
   /// The native command owner closes a group at the same boundary it gives to
   /// UndoManager. IME has its independently pinned single composition group.
-  @MainActor func beginNativeGroup() { nativeGroupID = UUID() }
+  @MainActor func beginNativeGroup(intent: PagedNativeInputOwner.TypingIntent? = nil) {
+    nativeGroupID = inputBinding?.owner?.nativeInputGroupID(intent: intent) ?? UUID()
+  }
+  @MainActor var currentNativeGroupID: UUID { nativeGroupID }
 
   /// Source installation is a bounded projection change, not a user text
   /// replacement. Its admitted command reserves the sequence before TextKit
@@ -169,10 +185,9 @@ final class PagedNativeTextStorage: NSTextStorage {
   }
 }
 
-/// Native text input supplies marked-text mutations to the same primitive.
-/// The ordinary app route remains disabled until coherent save/history and
-/// floating navigation are supplied by the session's real storage owner.
-@MainActor final class PagedNativeTextView: NSTextView {
+/// Native text input supplies marked-text mutations to the same primitive;
+/// the native command owner publishes and installs file-backed history.
+@MainActor final class PagedNativeTextView: MarkdownTextView {
   let session: PagedNativeSession
   let boundedStorage: PagedNativeTextStorage
   let inputBinding: PagedNativeInputBinding?
@@ -181,13 +196,34 @@ final class PagedNativeTextStorage: NSTextStorage {
   private(set) var performanceEvent: UInt64 = 0
   private var commandSelection: PagedWorkingSelection?
   private var pendingDocumentCommand: (selector: Selector, observation: PagedNativeSelectionObservation)?
+  private var pendingDocumentReplacement: (selection: PagedNativeNavigationSelection, bytes: Data)?
+  private var pendingDocumentClipboard: Bool?
+  private var pendingDocumentWrapping: (selection: PagedNativeNavigationSelection, prefix: String, suffix: String, toggles: Bool, name: String)?
+  private var typingIntent: PagedNativeInputOwner.TypingIntent?
   private var selectionMutationDepth = 0
   private var constructingView = true
   private let managedInputClient: PagedNativeTextInputClient?
+  override var hasCompleteMarkupContext: Bool {
+    guard let coordinates = try? session.documentCoordinates() else { return false }
+    return coordinates.utf16Start == 0
+      && UInt64(coordinates.localUTF16) == coordinates.projectedUTF16
+  }
+  override var completionCaretUTF16: Int {
+    let range = selectedRange()
+    guard range.location >= 0, range.location != NSNotFound,
+      let coordinates = try? session.documentCoordinates() else { return NSNotFound }
+    let absolute = coordinates.utf16Start.addingReportingOverflow(UInt64(range.location))
+    guard !absolute.overflow, let caret = Int(exactly: absolute.partialValue) else { return NSNotFound }
+    return caret
+  }
   private var managedInputContext: NSTextInputContext?
   private var constructingInputContext = false
   var didRejectInput: ((Error) -> Void)?
   override var undoManager: UndoManager? {
+    // TextKit asks for a manager while coalescing character input even with
+    // allowsUndo disabled. Our manually grouped root manager belongs to the
+    // responder/menu path, not automatic string Undo inside this scope.
+    guard inputCommandDepth == 0, !boundedStorage.hasOpenCharacterTransaction else { return nil }
     guard let inputBinding else { return super.undoManager }
     guard inputBinding.state == .active else { return nil }
     return inputBinding.owner?.commandOwner?.manager
@@ -222,7 +258,7 @@ final class PagedNativeTextStorage: NSTextStorage {
     self.inputBinding = inputBinding
     managedInputClient = inputBinding.map { PagedNativeTextInputClient(identity: $0.identity) }
     let storage = try PagedNativeTextStorage(session: session,
-      attributes: [.font: NSFont.systemFont(ofSize: 17)],
+      attributes: [.font: MarkdownStyle.body],
       inputBinding: inputBinding, stagedTicket: stagedTicket, stagedNavigationTicket: stagedNavigationTicket)
     boundedStorage = storage
     let manager = NSLayoutManager()
@@ -231,14 +267,24 @@ final class PagedNativeTextStorage: NSTextStorage {
     container.widthTracksTextView = true; container.heightTracksTextView = false
     storage.addLayoutManager(manager); manager.addTextContainer(container)
     super.init(frame: frame, textContainer: container)
+    documentID = session.sourceBaseRevision.documentID
     isEditable = true; isSelectable = true; isRichText = false
     // Canonical Undo uses registered root/group handles. TextKit must not also
     // retain old source strings or add a competing automatic Undo stack.
     allowsUndo = false
     drawsBackground = false; writingToolsBehavior = .none
+    isAutomaticQuoteSubstitutionEnabled = false; isAutomaticDashSubstitutionEnabled = false
+    isAutomaticTextReplacementEnabled = false; isAutomaticSpellingCorrectionEnabled = false
+    isAutomaticLinkDetectionEnabled = false; isContinuousSpellCheckingEnabled = true
+    importsGraphics = false
     isHorizontallyResizable = false; isVerticallyResizable = false
     textContainerInset = NSSize(width: 16, height: 16)
-    storage.didRejectMutation = { [weak self] error in self?.didRejectInput?(error) }
+    storage.didRejectMutation = { [weak self] error in
+      // This callback is emitted only AFTER an accepted source mutation.
+      // Ordinary rejected input uses didRejectInput's diagnostic route.
+      if let model = self?.owner { model.report(error) }
+      else { self?.didRejectInput?(error) }
+    }
     storage.nativeSelection = { [weak self] in
       guard let self else { throw BoomError.stale("The native selection owner has retired.") }
       if let commandSelection = self.commandSelection { return commandSelection }
@@ -257,6 +303,7 @@ final class PagedNativeTextStorage: NSTextStorage {
     }
     managedInputClient?.bindOnce(to: self)
     constructingView = false
+    MarkdownStyle.apply(to: self)
   }
   required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
@@ -305,7 +352,7 @@ final class PagedNativeTextStorage: NSTextStorage {
   }
   override func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
     inputCommand {
-      session.beginComposition()
+      session.beginComposition(groupID: boundedStorage.currentNativeGroupID)
       super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
     }
   }
@@ -317,14 +364,204 @@ final class PagedNativeTextStorage: NSTextStorage {
   override func insertText(_ string: Any, replacementRange: NSRange) {
     // AppKit may unmark and replace through several primitives in this call.
     // Keep the whole command gated so interim marked bytes cannot be sealed.
+    let text = (string as? String) ?? (string as? NSAttributedString)?.string
+    if let owner = inputBinding?.owner, let text, !hasMarkedText() {
+      do {
+        let global = try owner.currentDocumentSelection()
+        let local = replacementRange.location == NSNotFound ? selectedRange() : replacementRange
+        let selectionSpansWindows = global.utf16Length > UInt64(selectedRange().length)
+        let coordinates = try session.documentCoordinates()
+        let exceedsWindow = text.utf8.count > PagedWorkingWindow.hardBytes - coordinates.localBytes
+        if (selectionSpansWindows && local == selectedRange()) || exceedsWindow {
+          guard text.utf8.count <= PagedCapturedEditInput.maximumInputBytes, pendingDocumentReplacement == nil else {
+            throw BoomError.budget("This paste needs streamed file import.")
+          }
+          let selected = selectionSpansWindows ? global : try session.navigationSelection(local)
+          inputCommand { pendingDocumentReplacement = (selected, Data(text.utf8)) }
+          return
+        }
+      } catch { didRejectInput?(error); return }
+    }
     inputCommand { super.insertText(string, replacementRange: replacementRange) }
   }
+
+  override func compositionDidCommit() { MarkdownStyle.apply(to: self) }
+
+  override func wrapSelection(_ marker: String, placeholder: String = "") {
+    do {
+      if let owner = inputBinding?.owner,
+        let selection = try documentSelectionOutsideWindow(owner) {
+        finishComposition(); clearGhost()
+        try requestWrapping(selection, prefix: marker, suffix: marker, toggles: true, name: "Format")
+        return
+      }
+      super.wrapSelection(marker, placeholder: placeholder)
+    } catch { didRejectInput?(error) }
+  }
+
+  override func markdownLink(_ sender: Any?) {
+    do {
+      if let owner = inputBinding?.owner,
+        let selection = try documentSelectionOutsideWindow(owner) {
+        finishComposition(); clearGhost()
+        try requestWrapping(selection, prefix: "[", suffix: "](url)", toggles: false, name: "Link")
+        return
+      }
+      super.markdownLink(sender)
+    } catch { didRejectInput?(error) }
+  }
+
+  /// ASCII with observed neighbors supplies a complete local grapheme
+  /// boundary. Other cases use the full-source continuation, never a guessed
+  /// fixed overlap. The common arrow/backspace path stays entirely native.
+  func hasContainedASCIICharacterCommand(_ selector: Selector) -> Bool {
+    let range = selectedRange(), text = boundedStorage.string as NSString
+    guard range.location >= 0, range.location != NSNotFound, range.length >= 0,
+      range.location <= text.length, range.length <= text.length - range.location else { return false }
+    if range.length > 0 { return range.location > 0 && NSMaxRange(range) < text.length }
+    let command = NSStringFromSelector(selector)
+    let forward = command.hasPrefix("moveForward") || command.hasPrefix("moveRight") || command == "deleteForward:"
+    let at = range.location
+    let lower = forward ? at - 1 : at - 2
+    let upper = forward ? at + 2 : at + 1
+    guard lower >= 0, upper <= text.length else { return false }
+    for index in lower..<upper {
+      let unit = text.character(at: index)
+      guard unit < 128, unit != 13 else { return false }
+    }
+    return true
+  }
+
+  override func prefixLines(_ prefix: String) {
+    if let binding = inputBinding, binding.state != .active { return }
+    guard let commands = inputBinding?.owner?.commandOwner else { super.prefixLines(prefix); return }
+    finishComposition(); clearGhost()
+    // Queue now, including an interpreted menu selector inside keyDown. Pump
+    // waits for the existing lexical input scope and any earlier source task.
+    do { try commands.requestLinePrefix(prefix, from: self) }
+    catch { didRejectInput?(error) }
+  }
+
+  override func copy(_ sender: Any?) {
+    do {
+      if let inputOwner = inputBinding?.owner, try documentSelectionOutsideWindow(inputOwner) != nil {
+        try requestClipboard(cutting: false)
+        return
+      }
+      super.copy(sender)
+    } catch { didRejectInput?(error) }
+  }
+
+  override func cut(_ sender: Any?) {
+    do {
+      if let inputOwner = inputBinding?.owner, try documentSelectionOutsideWindow(inputOwner) != nil {
+        try requestClipboard(cutting: true)
+        return
+      }
+      inputCommand { super.cut(sender) }
+    } catch { didRejectInput?(error) }
+  }
+
+  override func paste(_ sender: Any?) {
+    inputCommand { super.paste(sender) }
+  }
+
+  private func requestClipboard(cutting: Bool) throws {
+    guard let owner else { throw BoomError.stale("Clipboard action lost its document workspace.") }
+    if inputCommandDepth > 0 {
+      guard pendingDocumentClipboard == nil else { throw BoomError.stale("A clipboard action already owns this native command.") }
+      pendingDocumentClipboard = cutting
+    } else { owner.copyDocumentSelection(from: self, cutting: cutting) }
+  }
+
+  private func documentSelectionOutsideWindow(_ owner: PagedNativeInputOwner)
+    throws -> PagedNativeNavigationSelection? {
+    let selection = try owner.currentDocumentSelection()
+    let coordinates = try session.documentCoordinates()
+    guard selection.utf16Offset <= coordinates.projectedUTF16,
+      selection.utf16Length <= coordinates.projectedUTF16 - selection.utf16Offset else {
+      throw BoomError.stale("Formatting has another document selection.")
+    }
+    let end = selection.utf16Offset + selection.utf16Length
+    let windowEnd = coordinates.utf16Start + UInt64(coordinates.localUTF16)
+    return selection.utf16Offset < coordinates.utf16Start || end > windowEnd ? selection : nil
+  }
+
+  private func requestWrapping(_ selection: PagedNativeNavigationSelection, prefix: String,
+    suffix: String, toggles: Bool, name: String) throws {
+    if inputCommandDepth > 0 {
+      guard pendingDocumentWrapping == nil else { throw BoomError.stale("Formatting already owns this native command.") }
+      pendingDocumentWrapping = (selection, prefix, suffix, toggles, name)
+    } else {
+      guard let commands = inputBinding?.owner?.commandOwner else {
+        throw BoomError.stale("Formatting lost its native command owner.")
+      }
+      try commands.requestDocumentWrapping(selection, prefix: prefix, suffix: suffix,
+        toggles: toggles, actionName: name)
+    }
+  }
+
+  // Menu actions are sent to these Objective-C selectors directly; they need
+  // not pass through the text key interpreter's doCommand(by:) route.
+  @objc(undo:) func undoCanonicalHistory(_ sender: Any?) { requestCanonicalHistory(.undo) }
+  @objc(redo:) func redoCanonicalHistory(_ sender: Any?) { requestCanonicalHistory(.redo) }
+
+  override func selectAll(_ sender: Any?) {
+    // Menu key equivalents reach selectAll: directly, while the key
+    // interpreter reaches doCommand(by:). Both must select the logical
+    // document rather than only the currently mounted editing window.
+    if inputBinding != nil {
+      guard admitsCommandDispatch() else { return }
+      let selector = NSSelectorFromString("selectAll:")
+      if inputBinding?.owner?.handlesDocumentCommand(selector) == true {
+        doCommand(by: selector)
+        return
+      }
+    }
+    super.selectAll(sender)
+  }
+
+  private func requestCanonicalHistory(_ direction: PagedNativeHistoryHandle.Direction) {
+    let trace = beginInputTiming()
+    defer { endInputTiming(trace) }
+    guard let binding = inputBinding, binding.state == .active,
+      let owner = binding.owner, owner.activeView === self,
+      let commands = owner.commandOwner, admitsCommandDispatch() else { return }
+    commands.request(direction)
+  }
+
+  override func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
+    if item.action == #selector(undoCanonicalHistory(_:)) || item.action == #selector(redoCanonicalHistory(_:)) {
+      guard let binding = inputBinding, binding.state == .active,
+        let owner = binding.owner, owner.activeView === self,
+        let commands = owner.commandOwner else { return false }
+      return item.action == #selector(undoCanonicalHistory(_:)) ? commands.manager.canUndo : commands.manager.canRedo
+    }
+    if item.action == #selector(markdownHeading(_:)) || item.action == #selector(markdownQuote(_:))
+      || item.action == #selector(markdownList(_:)) {
+      return isEditable && inputBinding?.state != .retired
+    }
+    return super.validateUserInterfaceItem(item)
+  }
+
+  override func didChangeText() {
+    super.didChangeText()
+    if !hasMarkedText(), !applyingExternal { MarkdownStyle.apply(to: self) }
+  }
+  var typedCharacterCommandGroupID: UUID? {
+    guard let typingIntent, typingIntent.kind == .backwardDeletion || typingIntent.kind == .forwardDeletion else { return nil }
+    return boundedStorage.currentNativeGroupID
+  }
+
   override func keyDown(with event: NSEvent) {
     let trace = beginInputTiming()
     defer { endInputTiming(trace) }
     guard admitsCommandDispatch() else { return }
     if inputBinding?.owner?.commandOwner?.interceptRawKey(event, from: self) == true { return }
     if inputBinding?.owner?.interceptDocumentKey(event, from: self) == true { return }
+    let previousIntent = typingIntent
+    typingIntent = PagedNativeInputOwner.typingIntent(for: event)
+    defer { typingIntent = previousIntent }
     inputCommand { super.keyDown(with: event) }
   }
   override func doCommand(by selector: Selector) {
@@ -361,7 +598,12 @@ final class PagedNativeTextStorage: NSTextStorage {
       throw BoomError.stale("Contained document movement has another native source command.")
     }
     try boundedStorage.admitsCurrentArena()
-    inputCommand { super.doCommand(by: selector) }
+    inputCommand {
+      // NSTextView's interpreter dynamically calls selectAll:. Its explicit
+      // superclass action avoids reentering our logical-document menu route.
+      if selector == NSSelectorFromString("selectAll:") { super.selectAll(nil) }
+      else { super.doCommand(by: selector) }
+    }
     guard inputBinding?.firstRefusal == nil, boundedStorage.mutationFailure == nil else {
       throw BoomError.stale("Contained native movement was refused by its actual input source.")
     }
@@ -404,19 +646,26 @@ final class PagedNativeTextStorage: NSTextStorage {
       let outermost = selectionMutationDepth == 0
       if outermost { try inputBinding.requireSelectionCapacity() }
       let before = outermost ? selectedRange() : nil
+      let beforeGeneration = session.generation
       let beforeAffinity = selectionAffinity
       selectionMutationDepth += 1
       operation()
       selectionMutationDepth -= 1
       if outermost, before != selectedRange() || beforeAffinity != selectionAffinity {
         inputBinding.recordSelectionChange()
+        inputBinding.owner?.userSelectionDidChange(from: self,
+          previousRange: before, previousGeneration: beforeGeneration)
+        if inputCommandDepth == 0 {
+          inputBinding.owner?.notifyNativeState(from: self, edited: false)
+        }
       }
     } catch { rejectInput(error) }
   }
 
   private func rejectInput(_ error: Error) {
     guard inputBinding?.state != .retired else { return }
-    inputBinding?.recordRefusal(error)
+    // Dispatch/selection refusal has not changed document characters. Keep
+    // this observation separate from an accepted mutation or failed mount.
     if inputBinding == nil || inputBinding?.state == .active { didRejectInput?(error) }
   }
 
@@ -451,6 +700,7 @@ final class PagedNativeTextStorage: NSTextStorage {
     guard inputBinding?.state != .retired else { return }
     let trace = beginInputTiming()
     defer { endInputTiming(trace) }
+    let beforeGeneration = session.generation
     var bindingOpened = false
     do {
       try boundedStorage.admitsCurrentArena()
@@ -459,7 +709,7 @@ final class PagedNativeTextStorage: NSTextStorage {
       }
       if inputCommandDepth == 0 { commandSelection = try session.nativeSelection(selectedRange()) }
       try session.nativeCharacterTransactionWillBegin()
-      if inputBinding != nil, inputCommandDepth == 0, !session.isPinned { boundedStorage.beginNativeGroup() }
+      if inputBinding != nil, inputCommandDepth == 0, !session.isPinned { boundedStorage.beginNativeGroup(intent: typingIntent) }
     }
     catch {
       if inputCommandDepth == 0 { commandSelection = nil }
@@ -476,9 +726,30 @@ final class PagedNativeTextStorage: NSTextStorage {
         session.endComposition()
         boundedStorage.beginNativeGroup()
       }
-      session.nativeCharacterTransactionDidClose()
+      session.nativeCharacterTransactionDidClose(
+        capturingSelectionFrom: inputCommandDepth == 0 && inputBinding != nil ? self : nil)
       if bindingOpened { inputBinding?.endCommand() }
       if inputCommandDepth == 0 {
+        if let wrapping = pendingDocumentWrapping {
+          pendingDocumentWrapping = nil
+          do { try requestWrapping(wrapping.selection, prefix: wrapping.prefix, suffix: wrapping.suffix,
+            toggles: wrapping.toggles, name: wrapping.name) }
+          catch { didRejectInput?(error) }
+        }
+        if let cutting = pendingDocumentClipboard {
+          pendingDocumentClipboard = nil
+          do { try requestClipboard(cutting: cutting) }
+          catch { didRejectInput?(error) }
+        }
+        if let pending = pendingDocumentReplacement {
+          pendingDocumentReplacement = nil
+          do {
+            guard let commands = inputBinding?.owner?.commandOwner else {
+              throw BoomError.stale("Document replacement lost its actual command owner.")
+            }
+            try commands.requestDocumentReplacement(pending.selection, replacement: pending.bytes, actionName: "Edit")
+          } catch { didRejectInput?(error) }
+        }
         if let pending = pendingDocumentCommand {
           // Move this value to the actual lexical receiver before a contained
           // native command opens/closes its own scope. It cannot recursively
@@ -490,10 +761,14 @@ final class PagedNativeTextStorage: NSTextStorage {
             }
             try owner.dispatchDocumentCommand(pending.selector, observed: pending.observation)
           } catch {
-            if pendingDocumentCommand == nil { pendingDocumentCommand = pending }
+            // The receiver refused this captured selector. Reinstalling it
+            // would redispatch an obsolete selection on every later key.
             rejectInput(error)
           }
         }
+        let edited = session.generation != beforeGeneration
+        if edited { clearGhost() }
+        inputBinding?.owner?.notifyNativeState(from: self, edited: edited)
         inputBinding?.owner?.commandOwner?.inputCommandDidClose()
       }
     }

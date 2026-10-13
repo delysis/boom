@@ -9,6 +9,13 @@ struct PagedWorkingSelection: Equatable, Sendable {
   let arenaID: UUID
   let generation: UInt64
   let localUTF16: NSRange
+  let focusAtEnd: Bool
+  let affinity: PagedSelectionAffinity
+  init(sessionID: UUID, arenaID: UUID, generation: UInt64, localUTF16: NSRange,
+    focusAtEnd: Bool = false, affinity: PagedSelectionAffinity = .downstream) {
+    self.sessionID = sessionID; self.arenaID = arenaID; self.generation = generation
+    self.localUTF16 = localUTF16; self.focusAtEnd = focusAtEnd; self.affinity = affinity
+  }
 }
 
 struct PagedNativeDelta: Sendable {
@@ -26,6 +33,15 @@ struct PagedNativeDelta: Sendable {
 struct PagedNativeLocalCursor: Equatable, Sendable {
   let byteOffset: Int
   let utf16Offset: Int
+  let selectionLengthUTF16: Int
+  let focusAtEnd: Bool
+  let affinity: PagedSelectionAffinity
+  init(byteOffset: Int, utf16Offset: Int, selectionLengthUTF16: Int = 0,
+    focusAtEnd: Bool = false, affinity: PagedSelectionAffinity = .downstream) {
+    self.byteOffset = byteOffset; self.utf16Offset = utf16Offset
+    self.selectionLengthUTF16 = selectionLengthUTF16
+    self.focusAtEnd = focusAtEnd; self.affinity = affinity
+  }
 }
 
 /// Bounded native Undo grouping survives queue compaction. This is a resident
@@ -37,6 +53,19 @@ struct PagedNativeGroupCheckpoint: Sendable {
   let beforeCursor: PagedNativeLocalCursor
   let afterBytes: Data
   let caretUTF16: Int
+  let afterSelectionLengthUTF16: Int
+  let afterFocusAtEnd: Bool
+  let afterAffinity: PagedSelectionAffinity
+
+  init(groupID: UUID, firstSequence: UInt64, lastSequence: UInt64,
+    beforeCursor: PagedNativeLocalCursor, afterBytes: Data, caretUTF16: Int,
+    afterSelectionLengthUTF16: Int = 0, afterFocusAtEnd: Bool = false,
+    afterAffinity: PagedSelectionAffinity = .downstream) {
+    self.groupID = groupID; self.firstSequence = firstSequence; self.lastSequence = lastSequence
+    self.beforeCursor = beforeCursor; self.afterBytes = afterBytes; self.caretUTF16 = caretUTF16
+    self.afterSelectionLengthUTF16 = afterSelectionLengthUTF16
+    self.afterFocusAtEnd = afterFocusAtEnd; self.afterAffinity = afterAffinity
+  }
 }
 
 /// An actual closed native chunk, before its worker publication starts. This
@@ -72,6 +101,23 @@ struct PagedNativeCommitBatch: Sendable {
   /// neutral groups never evict Undo. Disk evidence/recipe pins are separate.
   let historyBaseline: PagedNativeGroupCheckpoint?
   let groupCheckpoints: [PagedNativeGroupCheckpoint]
+  let finalSelectionLengthUTF16: Int
+  let finalFocusAtEnd: Bool
+  let finalAffinity: PagedSelectionAffinity
+
+  init(sessionID: UUID, batchID: UUID, expected: PagedTextWindow,
+    expectedRootRecord: PagedDocumentRootRecord, firstSequence: UInt64, lastSequence: UInt64,
+    deltas: [PagedNativeDelta], afterBytes: Data, finalCaretUTF16: Int,
+    historyBaseline: PagedNativeGroupCheckpoint?, groupCheckpoints: [PagedNativeGroupCheckpoint],
+    finalSelectionLengthUTF16: Int = 0, finalFocusAtEnd: Bool = false,
+    finalAffinity: PagedSelectionAffinity = .downstream) {
+    self.sessionID = sessionID; self.batchID = batchID; self.expected = expected
+    self.expectedRootRecord = expectedRootRecord; self.firstSequence = firstSequence; self.lastSequence = lastSequence
+    self.deltas = deltas; self.afterBytes = afterBytes; self.finalCaretUTF16 = finalCaretUTF16
+    self.historyBaseline = historyBaseline; self.groupCheckpoints = groupCheckpoints
+    self.finalSelectionLengthUTF16 = finalSelectionLengthUTF16
+    self.finalFocusAtEnd = finalFocusAtEnd; self.finalAffinity = finalAffinity
+  }
 }
 
 /// Only a storage implementation may construct a successful commit ack. It
@@ -171,6 +217,9 @@ struct PagedWorkingWindow: Sendable {
     let finalCaretUTF16: Int
     let historyBaseline: PagedNativeGroupCheckpoint?
     let groupCheckpoints: [PagedNativeGroupCheckpoint]
+    let finalSelectionLengthUTF16: Int
+    let finalFocusAtEnd: Bool
+    let finalAffinity: PagedSelectionAffinity
   }
   private struct ProvisionalHistory: Sendable {
     let prepared: PagedNativePreparedHistoryMove
@@ -192,6 +241,9 @@ struct PagedWorkingWindow: Sendable {
   private var openGroup: OpenGroup?
   private var historyBaseline: PagedNativeGroupCheckpoint?
   private var finalCaretUTF16 = 0
+  private var finalSelectionLengthUTF16 = 0
+  private var finalFocusAtEnd = false
+  private var finalAffinity: PagedSelectionAffinity = .downstream
   private var unsentBase: Data
   private(set) var inFlight: PagedNativeCommitBatch?
   private(set) var compositionGroup: UUID?
@@ -221,7 +273,16 @@ struct PagedWorkingWindow: Sendable {
   /// The source represented by the working island can be unpublished after
   /// Undo. Keep it distinct from the authenticated durable sealedWindow.
   var sourceBaseRevision: PagedTextRevision { provisionalHistory?.prepared.window.revision ?? sealedWindow.revision }
+  var projectionWindow: PagedTextWindow { provisionalHistory?.prepared.window ?? sealedWindow }
+  /// A COW copy of the current arena replaces its entire immutable source span.
+  /// In-flight/prefix queues and marked text are already reflected in bytes.
+  func captureScrollSnapshot() throws -> PagedNativeScrollSnapshot {
+    try PagedNativeScrollSnapshot(source: projectionWindow, replacement: bytes,
+      replacementUTF16: localUTF16Count, sessionID: sessionID, arenaID: arenaID,
+      generation: generation)
+  }
   var isPinned: Bool { compositionGroup != nil }
+  var hasOpenNativeGroup: Bool { openGroup != nil }
   var queuedDeltaCount: Int { queue.count }
   var chargedQueueBytes: Int { queuedBytes }
   var chargedGroupBytes: Int {
@@ -245,15 +306,16 @@ struct PagedWorkingWindow: Sendable {
   /// its current arena and can use the explicitly bounded reserve.
   var needsRecentering: Bool { bytes.count > Self.targetBytes }
 
-  mutating func beginComposition() {
-    if compositionGroup == nil { compositionGroup = UUID() }
+  mutating func beginComposition(groupID: UUID? = nil) {
+    if compositionGroup == nil { compositionGroup = groupID ?? UUID() }
   }
   mutating func endComposition() { compositionGroup = nil }
 
-  func selection(_ range: NSRange) throws -> PagedWorkingSelection {
+  func selection(_ range: NSRange, focusAtEnd: Bool = false,
+    affinity: PagedSelectionAffinity = .downstream) throws -> PagedWorkingSelection {
     _ = try localBytes(forUTF16: range)
     return PagedWorkingSelection(sessionID: sessionID, arenaID: arenaID,
-      generation: generation, localUTF16: range)
+      generation: generation, localUTF16: range, focusAtEnd: focusAtEnd, affinity: affinity)
   }
   func localBytes(for selection: PagedWorkingSelection) throws -> Range<Int> {
     guard selection.sessionID == sessionID, selection.arenaID == arenaID,
@@ -309,7 +371,8 @@ struct PagedWorkingWindow: Sendable {
       openGroup = OpenGroup(groupID: actualGroupID, firstSequence: next.partialValue,
         lastSequence: next.partialValue, beforeBytes: bytes,
         beforeCursor: PagedNativeLocalCursor(byteOffset: observedBytes.lowerBound,
-          utf16Offset: observed.localUTF16.location))
+          utf16Offset: observed.localUTF16.location, selectionLengthUTF16: observed.localUTF16.length,
+          focusAtEnd: observed.focusAtEnd, affinity: observed.affinity))
     } else if let beforeSelection {
       guard let group = openGroup, beforeSelection.sessionID == sessionID,
         beforeSelection.arenaID == arenaID,
@@ -340,10 +403,21 @@ struct PagedWorkingWindow: Sendable {
     let caret = range.location + (newPoints.last?.utf16 ?? 0)
     openGroup?.lastSequence = generation
     finalCaretUTF16 = caret
+    // A programmatic primitive has only its explicit replacement endpoint.
+    // A real managed view captures its complete selection after AppKit returns.
+    finalSelectionLengthUTF16 = 0; finalFocusAtEnd = false; finalAffinity = .downstream
     if queue.count > Self.maximumQueuedDeltas || queuedBytes > Self.maximumQueuedBytes {
       compactUnsent(groupID: delta.groupID)
     }
     return (true, closedGroup)
+  }
+
+  mutating func captureNativeAfterSelection(_ selection: PagedWorkingSelection) throws {
+    guard openGroup != nil else { return }
+    _ = try localBytes(for: selection) // exact current arena/generation and both scalar endpoints
+    finalCaretUTF16 = selection.localUTF16.location
+    finalSelectionLengthUTF16 = selection.localUTF16.length
+    finalFocusAtEnd = selection.focusAtEnd; finalAffinity = selection.affinity
   }
 
   mutating func reservePrefix() throws -> PagedNativePrefixReservation {
@@ -360,7 +434,9 @@ struct PagedWorkingWindow: Sendable {
     let closedGroup = closeOpenGroup()
     if !queue.isEmpty {
       capturedPrefixQueue = CapturedQueue(deltas: queue, afterBytes: bytes,
-        finalCaretUTF16: finalCaretUTF16, historyBaseline: historyBaseline, groupCheckpoints: groups)
+        finalCaretUTF16: finalCaretUTF16, historyBaseline: historyBaseline, groupCheckpoints: groups,
+        finalSelectionLengthUTF16: finalSelectionLengthUTF16,
+        finalFocusAtEnd: finalFocusAtEnd, finalAffinity: finalAffinity)
       queue.removeAll(keepingCapacity: true); queuedBytes = 0
       groups.removeAll(keepingCapacity: true); historyBaseline = nil
       unsentBase = bytes
@@ -405,7 +481,9 @@ struct PagedWorkingWindow: Sendable {
         expectedRootRecord: sealedRootRecord, firstSequence: first.firstSequence,
         lastSequence: last.lastSequence, deltas: captured.deltas, afterBytes: captured.afterBytes,
         finalCaretUTF16: captured.finalCaretUTF16, historyBaseline: captured.historyBaseline,
-        groupCheckpoints: captured.groupCheckpoints)
+        groupCheckpoints: captured.groupCheckpoints,
+        finalSelectionLengthUTF16: captured.finalSelectionLengthUTF16,
+        finalFocusAtEnd: captured.finalFocusAtEnd, finalAffinity: captured.finalAffinity)
       inFlight = batch; capturedPrefixQueue = nil
       return (batch, nil)
     }
@@ -420,7 +498,9 @@ struct PagedWorkingWindow: Sendable {
       expectedRootRecord: sealedRootRecord,
       firstSequence: first.firstSequence, lastSequence: last.lastSequence, deltas: queue,
       afterBytes: bytes, finalCaretUTF16: finalCaretUTF16,
-      historyBaseline: historyBaseline, groupCheckpoints: groups)
+      historyBaseline: historyBaseline, groupCheckpoints: groups,
+      finalSelectionLengthUTF16: finalSelectionLengthUTF16,
+      finalFocusAtEnd: finalFocusAtEnd, finalAffinity: finalAffinity)
     inFlight = batch; queue.removeAll(keepingCapacity: true); queuedBytes = 0
     groups.removeAll(keepingCapacity: true); historyBaseline = nil
     unsentBase = bytes
@@ -457,6 +537,7 @@ struct PagedWorkingWindow: Sendable {
     candidate.arenaID = admission.provisionalArenaID; candidate.generation = admission.admittedSequence
     candidate.bytes = nextBytes; candidate.points = nextPoints; candidate.unsentBase = nextBytes
     candidate.finalCaretUTF16 = prepared.localCaretUTF16
+    candidate.finalSelectionLengthUTF16 = 0; candidate.finalFocusAtEnd = false; candidate.finalAffinity = .downstream
     candidate.openGroup = nil; candidate.groups.removeAll(keepingCapacity: true); candidate.historyBaseline = nil
     candidate.reservedPrefix = nil
     candidate.provisionalHistory = ProvisionalHistory(prepared: prepared, admission: admission)
@@ -537,9 +618,22 @@ struct PagedWorkingWindow: Sendable {
       lastSequence: group.lastSequence, localCaretUTF16: finalCaretUTF16,
       hasEffectiveSourceChange: hasEffectiveSourceChange)
     if hasEffectiveSourceChange {
-      groups.append(PagedNativeGroupCheckpoint(groupID: group.groupID,
-        firstSequence: group.firstSequence, lastSequence: group.lastSequence,
-        beforeCursor: group.beforeCursor, afterBytes: bytes, caretUTF16: finalCaretUTF16))
+      if let previous = groups.last, previous.groupID == group.groupID {
+        // A disk seal or key-command boundary can close a chunk without
+        // ending the user's typing transaction. Keep one bounded checkpoint
+        // and its original Undo selection for adjacent chunks of that group.
+        groups[groups.count - 1] = PagedNativeGroupCheckpoint(groupID: group.groupID,
+          firstSequence: previous.firstSequence, lastSequence: group.lastSequence,
+          beforeCursor: previous.beforeCursor, afterBytes: bytes, caretUTF16: finalCaretUTF16,
+          afterSelectionLengthUTF16: finalSelectionLengthUTF16,
+          afterFocusAtEnd: finalFocusAtEnd, afterAffinity: finalAffinity)
+      } else {
+        groups.append(PagedNativeGroupCheckpoint(groupID: group.groupID,
+          firstSequence: group.firstSequence, lastSequence: group.lastSequence,
+          beforeCursor: group.beforeCursor, afterBytes: bytes, caretUTF16: finalCaretUTF16,
+          afterSelectionLengthUTF16: finalSelectionLengthUTF16,
+          afterFocusAtEnd: finalFocusAtEnd, afterAffinity: finalAffinity))
+      }
       if groups.count > PagedRootHistory.maximumEntries { historyBaseline = groups.removeFirst() }
     }
     openGroup = nil

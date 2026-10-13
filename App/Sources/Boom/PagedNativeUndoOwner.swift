@@ -101,14 +101,30 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
     let window: NSWindow
     let chargedBytes: Int
   }
+  private enum SourceAction {
+    case linePrefix(String)
+    case documentCommand(Selector)
+    case replacement(Data, String)
+  }
+  private struct SourceCommand {
+    let action: SourceAction
+    let originalLease: PagedNativeReplayInputLease
+    var replayLease: PagedNativeReplayInputLease
+    let window: NSWindow
+    let chargedBytes: Int
+  }
   private enum QueuedInput {
+    case sourceCommand(SourceCommand)
     case history(PagedNativeHistoryHandle.Direction)
     case rawKey(RawKey)
   }
-  static let maximumQueuedEntries = 64
   static let maximumQueuedCommands = 64
-  static let maximumQueuedRawKeys = 64
   static let maximumRawKeyBytes = 262_144
+  // The byte envelope, rather than an unrelated 64-keystroke cutoff, bounds
+  // original event memory. Every event/source command is charged at least 512.
+  static let maximumQueuedRawKeys = maximumRawKeyBytes / 512
+  static let maximumQueuedEntries = maximumQueuedRawKeys + maximumQueuedCommands + 32
+  private static let maximumReplayBurst = 4
   static let maximumKeyUTF16 = 256
   private static let entryKey = UndoManager.UserInfoKey(rawValue: "bloom.paged.native-entry.v1")
 
@@ -129,12 +145,15 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
   private var rawKeyBytes = 0
   private var replayingRawKeys = false
   private var replayInsertionCount = 0
+  private var currentRawKeyAwaitingSource = false
   private var registeringGroup = false
   private var expectedEntry: PagedNativeUndoEntry?
   private var inverseEntry: PagedNativeUndoEntry?
   private var adoptingSource: (() -> Void)?
   private var commandTask: Task<Void, Never>?
   private var navigationTask: Task<PagedTextWindow, Error>?
+  private var capturedEditTask: Task<PagedDocumentRootRecord, Error>?
+  private var capturedActionName: String?
   private(set) var isNavigating = false
   private var groupSubscription: PagedNativeGroupSubscription?
   private(set) var retainedPrefix: PagedNativePrefixReservation?
@@ -164,7 +183,7 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
   var manager: UndoManager { gatedManager }
   var hasPendingCommand: Bool {
     (phase != .idle && phase != .closed) || commandTask != nil || !queue.isEmpty
-      || receivingTransition || receivingTicket != nil || isNavigating || navigationTask != nil
+      || receivingTransition || receivingTicket != nil || isNavigating || navigationTask != nil || capturedEditTask != nil
   }
 
   init(input: PagedNativeInputOwner) throws {
@@ -172,7 +191,7 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
       throw BoomError.denied("This native session already has its command and group owner.")
     }
     self.input = input
-    queue.reserveCapacity(Self.maximumQueuedEntries)
+    queue.reserveCapacity(Self.maximumQueuedCommands)
     gatedManager.groupsByEvent = false
     gatedManager.levelsOfUndo = PagedRootHistory.maximumEntries
     undoEntries.reserveCapacity(PagedRootHistory.maximumEntries)
@@ -322,6 +341,10 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
       input.completeCanonicalOpening(commandOwner: self)
     }
     phase = .idle
+    try input.setDocumentSelection(PagedNativeNavigationSelection(
+      utf16Offset: opening.history.currentCursor.utf16Offset,
+      utf16Length: opening.history.currentCursor.selectionLengthUTF16,
+      focusAtEnd: opening.history.currentCursor.focusAtEnd, affinity: opening.history.currentCursor.affinity))
     // Public requests from real notifications remain queued. The graph is
     // still unexposed; its actual mounted/focused command will pump them.
   }
@@ -336,6 +359,7 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
   private func receivingStamp(after receipt: PagedNativeCanonicalSeal,
     incoming: PagedNativeCanonicalHistoryProjection) throws -> InstalledHistoryStamp? {
     switch receipt {
+    case .capturedEdit: return nil
     case .history(let acknowledgement):
       guard let prepared = retainedPreparation else {
         throw BoomError.stale("Receiving history metadata lacks its actual retained command.")
@@ -389,7 +413,7 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
         guard let canonical = desired.canonical, let index = desired.canonicalIndex,
           let record = desired.canonicalRecord else { throw BoomError.invalid("New Foundation metadata target lacks its full canonical slot.") }
         return try makeEntry(PagedNativeHistoryHandle(documentID: record.document.id,
-          groupID: canonical.groupID, direction: desired.direction), actionName: "Edit",
+          groupID: canonical.groupID, direction: desired.direction), actionName: capturedActionName ?? "Edit",
           canonical: canonical, record: record, index: index)
       }
       // Preallocate before removeAllActions or per-target disposal can reenter.
@@ -429,16 +453,341 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
     selectingUTF16 requested: PagedNativeNavigationSelection? = nil) async throws -> PagedTextWindow {
     try requireCommandQuiescence()
     try requireNavigationClient()
-    isNavigating = true
-    defer { navigationTask = nil; isNavigating = false; pump() }
     let observed = try input.observeSelection()
-    let selection = try requested ?? input.session.navigationSelection(observed.range)
+    let currentSelection = try input.currentDocumentSelection()
+    let selection = requested ?? currentSelection
+    // Loading another projection of the SAME selection need not defer
+    // contained input. Session rejects its candidate if source/input changes.
+    // An actual new caret/selection keeps the existing ordered command fence.
+    isNavigating = selection != currentSelection
+    defer { navigationTask = nil; isNavigating = false; pump() }
     let task = Task<PagedTextWindow, Error> { [self] in
       try await navigateAdmitted(toUTF16: anchor, selection: selection, observed: observed,
         roundGeneratedAnchor: false, deferredInput: false)
     }
     navigationTask = task
     return try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+  }
+
+  func applyCapturedEdits(expected: PagedDocumentRootRecord, edits: [PagedTextLocalEdit],
+    actionName: String) async throws -> PagedDocumentRootRecord {
+    guard edits.count <= PagedCapturedEditInput.maximumEdits else {
+      throw BoomError.budget("Explicit edit count exceeds its bounded source capture.")
+    }
+    var inputBytes = 0
+    for edit in edits {
+      guard edit.oldBytes.count <= PagedCapturedEditInput.maximumInputBytes - inputBytes else {
+        throw BoomError.budget("Explicit old bytes exceed their capture bound.")
+      }
+      inputBytes += edit.oldBytes.count
+      guard edit.newBytes.count <= PagedCapturedEditInput.maximumInputBytes - inputBytes else {
+        throw BoomError.budget("Explicit new bytes exceed their capture bound.")
+      }
+      inputBytes += edit.newBytes.count
+    }
+    let changed = edits.filter { $0.oldBytes != $0.newBytes }
+    guard !changed.isEmpty else {
+      guard try input.session.documentCoordinates().record == expected else {
+        throw BoomError.stale("Neutral edits no longer name the current source.")
+      }
+      return expected
+    }
+    guard changed.count <= PagedCapturedEditInput.maximumEdits else {
+      throw BoomError.budget("Explicit edit count exceeds its bounded source capture.")
+    }
+    var previousStart = expected.document.revision.summary.bytes
+    var charged = 0
+    for edit in changed {
+      guard edit.revision == expected.document.revision,
+        edit.byteStart <= edit.byteEnd, edit.byteEnd <= previousStart,
+        edit.byteEnd - edit.byteStart == UInt64(edit.oldBytes.count),
+        edit.oldBytes.count <= PagedCapturedEditInput.maximumInputBytes - charged else {
+        throw BoomError.stale("Explicit edits are not ordered exact ranges of the captured source.")
+      }
+      charged += edit.oldBytes.count
+      guard edit.newBytes.count <= PagedCapturedEditInput.maximumInputBytes - charged else {
+        throw BoomError.budget("Explicit replacement bytes exceed their capture bound.")
+      }
+      charged += edit.newBytes.count; previousStart = edit.byteStart
+    }
+    return try await beginCapturedEdit(expected: expected, operation: .edits(changed), actionName: actionName).value
+  }
+
+  func replaceDocumentSelection(_ selection: PagedNativeNavigationSelection,
+    with replacement: Data, actionName: String) async throws -> PagedDocumentRootRecord {
+    let coordinates = try input.session.documentCoordinates()
+    guard selection.utf16Offset <= coordinates.projectedUTF16,
+      selection.utf16Length <= coordinates.projectedUTF16 - selection.utf16Offset,
+      replacement.count <= PagedCapturedEditInput.maximumInputBytes else {
+      throw BoomError.budget("Explicit document replacement exceeds its range or buffer bound.")
+    }
+    if selection.utf16Length == 0, replacement.isEmpty { return coordinates.record }
+    // An explicit source selection must first join any local typing. Its root
+    // is captured after that join; the original selection remains owned here.
+    return try await beginCapturedEdit(expected: nil, operation: .replacement(selection, replacement), actionName: actionName).value
+  }
+
+  /// Fence the actual key command synchronously before returning to AppKit.
+  /// Later keys join the existing bounded event queue while disk work runs.
+  func requestDocumentReplacement(_ selection: PagedNativeNavigationSelection,
+    replacement: Data, actionName: String) throws {
+    guard replacement.count <= PagedCapturedEditInput.maximumInputBytes else {
+      throw BoomError.budget("Document replacement needs its streamed import route.")
+    }
+    guard let view = input.activeView else { return }
+    // Ordinary input selects its ordered current range at delivery. Explicit
+    // captured/agent edits above still require their supplied source record.
+    try enqueueSourceCommand(.replacement(replacement, actionName), from: view,
+      chargedBytes: replacement.count + actionName.utf8.count + 512)
+  }
+
+  /// Menu requests use the existing ordered input lane. Their selection is
+  /// observed only after earlier keys and source commands have joined.
+  func requestLinePrefix(_ prefix: String, from view: PagedNativeTextView) throws {
+    guard !prefix.isEmpty, prefix.utf8.count <= 256,
+      !prefix.unicodeScalars.contains(where: { [0x0A, 0x0D, 0x85, 0x2028, 0x2029].contains($0.value) }) else {
+      throw BoomError.invalid("The line prefix is not a bounded single-line marker.")
+    }
+    try enqueueSourceCommand(.linePrefix(prefix), from: view, chargedBytes: prefix.utf8.count + 512)
+  }
+
+  private func enqueueSourceCommand(_ action: SourceAction, from view: PagedNativeTextView,
+    chargedBytes: Int) throws {
+    guard phase != .closed, view === input.activeView,
+      view.inputBinding?.state == .active else { return }
+    let consumedHeadCharge: Int
+    if replayingRawKeys, let head = queue.first {
+      switch head {
+      case .rawKey(let key): consumedHeadCharge = key.chargedBytes
+      case .sourceCommand(let command): consumedHeadCharge = command.chargedBytes
+      case .history: consumedHeadCharge = 0
+      }
+    } else { consumedHeadCharge = 0 }
+    // The source command replaces the interpreted head. Reserve against the
+    // post-delivery byte charge, while retaining that head until real dispatch
+    // completes. This bounded lexical overlap is at most one source buffer.
+    guard let window = view.window, window.firstResponder === view,
+      queue.count < Self.maximumQueuedEntries,
+      chargedBytes >= 512, consumedHeadCharge <= rawKeyBytes,
+      chargedBytes <= Self.maximumRawKeyBytes - (rawKeyBytes - consumedHeadCharge) else {
+      throw BoomError.budget("The existing native input queue cannot retain this source command.")
+    }
+    let lease = try input.inputLease(for: view)
+    let request = QueuedInput.sourceCommand(SourceCommand(action: action, originalLease: lease,
+      replayLease: lease, window: window, chargedBytes: chargedBytes))
+    if replayingRawKeys {
+      queue.insert(request, at: 1 + replayInsertionCount); replayInsertionCount += 1
+    } else { queue.append(request) }
+    rawKeyBytes += chargedBytes
+    pump()
+  }
+
+  /// Formatting changes only its small delimiters. The selected source stays
+  /// in the file-backed tree, even when it spans the complete document.
+  func requestDocumentWrapping(_ selection: PagedNativeNavigationSelection,
+    prefix: String, suffix: String, toggles: Bool, actionName: String) throws {
+    let opening = Data(prefix.utf8), closing = Data(suffix.utf8)
+    guard !opening.isEmpty, !closing.isEmpty, opening.count <= 64, closing.count <= 64,
+      selection.utf16Length > 0 else {
+      throw BoomError.budget("Document delimiters exceed their bounded formatting command.")
+    }
+    let openingUnits = UInt64(prefix.utf16.count), closingUnits = UInt64(suffix.utf16.count)
+    _ = try beginCapturedEdit(expected: nil, actionName: actionName, reportFailure: true,
+      preparingOperation: { [self] record in
+        let total = record.document.revision.summary.utf16
+        guard selection.utf16Offset <= total,
+          selection.utf16Length <= total - selection.utf16Offset else {
+          throw BoomError.stale("Formatting has another document selection.")
+        }
+        let start = selection.utf16Offset, end = start + selection.utf16Length
+        var leftStart = start, leftEnd = start, rightStart = end, rightEnd = end
+        var leftOld = Data(), rightOld = Data(), leftNew = opening, rightNew = closing
+        let insertedStart = start.addingReportingOverflow(openingUnits)
+        guard !insertedStart.overflow else { throw BoomError.budget("Formatting exhausts document coordinates.") }
+        var after = PagedNativeNavigationSelection(utf16Offset: insertedStart.partialValue,
+          utf16Length: selection.utf16Length, focusAtEnd: selection.focusAtEnd, affinity: selection.affinity)
+        if toggles {
+          func matches(_ marker: Data, at offset: UInt64) async throws -> Bool {
+            let window = try await input.session.sealedTextWindow(atUTF16: offset,
+              maximumBytes: max(4, marker.count))
+            return window.text.utf8.prefix(marker.count).elementsEqual(marker)
+          }
+          if selection.utf16Length >= openingUnits + closingUnits,
+            try await matches(opening, at: start),
+            try await matches(closing, at: end - closingUnits) {
+            leftEnd = start + openingUnits; rightStart = end - closingUnits
+            leftOld = opening; rightOld = closing; leftNew = Data(); rightNew = Data()
+            after = PagedNativeNavigationSelection(utf16Offset: start,
+              utf16Length: selection.utf16Length - openingUnits - closingUnits,
+              focusAtEnd: selection.focusAtEnd, affinity: selection.affinity)
+          } else if start >= openingUnits, closingUnits <= total - end,
+            try await matches(opening, at: start - openingUnits),
+            try await matches(closing, at: end) {
+            leftStart = start - openingUnits; rightEnd = end + closingUnits
+            leftOld = opening; rightOld = closing; leftNew = Data(); rightNew = Data()
+            after = PagedNativeNavigationSelection(utf16Offset: start - openingUnits,
+              utf16Length: selection.utf16Length, focusAtEnd: selection.focusAtEnd, affinity: selection.affinity)
+          }
+        }
+        let windowID = try input.session.windowForNativeInstallation().windowID
+        func edit(_ low: UInt64, _ high: UInt64, _ old: Data, _ new: Data) async throws -> PagedTextLocalEdit {
+          let a = try await input.session.sealedCursor(for: PagedNativeNavigationSelection(utf16Offset: low, utf16Length: 0))
+          let b = low == high ? a : try await input.session.sealedCursor(for: PagedNativeNavigationSelection(utf16Offset: high, utf16Length: 0))
+          return PagedTextLocalEdit(revision: record.document.revision, windowID: windowID,
+            byteStart: a.byteOffset, byteEnd: b.byteOffset, oldBytes: old, newBytes: new)
+        }
+        let right = try await edit(rightStart, rightEnd, rightOld, rightNew)
+        let left = try await edit(leftStart, leftEnd, leftOld, leftNew)
+        return (.edits([right, left]), after)
+      })
+  }
+
+  /// Clipboard preparation shares the actual command fence and immutable
+  /// source capture. A Cut enters the writer only after publication succeeds.
+  @discardableResult
+  func requestDocumentClipboard(_ selection: PagedNativeNavigationSelection, cutting: Bool,
+    prepare: @escaping @MainActor (PagedDocumentRootRecord) async throws -> Void)
+    throws -> Task<PagedDocumentRootRecord, Error> {
+    try beginCapturedEdit(expected: nil, actionName: cutting ? "Cut" : "Copy",
+      reportFailure: true, sourceOnly: !cutting,
+      preparingOperation: { record in
+        try await prepare(record)
+        return (.replacement(selection, Data()), nil)
+      })
+  }
+
+  func replaceSelectionBeforeRawKey(_ event: NSEvent, from view: PagedNativeTextView,
+    selection: PagedNativeNavigationSelection) throws {
+    guard event.type == .keyDown, view === input.activeView,
+      (event.characters ?? "").utf16.count <= Self.maximumKeyUTF16,
+      (event.charactersIgnoringModifiers ?? "").utf16.count <= Self.maximumKeyUTF16 else {
+      throw BoomError.budget("Selected-source input exceeds its native event bound.")
+    }
+    if !replayingRawKeys {
+      // Own the original event before a captured writer can start. The real
+      // queue interprets this head at its ordered selection, with no duplicate
+      // event appended after later input if the deletion needs a new window.
+      try retainRawKey(event, from: view)
+      pump()
+      return
+    }
+    guard let first = queue.first, case .rawKey(let head) = first, head.event === event else {
+      throw BoomError.stale("Selected-source replay lost its original queue head.")
+    }
+    _ = try beginCapturedEdit(expected: nil, operation: .replacement(selection, Data()),
+      actionName: "Edit", reportFailure: true, continueTyping: true)
+    currentRawKeyAwaitingSource = true
+  }
+
+  private func beginCapturedEdit(expected: PagedDocumentRootRecord?,
+    operation: PagedCapturedEditInput.Operation? = nil, actionName: String, reportFailure: Bool = false,
+    continueTyping: Bool = false, sourceOnly: Bool = false, groupID capturedGroup: UUID? = nil,
+    preparingOperation: (@MainActor (PagedDocumentRootRecord) async throws ->
+      (PagedCapturedEditInput.Operation, PagedNativeNavigationSelection?))? = nil)
+    throws -> Task<PagedDocumentRootRecord, Error> {
+    guard (operation == nil) != (preparingOperation == nil) else {
+      throw BoomError.invalid("Explicit editing requires exactly one operation source.")
+    }
+    try requireCommandQuiescence(allowDeferredInput: replayingRawKeys)
+    try requireNavigationClient()
+    guard let view = input.activeView, let window = view.window, window.isKeyWindow,
+      window.firstResponder === view || window.makeFirstResponder(view) else {
+      throw BoomError.stale("Explicit editing requires its actual native document window.")
+    }
+    let observed = try input.observeSelection()
+    let selection = try input.currentDocumentSelection()
+    let editGroup = capturedGroup ?? UUID()
+    phase = .preparing; capturedActionName = actionName
+    let prefix: PagedNativePrefixReservation
+    do { prefix = try input.session.reservePrefix() }
+    catch { phase = .idle; capturedActionName = nil; throw error }
+    let task = Task<PagedDocumentRootRecord, Error> { [self] in
+      let startingFailureSerial = receivingFailureSerial
+      var reservation: PagedNativePrefixReservation? = prefix
+      var writerEntered = false
+      defer {
+        capturedEditTask = nil; capturedActionName = nil
+        if phase == .idle { pump() }
+      }
+      do {
+        let sealed = try await input.session.flush(prefix)
+        guard try input.observeSelection() == observed, firstFailure == nil,
+          expected == nil || sealed.rootRecord == expected else {
+          throw BoomError.stale("The explicit edit source changed before its file transaction.")
+        }
+        try input.session.releasePrefix(prefix); reservation = nil
+        let beforeCursor = try await input.session.sealedCursor(for: selection)
+        let prepared: (PagedCapturedEditInput.Operation, PagedNativeNavigationSelection?)
+        if let preparingOperation { prepared = try await preparingOperation(sealed.rootRecord) }
+        else if let operation { prepared = (operation, nil) }
+        else { throw BoomError.invalid("Explicit editing lost its operation.") }
+        try Task.checkCancellation()
+        guard try input.observeSelection() == observed, firstFailure == nil else {
+          throw BoomError.stale("The native selection changed before explicit editing.")
+        }
+        if sourceOnly {
+          phase = .idle
+          try replayOriginalKeys()
+          return sealed.rootRecord
+        }
+        let commandID = UUID(), groupID = editGroup, next = prefix.generation.addingReportingOverflow(1)
+        guard !next.overflow else { throw BoomError.budget("Native source sequence is exhausted.") }
+        let route = try input.session.beginCapturedEdit(expected: sealed.rootRecord, commandID: commandID)
+        writerEntered = true
+        let result: PagedCapturedEditResult
+        switch prepared.0 {
+        case .edits(let edits):
+          result = try await route.commitCapturedEdits(expected: sealed.rootRecord, edits: edits,
+            sessionID: input.session.sessionID, commandID: commandID, groupID: groupID,
+            sequence: next.partialValue, beforeCursor: beforeCursor, afterSelection: prepared.1)
+        case .replacement(let range, let bytes):
+          result = try await route.commitUserReplacement(expected: sealed.rootRecord, selection: range,
+            replacement: bytes, sessionID: input.session.sessionID, commandID: commandID,
+            groupID: groupID, sequence: next.partialValue, beforeCursor: beforeCursor)
+        case .linePrefix(let range, let prefix):
+          result = try await route.commitLinePrefix(expected: sealed.rootRecord, selection: range,
+            prefix: prefix, sessionID: input.session.sessionID, commandID: commandID,
+            groupID: groupID, sequence: next.partialValue, beforeCursor: beforeCursor)
+        }
+        guard try input.observeSelection() == observed, let mount = mountView else {
+          throw BoomError.stale("Published editing lost its original physical input receiver.")
+        }
+        let ticket = try input.session.preparePublishedEditInstallation(result, owner: input)
+        try input.stageNavigation(ticket, observedSelection: observed)
+        _ = try input.withStagedNavigationInstallation(ticket, mounted: mount)
+        try await input.session.finishCapturedEditInstallation(result)
+        try transferRawInputAfterMount()
+        phase = .idle
+        if continueTyping { input.continueNextInputGroup(groupID) }
+        input.notifyNativeState(from: input.activeView, edited: true)
+        try replayOriginalKeys()
+        return result.record
+      } catch {
+        let original = error
+        if let reservation {
+          do { try input.session.releasePrefix(reservation) }
+          catch { fail(PagedNativeNavigationOwnerFailure(original: original, cleanup: error)); throw original }
+        }
+        if let unchanged = original as? PagedCapturedEditUnchanged {
+          try input.session.completeUnchangedCapturedEdit(unchanged)
+          phase = .idle
+          try replayOriginalKeys()
+          return unchanged.record
+        }
+        if writerEntered {
+          if !receivingFailureSerialExhausted, receivingFailureSerial == startingFailureSerial {
+            input.session.recordCapturedEditFailure(original); fail(original)
+          } else { phase = .blocked }
+        } else {
+          phase = firstFailure == nil ? .idle : .blocked
+          do { try replayOriginalKeys() } catch { fail(error) }
+          if reportFailure { didFail?(original) }
+        }
+        throw original
+      }
+    }
+    capturedEditTask = task
+    return task
   }
 
   private func requireNavigationClient() throws {
@@ -457,12 +806,17 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
     if !deferredInput {
       guard commandTask == nil, queue.isEmpty else { throw BoomError.stale("Later native input invalidated this navigation.") }
     } else {
-      // These events were not interpreted or inserted in the old arena. They
-      // remain in their original order on THIS actual bounded command owner.
+      // Original events remain unchanged and ordered. Their current replay
+      // leases may already have passed through this owner's earlier actual
+      // mount; validate that current lease, not the original retired client.
       for item in queue {
         if case .rawKey(let key) = item {
-          guard key.originalLease == observed.inputLease, key.replayLease == observed.inputLease else {
+          guard key.replayLease == observed.inputLease else {
             throw BoomError.stale("A deferred navigation key belongs to another actual physical source.")
+          }
+        } else if case .sourceCommand(let command) = item {
+          guard command.replayLease == observed.inputLease else {
+            throw BoomError.stale("Deferred source input belongs to another actual physical source.")
           }
         }
       }
@@ -480,11 +834,13 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
       return reused
     }
     let ticket = try await input.session.prepareNavigationInstallation(owner: input,
-      toUTF16: anchor, selection: selection, affinity: observed.affinity,
+      toUTF16: anchor, selection: selection,
       roundGeneratedAnchor: roundGeneratedAnchor)
     do {
       try Task.checkCancellation()
-      guard isNavigating else { throw BoomError.stale("The exact navigation owner retired before mounting.") }
+      guard isNavigating || (!deferredInput && navigationTask != nil) else {
+        throw BoomError.stale("The exact navigation owner retired before mounting.")
+      }
       try requireNavigationQueue(observed, deferredInput: deferredInput)
       try input.stageNavigation(ticket, observedSelection: observed)
       try Task.checkCancellation()
@@ -516,13 +872,20 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
   /// unretained-input boundary and never pretends to be retained.
   func recenterBeforeRawKey(_ event: NSEvent, from view: PagedNativeTextView,
     toUTF16 anchor: UInt64) -> Bool {
-    guard !replayingRawKeys else { return false }
     var retained = false
     do {
-      try requireCommandQuiescence(); try requireNavigationClient()
+      try requireCommandQuiescence(allowDeferredInput: replayingRawKeys); try requireNavigationClient()
       let observed = try input.observeSelection()
-      let selection = try input.session.navigationSelection(observed.range)
-      try retainRawKey(event, from: view); retained = true
+      let selection = try input.currentDocumentSelection()
+      if replayingRawKeys {
+        guard let first = queue.first, case .rawKey(let head) = first, head.event === event else {
+          throw BoomError.stale("Recenter does not own the original replay head.")
+        }
+        // Keep this exact key at the head until its actual source mount. A
+        // recenter is not delivery, and appending it would reorder later keys.
+        currentRawKeyAwaitingSource = true
+      } else { try retainRawKey(event, from: view) }
+      retained = true
       beginOwnedNavigation(toUTF16: anchor, selection: selection, observed: observed)
     } catch {
       if retained { fail(error) }
@@ -533,8 +896,15 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
   /// An actual receiving refusal keeps the original event on this existing
   /// queue. It does not turn a failed presentation into navigation to zero.
   func refuseDocumentKey(_ event: NSEvent, from view: PagedNativeTextView, original: Error) {
-    do { try retainRawKey(event, from: view); fail(original) }
-    catch {
+    do {
+      if replayingRawKeys {
+        guard let first = queue.first, case .rawKey(let head) = first, head.event === event else {
+          throw BoomError.stale("The refused document key is not this original replay head.")
+        }
+        currentRawKeyAwaitingSource = true
+      } else { try retainRawKey(event, from: view) }
+      fail(original)
+    } catch {
       if unretainedRawKeyCount < UInt64.max { unretainedRawKeyCount += 1 }
       fail(PagedNativeNavigationOwnerFailure(original: original, cleanup: error))
     }
@@ -545,7 +915,7 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
   func requestDocumentNavigation(toUTF16 anchor: UInt64,
     selectingUTF16 selection: PagedNativeNavigationSelection,
     expected: PagedNativeDocumentCoordinates) throws {
-    try requireCommandQuiescence(); try requireNavigationClient()
+    try requireCommandQuiescence(allowDeferredInput: replayingRawKeys); try requireNavigationClient()
     let current = try input.session.documentCoordinates()
     guard current.record == expected.record, current.sessionID == expected.sessionID,
       current.arenaID == expected.arenaID, current.generation == expected.generation,
@@ -555,14 +925,294 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
     let observed = try input.observeSelection()
     beginOwnedNavigation(toUTF16: anchor, selection: selection, observed: observed)
   }
+  /// Resolve a character boundary against the sealed full source, retaining
+  /// later keys on the existing navigation queue until the window is adopted.
+  func requestGraphemeMovement(forward: Bool, extending: Bool,
+    selection: PagedNativeNavigationSelection, nativeTargetUTF16: UInt64? = nil,
+    resultAffinity: PagedSelectionAffinity? = nil) throws {
+    try requireCommandQuiescence(allowDeferredInput: replayingRawKeys); try requireNavigationClient()
+    let observed = try input.observeSelection()
+    let prefix = try input.session.reservePrefix()
+    beginOwnedNavigation(toUTF16: selection.focusUTF16, selection: selection, observed: observed) { [self] in
+      var held = true
+      do {
+        _ = try await input.session.flush(prefix)
+        guard try input.observeSelection() == observed else {
+          throw BoomError.stale("Character movement lost its original selection.")
+        }
+        try input.session.releasePrefix(prefix); held = false
+        let target: UInt64
+        if let nativeTargetUTF16 {
+          target = try await input.session.sealedGraphemeBoundary(atNativeUTF16: nativeTargetUTF16, forward: forward)
+        } else if !extending, selection.utf16Length > 0 {
+          target = forward ? selection.utf16Offset + selection.utf16Length : selection.utf16Offset
+        } else {
+          target = try await input.session.sealedGraphemeBoundary(atUTF16: selection.focusUTF16, forward: forward)
+        }
+        try Task.checkCancellation()
+        guard try input.observeSelection() == observed else {
+          throw BoomError.stale("Character movement changed while its boundary loaded.")
+        }
+        if extending {
+          let anchor = selection.anchorUTF16
+          return PagedNativeNavigationSelection(utf16Offset: min(anchor, target),
+            utf16Length: max(anchor, target) - min(anchor, target), focusAtEnd: target >= anchor,
+            affinity: resultAffinity ?? selection.affinity)
+        }
+        return PagedNativeNavigationSelection(utf16Offset: target, utf16Length: 0,
+          affinity: resultAffinity ?? selection.affinity)
+      } catch {
+        let original = error
+        if held {
+          do { try input.session.releasePrefix(prefix) }
+          catch { throw PagedNativeNavigationOwnerFailure(original: original, cleanup: error) }
+        }
+        throw original
+      }
+    }
+  }
+
+  func requestDocumentCommand(_ selector: Selector, from view: PagedNativeTextView) throws {
+    try enqueueSourceCommand(.documentCommand(selector), from: view, chargedBytes: 512)
+  }
+
+  func requestParagraphCommand(_ command: PagedNativeParagraphCommand) throws {
+    let selection = try input.currentDocumentSelection()
+    if command.deletes {
+      _ = try beginCapturedEdit(expected: nil, actionName: "Delete", reportFailure: true,
+        groupID: input.activeView?.typedCharacterCommandGroupID,
+        preparingOperation: { [self] _ in
+          if selection.utf16Length > 0 { return (.replacement(selection, Data()), nil) }
+          let target = try await paragraphEndpoint(command, atUTF16: selection.focusUTF16)
+          let start = min(target, selection.focusUTF16), end = max(target, selection.focusUTF16)
+          return (.replacement(PagedNativeNavigationSelection(utf16Offset: start,
+            utf16Length: end - start, focusAtEnd: selection.focusAtEnd,
+            affinity: selection.affinity), Data()), nil)
+        })
+      return
+    }
+    try requireCommandQuiescence(allowDeferredInput: replayingRawKeys); try requireNavigationClient()
+    let observed = try input.observeSelection(), prefix = try input.session.reservePrefix()
+    beginOwnedNavigation(toUTF16: selection.focusUTF16, selection: selection, observed: observed) { [self] in
+      var held = true
+      do {
+        _ = try await input.session.flush(prefix)
+        guard try input.observeSelection() == observed else {
+          throw BoomError.stale("Paragraph movement lost its original selection.")
+        }
+        try input.session.releasePrefix(prefix); held = false
+        let target = try await paragraphEndpoint(command, atUTF16: selection.focusUTF16)
+        try Task.checkCancellation()
+        guard try input.observeSelection() == observed else {
+          throw BoomError.stale("Paragraph movement changed while its source bounds loaded.")
+        }
+        if command.extends {
+          let fixed = selection.anchorUTF16
+          return PagedNativeNavigationSelection(utf16Offset: min(fixed, target),
+            utf16Length: max(fixed, target) - min(fixed, target), focusAtEnd: target >= fixed,
+            affinity: selection.affinity)
+        }
+        return PagedNativeNavigationSelection(utf16Offset: target, utf16Length: 0,
+          affinity: selection.affinity)
+      } catch {
+        let original = error
+        if held {
+          do { try input.session.releasePrefix(prefix) }
+          catch { throw PagedNativeNavigationOwnerFailure(original: original, cleanup: error) }
+        }
+        throw original
+      }
+    }
+  }
+
+  private func paragraphEndpoint(_ command: PagedNativeParagraphCommand,
+    atUTF16 offset: UInt64) async throws -> UInt64 {
+    let bounds = try await input.session.sealedParagraphBounds(atUTF16: offset)
+    switch command {
+    case .beginning, .beginningSelecting, .deleteBeginning: return bounds.start.utf16
+    case .end, .endSelecting: return bounds.contentEnd.utf16
+    case .deleteEnd: return offset < bounds.contentEnd.utf16 ? bounds.contentEnd.utf16 : bounds.end.utf16
+    case .forwardSelecting:
+      if offset < bounds.contentEnd.utf16 { return bounds.contentEnd.utf16 }
+      if bounds.end.utf16 < input.session.sealedRevision.summary.utf16 {
+        return try await input.session.sealedParagraphBounds(atUTF16: bounds.end.utf16).contentEnd.utf16
+      }
+      return bounds.end.utf16
+    case .backwardSelecting:
+      if offset > bounds.start.utf16 || bounds.start.utf16 == 0 { return bounds.start.utf16 }
+      let previous = try await input.session.sealedGraphemeBoundary(atUTF16: bounds.start.utf16, forward: false)
+      return try await input.session.sealedParagraphBounds(atUTF16: previous).start.utf16
+    }
+  }
+
+  /// Left/Right are visual commands. Probe this actual Cocoa layout, restore
+  /// its owned selection before any yield, then validate the observed target
+  /// against the full source on the existing navigation lane.
+  func requestVisualGraphemeMovement(_ selector: Selector) throws {
+    try requireCommandQuiescence(allowDeferredInput: replayingRawKeys); try requireNavigationClient()
+    let command = NSStringFromSelector(selector)
+    guard ["moveLeft:", "moveRight:", "moveLeftAndModifySelection:", "moveRightAndModifySelection:"].contains(command) else {
+      throw BoomError.invalid("A visual character command requires its actual native selector.")
+    }
+    let extending = command.contains("AndModifySelection")
+    let (original, native) = try probeNativeVisualMovement(selector, extending: extending)
+    try requireCommandQuiescence(allowDeferredInput: replayingRawKeys); try requireNavigationClient()
+    guard try input.selectionForVisualMovement() == original else {
+      throw BoomError.stale("Visual movement lost its restored selection before source capture.")
+    }
+    if native.focusUTF16 == original.focusUTF16,
+      extending || original.utf16Length == 0 {
+      // A native affinity-only movement or true endpoint no-op needs no
+      // source read, mount, or history entry.
+      if native != original { try input.setDocumentSelection(native) }
+      return
+    }
+    let forward: Bool
+    if !extending, original.utf16Length > 0 {
+      // Native collapse picked this exact endpoint; neither the arrow name
+      // nor its visual affinity identifies the logical direction.
+      forward = native.focusUTF16 == original.utf16Offset + original.utf16Length
+    } else { forward = native.focusUTF16 > original.focusUTF16 }
+    try requestGraphemeMovement(forward: forward, extending: extending, selection: original,
+      nativeTargetUTF16: native.focusUTF16, resultAffinity: native.affinity)
+  }
+
+  private func probeNativeVisualMovement(_ selector: Selector, extending: Bool) throws
+    -> (PagedNativeNavigationSelection, PagedNativeNavigationSelection) {
+    let view = input.activeView!
+    // Use the existing key/command fence during synchronous AppKit reentry.
+    // No Task, owner, receipt or source/history edit is created by this probe.
+    isNavigating = true
+    defer { isNavigating = false }
+    let source = try input.session.documentCoordinates()
+    let original = try input.selectionForVisualMovement(), observed = try input.observeSelection()
+    let windowEnd = source.utf16Start + UInt64(source.localUTF16)
+    let selectionEnd = original.utf16Offset + original.utf16Length
+    let lower = min(windowEnd, max(source.utf16Start, original.utf16Offset))
+    let upper = min(windowEnd, max(lower, selectionEnd))
+    let painted = NSRange(location: Int(lower - source.utf16Start), length: Int(upper - lower))
+    let extendsBeyondWindow = original.utf16Offset < source.utf16Start || selectionEnd > windowEnd
+    guard observed.inputLease.isFirstResponder, observed.inputLease.isKeyWindow,
+      observed.range == painted,
+      !extending || !extendsBeyondWindow || (original.focusUTF16 >= source.utf16Start && original.focusUTF16 <= windowEnd) else {
+      throw BoomError.unavailable("Visual extension requires its actual focused source window.")
+    }
+    func admitProjection() throws {
+      let current = try input.session.documentCoordinates(), actual = try input.observeSelection()
+      guard input.activeView === view, current.record == source.record, current.sessionID == source.sessionID,
+        current.arenaID == source.arenaID, current.generation == source.generation, current.windowID == source.windowID,
+        current.utf16Start == source.utf16Start, current.localUTF16 == source.localUTF16,
+        current.projectedUTF16 == source.projectedUTF16, current.localBytes == source.localBytes,
+        actual.identity == observed.identity, actual.inputLease == observed.inputLease,
+        input.firstRefusal == nil, view.inputBinding?.firstRefusal == nil,
+        view.boundedStorage.mutationFailure == nil, !view.hasMarkedText(), view.inputCommandIsClosed else {
+        throw BoomError.stale("Cocoa visual movement changed its actual source or physical consumer.")
+      }
+    }
+    func restore() throws {
+      try admitProjection()
+      try input.setDocumentSelection(original)
+      try admitProjection()
+      let restored = try input.observeSelection()
+      guard try input.selectionForVisualMovement() == original,
+        restored.range == observed.range, restored.affinity == observed.affinity else {
+        throw BoomError.stale("Cocoa visual movement did not restore its original owned selection.")
+      }
+    }
+    var entered = false, restored = false
+    do {
+      try admitProjection()
+      guard phase == .idle, (queue.isEmpty || replayingRawKeys), firstFailure == nil else {
+        throw BoomError.stale("Later native input preceded the visual probe.")
+      }
+      entered = true
+      if extending, extendsBeyondWindow {
+        // AppKit cannot own the distant anchor. Seed the actual local focus,
+        // execute its unmodified visual arrow, and keep the global anchor here.
+        try input.setDocumentSelection(PagedNativeNavigationSelection(utf16Offset: original.focusUTF16,
+          utf16Length: 0, affinity: original.affinity))
+        try admitProjection()
+        let command = NSStringFromSelector(selector)
+        try view.performContainedDocumentCommand(NSSelectorFromString(command.hasPrefix("moveLeft") ? "moveLeft:" : "moveRight:"))
+      } else { try view.performContainedDocumentCommand(selector) }
+      try admitProjection()
+      let observedTarget = try input.selectionForVisualMovement()
+      guard observedTarget.utf16Offset >= source.utf16Start,
+        observedTarget.utf16Offset + observedTarget.utf16Length <= windowEnd else {
+        throw BoomError.stale("Cocoa visual movement did not preserve its actual target or anchor.")
+      }
+      let native: PagedNativeNavigationSelection
+      if extending, extendsBeyondWindow {
+        guard observedTarget.utf16Length == 0 else { throw BoomError.stale("A visual focus probe did not return its actual caret.") }
+        let fixed = original.anchorUTF16, target = observedTarget.focusUTF16
+        native = PagedNativeNavigationSelection(utf16Offset: min(fixed, target),
+          utf16Length: max(fixed, target) - min(fixed, target), focusAtEnd: target >= fixed,
+          affinity: observedTarget.affinity)
+      } else if !extending, extendsBeyondWindow {
+        // Selection collapse chooses a real endpoint of the painted
+        // intersection. Map that observed choice to the owned full range.
+        guard painted.length > 0, observedTarget.utf16Length == 0,
+          observedTarget.focusUTF16 == lower || observedTarget.focusUTF16 == upper else {
+          throw BoomError.unavailable("Cocoa did not establish a visual selection-collapse endpoint.")
+        }
+        let target = observedTarget.focusUTF16 == lower ? original.utf16Offset : selectionEnd
+        native = PagedNativeNavigationSelection(utf16Offset: target, utf16Length: 0,
+          affinity: observedTarget.affinity)
+      } else { native = observedTarget }
+      guard (extending ? native.anchorUTF16 == original.anchorUTF16 : native.utf16Length == 0) else {
+        throw BoomError.stale("Visual movement lost its owned original anchor.")
+      }
+      if !extending, original.utf16Length > 0 {
+        guard native.focusUTF16 == original.utf16Offset || native.focusUTF16 == selectionEnd else {
+          throw BoomError.unavailable("Cocoa did not establish a complete selection-collapse endpoint.")
+        }
+      }
+      if native.focusUTF16 == original.focusUTF16, native.utf16Offset == original.utf16Offset,
+        native.utf16Length == original.utf16Length, native.affinity == original.affinity,
+        (native.focusUTF16 == source.utf16Start && source.utf16Start > 0)
+          || (native.focusUTF16 == windowEnd && windowEnd < source.projectedUTF16) {
+        throw BoomError.unavailable("The projected edge has no observed native visual target beyond this window.")
+      }
+      try restore(); restored = true
+      return (original, native)
+    } catch {
+      let originalError = error
+      if entered, !restored {
+        do { try restore() }
+        catch { throw PagedNativeNavigationOwnerFailure(original: originalError, cleanup: error) }
+      }
+      throw originalError
+    }
+  }
+
+  func requestGraphemeDeletion(forward: Bool, selection: PagedNativeNavigationSelection) throws {
+    _ = try beginCapturedEdit(expected: nil, actionName: "Delete", reportFailure: true,
+      groupID: input.activeView?.typedCharacterCommandGroupID,
+      preparingOperation: { [self] _ in
+        let target = try await input.session.sealedGraphemeBoundary(atUTF16: selection.focusUTF16, forward: forward)
+        let range = PagedNativeNavigationSelection(utf16Offset: min(target, selection.focusUTF16),
+          utf16Length: max(target, selection.focusUTF16) - min(target, selection.focusUTF16))
+        return (.replacement(range, Data()), nil)
+      })
+  }
+
   private func beginOwnedNavigation(toUTF16 anchor: UInt64, selection: PagedNativeNavigationSelection,
-    observed: PagedNativeSelectionObservation) {
+    observed: PagedNativeSelectionObservation,
+    resolvingSelection: (@MainActor () async throws -> PagedNativeNavigationSelection)? = nil) {
     precondition(!isNavigating && navigationTask == nil && commandTask == nil)
     isNavigating = true // synchronous input fence, before spawning the worker
     let startingFailureSerial = receivingFailureSerial
     var ownFailureRecorded = false
     let worker = Task<PagedTextWindow, Error> { [self] in
-      try await navigateAdmitted(toUTF16: anchor, selection: selection, observed: observed,
+      let resolved = try await resolvingSelection?() ?? selection
+      if resolvingSelection != nil,
+        let reused = try input.reuseJoinedNavigationWindow(toUTF16: input.session.documentCoordinates().utf16Start,
+          selection: resolved, observedSelection: observed) {
+        try requireNavigationQueue(observed, deferredInput: true)
+        return reused
+      }
+      let resolvedAnchor = resolvingSelection == nil ? anchor : (resolved.focusUTF16 > 4096 ? resolved.focusUTF16 - 4096 : 0)
+      return try await navigateAdmitted(toUTF16: resolvedAnchor, selection: resolved, observed: observed,
         roundGeneratedAnchor: true, deferredInput: true,
         recordedFailure: { ownFailureRecorded = true })
     }
@@ -586,7 +1236,7 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
   func request(_ direction: PagedNativeHistoryHandle.Direction) {
     guard phase != .closed else { return }
     guard queue.count < Self.maximumQueuedEntries, queuedDirections < Self.maximumQueuedCommands else {
-      if unretainedCommandCount < UInt64.max { unretainedCommandCount += 1 }
+      if !replayingRawKeys, unretainedCommandCount < UInt64.max { unretainedCommandCount += 1 }
       fail(BoomError.budget("Native history requests require owner resolution before accepting more input."))
       return
     }
@@ -605,6 +1255,18 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
   /// fabricates unmark/discardMarkedText or opens a Foundation group over await.
   func inputCommandDidClose() { if phase != .closed { pump() } }
 
+  private func resumeQueuedInput() {
+    guard phase == .idle, commandTask == nil, capturedEditTask == nil,
+      !isNavigating, navigationTask == nil, !queue.isEmpty else { return }
+    // Keep this existing task slot joinable while yielding between bounded
+    // replay bursts. No timer or awaited task is substituted for delivery.
+    commandTask = Task { [self] in
+      await Task.yield()
+      commandTask = nil
+      pump()
+    }
+  }
+
   private func pump() {
     guard phase == .idle, commandTask == nil, !isNavigating, navigationTask == nil, !queue.isEmpty, !replayingRawKeys,
       !registeringGroup, !receivingTransition,
@@ -614,7 +1276,36 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
     do {
       if case .rawKey = queue[0] {
         try replayOriginalKeys()
-        guard !queue.isEmpty else { return }
+        guard !queue.isEmpty, phase == .idle, capturedEditTask == nil,
+          !isNavigating, navigationTask == nil else { return }
+        if case .rawKey = queue[0] { resumeQueuedInput(); return }
+      }
+      if case .sourceCommand(let command) = queue[0] {
+        guard let view = input.activeView, command.window === view.window,
+          command.window.firstResponder === view,
+          command.replayLease == (try input.inputLease(for: view)) else {
+          throw BoomError.stale("Deferred source input lost its original physical focus.")
+        }
+        // Reuse the actual lexical replay scope; later queue entries stay
+        // owned until this source command's real publication/installation.
+        replayingRawKeys = true
+        defer {
+          replayingRawKeys = false; replayInsertionCount = 0
+          if phase == .idle, commandTask == nil, capturedEditTask == nil, !isNavigating { resumeQueuedInput() }
+        }
+        let selection = try input.currentDocumentSelection()
+        switch command.action {
+        case .linePrefix(let prefix):
+          _ = try beginCapturedEdit(expected: nil, operation: .linePrefix(selection, prefix),
+            actionName: "Format", reportFailure: true)
+        case .documentCommand(let selector):
+          try input.performQueuedDocumentCommand(selector)
+        case .replacement(let bytes, let name):
+          _ = try beginCapturedEdit(expected: nil, operation: .replacement(selection, bytes),
+            actionName: name, reportFailure: true)
+        }
+        queue.removeFirst(); rawKeyBytes -= command.chargedBytes
+        return
       }
       phase = .preparing // includes SDK checkpoint/top queries and group closure reentry
       _ = try input.session.closeNativeGroup()
@@ -740,16 +1431,53 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
     // IME input still needed to close the composition remains on its original
     // client. A waiting Undo cannot prevent the actual unmark it waits for.
     if phase == .idle, commandTask == nil, view.hasMarkedText() { return false }
+    let waitsForSource: Bool
+    do { waitsForSource = try (phase == .publishing && keyNeedsJoinedSource(event, from: view)) }
+    catch { PerformanceTrace.event("Editor.ManagedAdmission"); return false }
     guard !replayingRawKeys,
-      isNavigating || phase == .preparing || phase == .reconciling || phase == .hydrating
-        || phase == .advancing || phase == .blocked || !queue.isEmpty else { return false }
-    do { try retainRawKey(event, from: view) }
-    catch {
-      if unretainedRawKeyCount < UInt64.max { unretainedRawKeyCount += 1 }
-      fail(error)
+      waitsForSource || isNavigating || phase == .preparing || phase == .reconciling || phase == .hydrating
+        || phase == .advancing || !queue.isEmpty else { return false }
+    var retained = false
+    let failureSerial = receivingFailureSerial
+    do {
+      try retainRawKey(event, from: view); retained = true
+      if phase == .publishing { try replayOriginalKeys() }
+    } catch {
+      if !retained, unretainedRawKeyCount < UInt64.max { unretainedRawKeyCount += 1 }
+      if !receivingFailureSerialExhausted, receivingFailureSerial == failureSerial { fail(error) }
+      else { phase = .blocked }
     }
     return true
   }
+  private func keyNeedsJoinedSource(_ event: NSEvent, from view: PagedNativeTextView) throws -> Bool {
+    // Selectors are interpreted by AppKit and enter the same source-command
+    // queue if needed. Only a literal insertion that needs a different source
+    // window must wait before interpretation; display-edge proximity is not
+    // character admission and cannot make ordinary typing await a disk ACK.
+    let text = event.characters ?? ""
+    let excluded: Bool
+    switch event.keyCode {
+    case 48, 53, 115, 116, 119, 121, 123, 124, 125, 126: excluded = true
+    default: excluded = false
+    }
+    let inserting = !excluded
+      && event.modifierFlags.intersection([.command, .control]).isEmpty
+      && (!text.isEmpty && text.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) }
+        || event.keyCode == 36 || event.keyCode == 76)
+    guard inserting else { return false }
+    let selected = try input.currentDocumentSelection()
+    if selected.utf16Length > UInt64(view.selectedRange().length) { return true }
+    let replacement = event.keyCode == 36 || event.keyCode == 76 ? "\n" : text
+    do { try input.session.canReplace(view.selectedRange(), with: replacement); return false }
+    catch {
+      if case BoomError.budget = error { return true }
+      // A stale/malformed source callback belongs to its actual native
+      // primitive, not a new permanent command/input refusal.
+      PerformanceTrace.event("Editor.ManagedAdmission")
+      return false
+    }
+  }
+
   private func retainRawKey(_ event: NSEvent, from view: PagedNativeTextView) throws {
       guard event.type == .keyDown, view === input.activeView,
         let window = view.window, window.firstResponder === view else {
@@ -773,7 +1501,7 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
 
   private func transferRawInputAfterMount() throws {
     guard phase != .closed else { return }
-    guard queuedRawKeyCount > 0 else { return }
+    guard queue.contains(where: { if case .history = $0 { return false }; return true }) else { return }
     guard let transition = input.lastReplayTransition else {
       throw BoomError.stale("Deferred native keys have no actual focus-preserving mount receipt.")
     }
@@ -782,11 +1510,15 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
     // Validate the complete bounded queue before changing any replay lease.
     for item in queue {
       if case .rawKey(let key) = item { _ = try transition.rebase(key.replayLease) }
+      else if case .sourceCommand(let command) = item { _ = try transition.rebase(command.replayLease) }
     }
     for index in queue.indices {
       if case .rawKey(var key) = queue[index] {
         key.replayLease = try transition.rebase(key.replayLease)
         queue[index] = .rawKey(key)
+      } else if case .sourceCommand(var command) = queue[index] {
+        command.replayLease = try transition.rebase(command.replayLease)
+        queue[index] = .sourceCommand(command)
       }
     }
   }
@@ -794,9 +1526,11 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
   private func replayOriginalKeys() throws {
     guard phase != .closed else { return }
     replayingRawKeys = true
-    defer { replayingRawKeys = false; replayInsertionCount = 0 }
-    while let first = queue.first, case .rawKey(let next) = first {
-      replayInsertionCount = 0
+    defer { replayingRawKeys = false; replayInsertionCount = 0; currentRawKeyAwaitingSource = false }
+    var delivered = 0
+    while delivered < Self.maximumReplayBurst,
+      let first = queue.first, case .rawKey(let next) = first {
+      replayInsertionCount = 0; currentRawKeyAwaitingSource = false
       guard let view = input.activeView else {
         throw BoomError.stale("Deferred native input lost its physical client.")
       }
@@ -804,13 +1538,37 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
         next.replayLease == (try input.inputLease(for: view)) else {
         throw BoomError.stale("Native focus or keyboard source changed before deferred input replay.")
       }
-      view.keyDown(with: next.event)
-      guard input.firstRefusal == nil, view.inputBinding?.firstRefusal == nil else {
-        throw BoomError.stale("The replayed native event was refused by its new source owner.")
+      if phase == .publishing, try keyNeedsJoinedSource(next.event, from: view) { return }
+      let beforeGeneration = input.session.generation
+      let beforeSelectionEpoch = view.inputBinding?.selectionEpoch
+      let originalRefusal = view.didRejectInput
+      var dispatchRefusal: Error?
+      view.didRejectInput = { error in
+        if dispatchRefusal == nil { dispatchRefusal = error }
+        originalRefusal?(error)
       }
-      // Remove only after the actual native command completed without refusal.
+      view.keyDown(with: next.event)
+      view.didRejectInput = originalRefusal
+      if let dispatchRefusal, input.session.generation == beforeGeneration,
+        view.inputBinding?.selectionEpoch == beforeSelectionEpoch,
+        replayInsertionCount == 0, !currentRawKeyAwaitingSource {
+        // No primitive or interpreted successor consumed this event. Retain
+        // it at its exact position; nil historical latches are not delivery.
+        throw dispatchRefusal
+      }
+      if let mutation = view.boundedStorage.mutationFailure { throw mutation }
+      if phase == .blocked, input.session.generation == beforeGeneration,
+        view.inputBinding?.selectionEpoch == beforeSelectionEpoch,
+        replayInsertionCount == 0, !currentRawKeyAwaitingSource {
+        throw firstFailure ?? BoomError.stale("The original input has no completed native receiver.")
+      }
+      if currentRawKeyAwaitingSource { return }
+      // Only the completed primitive/command or its retained ordered successor
+      // owns delivery. A new structural task may require the same original key.
       queue.removeFirst(); queuedRawKeyCount -= 1; rawKeyBytes -= next.chargedBytes
+      delivered += 1
       if phase == .blocked { throw firstFailure ?? BoomError.stale("A native replay command lost its source owner.") }
+      if (phase != .idle && phase != .publishing) || isNavigating || capturedEditTask != nil { return }
     }
   }
 
@@ -887,7 +1645,9 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
     guard lease.isFirstResponder, lease.isKeyWindow,
       lease.identity.ownerID == input.ownerID, lease.identity.sessionID == input.session.sessionID,
       lease.identity.arenaID == input.session.arenaID,
-      queuedDirections + queuedRawKeyCount == queue.count,
+      queuedDirections + queuedRawKeyCount + queue.reduce(0, { count, item in
+        if case .sourceCommand = item { return count + 1 }; return count
+      }) == queue.count,
       foundationProjectionIsExact() else {
       throw BoomError.stale("Receiving disposition lost its actual physical focus or Foundation targets.")
     }
@@ -897,6 +1657,10 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
       if case .rawKey(let key) = item {
         guard key.window === view.window, key.event.type == .keyDown, key.replayLease == lease else {
           throw BoomError.stale("Receiving disposition cannot rebase an original raw event.")
+        }
+      } else if case .sourceCommand(let command) = item {
+        guard command.window === view.window, command.replayLease == lease else {
+          throw BoomError.stale("Receiving disposition cannot redirect the retained source input.")
         }
       }
     }
@@ -1063,14 +1827,17 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
     // SAME task slot when it joins. Follow those actual entered successors,
     // with the existing queue bound; never poll or use elapsed time as a join.
     for _ in 0..<(Self.maximumQueuedEntries + 2) {
-      if navigationTask == nil, commandTask == nil { break }
+      if navigationTask == nil, commandTask == nil, capturedEditTask == nil { break }
       if let task = navigationTask {
         if case .failure(let error) = await task.result, originalTaskRefusal == nil { originalTaskRefusal = error }
       }
       if let task = commandTask { await task.value }
+      if let task = capturedEditTask {
+        if case .failure(let error) = await task.result, originalTaskRefusal == nil { originalTaskRefusal = error }
+      }
     }
     if let firstFailure { throw firstFailure }
-    if navigationTask != nil || commandTask != nil {
+    if navigationTask != nil || commandTask != nil || capturedEditTask != nil {
       let bound = BoomError.budget("New native requests kept the actual command lane active beyond its bounded join.")
       if let originalTaskRefusal { throw PagedNativeNavigationOwnerFailure(original: originalTaskRefusal, cleanup: bound) }
       throw bound
@@ -1080,10 +1847,11 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
     try requireCommandQuiescence()
   }
 
-  private func requireCommandQuiescence() throws {
-    guard phase == .idle, commandTask == nil, !isNavigating, navigationTask == nil, queue.isEmpty,
-      queuedDirections == 0, queuedRawKeyCount == 0, rawKeyBytes == 0,
-      !replayingRawKeys, replayInsertionCount == 0,
+  private func requireCommandQuiescence(allowDeferredInput: Bool = false) throws {
+    let orderedReplay = allowDeferredInput && replayingRawKeys
+    guard phase == .idle, commandTask == nil, capturedEditTask == nil, !isNavigating, navigationTask == nil,
+      orderedReplay || (queue.isEmpty && queuedDirections == 0 && queuedRawKeyCount == 0 && rawKeyBytes == 0),
+      orderedReplay || (!replayingRawKeys && replayInsertionCount == 0),
       !registeringGroup, !receivingTransition, receivingTicket == nil,
       expectedEntry == nil, inverseEntry == nil, adoptingSource == nil,
       hydrationExpected == nil, resolvedExpectedEntry == nil, resolvedOriginalEntryID == nil,

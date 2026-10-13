@@ -1,5 +1,4 @@
 import AppKit
-import CryptoKit
 import BoomCore
 import Foundation
 import SwiftUI
@@ -17,41 +16,74 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
 /// Source-authored ordinary Model/WorkspaceView controls. No fake engine,
 /// WorkspaceState, durable ACK, native history or actor callback is supplied.
 @MainActor final class BoundedWorkspaceConsumerTests: XCTestCase {
+  @MainActor private final class CharacterUndoObservation: NSObject, NSTextStorageDelegate {
+    weak var view: PagedNativeTextView?
+    private(set) var characterNotifications = 0
+    private(set) var exposedManagerDuringCharacters = false
+    init(view: PagedNativeTextView) { self.view = view }
+    func textStorage(_ textStorage: NSTextStorage, didProcessEditing editedMask: NSTextStorageEditActions,
+      range editedRange: NSRange, changeInLength delta: Int) {
+      if editedMask.contains(.editedCharacters) {
+        characterNotifications += 1
+        exposedManagerDuringCharacters = exposedManagerDuringCharacters || view?.undoManager != nil
+      }
+    }
+  }
   private static var failedModel: WorkspaceModel?
   private static var failedWindow: NSWindow?
   private static var failedRoot: URL?
   private static var failedExport: URL?
-  private let key = SymmetricKey(data: Data(repeating: 0x39, count: 32))
-  private func root() throws -> URL {
-    let result = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-bounded-consumer-\(UUID().uuidString)")
+  private func root(parent: URL? = nil) throws -> URL {
+    let result = (parent ?? FileManager.default.temporaryDirectory).appendingPathComponent("Bloom-bounded-consumer-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: result, withIntermediateDirectories: false)
     Self.failedRoot = result; return result
   }
-  private func open(_ root: URL) async throws -> WorkspaceModel {
-    _ = NSApplication.shared
-    let publicKey = key
-    let store = try await Task.detached { try WorkspaceStore(rootOverride: root, testKey: publicKey) }.value
+  private func diagnosticRoot() throws -> URL {
+    guard let path = ProcessInfo.processInfo.environment["TMPDIR"], !path.isEmpty, path.hasPrefix("/") else {
+      throw BoomError.invalid("The public native diagnostic requires its actual absolute caller TMPDIR.")
+    }
+    var directory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: path, isDirectory: &directory), directory.boolValue else {
+      throw BoomError.invalid("The public native diagnostic TMPDIR is not an existing directory.")
+    }
+    return try root(parent: URL(fileURLWithPath: path, isDirectory: true))
+  }
+  private func open(_ root: URL, requiresActualKeyWindow: Bool = true) async throws -> WorkspaceModel {
+    let application = NSApplication.shared
+    guard application.setActivationPolicy(.regular) else {
+      throw BoomError.unavailable("The public native control could not activate its ordinary application.")
+    }
+    let store = try await Task.detached { try WorkspaceStore(rootOverride: root) }.value
     let model: WorkspaceModel
-    do { model = try await WorkspaceModel(storeOverride: store, loadModels: false, storageRoute: .boundedSQL) }
+    do { model = try await WorkspaceModel(storeOverride: store, loadModels: false) }
     catch let failure as WorkspacePagedStartupFailure { Self.failedModel = failure.model; throw failure.original }
     Self.failedModel = model
-    XCTAssertTrue(model.usesPagedStorage)
     XCTAssertTrue(model.layout.isAuthor, "This exact control requires the actual Author product layout.")
     let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1_100, height: 780),
       styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
     window.isReleasedWhenClosed = false
     window.contentView = NSHostingView(rootView: WorkspaceView(model: model))
     Self.failedWindow = window
-    try focusCurrentEditor(model)
+    try await focusCurrentEditor(model, requiresActualKeyWindow: requiresActualKeyWindow)
     return model
   }
-  private func focusCurrentEditor(_ model: WorkspaceModel) throws {
+  private func focusCurrentEditor(_ model: WorkspaceModel, requiresActualKeyWindow: Bool = true) async throws {
+    try Task.checkCancellation()
     let window = try XCTUnwrap(Self.failedWindow)
     window.contentView?.layoutSubtreeIfNeeded()
+    let becameKey = !requiresActualKeyWindow || window.isKeyWindow ? nil : XCTNSNotificationExpectation(
+      name: NSWindow.didBecomeKeyNotification, object: window)
     window.makeKeyAndOrderFront(nil)
+    NSApplication.shared.activate(ignoringOtherApps: true)
+    if let becameKey {
+      guard await XCTWaiter.fulfillment(of: [becameKey], timeout: 10) == .completed else {
+        throw BoomError.unavailable("The ordinary editor did not receive its actual key-window notification.")
+      }
+    }
+    try Task.checkCancellation()
     let view = try XCTUnwrap(model.pagedInput?.activeView)
     guard model.pagedViewport?.textView === view, view.window === window,
-      window.isKeyWindow, window.makeFirstResponder(view), window.firstResponder === view else {
+      (!requiresActualKeyWindow || window.isKeyWindow), window.makeFirstResponder(view), window.firstResponder === view else {
       throw BoomError.unavailable("The ordinary editor did not acquire native focus: mounted=\(view.window === window), currentViewport=\(model.pagedViewport?.textView === view), keyWindow=\(window.isKeyWindow), firstResponder=\(window.firstResponder === view).")
     }
   }
@@ -97,18 +129,208 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
     for child in view.subviews { if let text = chatTextView(in: child) { return text } }
     return nil
   }
-  private func writeSource(_ root: URL) async throws -> URL {
-    try await Task.detached {
+  private func writeSource(_ root: URL, edgeText: String? = nil) async throws -> URL {
+    guard (edgeText?.utf8.count ?? 0) <= 64 else { throw BoomError.budget("The public edge fixture exceeds its bound.") }
+    let edge = edgeText.map { Data($0.utf8) }
+    return try await Task.detached {
       let url = root.appendingPathComponent("public-source.md")
       guard FileManager.default.createFile(atPath: url.path, contents: nil) else { throw BoomError.unavailable("Could not create the physical public source.") }
       let file = try FileHandle(forWritingTo: url)
       let block = Data((0..<8_192).map { $0 % 128 == 127 ? UInt8(10) : UInt8(97) })
       do {
-        for _ in 0..<384 { try file.write(contentsOf: block) } // actual3MiB; no3MiB String/Data
+        for index in 0..<384 { // actual3MiB base; no3MiB String/Data
+          if index == 1, let edge {
+            var boundary = block
+            boundary.replaceSubrange(8190..<8192, with: edge)
+            try file.write(contentsOf: boundary)
+          } else { try file.write(contentsOf: block) }
+        }
         try file.synchronize(); try file.close()
       } catch { try? file.close(); throw error }
       return url
     }.value
+  }
+
+  private func sourceBytes(_ model: WorkspaceModel, atUTF16 offset: UInt64) async throws -> Data {
+    let record = try XCTUnwrap(model.pagedSelectedRecord)
+    let engine = try XCTUnwrap(model.pagedEngine)
+    let start = try await engine.byteAtUTF16(record.document.revision, offset: offset)
+    let output = try await engine.windowRetaining(record.document.revision, byteStart: start, maximumBytes: 64)
+    let bytes = Data(output.value.text.utf8)
+    try await engine.abandonJoinedRootOutput(output.lease)
+    return bytes
+  }
+
+  func testActualWindowKeyInputKeepsTextKitCoalescingOutsideCanonicalUndoAndRedo() async throws {
+    let failures = testRun?.failureCount ?? 0
+    let scratch = try root(), model = try await open(scratch)
+    let original = try XCTUnwrap(model.pagedSelectedRecord)
+    let captured = try await model.captureDocument(original.document.id)
+    let before = try XCTUnwrap(captured.completeSnapshot).text
+    try await focusCurrentEditor(model)
+    let commands = try XCTUnwrap(model.pagedCommands)
+    let view = try XCTUnwrap(model.pagedInput?.activeView)
+    let window = try XCTUnwrap(Self.failedWindow)
+    XCTAssertEqual(Data(view.string.utf8), Data(before.utf8))
+    XCTAssertFalse(view.allowsUndo); XCTAssertFalse(commands.manager.groupsByEvent)
+    XCTAssertTrue(view.undoManager === commands.manager)
+    XCTAssertEqual(commands.manager.groupingLevel, 0); XCTAssertFalse(commands.manager.canUndo)
+    view.setSelectedRange(NSRange(location: before.utf16.count, length: 0))
+    let observation = CharacterUndoObservation(view: view)
+    let storage = view.boundedStorage, previousDelegate = storage.delegate
+    storage.delegate = observation
+    defer { storage.delegate = previousDelegate }
+    let event = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+      timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+      context: nil, characters: "a", charactersIgnoringModifiers: "a", isARepeat: false, keyCode: 0))
+    // The original failure came through this window→input-context→TextKit
+    // path, before the native source primitive could mutate any characters.
+    window.sendEvent(event)
+    XCTAssertGreaterThan(observation.characterNotifications, 0)
+    XCTAssertFalse(observation.exposedManagerDuringCharacters)
+    XCTAssertNil(view.inputBinding?.firstRefusal); XCTAssertNil(storage.mutationFailure)
+    XCTAssertTrue(view.undoManager === commands.manager)
+    try await commands.joinPendingCommand(); try await model.flush()
+    let edited = try await model.captureDocument(original.document.id)
+    XCTAssertEqual(edited.completeSnapshot?.text, before + "a")
+    XCTAssertEqual(model.pagedSession?.canonicalHistory?.undo.count, 1)
+    XCTAssertEqual(commands.manager.groupingLevel, 0)
+    let entryKey = UndoManager.UserInfoKey(rawValue: "bloom.paged.native-entry.v1")
+    XCTAssertNotNil(commands.manager.undoActionUserInfoValue(forKey: entryKey) as? NSObject)
+    let responderManager = try XCTUnwrap(model.pagedInput?.activeView?.undoManager)
+    XCTAssertTrue(responderManager === commands.manager)
+    responderManager.undo(); try await commands.joinPendingCommand(); try await model.flush()
+    let undone = try await model.captureDocument(original.document.id)
+    XCTAssertEqual(undone.completeSnapshot?.text, before)
+    XCTAssertFalse(commands.manager.canUndo); XCTAssertTrue(commands.manager.canRedo)
+    responderManager.redo(); try await commands.joinPendingCommand(); try await model.flush()
+    let redone = try await model.captureDocument(original.document.id)
+    XCTAssertEqual(redone.completeSnapshot?.text, before + "a")
+    XCTAssertFalse(commands.manager.canRedo); XCTAssertEqual(commands.manager.groupingLevel, 0)
+    guard (testRun?.failureCount ?? 0) == failures else {
+      throw BoomError.invalid("Actual window key/coalescing assertions failed; source and native owner retained.")
+    }
+    try await joinedClose(model); try await removeJoinedScratch(scratch)
+  }
+
+  func testActualResponderUndoAndRedoActionsRestoreCanonicalSourceAndSelection() async throws {
+    let failures = testRun?.failureCount ?? 0
+    // This SDK action control requires a real mounted first responder. The
+    // Application.run keyboard/menu journey separately requires a key window.
+    let scratch = try diagnosticRoot(), model = try await open(scratch, requiresActualKeyWindow: false)
+    let original = try XCTUnwrap(model.pagedSelectedRecord)
+    let input = try XCTUnwrap(model.pagedInput), commands = try XCTUnwrap(model.pagedCommands)
+    let view = try XCTUnwrap(input.activeView), window = try XCTUnwrap(Self.failedWindow)
+    let beforeSelection = try input.currentDocumentSelection()
+    XCTAssertEqual(view.string, ""); XCTAssertFalse(view.allowsUndo)
+    XCTAssertTrue(window.firstResponder === view); XCTAssertTrue(view.undoManager === commands.manager)
+    view.insertText("é🙂", replacementRange: NSRange(location: NSNotFound, length: 0))
+    try await commands.joinPendingCommand(); try await model.flush()
+    let edited = try XCTUnwrap(model.pagedSelectedRecord)
+    let editedCapture = try await model.captureDocument(original.document.id)
+    let editedSelection = try input.currentDocumentSelection()
+    XCTAssertEqual(editedCapture.completeSnapshot?.text, "é🙂")
+    XCTAssertEqual(editedSelection.utf16Offset, 3); XCTAssertEqual(editedSelection.utf16Length, 0)
+    XCTAssertEqual(model.pagedSession?.canonicalHistory?.undo.count, 1)
+
+    let undoAction = NSSelectorFromString("undo:"), redoAction = NSSelectorFromString("redo:")
+    let undoItem = NSMenuItem(title: "Undo", action: undoAction, keyEquivalent: "z")
+    let redoItem = NSMenuItem(title: "Redo", action: redoAction, keyEquivalent: "z")
+    redoItem.keyEquivalentModifierMask = [.command, .shift]
+    XCTAssertNil(undoItem.target); XCTAssertNil(redoItem.target)
+    XCTAssertTrue(view.validateUserInterfaceItem(undoItem)); XCTAssertFalse(view.validateUserInterfaceItem(redoItem))
+    // Start with the actual responder chain, not UndoManager.undo().
+    XCTAssertTrue(try XCTUnwrap(window.firstResponder).tryToPerform(undoAction, with: undoItem))
+    try await commands.joinPendingCommand(); try await model.flush()
+    let undoneCapture = try await model.captureDocument(original.document.id)
+    let current = try XCTUnwrap(input.activeView)
+    XCTAssertEqual(undoneCapture.completeSnapshot?.text, "")
+    XCTAssertEqual(model.pagedSelectedRecord?.document.revision, original.document.revision)
+    XCTAssertEqual(try input.currentDocumentSelection(), beforeSelection)
+    XCTAssertFalse(current === view); XCTAssertEqual(view.inputBinding?.state, .retired)
+    XCTAssertTrue(window.firstResponder === current)
+    XCTAssertFalse(current.validateUserInterfaceItem(undoItem)); XCTAssertTrue(current.validateUserInterfaceItem(redoItem))
+
+    // The retired selector cannot redirect an effective Redo to its replacement.
+    let stableRecord = model.pagedSelectedRecord, stableGeneration = model.pagedSession?.generation
+    XCTAssertFalse(view.validateUserInterfaceItem(redoItem))
+    XCTAssertTrue(view.tryToPerform(redoAction, with: redoItem))
+    try await commands.joinPendingCommand()
+    XCTAssertEqual(model.pagedSelectedRecord, stableRecord); XCTAssertEqual(model.pagedSession?.generation, stableGeneration)
+    XCTAssertEqual(try input.currentDocumentSelection(), beforeSelection)
+    XCTAssertTrue(commands.manager.canRedo)
+
+    // Exercise the public SDK action dispatcher on that same actual responder.
+    // Resolving a nil target through the application's key window is a separate
+    // packaged route; this call deliberately nominates the observed responder.
+    XCTAssertTrue(NSApp.sendAction(redoAction, to: try XCTUnwrap(window.firstResponder), from: redoItem))
+    try await commands.joinPendingCommand(); try await model.flush()
+    let redoneCapture = try await model.captureDocument(original.document.id)
+    let redoneView = try XCTUnwrap(input.activeView)
+    XCTAssertEqual(redoneCapture.completeSnapshot?.text, "é🙂")
+    XCTAssertEqual(model.pagedSelectedRecord?.document.revision, edited.document.revision)
+    XCTAssertEqual(try input.currentDocumentSelection(), editedSelection)
+    XCTAssertTrue(window.firstResponder === redoneView); XCTAssertTrue(redoneView.undoManager === commands.manager)
+    XCTAssertTrue(redoneView.validateUserInterfaceItem(undoItem)); XCTAssertFalse(redoneView.validateUserInterfaceItem(redoItem))
+    XCTAssertFalse(redoneView.allowsUndo); XCTAssertEqual(commands.manager.groupingLevel, 0)
+    XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure); XCTAssertNil(redoneView.boundedStorage.mutationFailure)
+    guard (testRun?.failureCount ?? 0) == failures else {
+      throw BoomError.invalid("Actual responder action assertions failed; source and native owners retained.")
+    }
+    try await joinedClose(model); try await removeJoinedScratch(scratch)
+  }
+
+  func testActualContainedSelectedDeletionIsImmediateAndCanonicalUndoRestoresNativeSelection() async throws {
+    let failures = testRun?.failureCount ?? 0
+    let scratch = try diagnosticRoot(), model = try await open(scratch, requiresActualKeyWindow: false)
+    let input = try XCTUnwrap(model.pagedInput), commands = try XCTUnwrap(model.pagedCommands)
+    let session = try XCTUnwrap(model.pagedSession), window = try XCTUnwrap(Self.failedWindow)
+    let initial = try XCTUnwrap(model.pagedSelectedRecord)
+    try XCTUnwrap(input.activeView).insertText("é🙂x", replacementRange: NSRange(location: NSNotFound, length: 0))
+    try await commands.joinPendingCommand(); try await model.flush()
+    let original = try XCTUnwrap(model.pagedSelectedRecord)
+    let selector = NSSelectorFromString("deleteBackward:")
+    for length in [3, 4] { // selected prefix, then the entire actual short source island
+      let view = try XCTUnwrap(input.activeView)
+      XCTAssertTrue(window.firstResponder === view); XCTAssertEqual(view.string, "é🙂x")
+      view.setSelectedRange(NSRange(location: 0, length: 0)) // a real independently observed anchor
+      view.setSelectedRange(NSRange(location: 0, length: length), affinity: .upstream, stillSelecting: false)
+      let selected = try input.currentDocumentSelection()
+      XCTAssertEqual(selected.utf16Offset, 0); XCTAssertEqual(selected.utf16Length, UInt64(length))
+      XCTAssertTrue(selected.focusAtEnd); XCTAssertEqual(selected.affinity, .upstream)
+      XCTAssertFalse(input.handlesDocumentCommand(selector))
+      let generation = session.generation
+      view.doCommand(by: selector)
+      let expected = length == 3 ? "x" : ""
+      XCTAssertEqual(session.generation, generation + 1)
+      XCTAssertEqual(view.string, expected, "Contained selected deletion must finish before any worker publication await.")
+      XCTAssertEqual(view.selectedRange(), NSRange(location: 0, length: 0))
+      let deletionSelection = try input.currentDocumentSelection()
+      try await commands.joinPendingCommand(); try await model.flush()
+      let deleted = try await model.captureDocument(initial.document.id)
+      XCTAssertEqual(deleted.completeSnapshot?.text, expected)
+      XCTAssertEqual(model.pagedSelectedRecord?.document.revision.summary.bytes, UInt64(expected.utf8.count))
+      XCTAssertEqual(model.pagedSelectedRecord?.document.revision.summary.utf16, UInt64(expected.utf16.count))
+      XCTAssertTrue(try XCTUnwrap(window.firstResponder).tryToPerform(NSSelectorFromString("undo:"), with: nil))
+      try await commands.joinPendingCommand(); try await model.flush()
+      let undone = try await model.captureDocument(initial.document.id)
+      XCTAssertEqual(undone.completeSnapshot?.text, "é🙂x")
+      XCTAssertEqual(model.pagedSelectedRecord?.document.revision, original.document.revision)
+      XCTAssertEqual(try input.currentDocumentSelection(), selected)
+      XCTAssertTrue(try XCTUnwrap(window.firstResponder).tryToPerform(NSSelectorFromString("redo:"), with: nil))
+      try await commands.joinPendingCommand(); try await model.flush()
+      let redone = try await model.captureDocument(initial.document.id)
+      XCTAssertEqual(redone.completeSnapshot?.text, expected)
+      XCTAssertEqual(try input.currentDocumentSelection(), deletionSelection)
+      XCTAssertTrue(try XCTUnwrap(window.firstResponder).tryToPerform(NSSelectorFromString("undo:"), with: nil))
+      try await commands.joinPendingCommand(); try await model.flush()
+      XCTAssertEqual(model.pagedSelectedRecord?.document.revision, original.document.revision)
+    }
+    XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+    guard (testRun?.failureCount ?? 0) == failures else {
+      throw BoomError.invalid("Actual contained deletion assertions failed; source and native owners retained.")
+    }
+    try await joinedClose(model); try await removeJoinedScratch(scratch)
   }
 
   func testActualOrdinaryLargeImportTailTypingUndoRedoAndColdHydrationPreserveExactRootsAndDraft() async throws {
@@ -119,7 +341,7 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
     let imported = try XCTUnwrap(model.pagedSelectedRecord)
     XCTAssertEqual(imported.document.revision.summary.bytes, 3_145_728)
     XCTAssertNil(model.selectedDocument, "The real paged source is never a DocumentSnapshot/viewport substitution.")
-    try focusCurrentEditor(model)
+    try await focusCurrentEditor(model)
     let viewport = try XCTUnwrap(model.pagedViewport)
     try viewport.requestScroll(toUTF16: imported.document.revision.summary.utf16 - 16)
     try await viewport.joinPresentation()
@@ -129,7 +351,25 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
     try viewport.selectVisibleUTF16(0)
     let commands = try XCTUnwrap(model.pagedCommands)
     try await commands.joinPendingCommand()
+    let clicked = try XCTUnwrap(model.pagedInput).currentDocumentSelection()
+    try viewport.requestScroll(toUTF16: imported.document.revision.summary.utf16 - 16)
+    try await viewport.joinPresentation()
+    let extensionWindow = try XCTUnwrap(viewport.visibleScrollWindow)
+    XCTAssertEqual(extensionWindow.utf16Start, clicked.utf16Offset)
+    try viewport.selectVisibleUTF16(3, extending: true)
+    try await commands.joinPendingCommand()
+    let extended = try XCTUnwrap(model.pagedInput).currentDocumentSelection()
+    XCTAssertEqual(extended.utf16Offset, clicked.utf16Offset); XCTAssertEqual(extended.utf16Length, 3)
+    XCTAssertTrue(extended.focusAtEnd)
+    try XCTUnwrap(model.pagedInput?.activeView).cut(nil)
+    try await commands.joinPendingCommand(); try await model.flush()
+    XCTAssertEqual(NSPasteboard.general.string(forType: .string), "aaa")
+    XCTAssertEqual(model.pagedSelectedRecord?.document.revision.summary.bytes, imported.document.revision.summary.bytes - 3)
+    commands.manager.undo(); try await commands.joinPendingCommand(); try await model.flush()
+    XCTAssertEqual(model.pagedSelectedRecord?.document.revision, imported.document.revision)
+    XCTAssertEqual(try XCTUnwrap(model.pagedInput).currentDocumentSelection(), extended)
     let view = try XCTUnwrap(model.pagedInput?.activeView)
+    view.setSelectedRange(NSRange(location: view.selectedRange().location, length: 0))
     let beforeCaret = view.selectedRange()
     view.insertText("Q", replacementRange: beforeCaret)
     try await model.flush()
@@ -156,7 +396,320 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
     try await joinedClose(reopened); try await removeJoinedScratch(scratch)
   }
 
-  func testActualOrdinaryRenameRetiresOldClientAndTrashReceivesFullEncryptedArchiveWithoutRemovingDraft() async throws {
+  func testActualLargeSelectAllReplaceDeleteUndoRedoPreserveGlobalSelectionWithoutLoadingWholeText() async throws {
+    let failures = testRun?.failureCount ?? 0
+    let scratch = try root()
+    var model = try await open(scratch)
+    let source = try await writeSource(scratch)
+    try await model.importDocuments([source], flag: CancellationFlag())
+    try await focusCurrentEditor(model)
+    let original = try XCTUnwrap(model.pagedSelectedRecord)
+    var commands = try XCTUnwrap(model.pagedCommands)
+    let length = original.document.revision.summary.utf16
+    _ = try await commands.navigate(toUTF16: length - 16,
+      selectingUTF16: PagedNativeNavigationSelection(utf16Offset: length - 16, utf16Length: 0))
+    try await focusCurrentEditor(model)
+    let tail = try XCTUnwrap(model.pagedInput?.activeView)
+    XCTAssertLessThanOrEqual(tail.string.utf8.count, PagedWorkingWindow.hardBytes)
+    let input = try XCTUnwrap(model.pagedInput)
+    let localCaret = tail.selectedRange().location
+    // The native setters supply a normalized range. An already owned caret
+    // is its actual anchor when extension keeps that endpoint fixed.
+    tail.setSelectedRange(NSRange(location: localCaret, length: 3), affinity: .upstream, stillSelecting: true)
+    let forward = try input.currentDocumentSelection()
+    XCTAssertEqual(forward.utf16Offset, length - 16); XCTAssertEqual(forward.utf16Length, 3)
+    XCTAssertTrue(forward.focusAtEnd); XCTAssertEqual(forward.affinity, .upstream)
+    tail.setSelectedRange(NSRange(location: localCaret + 3, length: 0), affinity: .upstream, stillSelecting: false)
+    tail.setSelectedRange(NSRange(location: localCaret, length: 3), affinity: .downstream, stillSelecting: true)
+    let backward = try input.currentDocumentSelection()
+    XCTAssertEqual(backward.utf16Offset, length - 16); XCTAssertEqual(backward.utf16Length, 3)
+    XCTAssertFalse(backward.focusAtEnd); XCTAssertEqual(backward.affinity, .downstream)
+    tail.selectAll(nil)
+    let all = try input.currentDocumentSelection()
+    XCTAssertEqual(all.utf16Offset, 0)
+    XCTAssertEqual(all.utf16Length, length, "The direct menu action selects the entire file, not its mounted tail.")
+    tail.doCommand(by: NSSelectorFromString("moveForward:"))
+    try await commands.joinPendingCommand()
+    let collapsedEnd = try XCTUnwrap(model.pagedInput).currentDocumentSelection()
+    XCTAssertEqual(collapsedEnd.utf16Offset, length); XCTAssertEqual(collapsedEnd.utf16Length, 0)
+    let endView = try XCTUnwrap(model.pagedInput?.activeView)
+    endView.selectAll(nil); endView.doCommand(by: NSSelectorFromString("moveBackward:"))
+    try await commands.joinPendingCommand()
+    let collapsedStart = try XCTUnwrap(model.pagedInput).currentDocumentSelection()
+    XCTAssertEqual(collapsedStart.utf16Offset, 0); XCTAssertEqual(collapsedStart.utf16Length, 0)
+    // Logical direction and visual affinity are independent owned facts.
+    // Undo must not turn the upstream visual preference into a start focus.
+    try XCTUnwrap(model.pagedInput).setDocumentSelection(PagedNativeNavigationSelection(
+      utf16Offset: 0, utf16Length: length, focusAtEnd: true, affinity: .upstream))
+    let selected = try XCTUnwrap(model.pagedInput).currentDocumentSelection()
+    XCTAssertEqual(selected.utf16Offset, 0); XCTAssertEqual(selected.utf16Length, length)
+    XCTAssertTrue(selected.focusAtEnd); XCTAssertEqual(selected.affinity, .upstream)
+    let selectionOwner = try XCTUnwrap(model.pagedInput)
+    let beforeLogicalChange = try selectionOwner.observeSelection()
+    let startFocused = PagedNativeNavigationSelection(utf16Offset: 0, utf16Length: length,
+      focusAtEnd: false, affinity: .upstream)
+    try selectionOwner.setDocumentSelection(startFocused)
+    let afterLogicalChange = try selectionOwner.observeSelection()
+    XCTAssertEqual(afterLogicalChange.range, beforeLogicalChange.range)
+    XCTAssertEqual(afterLogicalChange.affinity, beforeLogicalChange.affinity)
+    XCTAssertEqual(afterLogicalChange.selectionEpoch, beforeLogicalChange.selectionEpoch + 1)
+    try selectionOwner.setDocumentSelection(startFocused)
+    XCTAssertEqual(try selectionOwner.observeSelection(), afterLogicalChange)
+    try selectionOwner.setDocumentSelection(selected)
+    let replacement = "Café 🙂\nA small replacement."
+    try XCTUnwrap(model.pagedInput?.activeView).insertText(replacement, replacementRange: NSRange(location: NSNotFound, length: 0))
+    try await commands.joinPendingCommand(); try await model.flush()
+    let replaced = try await model.captureDocument(original.document.id)
+    XCTAssertEqual(replaced.completeSnapshot?.text, replacement)
+    commands.manager.undo(); try await commands.joinPendingCommand(); try await model.flush()
+    XCTAssertEqual(model.pagedSelectedRecord?.document.revision, original.document.revision)
+    let restoredSelection = try XCTUnwrap(model.pagedInput).currentDocumentSelection()
+    XCTAssertEqual(restoredSelection.utf16Offset, 0); XCTAssertEqual(restoredSelection.utf16Length, length)
+    XCTAssertTrue(restoredSelection.focusAtEnd); XCTAssertEqual(restoredSelection.affinity, .upstream)
+    XCTAssertEqual(model.pagedInput?.activeView?.selectionAffinity, .upstream)
+    let focused = try XCTUnwrap(model.pagedSession).documentCoordinates()
+    XCTAssertEqual(focused.utf16Start + UInt64(focused.localUTF16), length)
+    XCTAssertLessThanOrEqual(try XCTUnwrap(model.pagedInput?.activeView).string.utf8.count, PagedWorkingWindow.hardBytes)
+    try await model.flush(); try await joinedClose(model)
+    model = try await open(scratch); commands = try XCTUnwrap(model.pagedCommands)
+    let reopenedSelection = try XCTUnwrap(model.pagedInput).currentDocumentSelection()
+    XCTAssertEqual(reopenedSelection, restoredSelection)
+    XCTAssertEqual(model.pagedInput?.activeView?.selectionAffinity, .upstream)
+    let reopenedFocus = try XCTUnwrap(model.pagedSession).documentCoordinates()
+    XCTAssertEqual(reopenedFocus.utf16Start + UInt64(reopenedFocus.localUTF16), length)
+    commands.manager.redo(); try await commands.joinPendingCommand(); try await model.flush()
+    let redoSelection = try XCTUnwrap(model.pagedInput).currentDocumentSelection()
+    XCTAssertEqual(redoSelection.utf16Offset, UInt64(replacement.utf16.count)); XCTAssertEqual(redoSelection.utf16Length, 0)
+    XCTAssertFalse(redoSelection.focusAtEnd); XCTAssertEqual(redoSelection.affinity, .downstream)
+    let current = try XCTUnwrap(model.pagedInput?.activeView)
+    current.selectAll(nil); current.deleteBackward(nil)
+    try await commands.joinPendingCommand(); try await model.flush()
+    let deleted = try await model.captureDocument(original.document.id)
+    XCTAssertEqual(deleted.completeSnapshot?.text, "")
+    commands.manager.undo(); try await commands.joinPendingCommand(); try await model.flush()
+    let restored = try await model.captureDocument(original.document.id)
+    XCTAssertEqual(restored.completeSnapshot?.text, replacement)
+    let deletionSelection = try XCTUnwrap(model.pagedInput).currentDocumentSelection()
+    XCTAssertEqual(deletionSelection.utf16Offset, 0)
+    XCTAssertEqual(deletionSelection.utf16Length, UInt64(replacement.utf16.count))
+    commands.manager.redo(); try await commands.joinPendingCommand(); try await model.flush()
+    let deletedAgain = try await model.captureDocument(original.document.id)
+    XCTAssertEqual(deletedAgain.completeSnapshot?.text, "")
+    guard (testRun?.failureCount ?? 0) == failures else { throw BoomError.invalid("Actual global replacement assertions failed; source/window retained.") }
+    try await joinedClose(model); try await removeJoinedScratch(scratch)
+  }
+
+  func testActualGraphemeDeletionAndShiftCutUndoAcrossNFDAndZWJWindowEdges() async throws {
+    let failures = testRun?.failureCount ?? 0
+    let scratch = try root(), model = try await open(scratch)
+    let nfd = "e\u{301}", zwj = "👩🏽‍💻", edge = nfd + zwj
+    let source = try await writeSource(scratch, edgeText: edge)
+    try await model.importDocuments([source], flag: CancellationFlag())
+    try await focusCurrentEditor(model)
+    let original = try XCTUnwrap(model.pagedSelectedRecord)
+    let commands = try XCTUnwrap(model.pagedCommands), edgeStart: UInt64 = 16_382
+    let nfdEnd = edgeStart + UInt64(nfd.utf16.count), edgeEnd = edgeStart + UInt64(edge.utf16.count)
+    XCTAssertEqual(original.document.revision.summary.bytes, 3_145_728 - 2 + UInt64(edge.utf8.count))
+    XCTAssertNil(model.selectedDocument)
+
+    // The actual mounted String begins at the combining mark. Backspace
+    // must nevertheless remove the base and mark from the full source.
+    _ = try await commands.navigate(toUTF16: edgeStart + 1,
+      selectingUTF16: PagedNativeNavigationSelection(utf16Offset: nfdEnd, utf16Length: 0, affinity: .upstream))
+    try XCTUnwrap(model.pagedInput?.activeView).doCommand(by: NSSelectorFromString("deleteBackward:"))
+    try await commands.joinPendingCommand(); try await model.flush()
+    let afterNFD = try XCTUnwrap(model.pagedSelectedRecord)
+    XCTAssertEqual(afterNFD.document.revision.summary.bytes, original.document.revision.summary.bytes - UInt64(nfd.utf8.count))
+    let nfdDeleted = try await sourceBytes(model, atUTF16: edgeStart)
+    XCTAssertEqual(Data(nfdDeleted.prefix(zwj.utf8.count)), Data(zwj.utf8))
+    commands.manager.undo(); try await commands.joinPendingCommand(); try await model.flush()
+    XCTAssertEqual(model.pagedSelectedRecord?.document.revision, original.document.revision)
+
+    // The next projection begins at the modifier, excluding the initial
+    // pictograph. Its whole ZWJ cluster still forms one deletion/Undo group.
+    _ = try await commands.navigate(toUTF16: nfdEnd + 2,
+      selectingUTF16: PagedNativeNavigationSelection(utf16Offset: edgeEnd, utf16Length: 0))
+    let truncatedZWJ = try XCTUnwrap(model.pagedInput?.activeView)
+    XCTAssertFalse(truncatedZWJ.hasContainedCharacterCommand(NSSelectorFromString("deleteBackward:")))
+    XCTAssertTrue(try XCTUnwrap(model.pagedInput).handlesDocumentCommand(NSSelectorFromString("deleteBackward:")))
+    try XCTUnwrap(model.pagedInput?.activeView).doCommand(by: NSSelectorFromString("deleteBackward:"))
+    try await commands.joinPendingCommand(); try await model.flush()
+    let afterZWJ = try XCTUnwrap(model.pagedSelectedRecord)
+    XCTAssertEqual(afterZWJ.document.revision.summary.bytes, original.document.revision.summary.bytes - UInt64(zwj.utf8.count))
+    let zwjDeleted = try await sourceBytes(model, atUTF16: edgeStart)
+    XCTAssertEqual(Data(zwjDeleted.prefix(nfd.utf8.count)), Data(nfd.utf8))
+    XCTAssertEqual(try XCTUnwrap(zwjDeleted.dropFirst(nfd.utf8.count).first), 97)
+    commands.manager.undo(); try await commands.joinPendingCommand(); try await model.flush()
+    XCTAssertEqual(model.pagedSelectedRecord?.document.revision, original.document.revision)
+
+    _ = try await commands.navigate(toUTF16: edgeStart - 1,
+      selectingUTF16: PagedNativeNavigationSelection(utf16Offset: edgeStart, utf16Length: 0, affinity: .upstream))
+    for _ in 0..<2 {
+      try XCTUnwrap(model.pagedInput?.activeView).doCommand(by: NSSelectorFromString("moveForwardAndModifySelection:"))
+      try await commands.joinPendingCommand()
+    }
+    let selected = try XCTUnwrap(model.pagedInput).currentDocumentSelection()
+    XCTAssertEqual(selected.utf16Offset, edgeStart); XCTAssertEqual(selected.utf16Length, UInt64(edge.utf16.count))
+    XCTAssertTrue(selected.focusAtEnd); XCTAssertEqual(selected.affinity, .upstream)
+    try XCTUnwrap(model.pagedInput?.activeView).cut(nil)
+    try await commands.joinPendingCommand(); try await model.flush()
+    XCTAssertEqual(NSPasteboard.general.string(forType: .string).map { Data($0.utf8) }, Data(edge.utf8))
+    XCTAssertEqual(model.pagedSelectedRecord?.document.revision.summary.bytes,
+      original.document.revision.summary.bytes - UInt64(edge.utf8.count))
+    commands.manager.undo(); try await commands.joinPendingCommand(); try await model.flush()
+    XCTAssertEqual(model.pagedSelectedRecord?.document.revision, original.document.revision)
+    XCTAssertEqual(try XCTUnwrap(model.pagedInput).currentDocumentSelection(), selected)
+    let restored = try await sourceBytes(model, atUTF16: edgeStart)
+    XCTAssertEqual(Data(restored.prefix(edge.utf8.count)), Data(edge.utf8))
+    XCTAssertLessThanOrEqual(try XCTUnwrap(model.pagedInput?.activeView).string.utf8.count, PagedWorkingWindow.hardBytes)
+    guard (testRun?.failureCount ?? 0) == failures else {
+      throw BoomError.invalid("Actual grapheme/Shift/Cut assertions failed; source, clipboard result and native owners retained.")
+    }
+    try await joinedClose(model); try await removeJoinedScratch(scratch)
+  }
+
+  func testActualVisualArrowsPreserveCocoaBidiTargetsAndOwnedShiftAnchorOnPagedSource() async throws {
+    let failures = testRun?.failureCount ?? 0
+    let scratch = try root(), model = try await open(scratch)
+    let source = try await writeSource(scratch, edgeText: "אבג e\u{301}👩🏽‍💻 xyz\n")
+    try await model.importDocuments([source], flag: CancellationFlag())
+    try await focusCurrentEditor(model)
+    let record = try XCTUnwrap(model.pagedSelectedRecord), commands = try XCTUnwrap(model.pagedCommands)
+    let input = try XCTUnwrap(model.pagedInput), edgeStart: UInt64 = 16_382
+    let initial = PagedNativeNavigationSelection(utf16Offset: edgeStart + 1, utf16Length: 0, affinity: .upstream)
+    _ = try await commands.navigate(toUTF16: edgeStart - 8, selectingUTF16: initial)
+    let view = try XCTUnwrap(input.activeView)
+    Self.failedWindow?.contentView?.layoutSubtreeIfNeeded()
+    if let container = view.textContainer { view.layoutManager?.ensureLayout(for: container) }
+    let undoCount = try XCTUnwrap(model.pagedSession).canonicalHistory?.undo.count
+
+    // The native oracle is THIS actual product view, source and layout. In
+    // this RTL run, visual Left must not be aliased to logical Backward.
+    let left = NSSelectorFromString("moveLeft:")
+    try view.performContainedDocumentCommand(left)
+    let nativeLeft = try input.selectionForVisualMovement()
+    XCTAssertGreaterThan(nativeLeft.focusUTF16, initial.focusUTF16)
+    try input.setDocumentSelection(initial)
+    let restoredEpoch = try input.observeSelection().selectionEpoch
+    view.doCommand(by: left)
+    try await commands.joinPendingCommand()
+    let actualLeft = try input.currentDocumentSelection()
+    XCTAssertEqual(actualLeft.focusUTF16, nativeLeft.focusUTF16)
+    XCTAssertEqual(actualLeft.affinity, nativeLeft.affinity)
+    XCTAssertGreaterThan(try input.observeSelection().selectionEpoch, restoredEpoch)
+
+    try input.setDocumentSelection(initial)
+    let shiftedLeft = NSSelectorFromString("moveLeftAndModifySelection:")
+    try XCTUnwrap(input.activeView).performContainedDocumentCommand(shiftedLeft)
+    let nativeShift = try input.selectionForVisualMovement()
+    XCTAssertEqual(nativeShift.anchorUTF16, initial.focusUTF16)
+    XCTAssertGreaterThan(nativeShift.focusUTF16, initial.focusUTF16)
+    try input.setDocumentSelection(initial)
+    try XCTUnwrap(input.activeView).doCommand(by: shiftedLeft)
+    try await commands.joinPendingCommand()
+    let actualShift = try input.currentDocumentSelection()
+    XCTAssertEqual(actualShift, nativeShift)
+    XCTAssertEqual(actualShift.anchorUTF16, initial.focusUTF16)
+
+    let rightInitial = PagedNativeNavigationSelection(utf16Offset: edgeStart + 2, utf16Length: 0)
+    try input.setDocumentSelection(rightInitial)
+    let right = NSSelectorFromString("moveRight:")
+    try XCTUnwrap(input.activeView).performContainedDocumentCommand(right)
+    let nativeRight = try input.selectionForVisualMovement()
+    XCTAssertLessThan(nativeRight.focusUTF16, rightInitial.focusUTF16)
+    try input.setDocumentSelection(rightInitial)
+    try XCTUnwrap(input.activeView).doCommand(by: right)
+    try await commands.joinPendingCommand()
+    let actualRight = try input.currentDocumentSelection()
+    XCTAssertEqual(actualRight.focusUTF16, nativeRight.focusUTF16)
+    XCTAssertEqual(actualRight.affinity, nativeRight.affinity)
+    try input.setDocumentSelection(rightInitial)
+    let shiftedRight = NSSelectorFromString("moveRightAndModifySelection:")
+    try XCTUnwrap(input.activeView).performContainedDocumentCommand(shiftedRight)
+    let nativeRightShift = try input.selectionForVisualMovement()
+    XCTAssertEqual(nativeRightShift.anchorUTF16, rightInitial.focusUTF16)
+    XCTAssertLessThan(nativeRightShift.focusUTF16, rightInitial.focusUTF16)
+    try input.setDocumentSelection(rightInitial)
+    try XCTUnwrap(input.activeView).doCommand(by: shiftedRight)
+    try await commands.joinPendingCommand()
+    XCTAssertEqual(try input.currentDocumentSelection(), nativeRightShift)
+
+    // A local target inside the full NFD/ZWJ cluster is normalized without
+    // converting that cluster, paragraph or document into a larger String.
+    let nfdStart = edgeStart + 4, nfdEnd = nfdStart + 2, zwjEnd = nfdEnd + UInt64("👩🏽‍💻".utf16.count)
+    let session = try XCTUnwrap(model.pagedSession)
+    let fullNFD = try await session.sealedGraphemeBoundary(atNativeUTF16: nfdStart + 1, forward: true)
+    let fullZWJ = try await session.sealedGraphemeBoundary(atNativeUTF16: nfdEnd + 2, forward: true)
+    let fullNFDStart = try await session.sealedGraphemeBoundary(atNativeUTF16: nfdStart + 1, forward: false)
+    let fullZWJStart = try await session.sealedGraphemeBoundary(atNativeUTF16: nfdEnd + 2, forward: false)
+    XCTAssertEqual(fullNFD, nfdEnd); XCTAssertEqual(fullZWJ, zwjEnd)
+    XCTAssertEqual(fullNFDStart, nfdStart); XCTAssertEqual(fullZWJStart, nfdEnd)
+    XCTAssertEqual(model.pagedSelectedRecord, record)
+    XCTAssertEqual(session.canonicalHistory?.undo.count, undoCount)
+    XCTAssertFalse(commands.manager.canUndo); XCTAssertNil(input.firstRefusal)
+
+    // Cocoa chooses an endpoint of the painted intersection; the managed
+    // command collapses to that corresponding endpoint of the whole source.
+    let global = PagedNativeNavigationSelection(utf16Offset: 0,
+      utf16Length: record.document.revision.summary.utf16, focusAtEnd: true, affinity: .upstream)
+    for arrow in [left, right] {
+      try input.setDocumentSelection(global)
+      let client = try XCTUnwrap(input.activeView), painted = client.selectedRange()
+      let origin = try session.documentCoordinates().utf16Start
+      try client.performContainedDocumentCommand(arrow)
+      let endpoint = try input.selectionForVisualMovement()
+      XCTAssertEqual(endpoint.utf16Length, 0)
+      let choseLower = endpoint.focusUTF16 == origin + UInt64(painted.location)
+      XCTAssertTrue(choseLower || endpoint.focusUTF16 == origin + UInt64(NSMaxRange(painted)))
+      let expected = choseLower ? global.utf16Offset : global.utf16Offset + global.utf16Length
+      try input.setDocumentSelection(global)
+      client.doCommand(by: arrow)
+      try await commands.joinPendingCommand()
+      let collapsed = try input.currentDocumentSelection()
+      XCTAssertEqual(collapsed.utf16Offset, expected); XCTAssertEqual(collapsed.utf16Length, 0)
+      XCTAssertEqual(collapsed.affinity, endpoint.affinity)
+      XCTAssertEqual(model.pagedSelectedRecord, record); XCTAssertFalse(commands.manager.canUndo)
+    }
+
+    // With the focus mounted at EOF, Shift+Left/Right use a true local caret
+    // probe but preserve the global BOF anchor, not the painted local anchor.
+    _ = try await commands.navigate(toUTF16: global.utf16Length - 4_096,
+      selectingUTF16: PagedNativeNavigationSelection(utf16Offset: global.utf16Length, utf16Length: 0))
+    var logical = global
+    for (arrow, modified) in [(left, shiftedLeft), (right, shiftedRight)] {
+      try input.setDocumentSelection(PagedNativeNavigationSelection(utf16Offset: logical.focusUTF16,
+        utf16Length: 0, affinity: logical.affinity))
+      let client = try XCTUnwrap(input.activeView)
+      try client.performContainedDocumentCommand(arrow)
+      let target = try input.selectionForVisualMovement()
+      let expected = PagedNativeNavigationSelection(utf16Offset: min(logical.anchorUTF16, target.focusUTF16),
+        utf16Length: max(logical.anchorUTF16, target.focusUTF16) - min(logical.anchorUTF16, target.focusUTF16),
+        focusAtEnd: target.focusUTF16 >= logical.anchorUTF16, affinity: target.affinity)
+      try input.setDocumentSelection(logical)
+      client.doCommand(by: modified)
+      try await commands.joinPendingCommand()
+      logical = try input.currentDocumentSelection()
+      XCTAssertEqual(logical, expected); XCTAssertEqual(logical.anchorUTF16, 0)
+      XCTAssertEqual(model.pagedSelectedRecord, record); XCTAssertFalse(commands.manager.canUndo)
+    }
+    _ = try await commands.navigate(toUTF16: edgeStart - 8, selectingUTF16: initial)
+    let heldView = try XCTUnwrap(input.activeView)
+
+    // Changing both native endpoints supplies no actual independent anchor.
+    // Even opposite affinity cannot justify inventing one for Shift+Arrow.
+    heldView.setSelectedRange(NSRange(location: 10, length: 2), affinity: .downstream, stillSelecting: false)
+    let unknown = try input.observeSelection()
+    XCTAssertThrowsError(try commands.requestVisualGraphemeMovement(shiftedLeft))
+    XCTAssertEqual(try input.observeSelection(), unknown)
+    XCTAssertNil(input.firstRefusal); XCTAssertFalse(commands.isNavigating)
+    try input.setDocumentSelection(initial)
+    guard (testRun?.failureCount ?? 0) == failures else {
+      throw BoomError.invalid("Actual visual-arrow assertions failed; source, Cocoa target and physical owners retained.")
+    }
+    try await joinedClose(model); try await removeJoinedScratch(scratch)
+  }
+
+  func testActualOrdinaryRenameRetiresOldClientAndTrashRetainsFileSourceWithoutRemovingDraft() async throws {
     let failureCount = testRun?.failureCount ?? 0
     let scratch = try root(), model = try await open(scratch)
     let oldView = try XCTUnwrap(model.pagedInput?.activeView)
@@ -192,11 +745,10 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
     model.renameDocument(before.document.id, to: "Renamed")
     try await model.joinWorkspaceOperation()
     let renamed = try XCTUnwrap(model.pagedSelectedRecord)
-    XCTAssertEqual(renamed.document.title, "Renamed")
+    XCTAssertEqual(model.selectedDocumentIndex?.title, "Renamed")
     XCTAssertEqual(renamed.document.revision, before.document.revision)
     XCTAssertEqual(renamed.historyPage, before.historyPage)
-    XCTAssertEqual(oldView.inputBinding?.state, .retired)
-    oldContext.client.insertText("late old context", replacementRange: NSRange(location: 0, length: 0))
+    XCTAssertEqual(oldView.inputBinding?.state, .active)
     XCTAssertEqual(model.pagedSelectedRecord, renamed)
     // Use the actual public Model transition, preserving its real confirmation.
     // Modal confirmation cannot be fabricated by this component control. The
@@ -216,104 +768,68 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
     XCTAssertEqual(model.draft, retainedDraft); XCTAssertEqual(composer.string, retainedDisplay)
     XCTAssertNil(composer.onSend); XCTAssertNil(composer.onCancel); XCTAssertNil(composer.onAttachments); XCTAssertNil(composer.onFocus)
     let engine = try XCTUnwrap(model.pagedEngine), publisher = try XCTUnwrap(model.pagedPublisher)
-    let archive = try await engine.loadWorkspaceDocumentArchiveRetaining(publisher, documentID: before.document.id)
-    let exact = try XCTUnwrap(archive.value)
-    XCTAssertEqual(exact.archive.retainedRecord, renamed)
-    try await engine.abandonJoinedRootOutput(archive.lease)
+    let state = try await model.store.loadState()
+    XCTAssertTrue(state.archivedDocuments?.contains(where: { $0.id == before.document.id }) == true)
+    let retained = try await engine.currentDocumentRecordRetaining(publisher, documentID: before.document.id)
+    XCTAssertEqual(retained.value.document.revision, renamed.document.revision)
+    try await engine.abandonJoinedRootOutput(retained.lease)
     let owner = ComposerOwner(kind: .document, id: before.document.id)
-    let draft = try await engine.loadWorkspaceDraftRetaining(publisher, owner: owner)
-    XCTAssertEqual(draft.value?.header.draftOwner, owner)
-    try await engine.abandonJoinedRootOutput(draft.lease)
+    XCTAssertEqual(state.composerDrafts?.first(where: { $0.owner == owner })?.text, "Keep this source owner's unsent text.")
     guard (testRun?.failureCount ?? 0) == failureCount else { throw BoomError.invalid("Actual ordinary assertions failed; owner/evidence retained.") }
     try await joinedClose(model); try await removeJoinedScratch(scratch)
   }
 
-  func testActualEnteredSaveJoinsRenameAndShutdownAndZeroEntryCancellationKeepsWorkspaceUsable() async throws {
+  func testActualJoinedEditSaveRenameShutdownAndZeroEntryCancellationPreserveColdSource() async throws {
     let failureCount = testRun?.failureCount ?? 0
     let scratch = try root(), model = try await open(scratch)
-    let engine = try XCTUnwrap(model.pagedEngine), before = try XCTUnwrap(model.pagedSelectedRecord)
-    let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
-    let gate = Task.detached { try await engine._rootCustodyControlBarrier(entered: entered, release: release) }
-    var gateReleased = false
-    do {
-      try await Task.detached {
-        guard entered.wait(timeout: .now() + .seconds(1)) == .success else { throw BoomError.unavailable("The actual executor gate did not enter.") }
-      }.value
-      model.draft = "The actual autosave must precede rename."
-      // The time bound only limits this admission observation. The actual Root
-      // entry proves the autosave passed its guard and yielded to its real read;
-      // the later task/result joins below prove completion, never elapsed time.
-      let deadline = ContinuousClock().now.advanced(by: .seconds(1))
-      var observed = false
-      while ContinuousClock().now < deadline {
-        if engine.custodySnapshot.items.contains(where: {
-          $0.phase == .admitted && !$0.producerJoined && $0.claims == [.workspace]
-        }) { observed = true; break }
-        await Task.yield()
-      }
-      guard observed else { throw BoomError.unavailable("The genuine scheduled autosave never admitted its held settings read.") }
-      model.renameDocument(before.document.id, to: "After autosave")
-      release.signal(); gateReleased = true
-      try await gate.value
-      try await model.joinWorkspaceOperation()
-      XCTAssertEqual(model.pagedSelectedRecord?.document.title, "After autosave")
-      XCTAssertEqual(model.pagedSelectedRecord?.document.revision, before.document.revision)
-      // Both calls happen synchronously on Main before the new work task can
-      // enter its body. There is no import/source/SQL outcome to cancel here.
-      let unchanged = try XCTUnwrap(model.pagedSelectedRecord)
-      try model.newDocument(); model.cancel()
-      try await model.joinWorkspaceOperation()
-      XCTAssertEqual(model.pagedSelectedRecord, unchanged)
-      try await model.flush()
-    } catch {
-      let original = error
-      if !gateReleased { release.signal(); gateReleased = true }
-      do { try await gate.value } catch { throw BoundedWorkspaceCleanupFailure(original: original, cleanup: error) }
-      throw original
-    }
+    let engine = try XCTUnwrap(model.pagedEngine)
+    let documentID = try XCTUnwrap(model.pagedSelectedRecord).document.id
+    let view = try XCTUnwrap(model.pagedInput?.activeView)
+    let source = "The actual é🙂 source survives ordered saves."
+    view.insertText(source, replacementRange: view.selectedRange())
+    try await model.flush()
+    let before = try XCTUnwrap(model.pagedSelectedRecord)
+    model.draft = "The actual reserved save must precede rename."
+    // Reserve the real save and transition on Main before either task yields.
+    // Their actual joins and cold readback are the oracle; this does not force
+    // or claim the removed SQL-era held-queue admission interleaving.
+    let actualSave = try model.beginPagedWorkspaceSave()
+    model.renameDocument(documentID, to: "After reserved save")
+    await actualSave.value
+    try await model.joinWorkspaceOperation()
+    XCTAssertEqual(model.pagedSelectedRecord?.document.title, "After reserved save")
+    XCTAssertEqual(model.pagedSelectedRecord?.document.revision, before.document.revision)
+    let afterRename = try await model.captureDocument(documentID)
+    XCTAssertEqual(afterRename.completeSnapshot?.text, source)
+    // Both calls run synchronously before the new operation enters its body.
+    let unchanged = try XCTUnwrap(model.pagedSelectedRecord)
+    try model.newDocument(); model.cancel()
+    try await model.joinWorkspaceOperation()
+    XCTAssertEqual(model.pagedSelectedRecord, unchanged)
+    try await model.flush()
 
-    let closingEntered = DispatchSemaphore(value: 0), closingRelease = DispatchSemaphore(value: 0)
-    let closingGate = Task.detached { try await engine._rootCustodyControlBarrier(entered: closingEntered, release: closingRelease) }
-    var closingReleased = false
-    var closingTask: Task<Void, Error>?
-    do {
-      try await Task.detached {
-        guard closingEntered.wait(timeout: .now() + .seconds(1)) == .success else { throw BoomError.unavailable("The actual close-order executor gate did not enter.") }
-      }.value
-      model.draft = "The entered save must durably finish before shutdown."
-      let actualSave = try model.beginPagedWorkspaceSave()
-      let deadline = ContinuousClock().now.advanced(by: .seconds(1))
-      var observed = false
-      while ContinuousClock().now < deadline {
-        if engine.custodySnapshot.items.contains(where: {
-          $0.phase == .admitted && !$0.producerJoined && $0.claims == [.workspace]
-        }) { observed = true; break }
-        await Task.yield()
-      }
-      guard observed else { throw BoomError.unavailable("The reserved save did not enter its real held read before shutdown.") }
-      closingTask = Task { try await model.shutdown() }
-      closingRelease.signal(); closingReleased = true
-      await actualSave.value
-      try await closingGate.value
-      try await XCTUnwrap(closingTask).value
-      XCTAssertNil(model.pagedEngine); XCTAssertNil(model.pagedViewport)
-      XCTAssertTrue(engine.custodySnapshot.items.isEmpty); XCTAssertEqual(engine.custodySnapshot.jobs, 0)
-    } catch {
-      let original = error
-      if !closingReleased { closingRelease.signal(); closingReleased = true }
-      do { try await closingGate.value } catch { throw BoundedWorkspaceCleanupFailure(original: original, cleanup: error) }
-      if let closingTask {
-        do { try await closingTask.value } catch { throw BoundedWorkspaceCleanupFailure(original: original, cleanup: error) }
-      }
-      throw original
+    model.draft = "The reserved save must durably finish before shutdown."
+    let finalSave = try model.beginPagedWorkspaceSave()
+    let closing = Task { try await model.shutdown() }
+    await finalSave.value
+    try await closing.value
+    XCTAssertNil(model.pagedEngine); XCTAssertNil(model.pagedViewport)
+    XCTAssertTrue(engine.custodySnapshot.items.isEmpty)
+    XCTAssertEqual(engine.custodySnapshot.jobs, 0)
+    guard (testRun?.failureCount ?? 0) == failureCount else {
+      throw BoomError.invalid("Actual ordered save/close assertions failed; owner and public source retained.")
     }
-    guard (testRun?.failureCount ?? 0) == failureCount else { throw BoomError.invalid("Actual ordered save/close assertions failed; owner and public source retained.") }
-    Self.failedWindow?.orderOut(nil); Self.failedWindow?.close(); Self.failedWindow = nil; Self.failedModel = nil
+    Self.failedWindow?.orderOut(nil); Self.failedWindow?.close()
+    Self.failedWindow = nil; Self.failedModel = nil
     let reopened = try await open(scratch)
-    XCTAssertEqual(reopened.pagedSelectedRecord?.document.title, "After autosave")
+    XCTAssertEqual(reopened.selectedDocumentIndex?.title, "After reserved save")
     XCTAssertEqual(reopened.pagedSelectedRecord?.document.revision, before.document.revision)
-    XCTAssertEqual(reopened.draft, "The entered save must durably finish before shutdown.")
-    guard (testRun?.failureCount ?? 0) == failureCount else { throw BoomError.invalid("Actual cold draft receiving failed; encrypted records and owner retained.") }
+    XCTAssertEqual(reopened.draft, "The reserved save must durably finish before shutdown.")
+    let coldSource = try await reopened.captureDocument(documentID)
+    XCTAssertEqual(coldSource.completeSnapshot?.text, source)
+    guard (testRun?.failureCount ?? 0) == failureCount else {
+      throw BoomError.invalid("Actual cold source/draft receiving failed; file records and owner retained.")
+    }
     try await joinedClose(reopened); try await removeJoinedScratch(scratch)
   }
 
@@ -340,4 +856,347 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
     XCTAssertNotNil(model.pagedEngine)
     print("RETAINED_TERMINAL actual ordinary marked input/source/controller at \(scratch.path); no false close or scratch deletion.")
   }
+
+  /// This is the ordinary Send boundary through its actual Work prelude and
+  /// native finish/flush, without crossing canInfer or loading a model. The
+  /// empty attachment entry invokes the same real chat-destination factory as
+  /// ensureChatForSend; attach itself admits no attachment work for [] input.
+  private func runActualChatNativeTransition(source: String, marked: Bool = false,
+    directUnmark: Bool = false) async throws {
+    let failures = testRun?.failureCount ?? 0
+    let scratch = try diagnosticRoot(), model = try await open(scratch, requiresActualKeyWindow: false)
+    let record = try XCTUnwrap(model.pagedSelectedRecord)
+    let input = try XCTUnwrap(model.pagedInput), view = try XCTUnwrap(input.activeView)
+    let window = try XCTUnwrap(Self.failedWindow), host = try XCTUnwrap(window.contentView)
+    XCTAssertEqual(view.string, ""); XCTAssertTrue(model.state.chats.isEmpty)
+    XCTAssertNil(model.selectedMLXRunner); XCTAssertNil(model.completionRunner)
+    if !source.isEmpty {
+      view.insertText(source, replacementRange: NSRange(location: NSNotFound, length: 0))
+      try await model.pagedCommands?.joinPendingCommand(); try await model.flush()
+    }
+    if marked {
+      view.setMarkedText("に", selectedRange: NSRange(location: 1, length: 0),
+        replacementRange: NSRange(location: NSNotFound, length: 0))
+      XCTAssertTrue(view.hasMarkedText())
+    } else { XCTAssertFalse(view.hasMarkedText()) }
+    XCTAssertNil(view.inputBinding?.firstRefusal); XCTAssertNil(view.boundedStorage.mutationFailure)
+    model.draft = "hello"
+    host.layoutSubtreeIfNeeded()
+    print("SDK_SEND_NATIVE_BOUNDARY chat-destination")
+    model.attachToCurrentChat([])
+    XCTAssertEqual(model.state.chats.count, 1)
+    XCTAssertEqual(model.selectedChat?.attachedDocumentID, record.document.id)
+    XCTAssertEqual(model.draft, "hello")
+    host.layoutSubtreeIfNeeded()
+    let composer = try XCTUnwrap(chatTextView(in: host))
+    XCTAssertFalse(composer.textStorage === view.textStorage)
+    guard window.makeFirstResponder(composer), window.firstResponder === composer else {
+      throw BoomError.unavailable("The actual Send-boundary composer did not acquire its window responder.")
+    }
+    var enteredBodies = 0
+    print("SDK_SEND_NATIVE_BOUNDARY work-prelude")
+    model.work("Public native Send-boundary diagnostic") { flag in
+      enteredBodies += 1
+      try flag.check()
+      print("SDK_SEND_NATIVE_BOUNDARY finish-composition")
+      if directUnmark { view.unmarkText() }
+      else { model.finishComposition() }
+      try await model.flush()
+      host.layoutSubtreeIfNeeded()
+      let busyComposer = try XCTUnwrap(self.chatTextView(in: host))
+      XCTAssertTrue(busyComposer.isEditable)
+      XCTAssertFalse(busyComposer.textStorage === view.textStorage)
+      print("SDK_SEND_NATIVE_BOUNDARY clear-composer")
+      model.draft = ""
+    }
+    XCTAssertTrue(model.isBusy)
+    try await model.joinWorkspaceOperation() // Actual retained foreground Task.
+    try await model.flush()
+    host.layoutSubtreeIfNeeded()
+    let expected = source + (marked ? "に" : "")
+    let capture = try await model.captureDocument(record.document.id)
+    XCTAssertEqual(enteredBodies, 1); XCTAssertFalse(model.isBusy)
+    XCTAssertNil(model.errorMessage)
+    XCTAssertNil(view.inputBinding?.firstRefusal); XCTAssertNil(view.boundedStorage.mutationFailure)
+    XCTAssertTrue(input.activeView === view); XCTAssertFalse(view.hasMarkedText())
+    XCTAssertEqual(Data(view.string.utf8), Data(expected.utf8))
+    XCTAssertEqual(capture.completeSnapshot?.text, expected)
+    XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, UInt64(expected.utf16.count))
+    XCTAssertEqual(model.draft, "")
+    XCTAssertEqual(try XCTUnwrap(chatTextView(in: host)).string, "")
+    XCTAssertNil(model.selectedMLXRunner); XCTAssertNil(model.completionRunner)
+    guard (testRun?.failureCount ?? 0) == failures else {
+      throw BoomError.invalid("Actual Send native-boundary assertions failed; source and receivers retained.")
+    }
+    try await joinedClose(model); try await removeJoinedScratch(scratch)
+  }
+
+  func testActualEmptyDocumentDirectUnmarkWorkBoundaryWithoutModel() async throws {
+    try await runActualChatNativeTransition(source: "", directUnmark: true)
+  }
+  func testActualEmptyDocumentGuardedFinishWorkBoundaryWithoutModel() async throws {
+    try await runActualChatNativeTransition(source: "")
+  }
+  func testActualNonemptyDocumentGuardedFinishWorkBoundaryWithoutModel() async throws {
+    try await runActualChatNativeTransition(source: "Some ")
+  }
+  func testActualMarkedDocumentWorkBoundaryCommitsNativeCompositionWithoutModel() async throws {
+    try await runActualChatNativeTransition(source: "Cafe\u{301} ", marked: true)
+  }
+
+  /// A real current TextKit storage primitive need not originate inside the
+  /// view's lexical key wrapper. Retired callbacks cannot write the new arena.
+  func testActualCurrentStoragePrimitiveAndRetiredCallbacksKeepLaterTypingUndoAndRedoUsable() async throws {
+    let failures = testRun?.failureCount ?? 0
+    let scratch = try diagnosticRoot(), model = try await open(scratch, requiresActualKeyWindow: false)
+    let initial = try XCTUnwrap(model.pagedSelectedRecord)
+    let input = try XCTUnwrap(model.pagedInput), commands = try XCTUnwrap(model.pagedCommands)
+    let view = try XCTUnwrap(input.activeView), session = try XCTUnwrap(model.pagedSession)
+    XCTAssertEqual(view.string, ""); XCTAssertTrue(view.inputCommandIsClosed)
+    XCTAssertEqual(view.inputBinding?.commandDepth, 0)
+    let storage = view.boundedStorage
+    let previousDelegate = storage.delegate
+    let observation = CharacterUndoObservation(view: view)
+    storage.delegate = observation
+    defer { storage.delegate = previousDelegate }
+    let generation = session.generation
+    view.boundedStorage.replaceCharacters(in: NSRange(location: 0, length: 0), with: "a")
+    XCTAssertGreaterThan(observation.characterNotifications, 0)
+    XCTAssertFalse(observation.exposedManagerDuringCharacters)
+    XCTAssertFalse(storage.hasOpenCharacterTransaction)
+    XCTAssertTrue(view.undoManager === commands.manager)
+    XCTAssertEqual(session.generation, generation + 1)
+    XCTAssertEqual(view.string, "a")
+    XCTAssertNil(view.inputBinding?.firstRefusal); XCTAssertNil(view.boundedStorage.mutationFailure)
+    view.setSelectedRange(NSRange(location: 1, length: 0))
+    try await commands.joinPendingCommand(); try await model.flush()
+    let first = try await model.captureDocument(initial.document.id)
+    XCTAssertEqual(first.completeSnapshot?.text, "a")
+    XCTAssertTrue(commands.manager.canUndo)
+    view.insertText("b", replacementRange: NSRange(location: NSNotFound, length: 0))
+    try await commands.joinPendingCommand(); try await model.flush()
+    let second = try await model.captureDocument(initial.document.id)
+    XCTAssertEqual(second.completeSnapshot?.text, "ab")
+    XCTAssertEqual(session.canonicalHistory?.undo.count, 2)
+
+    commands.manager.undo(); try await commands.joinPendingCommand(); try await model.flush()
+    let undone = try await model.captureDocument(initial.document.id)
+    XCTAssertEqual(undone.completeSnapshot?.text, "a")
+    let current = try XCTUnwrap(input.activeView)
+    XCTAssertFalse(current === view); XCTAssertEqual(view.inputBinding?.state, .retired)
+    let stableRecord = try XCTUnwrap(model.pagedSelectedRecord), stableGeneration = session.generation
+    let stableSelection = try input.currentDocumentSelection()
+    view.boundedStorage.replaceCharacters(in: NSRange(location: 0, length: 1), with: "z")
+    view.insertText("late", replacementRange: NSRange(location: 0, length: 0))
+    view.setMarkedText("late", selectedRange: NSRange(location: 0, length: 0),
+      replacementRange: NSRange(location: NSNotFound, length: 0))
+    XCTAssertEqual(model.pagedSelectedRecord, stableRecord); XCTAssertEqual(session.generation, stableGeneration)
+    XCTAssertEqual(try input.currentDocumentSelection(), stableSelection)
+    XCTAssertEqual(current.string, "a"); XCTAssertFalse(current.hasMarkedText())
+    XCTAssertNil(input.firstRefusal); XCTAssertNil(current.inputBinding?.firstRefusal)
+    XCTAssertNil(current.boundedStorage.mutationFailure)
+
+    commands.manager.redo(); try await commands.joinPendingCommand(); try await model.flush()
+    let redone = try await model.captureDocument(initial.document.id)
+    XCTAssertEqual(redone.completeSnapshot?.text, "ab")
+    let typing = try XCTUnwrap(input.activeView)
+    typing.setSelectedRange(NSRange(location: 2, length: 0))
+    typing.insertText("c", replacementRange: NSRange(location: NSNotFound, length: 0))
+    try await commands.joinPendingCommand(); try await model.flush()
+    let later = try await model.captureDocument(initial.document.id)
+    XCTAssertEqual(later.completeSnapshot?.text, "abc")
+    XCTAssertNil(input.firstRefusal); XCTAssertNil(typing.boundedStorage.mutationFailure)
+    commands.manager.undo(); try await commands.joinPendingCommand(); try await model.flush()
+    let laterUndone = try await model.captureDocument(initial.document.id)
+    XCTAssertEqual(laterUndone.completeSnapshot?.text, "ab")
+    commands.manager.redo(); try await commands.joinPendingCommand(); try await model.flush()
+    let laterRedone = try await model.captureDocument(initial.document.id)
+    XCTAssertEqual(laterRedone.completeSnapshot?.text, "abc")
+    guard (testRun?.failureCount ?? 0) == failures else {
+      throw BoomError.invalid("Actual current/retired callback assertions failed; source and receivers retained.")
+    }
+    try await joinedClose(model); try await removeJoinedScratch(scratch)
+  }
+
+  /// Rejected scalar/selection callbacks do not grant an edit and do not
+  /// poison the next native input primitive or its canonical inverse.
+  func testActualMalformedAndStaleCallbacksLeaveLaterNativeTypingAndUndoUsable() async throws {
+    let failures = testRun?.failureCount ?? 0
+    let scratch = try diagnosticRoot(), model = try await open(scratch, requiresActualKeyWindow: false)
+    let initial = try XCTUnwrap(model.pagedSelectedRecord)
+    let input = try XCTUnwrap(model.pagedInput), commands = try XCTUnwrap(model.pagedCommands)
+    let session = try XCTUnwrap(model.pagedSession), view = try XCTUnwrap(input.activeView)
+    view.insertText("A😀Z", replacementRange: NSRange(location: NSNotFound, length: 0))
+    try await commands.joinPendingCommand(); try await model.flush()
+    view.setSelectedRange(NSRange(location: 4, length: 0))
+    let record = try XCTUnwrap(model.pagedSelectedRecord), generation = session.generation
+    let selection = try input.currentDocumentSelection(), undoCount = session.canonicalHistory?.undo.count
+    let backing = view.string, selectionEpoch = try XCTUnwrap(view.inputBinding).selectionEpoch
+
+    // UTF16 position2 is inside the actual emoji's surrogate pair. Neither
+    // the primitive nor the view permission callback may accept that range.
+    view.boundedStorage.replaceCharacters(in: NSRange(location: 2, length: 0), with: "x")
+    XCTAssertFalse(view.shouldChangeText(in: NSRange(location: 2, length: 0), replacementString: "x"))
+    view.setSelectedRange(NSRange(location: 5, length: 0))
+    input.userSelectionDidChange(from: view, previousRange: NSRange(location: 2, length: 0),
+      previousGeneration: generation)
+    input.notifyNativeState(from: view, edited: false)
+    XCTAssertEqual(session.generation, generation); XCTAssertEqual(model.pagedSelectedRecord, record)
+    XCTAssertEqual(view.string, backing); XCTAssertEqual(view.selectedRange(), NSRange(location: 4, length: 0))
+    XCTAssertEqual(try input.currentDocumentSelection(), selection)
+    XCTAssertEqual(view.inputBinding?.selectionEpoch, selectionEpoch)
+    XCTAssertEqual(session.canonicalHistory?.undo.count, undoCount)
+    XCTAssertNil(view.boundedStorage.mutationFailure); XCTAssertNil(view.inputBinding?.firstRefusal)
+    XCTAssertNil(input.firstRefusal); XCTAssertNil(model.errorMessage); XCTAssertNil(commands.firstFailure)
+
+    // Exercise the real TextKit input primitive without claiming the separate
+    // packaged key-window/event journey that this SDK fixture cannot supply.
+    view.insertText("x", replacementRange: NSRange(location: NSNotFound, length: 0))
+    XCTAssertEqual(session.generation, generation + 1)
+    try await commands.joinPendingCommand(); try await model.flush()
+    let edited = try await model.captureDocument(initial.document.id)
+    XCTAssertEqual(edited.completeSnapshot?.text, "A😀Zx")
+    XCTAssertEqual(session.canonicalHistory?.undo.count, (undoCount ?? 0) + 1)
+    commands.manager.undo(); try await commands.joinPendingCommand(); try await model.flush()
+    let undone = try await model.captureDocument(initial.document.id)
+    XCTAssertEqual(undone.completeSnapshot?.text, "A😀Z")
+    let current = try XCTUnwrap(input.activeView)
+    XCTAssertFalse(current === view); XCTAssertEqual(view.inputBinding?.state, .retired)
+    let afterUndo = try XCTUnwrap(model.pagedSelectedRecord), afterGeneration = session.generation
+    let afterSelection = try input.currentDocumentSelection()
+    view.boundedStorage.replaceCharacters(in: NSRange(location: 2, length: 0), with: "late")
+    view.setSelectedRange(NSRange(location: 99, length: 0))
+    input.userSelectionDidChange(from: view, previousRange: nil, previousGeneration: generation)
+    input.notifyNativeState(from: view, edited: true)
+    XCTAssertEqual(model.pagedSelectedRecord, afterUndo); XCTAssertEqual(session.generation, afterGeneration)
+    XCTAssertEqual(try input.currentDocumentSelection(), afterSelection)
+    XCTAssertEqual(current.string, "A😀Z"); XCTAssertNil(current.boundedStorage.mutationFailure)
+    XCTAssertNil(input.firstRefusal); XCTAssertNil(current.inputBinding?.firstRefusal)
+    XCTAssertNil(model.errorMessage)
+    commands.manager.redo(); try await commands.joinPendingCommand(); try await model.flush()
+    let redone = try await model.captureDocument(initial.document.id)
+    XCTAssertEqual(redone.completeSnapshot?.text, "A😀Zx")
+    XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure); XCTAssertNil(model.errorMessage)
+    guard (testRun?.failureCount ?? 0) == failures else {
+      throw BoomError.invalid("Malformed/stale callback assertions failed; actual source and receivers retained.")
+    }
+    try await joinedClose(model); try await removeJoinedScratch(scratch)
+  }
+  func testActualContainedNFDAndZWJCommandsAfterKnownLFDoNotAwaitPublication() async throws {
+    let failures = testRun?.failureCount ?? 0
+    let scratch = try root(), model = try await open(scratch)
+    let nfd = "e\u{301}", zwj = "👩🏽‍💻"
+    let source = try await writeSource(scratch, edgeText: "\n" + nfd + zwj)
+    try await model.importDocuments([source], flag: CancellationFlag())
+    try await focusCurrentEditor(model)
+    let original = try XCTUnwrap(model.pagedSelectedRecord)
+    let input = try XCTUnwrap(model.pagedInput), commands = try XCTUnwrap(model.pagedCommands)
+    let edgeStart: UInt64 = 16_382, nfdStart = edgeStart + 1
+    let nfdEnd = nfdStart + UInt64(nfd.utf16.count), zwjEnd = nfdEnd + UInt64(zwj.utf16.count)
+    let backward = NSSelectorFromString("moveBackward:"), deleteForward = NSSelectorFromString("deleteForward:")
+    let deleteBackward = NSSelectorFromString("deleteBackward:")
+
+    // The initial real16KiB read ends in the NFD base. Its unseen mark cannot
+    // become a local grapheme, even though this projection starts the document.
+    let initial = try XCTUnwrap(input.activeView)
+    initial.setSelectedRange(NSRange(location: Int(nfdStart), length: 0))
+    XCTAssertFalse(initial.hasContainedCharacterCommand(NSSelectorFromString("moveForward:")))
+    XCTAssertTrue(input.handlesDocumentCommand(NSSelectorFromString("moveForward:")))
+
+    _ = try await commands.navigate(toUTF16: edgeStart,
+      selectingUTF16: PagedNativeNavigationSelection(utf16Offset: nfdEnd, utf16Length: 0))
+    try await focusCurrentEditor(model)
+    let nfdView = try XCTUnwrap(input.activeView), coordinates = try input.session.documentCoordinates()
+    XCTAssertEqual(coordinates.utf16Start, edgeStart, "Known LF must be observed in a nonzero-origin real projection.")
+    XCTAssertFalse(input.handlesDocumentCommand(backward))
+    let movementGeneration = input.session.generation
+    nfdView.doCommand(by: backward)
+    XCTAssertEqual(nfdView.selectedRange(), NSRange(location: 1, length: 0))
+    XCTAssertEqual(input.session.generation, movementGeneration)
+    nfdView.setSelectedRange(NSRange(location: 3, length: 0))
+    let extend = NSSelectorFromString("moveBackwardAndModifySelection:")
+    XCTAssertFalse(input.handlesDocumentCommand(extend))
+    nfdView.doCommand(by: extend)
+    XCTAssertEqual(nfdView.selectedRange(), NSRange(location: 1, length: 2))
+    let extended = try input.currentDocumentSelection()
+    XCTAssertEqual(extended.utf16Offset, nfdStart); XCTAssertEqual(extended.utf16Length, 2)
+    XCTAssertFalse(extended.focusAtEnd)
+    XCTAssertEqual(input.session.generation, movementGeneration)
+    nfdView.setSelectedRange(NSRange(location: 1, length: 0))
+    XCTAssertFalse(input.handlesDocumentCommand(deleteForward))
+    let beforeNFD = input.session.generation
+    nfdView.doCommand(by: deleteForward)
+    // These assertions occur synchronously before any storage Task can run.
+    XCTAssertEqual(input.session.generation, beforeNFD + 1)
+    XCTAssertTrue(nfdView.string.hasPrefix("\n" + zwj))
+    XCTAssertNil(nfdView.boundedStorage.mutationFailure); XCTAssertNil(input.firstRefusal)
+    try await commands.joinPendingCommand(); try await model.flush()
+    XCTAssertEqual(model.pagedSelectedRecord?.document.revision.summary.bytes,
+      original.document.revision.summary.bytes - UInt64(nfd.utf8.count))
+    let undo = NSSelectorFromString("undo:"), item = NSMenuItem(title: "Undo", action: undo, keyEquivalent: "z")
+    let window = try XCTUnwrap(Self.failedWindow)
+    guard let responder = window.firstResponder, responder === input.activeView,
+      try XCTUnwrap(input.activeView).validateUserInterfaceItem(item), responder.tryToPerform(undo, with: item) else {
+      throw BoomError.unavailable("The actual Unicode control responder did not own Undo.")
+    }
+    try await commands.joinPendingCommand(); try await model.flush()
+    XCTAssertEqual(model.pagedSelectedRecord?.document.revision, original.document.revision)
+
+    let zwjView = try XCTUnwrap(input.activeView), restored = try input.session.documentCoordinates()
+    guard zwjEnd >= restored.utf16Start else { throw BoomError.invalid("Restored Unicode source has another origin.") }
+    zwjView.setSelectedRange(NSRange(location: Int(zwjEnd - restored.utf16Start), length: 0))
+    XCTAssertFalse(input.handlesDocumentCommand(deleteBackward))
+    let beforeZWJ = input.session.generation
+    zwjView.doCommand(by: deleteBackward)
+    XCTAssertEqual(input.session.generation, beforeZWJ + 1)
+    XCTAssertNil(zwjView.boundedStorage.mutationFailure); XCTAssertNil(input.firstRefusal)
+    try await commands.joinPendingCommand(); try await model.flush()
+    XCTAssertEqual(model.pagedSelectedRecord?.document.revision.summary.bytes,
+      original.document.revision.summary.bytes - UInt64(zwj.utf8.count))
+    let bytes = try await sourceBytes(model, atUTF16: nfdStart)
+    XCTAssertEqual(Data(bytes.prefix(nfd.utf8.count)), Data(nfd.utf8))
+    XCTAssertEqual(try XCTUnwrap(bytes.dropFirst(nfd.utf8.count).first), 97)
+    guard let finalResponder = window.firstResponder, finalResponder === input.activeView,
+      try XCTUnwrap(input.activeView).validateUserInterfaceItem(item), finalResponder.tryToPerform(undo, with: item) else {
+      throw BoomError.unavailable("The actual ZWJ control responder did not own Undo.")
+    }
+    try await commands.joinPendingCommand(); try await model.flush()
+    XCTAssertEqual(model.pagedSelectedRecord?.document.revision, original.document.revision)
+    guard (testRun?.failureCount ?? 0) == failures else {
+      throw BoomError.invalid("Contained Unicode assertions failed; actual source and owners retained.")
+    }
+    try await joinedClose(model); try await removeJoinedScratch(scratch)
+  }
+
+  func testActualTruncatedRegionalIndicatorContextKeepsFullSourceMovement() async throws {
+    let failures = testRun?.failureCount ?? 0
+    let scratch = try root(), model = try await open(scratch)
+    let source = try await writeSource(scratch, edgeText: "🇦🇧🇨🇩🇪🇫")
+    try await model.importDocuments([source], flag: CancellationFlag())
+    try await focusCurrentEditor(model)
+    let original = try XCTUnwrap(model.pagedSelectedRecord)
+    let input = try XCTUnwrap(model.pagedInput), commands = try XCTUnwrap(model.pagedCommands)
+    let edgeStart: UInt64 = 16_382
+    // The actual window starts at the second RI. Its local pairing differs
+    // from the complete source, whose pairs are AB/CD/EF.
+    _ = try await commands.navigate(toUTF16: edgeStart + 2,
+      selectingUTF16: PagedNativeNavigationSelection(utf16Offset: edgeStart + 4, utf16Length: 0))
+    try await focusCurrentEditor(model)
+    let view = try XCTUnwrap(input.activeView), forward = NSSelectorFromString("moveForward:")
+    XCTAssertEqual(try input.session.documentCoordinates().utf16Start, edgeStart + 2)
+    XCTAssertFalse(view.hasContainedCharacterCommand(forward))
+    XCTAssertTrue(input.handlesDocumentCommand(forward))
+    view.doCommand(by: forward)
+    try await commands.joinPendingCommand()
+    let moved = try input.currentDocumentSelection()
+    XCTAssertEqual(moved.utf16Offset, edgeStart + 8, "Full source ends the actual CD pair, not the island's BC pair.")
+    XCTAssertEqual(moved.utf16Length, 0)
+    XCTAssertEqual(model.pagedSelectedRecord, original)
+    XCTAssertNil(input.firstRefusal)
+    guard (testRun?.failureCount ?? 0) == failures else {
+      throw BoomError.invalid("Actual truncated RI assertions failed; source and native owners retained.")
+    }
+    try await joinedClose(model); try await removeJoinedScratch(scratch)
+  }
+
 }

@@ -1,10 +1,9 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import SwiftUI
 
 /// Production inputs and real local weights in this process's own public,
-/// encrypted fixture. No user windows, Keychain, or network access is needed.
+/// file fixture. No user windows, Keychain, or network access is needed.
 @MainActor enum InputCompletionSmoke {
   static func run(arguments: [String]) async throws {
     guard let index = arguments.firstIndex(of: "--evidence"), index + 1 < arguments.count,
@@ -23,8 +22,7 @@ import SwiftUI
     }
     var receipt = ["status": "running", "source": Bundle.main.object(forInfoDictionaryKey: "BoomSourceSHA256") as? String ?? "unavailable"]
     try write(receipt, "receipt")
-    let store = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("public-workspace"),
-      testKey: SymmetricKey(data: Data(repeating: 0x71, count: 32)))
+    let store = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("public-workspace"))
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     if model.selectedChat == nil { try model.newChat() }
     model.authorChatMessage(.user); model.draft = "Suggest a title for a story set in a harbor. Answer in twelve words or fewer."; model.send()
@@ -154,7 +152,7 @@ import SwiftUI
         model.selectedChat?.messages.last == reply else { throw BoomError.invalid("Assistant branching regenerated the preserved reply.") }
       try write(model.selectedChat, "preserved-reply-branch")
       try await model.shutdown()
-      let saved = try await store.load().get().0
+      let saved = try await store.loadState()
       for id in saved.candidateIDs { _ = try await store.readCandidate(id) }
       model.refreshModelChoices()
       for _ in 0..<100 where model.modelChoices.isEmpty { try await Task.sleep(for: .milliseconds(50)) }
@@ -178,7 +176,7 @@ import SwiftUI
         guard let png = bitmap.representation(using: .png, properties: [:]) else { throw BoomError.invalid("Picker PNG unavailable.") }
         try png.write(to: evidence.appendingPathComponent("picker-" + name + ".png"))
       }
-      receipt["status"] = "passed"; receipt["window"] = "unshown"; receipt["keychain"] = "unused"
+      receipt["status"] = "passed"; receipt["window"] = "unshown"; receipt["workspaceStorage"] = "files"
       try write(receipt, "receipt")
     } catch {
       model.cancel(); try? await model.shutdown()

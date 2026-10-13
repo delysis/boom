@@ -105,7 +105,7 @@ struct TextInputCapture: Codable, Sendable {
       guard let chat = model.state.chats.first(where: { $0.id == id }) else { return false }
       if let message = target.messageID, !chat.messages.contains(where: { $0.id == message }) { return false }
     }
-    if let id = target.documentID, !model.documents.contains(where: { $0.id == id }) { return false }
+    if let id = target.documentID, !model.documentIndices.contains(where: { $0.id == id }) { return false }
     return true
   }
   private var eligible: Bool {
@@ -173,7 +173,7 @@ struct TextInputCapture: Codable, Sendable {
         if self.epoch == capturedEpoch, !operation.isCancelled { self.bundle = result }
       } catch is CancellationError {} catch {
         // A background suggestion can fail without interrupting authored text.
-        // The encrypted attempt and its failure remain available for diagnosis.
+        // The attempt and its failure remain available for diagnosis.
       }
     }
   }

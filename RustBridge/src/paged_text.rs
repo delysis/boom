@@ -2,7 +2,9 @@
 //! executor owns callback contexts, permission, current-root CAS and durability.
 //! This is deliberately not an operation in the model-facing core request.
 use crate::{encoding, error, BoomAttachmentBuffer};
-use bloom_text::{Error, PageKind, PageLocator, PageProvider, PageRef, Revision, TextEngine};
+use bloom_text::{
+    Error, PageKind, PageLocator, PageProvider, PageRef, Revision, TextEngine, TreeRef,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -55,12 +57,14 @@ pub struct BloomTextOperation {
 }
 
 // The integer is the embedding's opaque context, never dereferenced by Rust.
-// Callbacks are serialized by EngineSlot; the embedding permits thread migration
-// on its dedicated storage executor and retains this context until close joins.
+// Writer callbacks are serialized by EngineSlot; their context lives until
+// close joins. A one-shot immutable reader instead borrows its own read-only
+// context synchronously and never uses an EngineSlot.
 struct CallbackPages {
     context: usize,
     read: PageRead,
-    write: PageWrite,
+    write: Option<PageWrite>,
+    cancellation: Option<(usize, Cancelled)>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -91,6 +95,12 @@ impl PageProvider for CallbackPages {
         page: &PageRef,
         maximum_bytes: usize,
     ) -> bloom_text::Result<Vec<u8>> {
+        if self.cancellation.is_some_and(|(context, callback)| {
+            // SAFETY: the one-shot embedding retains this flag through return.
+            unsafe { callback(context as *mut c_void) != 0 }
+        }) {
+            return Err(Error::Cancelled);
+        }
         if maximum_bytes > kind.maximum_bytes() {
             return Err(Error::Invalid("page callback read bound"));
         }
@@ -116,9 +126,7 @@ impl PageProvider for CallbackPages {
             )
         };
         if status != 0 || written > maximum_bytes {
-            return Err(Error::Storage(
-                "Authenticated page read was rejected.".into(),
-            ));
+            return Err(Error::Storage("File page read was rejected.".into()));
         }
         bytes.truncate(written);
         Ok(bytes)
@@ -133,6 +141,9 @@ impl PageProvider for CallbackPages {
         if bytes.len() > kind.maximum_bytes() {
             return Err(Error::Invalid("page callback write bound"));
         }
+        let write = self
+            .write
+            .ok_or(Error::Invalid("read-only page provider"))?;
         let request = callback_json(&WritePage {
             owner_id: owner,
             document_id: document,
@@ -143,7 +154,7 @@ impl PageProvider for CallbackPages {
         // SAFETY: the embedding's context is live; all buffers are bounded and
         // borrowed until return. The reply is an immutable locator, not a key.
         let status = unsafe {
-            (self.write)(
+            write(
                 self.context as *mut c_void,
                 request.as_ptr(),
                 request.len(),
@@ -155,9 +166,7 @@ impl PageProvider for CallbackPages {
             )
         };
         if status != 0 || written == 0 || written > reply.len() {
-            return Err(Error::Storage(
-                "Authenticated page write was rejected.".into(),
-            ));
+            return Err(Error::Storage("File page write was rejected.".into()));
         }
         let locator: PageLocator = serde_json::from_slice(&reply[..written])
             .map_err(|_| Error::Invalid("page callback locator"))?;
@@ -182,7 +191,7 @@ pub unsafe extern "C" fn bloom_text_create(host: BloomTextHost) -> u64 {
         let (Some(read), Some(write)) = (host.read_page, host.write_page) else {
             return 0;
         };
-        if host.schema != 2 {
+        if host.schema != 3 {
             return 0;
         }
         let Ok(mut slots) = engines().lock() else {
@@ -201,7 +210,8 @@ pub unsafe extern "C" fn bloom_text_create(host: BloomTextHost) -> u64 {
             Arc::new(Mutex::new(Some(TextEngine::new(CallbackPages {
                 context: host.context as usize,
                 read,
-                write,
+                write: Some(write),
+                cancellation: None,
             })))),
         );
         handle
@@ -226,6 +236,12 @@ pub extern "C" fn bloom_text_close(handle: u64) -> u8 {
             Err(TryLockError::Poisoned(error)) => error.into_inner(),
             Err(TryLockError::WouldBlock) => return 0,
         };
+        if engine
+            .as_ref()
+            .is_some_and(|engine| engine.active_bulk_operations() > 0)
+        {
+            return 0;
+        }
         *engine = None;
         slots.remove(&handle);
         1
@@ -302,9 +318,18 @@ enum Request {
     Open {
         revision: Revision,
     },
+    PageChildren {
+        revision: Revision,
+        tree: TreeRef,
+    },
     Window {
         revision: Revision,
         byte_start: u64,
+        maximum_bytes: usize,
+    },
+    PrefixWindow {
+        revision: Revision,
+        utf16_offset: u64,
         maximum_bytes: usize,
     },
     Splice {
@@ -318,6 +343,16 @@ enum Request {
         revision: Revision,
         byte_start: u64,
         byte_end: u64,
+    },
+    ReplaceUserRange {
+        revision: Revision,
+        byte_start: u64,
+        byte_end: u64,
+        new_text: String,
+    },
+    BytePosition {
+        revision: Revision,
+        byte_start: u64,
     },
     Checkout {
         revision: Revision,
@@ -352,9 +387,50 @@ enum Request {
         revision: Revision,
         operation_id: Uuid,
     },
+    GraphemeSeekBegin {
+        revision: Revision,
+        utf16_offset: u64,
+        forward: bool,
+    },
+    GraphemeSeekStep {
+        revision: Revision,
+        operation_id: Uuid,
+    },
+    GraphemeSeekFinish {
+        revision: Revision,
+        operation_id: Uuid,
+    },
+    ParagraphBoundsBegin {
+        revision: Revision,
+        utf16_offset: u64,
+        #[serde(default = "include_line_endings_default")]
+        include_line_endings: bool,
+    },
+    ParagraphBoundsStep {
+        revision: Revision,
+        operation_id: Uuid,
+    },
+    ParagraphBoundsFinish {
+        revision: Revision,
+        operation_id: Uuid,
+    },
     BulkAbort {
         owner_id: Uuid,
         document_id: Uuid,
+        operation_id: Uuid,
+    },
+    LinePrefixBegin {
+        revision: Revision,
+        utf16_start: u64,
+        utf16_end: u64,
+        prefix: String,
+    },
+    LinePrefixStep {
+        revision: Revision,
+        operation_id: Uuid,
+    },
+    LinePrefixFinish {
+        revision: Revision,
         operation_id: Uuid,
     },
     Position {
@@ -366,8 +442,15 @@ enum Request {
         utf16_offset: u64,
         forward: bool,
     },
+    LineBounds {
+        revision: Revision,
+        utf16_offset: u64,
+    },
     Stats,
-    DiscardPageCacheAfterRollback,
+}
+
+fn include_line_endings_default() -> bool {
+    true
 }
 
 fn execute(
@@ -390,8 +473,13 @@ fn execute(
             | Request::ImportFinish { .. }
             | Request::StreamStep { .. }
             | Request::StreamFinish { .. }
+            | Request::GraphemeSeekStep { .. }
+            | Request::GraphemeSeekFinish { .. }
+            | Request::ParagraphBoundsStep { .. }
+            | Request::ParagraphBoundsFinish { .. }
+            | Request::LinePrefixStep { .. }
+            | Request::LinePrefixFinish { .. }
             | Request::BulkAbort { .. }
-            | Request::DiscardPageCacheAfterRollback
     );
     if !owned_bulk && cancelled() {
         return Err(Error::Cancelled);
@@ -435,6 +523,9 @@ fn execute(
             )
         }
         Request::Open { revision } => Ok(json!(engine.open(revision)?.revision())),
+        Request::PageChildren { revision, tree } => {
+            Ok(json!(engine.page_children(&revision, &tree)?))
+        }
         Request::Window {
             revision,
             byte_start,
@@ -445,6 +536,19 @@ fn execute(
                 &document,
                 &revision,
                 byte_start,
+                maximum_bytes
+            )?))
+        }
+        Request::PrefixWindow {
+            revision,
+            utf16_offset,
+            maximum_bytes,
+        } => {
+            let document = engine.open(revision.clone())?;
+            Ok(json!(engine.prefix_window(
+                &document,
+                &revision,
+                utf16_offset,
                 maximum_bytes
             )?))
         }
@@ -484,6 +588,31 @@ fn execute(
                 "",
                 &mut cancelled
             )?))
+        }
+        Request::ReplaceUserRange {
+            revision,
+            byte_start,
+            byte_end,
+            new_text,
+        } => {
+            let mut document = engine.open(revision.clone())?;
+            Ok(json!(engine.splice(
+                &mut document,
+                &revision,
+                byte_start..byte_end,
+                None,
+                &new_text,
+                &mut cancelled
+            )?))
+        }
+        Request::BytePosition {
+            revision,
+            byte_start,
+        } => {
+            let document = engine.open(revision.clone())?;
+            Ok(json!(
+                engine.byte_position(&document, &revision, byte_start)?
+            ))
         }
         Request::Checkout { revision, retained } => {
             let mut document = engine.open(revision.clone())?;
@@ -525,6 +654,36 @@ fn execute(
             document_id,
             operation_id
         )?)),
+        Request::GraphemeSeekBegin {
+            revision,
+            utf16_offset,
+            forward,
+        } => {
+            let owner = revision.owner_id;
+            let document = revision.document_id;
+            let id = engine.grapheme_seek_begin(revision, utf16_offset, forward)?;
+            if cancelled() {
+                engine.bulk_abort(owner, document, id)?;
+                return Err(Error::Cancelled);
+            }
+            Ok(json!(id))
+        }
+        Request::GraphemeSeekStep {
+            revision,
+            operation_id,
+        } => Ok(json!(engine.grapheme_seek_step(
+            &revision,
+            operation_id,
+            &mut cancelled
+        )?)),
+        Request::GraphemeSeekFinish {
+            revision,
+            operation_id,
+        } => Ok(json!(engine.grapheme_seek_finish(
+            &revision,
+            operation_id,
+            &mut cancelled
+        )?)),
         Request::Position {
             revision,
             utf16_offset,
@@ -536,13 +695,90 @@ fn execute(
                 utf16_offset
             )?))
         }
-        Request::ScalarPosition { revision, utf16_offset, forward } => {
-            let document = engine.open(revision.clone())?;
-            Ok(json!(engine.scalar_position(&document, &revision, utf16_offset, forward)?))
+        Request::ParagraphBoundsBegin {
+            revision,
+            utf16_offset,
+            include_line_endings,
+        } => {
+            let owner = revision.owner_id;
+            let document = revision.document_id;
+            let id = engine.paragraph_bounds_begin(revision, utf16_offset, include_line_endings)?;
+            if cancelled() {
+                engine.bulk_abort(owner, document, id)?;
+                return Err(Error::Cancelled);
+            }
+            Ok(json!(id))
         }
-        Request::DiscardPageCacheAfterRollback => {
-            engine.discard_page_cache_after_rollback();
-            Ok(json!(engine.stats()))
+        Request::ParagraphBoundsStep {
+            revision,
+            operation_id,
+        } => Ok(json!(engine.paragraph_bounds_step(
+            &revision,
+            operation_id,
+            &mut cancelled
+        )?)),
+        Request::ParagraphBoundsFinish {
+            revision,
+            operation_id,
+        } => Ok(json!(engine.paragraph_bounds_finish(
+            &revision,
+            operation_id,
+            &mut cancelled
+        )?)),
+        Request::ScalarPosition {
+            revision,
+            utf16_offset,
+            forward,
+        } => {
+            let document = engine.open(revision.clone())?;
+            Ok(json!(engine.scalar_position(
+                &document,
+                &revision,
+                utf16_offset,
+                forward
+            )?))
+        }
+        Request::LinePrefixBegin {
+            revision,
+            utf16_start,
+            utf16_end,
+            prefix,
+        } => {
+            let owner = revision.owner_id;
+            let document = revision.document_id;
+            let id = engine.line_prefix_begin(revision, utf16_start, utf16_end, prefix)?;
+            if cancelled() {
+                engine.bulk_abort(owner, document, id)?;
+                return Err(Error::Cancelled);
+            }
+            Ok(json!(id))
+        }
+        Request::LinePrefixStep {
+            revision,
+            operation_id,
+        } => Ok(json!(engine.line_prefix_step(
+            &revision,
+            operation_id,
+            &mut cancelled
+        )?)),
+        Request::LinePrefixFinish {
+            revision,
+            operation_id,
+        } => Ok(json!(engine.line_prefix_finish(
+            &revision,
+            operation_id,
+            &mut cancelled
+        )?)),
+        Request::LineBounds {
+            revision,
+            utf16_offset,
+        } => {
+            let document = engine.open(revision.clone())?;
+            let bounds = engine.line_bounds(&document, &revision, utf16_offset)?;
+            if cancelled() {
+                return Err(Error::Cancelled);
+            }
+            Ok(json!(bounds))
         }
         Request::Stats => {
             let mut value = json!(engine.stats());
@@ -561,6 +797,85 @@ fn owned_reply(value: &Value) -> BoomAttachmentBuffer {
         data: Box::into_raw(boxed) as *mut u8,
         length,
     }
+}
+
+/// Read one bounded immutable source without the writer handle/registry/mutex.
+/// Its small cache dies before return and cannot publish a page or source root.
+///
+/// # Safety
+/// The revision bytes, read callback and cancellation context must remain live
+/// for this call. Callbacks must not unwind or retain borrowed buffers. The
+/// host pins all referenced immutable extents until return and closes their
+/// actual file handles before its read callback returns. Free the result once.
+#[no_mangle]
+pub unsafe extern "C" fn bloom_text_read_window(
+    host: BloomTextHost,
+    data: *const u8,
+    length: usize,
+    utf16_offset: u64,
+    maximum_bytes: usize,
+    operation: BloomTextOperation,
+) -> BoomAttachmentBuffer {
+    if data.is_null()
+        || length == 0
+        || length > 16 * 1024
+        || !(4..=16 * 1024).contains(&maximum_bytes)
+        || host.schema != 3
+        || host.write_page.is_some()
+    {
+        return owned_reply(&error("input_limit", "Immutable window exceeds its bound."));
+    }
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        let Some(read) = host.read_page else {
+            return error("invalid", "Immutable window has no page reader.");
+        };
+        let cancelled = || {
+            operation.is_cancelled.is_some_and(|callback| {
+                // SAFETY: the embedding retains this nonblocking flag until return.
+                unsafe { callback(operation.context) != 0 }
+            })
+        };
+        let result = (|| -> bloom_text::Result<Value> {
+            if cancelled() {
+                return Err(Error::Cancelled);
+            }
+            // SAFETY: immutable input is bounded and live through this call.
+            let bytes = unsafe { slice::from_raw_parts(data, length) };
+            let revision: Revision = serde_json::from_slice(bytes)
+                .map_err(|_| Error::Invalid("immutable window revision"))?;
+            let mut reader = TextEngine::with_cache_budget(
+                CallbackPages {
+                    context: host.context as usize,
+                    read,
+                    write: None,
+                    cancellation: operation
+                        .is_cancelled
+                        .map(|callback| (operation.context as usize, callback)),
+                },
+                256 * 1024,
+            );
+            let document = reader.open(revision.clone())?;
+            let position = reader.scalar_position(&document, &revision, utf16_offset, false)?;
+            let window = reader.window(&document, &revision, position.bytes, maximum_bytes)?;
+            if cancelled() {
+                return Err(Error::Cancelled);
+            }
+            serde_json::to_value(window).map_err(|_| Error::Invalid("immutable window encoding"))
+        })();
+        match result {
+            Ok(value) => json!({"schema": 1, "ok": true, "value": value}),
+            Err(e) => error(
+                match &e {
+                    Error::Cancelled => "cancelled",
+                    Error::Stale => "stale",
+                    Error::Invalid(_) => "invalid",
+                    Error::Storage(_) | Error::Io(_) => "storage_failed",
+                },
+                &e.to_string(),
+            ),
+        }
+    }));
+    owned_reply(&outcome.unwrap_or_else(|_| error("engine_panic", "Immutable window failed.")))
 }
 
 /// # Safety

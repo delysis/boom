@@ -1,19 +1,18 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import Foundation
 import XCTest
 @testable import Boom
 
 // SOURCE ONLY: these controls require exactly one nominated public case per
-// process. Every successful root/window/ACK is from the actual current encrypted
+// process. Every successful root/window/ACK is from the actual current file
 // backend; the shared route changes scheduling only and joins its real calls.
 @MainActor private final class ManagedNavigationFixture {
   let root: URL
   let ownerID = UUID()
   let storeID = UUID()
   let originalText: String
-  var vault: Vault?
+  var store: WorkspaceStore?
   var engine: PagedTextEngineAdapter?
   var publisher: PagedWorkspacePublisher?
   var backend: PagedNativeStorageBackend?
@@ -31,7 +30,7 @@ import XCTest
   private(set) var mounts: [PagedNativeInputIdentity] = []
   private(set) var closed = false
   var refuseNextActualMount = false
-  var view: PagedNativeTextView { input!.activeView }
+  var view: PagedNativeTextView { input!.activeView! }
 
   init(root: URL, text: String = String(repeating: "a", count: 72_196) + "🙂e\u{301}\n") {
     self.root = root; originalText = text
@@ -48,13 +47,12 @@ import XCTest
     precondition(outputs.contains(lease)); outputs.removeAll { $0 == lease }
   }
   func open() async throws {
-    _ = NSApplication.shared
+    try PagedNativeFixtureApplication.bootstrap()
     let root = root
-    let opened = try await Task.detached {
-      try Vault(root: root, testKey: SymmetricKey(data: Data(repeating: 0x61, count: 32)))
-    }.value
-    vault = opened
-    let actual = try await PagedTextEngineAdapter.create(vault: opened, ownerID: ownerID, sqliteOpening: .fresh(storeID: storeID))
+    let opened = try WorkspaceStore(rootOverride: root)
+    store = opened
+    try await opened.acquireExclusiveWorkspace()
+    let actual = try await PagedTextEngineAdapter.create(root: opened.root, ownerID: ownerID, storeID: storeID)
     engine = actual // strong ownership before any later setup/observation can refuse
     let text = originalText
     let file = try await Task.detached {
@@ -72,12 +70,9 @@ import XCTest
     let pub = try await actual.makeWorkspacePublisher(); publisher = pub
     var state = WorkspaceState(); state.documents = [DocumentIndex(id: descriptor.id, title: descriptor.title)]
     state.selectedDocument = descriptor.id
-    let saved = try await actual.initializeWorkspaceRetaining(pub, state: state, documents: [record])
-    _ = try receive(saved)
-    try await actual.finishWorkspacePublication(saved, publisher: pub)
-    try await actual.transferJoinedRootToHead(imported.lease, publisher: pub, expected: record); removeReceived(imported.lease)
-    try await actual.transferJoinedRootToHead(initial.lease, publisher: pub, expected: record); removeReceived(initial.lease)
-    try await actual.abandonJoinedRootOutput(saved.lease); removeReceived(saved.lease)
+    _ = try await actual.publishInitialDocumentRetaining(pub, imported: imported, initialized: initial)
+    removeReceived(imported.lease); removeReceived(initial.lease)
+    try await opened.saveState(state)
     let storage = try await actual.makeNativeStorage(pub, expected: record); backend = storage
     let opening = try await storage.opening(sessionID: UUID())
     let forwarding = PagedStagedControlledStorage(storage); route = forwarding
@@ -105,15 +100,14 @@ import XCTest
         throw error
       }
       XCTAssertTrue(host.textView === new); XCTAssertTrue(window.firstResponder === new)
-      guard self.mounts.count < 16, let identity = new.inputBinding?.identity else {
-        throw BoomError.budget("Actual public mount exceeds 16 identities or lost its binding.")
+      let maximumMounts = self.originalText.utf8.count > 72_204 ? 32 : 16
+      guard self.mounts.count < maximumMounts, let identity = new.inputBinding?.identity else {
+        throw BoomError.budget("Actual public mount exceeds its explicit fixture bound or lost its binding.")
       }
       self.mounts.append(identity)
     }
     host.documentView = physical.activeView
-    nativeWindow.makeKeyAndOrderFront(nil)
-    guard nativeWindow.makeFirstResponder(physical.activeView), nativeWindow.firstResponder === physical.activeView,
-      nativeWindow.isKeyWindow else { throw BoomError.unavailable("Public native source did not acquire actual focus.") }
+    try await PagedNativeFixtureApplication.focus(physical.activeView!, in: nativeWindow)
   }
   func startNavigation(anchor: UInt64 = 48_000, caret: UInt64? = 50_000) throws -> Task<PagedTextWindow, Error> {
     guard enteredNavigation.count < 8, let commands else { throw BoomError.budget("Public navigation task/owner bound exceeded.") }
@@ -145,9 +139,8 @@ import XCTest
   }
   func record() async throws -> PagedDocumentRootRecord {
     guard let engine, let publisher else { throw BoomError.stale("Actual public source owner is missing.") }
-    let loaded = try receive(try await engine.loadWorkspaceRetaining(publisher))
-    guard loaded.documents.count == 1 else { throw BoomError.invalid("Public source acquired another document.") }
-    return loaded.documents[0]
+    return try receive(try await engine.currentDocumentRecordRetaining(publisher,
+      documentID: session!.sourceBaseRevision.documentID))
   }
   func assertSource(_ expected: String) async throws {
     try await seal(); let record = try await record()
@@ -176,9 +169,9 @@ import XCTest
     try await backend!.detachJoinedController(sessionID: session!.sessionID, sequence: session!.generation, record: current)
     for lease in outputs { try await engine!.abandonJoinedRootOutput(lease) }
     outputs.removeAll()
-    let wal = try await engine!.joinScheduledWALMaintenance()
-    if let failure = wal.failure { throw failure }
-    try await engine!.close(); closed = true; window?.close()
+    try await engine!.close()
+    try await store!.releaseExclusiveWorkspace()
+    closed = true; window?.close()
   }
   func joinEnteredOnFailure() async {
     // Release/join the actual shared scheduling gates before awaiting a held
@@ -201,13 +194,17 @@ import XCTest
     text: String = String(repeating: "a", count: 72_196) + "🙂e\u{301}\n",
     retainedTerminal: Bool = false,
     _ body: (ManagedNavigationFixture) async throws -> Void) async throws {
-    guard text.utf8.count <= 72_204 else { throw BoomError.budget("Public navigation source exceeds its unchanged small fixture bound.") }
+    let largeCase = name == "testActualThreeMiBParagraphCommandsDeleteAcrossWindowsAndRestoreCaretWithUndoRedo()"
+      || name == "testActualThreeMiBPrefixWaitsForNavigationAndEarlierTypingThenFormatsTheWholeSourceWithUndoRedo()"
+    guard text.utf8.count <= (largeCase ? 3_145_856 : 72_204) else {
+      throw BoomError.budget("Public navigation source exceeds its explicitly nominated fixture bound.")
+    }
     guard ProcessInfo.processInfo.environment["BLOOM_PAGED_NATIVE_NAVIGATION_CASE"] == name else {
       throw BoomError.denied("Nominate this exact public native navigation case; no skip or implicit multi-case run.")
     }
     guard Self.retained == nil else { throw BoomError.stale("An earlier failed public owner still owns this process.") }
     let failures = testRun?.failureCount ?? 0
-    let root = FileManager.default.temporaryDirectory.appendingPathComponent("public-native-navigation-" + UUID().uuidString)
+    let root = try PagedNativeFixtureApplication.scratchRoot(prefix: "public-native-navigation-")
     let held = ManagedNavigationFixture(root: root, text: text); Self.retained = held
     print("Actual public managed navigation: \(root.path)")
     do {
@@ -485,6 +482,349 @@ import XCTest
       let route = await f.route!.snapshot
       XCTAssertEqual(route.activeCalls, 0); XCTAssertEqual(route.startedCalls, route.finishedCalls)
       XCTAssertEqual(f.session!.activeNavigationOperationCount, 0)
+    }
+  }
+
+
+  func testActualThreeMiBParagraphCommandsDeleteAcrossWindowsAndRestoreCaretWithUndoRedo() async throws {
+    let count = 3 * 1024 * 1024, middle = count / 2
+    let tail = "\r\nSecond\u{2028}continued\u{85}still\u{2029}Third\rFourth\n"
+    let text = String(repeating: "q", count: count) + tail
+    try await fixture(#function, text: text) { f in
+      let commands = f.commands!, input = f.input!, source = f.session!, manager = commands.manager
+      let original = try await f.record()
+      // The short native reference determines AppKit's actual endpoint and
+      // selection conventions. Only its known first paragraph is stretched.
+      func mapped(_ offset: Int) throws -> UInt64 {
+        if offset >= 4 { return UInt64(count + offset - 4) }
+        switch offset {
+        case 0: return 0
+        case 2: return UInt64(middle)
+        default: throw BoomError.invalid("The real Cocoa paragraph command returned an unexpected interior target.")
+        }
+      }
+      for selector in ["moveToBeginningOfParagraph:", "moveToEndOfParagraph:",
+        "moveToBeginningOfParagraphAndModifySelection:", "moveToEndOfParagraphAndModifySelection:",
+        "moveParagraphForwardAndModifySelection:", "moveParagraphBackwardAndModifySelection:"] {
+        _ = try await f.startNavigation(anchor: UInt64(middle - 4096), caret: UInt64(middle)).value
+        let reference = NSTextView(frame: NSRect(x: 0, y: 0, width: 640, height: 320))
+        reference.string = "qqqq" + tail
+        reference.setSelectedRange(NSRange(location: 2, length: 0))
+        reference.doCommand(by: NSSelectorFromString(selector))
+        let native = reference.selectedRange()
+        f.view.doCommand(by: NSSelectorFromString(selector))
+        try await commands.joinPendingCommand()
+        let selection = try input.currentDocumentSelection()
+        let lower = try mapped(native.location), upper = try mapped(NSMaxRange(native))
+        XCTAssertEqual(selection.utf16Offset, lower); XCTAssertEqual(selection.utf16Length, upper - lower)
+        XCTAssertEqual(source.sealedRevision, original.document.revision)
+        XCTAssertEqual(manager.undoCount, 0); XCTAssertNil(commands.firstFailure); XCTAssertNil(input.firstRefusal)
+        XCTAssertLessThanOrEqual(f.view.boundedStorage.string.utf8.count, PagedWorkingWindow.targetBytes)
+      }
+      _ = try await f.startNavigation(anchor: UInt64(middle - 4096), caret: UInt64(middle)).value
+      let old = f.view, oldClient = try XCTUnwrap(old.inputContext?.client as? PagedNativeTextInputClient)
+      let reference = NSTextView(frame: NSRect(x: 0, y: 0, width: 640, height: 320))
+      reference.string = "qqqq" + tail; reference.setSelectedRange(NSRange(location: 2, length: 0))
+      reference.doCommand(by: NSSelectorFromString("deleteToEndOfParagraph:"))
+      let afterEnd = String(repeating: "q", count: middle) + String(reference.string.dropFirst(2))
+      f.view.doCommand(by: NSSelectorFromString("deleteToEndOfParagraph:"))
+      try await commands.joinPendingCommand(); try await f.assertSource(afterEnd)
+      XCTAssertEqual(manager.undoCount, 1); XCTAssertTrue(oldClient.isRetired)
+      let changed = try await f.record()
+      oldClient.insertText("OLD", replacementRange: NSRange(location: 0, length: 0))
+      oldClient.doCommand(by: NSSelectorFromString("deleteToBeginningOfParagraph:"))
+      XCTAssertEqual(source.sealedRevision, changed.document.revision)
+      XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+      manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource(text)
+      XCTAssertEqual(source.sealedRevision, original.document.revision)
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, UInt64(middle))
+      manager.redo(); try await commands.joinPendingCommand(); try await f.assertSource(afterEnd)
+      XCTAssertEqual(source.sealedRevision, changed.document.revision)
+      manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource(text)
+      f.view.doCommand(by: NSSelectorFromString("deleteToBeginningOfParagraph:"))
+      try await commands.joinPendingCommand()
+      let afterBeginning = String(repeating: "q", count: count - middle) + tail
+      try await f.assertSource(afterBeginning)
+      manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource(text)
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, UInt64(middle))
+      manager.redo(); try await commands.joinPendingCommand(); try await f.assertSource(afterBeginning)
+      manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource(text)
+      // LS and NEL remain within the paragraph; PS and bare CR terminate it.
+      let second = UInt64(count + 2), secondLength = UInt64(("Second\u{2028}continued\u{85}still" as NSString).length)
+      _ = try await f.startNavigation(anchor: second, caret: second + 3).value
+      f.view.doCommand(by: NSSelectorFromString("moveToEndOfParagraph:"))
+      try await commands.joinPendingCommand()
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, second + secondLength)
+      XCTAssertEqual(source.sealedRevision, original.document.revision)
+      XCTAssertLessThanOrEqual(f.view.boundedStorage.string.utf8.count, PagedWorkingWindow.targetBytes)
+    }
+  }
+
+  func testActualThreeMiBPrefixWaitsForNavigationAndEarlierTypingThenFormatsTheWholeSourceWithUndoRedo() async throws {
+    let line = String(repeating: "q", count: 1020)
+    let block = line + "\r\n" + line + "\r" + line + "\u{2029}" + line + "\n"
+    let base = String(repeating: block, count: 769)
+    let text = base + String(repeating: "q", count: 3 * 1024 * 1024 - base.utf8.count)
+    XCTAssertEqual(text.utf8.count, 3 * 1024 * 1024)
+    try await fixture(#function, text: text) { f in
+      let commands = f.commands!, input = f.input!, source = f.session!, manager = commands.manager
+      let coordinates = try source.documentCoordinates(), caret: UInt64 = 1_050_000
+      let hold = try await f.route!.holdNext(.windowAfter)
+      try commands.requestDocumentNavigation(toUTF16: caret - 4096,
+        selectingUTF16: PagedNativeNavigationSelection(utf16Offset: caret, utf16Length: 0), expected: coordinates)
+      try await f.route!.awaitHeld(hold)
+      let old = f.view, oldClient = try XCTUnwrap(old.inputContext?.client as? PagedNativeTextInputClient)
+      old.keyDown(with: try f.key()) // z must enter before formatting
+      old.prefixLines("> ") // menu command queues while the actual navigation is held
+      let y = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+        windowNumber: f.window!.windowNumber, context: nil, characters: "y", charactersIgnoringModifiers: "y",
+        isARepeat: false, keyCode: 16))
+      old.keyDown(with: y)
+      XCTAssertEqual(commands.queuedRawKeyCount, 2)
+      XCTAssertNil(commands.firstFailure); XCTAssertNil(input.firstRefusal)
+      try await f.route!.release(hold)
+      try await commands.joinPendingCommand(); try await f.seal()
+      // Foundation's independent logical-line API supplies the small changed
+      // range. Fixture Strings are bounded to this explicit 3 MiB control;
+      // production never asks Cocoa to hold the whole document.
+      let before = text as NSString
+      let withZ = before.replacingCharacters(in: NSRange(location: Int(caret), length: 0), with: "z")
+      let changedLine = (withZ as NSString).lineRange(for: NSRange(location: Int(caret + 1), length: 0))
+      let formattedLine = (withZ as NSString).replacingCharacters(in: NSRange(location: changedLine.location, length: 0), with: "> ")
+      let formattedRange = NSRange(location: changedLine.location, length: changedLine.length + 2)
+      let afterY = (formattedLine as NSString).replacingCharacters(in: formattedRange, with: "y")
+      try await f.assertSource(afterY)
+      XCTAssertEqual(manager.undoCount, 3); XCTAssertEqual(commands.queuedRawKeyCount, 0)
+      XCTAssertTrue(oldClient.isRetired); XCTAssertNil(commands.firstFailure); XCTAssertNil(input.firstRefusal)
+      manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource(formattedLine)
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, UInt64(formattedRange.location))
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Length, UInt64(formattedRange.length))
+      manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource(withZ)
+      manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource(text)
+      manager.redo(); try await commands.joinPendingCommand(); try await f.assertSource(withZ)
+      manager.redo(); try await commands.joinPendingCommand(); try await f.assertSource(formattedLine)
+      manager.redo(); try await commands.joinPendingCommand(); try await f.assertSource(afterY)
+      // The same prefix route handles every logical line, not a flat edit
+      // array. Preserve CRLF, bare CR, PS and LF, including final source text.
+      let sourceText = afterY as NSString
+      var formattedAll = "", offset = 0
+      while offset < sourceText.length {
+        var start = 0, end = 0, contentEnd = 0
+        sourceText.getLineStart(&start, end: &end, contentsEnd: &contentEnd,
+          for: NSRange(location: offset, length: 0))
+        guard start == offset, end > offset else { throw BoomError.invalid("The independent fixture line oracle did not advance.") }
+        formattedAll += "> " + sourceText.substring(with: NSRange(location: offset, length: end - offset))
+        offset = end
+      }
+      let beforeAll = try await f.record()
+      f.view.doCommand(by: NSSelectorFromString("selectAll:")); f.view.prefixLines("> ")
+      try await commands.joinPendingCommand(); try await f.assertSource(formattedAll)
+      let afterAll = try await f.record()
+      XCTAssertNotEqual(afterAll.document.revision, beforeAll.document.revision)
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, 0)
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Length, afterAll.document.revision.summary.utf16)
+      XCTAssertLessThanOrEqual(f.view.boundedStorage.string.utf8.count, PagedWorkingWindow.targetBytes)
+      manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource(afterY)
+      XCTAssertEqual(source.sealedRevision, beforeAll.document.revision)
+      manager.redo(); try await commands.joinPendingCommand(); try await f.assertSource(formattedAll)
+      XCTAssertEqual(source.sealedRevision, afterAll.document.revision)
+      f.view.prefixLines("> ") // all lines carry the marker, so the real worker removes it
+      try await commands.joinPendingCommand(); try await f.assertSource(afterY)
+      manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource(formattedAll)
+      XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure); XCTAssertNil(source.persistenceFailure)
+    }
+  }
+
+
+  func testActualHistoryPublicationDefersGlobalTypingAndParagraphDeletionUntilItsJoinedSource() async throws {
+    try await fixture(#function) { f in
+      try f.replaceFirst("A"); try await f.seal()
+      let commands = f.commands!, input = f.input!, source = f.session!, manager = commands.manager
+      let hold = try await f.route!.holdNext(.historyBefore)
+      manager.undo()
+      try await f.route!.awaitHeld(hold) // real new arena, real history publication still pending
+      f.view.doCommand(by: NSSelectorFromString("selectAll:"))
+      let selected = PagedNativeNavigationSelection(utf16Offset: 0,
+        utf16Length: UInt64(f.originalText.utf16.count))
+      // The selection command itself is ordered ahead of typing and cannot
+      // operate on a source whose actual publication has not joined yet.
+      let generation = source.generation, visible = Data(f.view.string.utf8)
+      f.view.keyDown(with: try f.key()) // the original z cannot edit the provisional root
+      f.view.doCommand(by: NSSelectorFromString("deleteToBeginningOfParagraph:"))
+      XCTAssertEqual(commands.queuedRawKeyCount, 1)
+      XCTAssertEqual(source.generation, generation); XCTAssertEqual(Data(f.view.string.utf8), visible)
+      XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+      try await f.route!.release(hold)
+      try await commands.joinPendingCommand(); try await f.assertSource("")
+      // Typing replaces the full source once, then the later paragraph delete
+      // removes z. The original key is never appended behind that delete.
+      XCTAssertEqual(manager.undoCount, 2); XCTAssertEqual(commands.queuedRawKeyCount, 0)
+      manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource("z")
+      manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource(f.originalText)
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, selected.utf16Offset)
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Length, selected.utf16Length)
+      manager.redo(); try await commands.joinPendingCommand(); try await f.assertSource("z")
+      manager.redo(); try await commands.joinPendingCommand(); try await f.assertSource("")
+      XCTAssertNil(source.persistenceFailure); XCTAssertNil(source.historyFailure)
+      XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+    }
+  }
+
+  func testActualShortPrefixUsesTheSameSeparatorRouteAndRealNativeUndoRedo() async throws {
+    let text = "one\r\ntwo\rthree\u{2029}four\u{2028}five\u{85}six\n"
+    let expected = "> one\r\n> two\r> three\u{2029}> four\u{2028}> five\u{85}> six\n"
+    try await fixture(#function, text: text) { f in
+      let commands = f.commands!, input = f.input!, source = f.session!, manager = commands.manager
+      let original = try await f.record()
+      f.view.doCommand(by: NSSelectorFromString("selectAll:")); f.view.prefixLines("> ")
+      try await commands.joinPendingCommand(); try await f.assertSource(expected)
+      let prefixed = try await f.record()
+      XCTAssertEqual(manager.undoCount, 1)
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Length, UInt64(expected.utf16.count))
+      f.view.prefixLines("> ")
+      try await commands.joinPendingCommand(); try await f.assertSource(text)
+      XCTAssertEqual(manager.undoCount, 2)
+      manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource(expected)
+      XCTAssertEqual(source.sealedRevision, prefixed.document.revision)
+      manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource(text)
+      XCTAssertEqual(source.sealedRevision, original.document.revision)
+      manager.redo(); try await commands.joinPendingCommand(); try await f.assertSource(expected)
+      manager.redo(); try await commands.joinPendingCommand(); try await f.assertSource(text)
+      XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+    }
+  }
+
+
+  func testActualByteBoundedHeldInputPreservesMoreThanSixtyFourKeysAndOrderedPrefix() async throws {
+    try await fixture(#function) { f in
+      let source = f.session!, commands = f.commands!, input = f.input!
+      let caret: UInt64 = 50_000, before = source.generation
+      let hold = try await f.route!.holdNext(.windowAfter)
+      let task = try f.startNavigation(anchor: caret - 4096, caret: caret)
+      try await f.route!.awaitHeld(hold)
+      let old = f.view
+      let windowNumber = try XCTUnwrap(f.window).windowNumber
+      func key(_ letter: String) throws -> NSEvent {
+        try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero,
+          modifierFlags: [], timestamp: 0, windowNumber: windowNumber,
+          context: nil, characters: letter, charactersIgnoringModifiers: letter,
+          isARepeat: false, keyCode: letter == "z" ? 6 : 16))
+      }
+      let earlier = String(repeating: "zy", count: 48)
+      for letter in earlier { old.keyDown(with: try key(String(letter))) }
+      old.prefixLines("> ")
+      let later = String(repeating: "yz", count: 16)
+      for letter in later { old.keyDown(with: try key(String(letter))) }
+      XCTAssertEqual(commands.queuedRawKeyCount, 128)
+      XCTAssertEqual(commands.unretainedRawKeyCount, 0)
+      XCTAssertEqual(source.generation, before); XCTAssertNil(commands.firstFailure)
+      XCTAssertNil(input.firstRefusal)
+      try await f.route!.release(hold); _ = try await task.value
+      try await commands.joinPendingCommand()
+      var expected = f.originalText
+      let position = expected.index(expected.startIndex, offsetBy: Int(caret))
+      expected.insert(contentsOf: earlier + later, at: position)
+      expected = "> " + expected
+      try await f.assertSource(expected)
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Offset,
+        caret + UInt64(earlier.utf16.count + later.utf16.count) + 2)
+      XCTAssertEqual(commands.queuedRawKeyCount, 0); XCTAssertEqual(commands.unretainedRawKeyCount, 0)
+      XCTAssertNil(commands.firstFailure); XCTAssertNil(input.firstRefusal)
+      // Actual typing groups may split at the editor's real idle boundary.
+      // Traverse the actual Foundation stack, retaining all source assertions.
+      let undoCount = commands.manager.undoCount
+      XCTAssertGreaterThanOrEqual(undoCount, 3); XCTAssertLessThanOrEqual(undoCount, 100)
+      for _ in 0..<undoCount { commands.manager.undo(); try await commands.joinPendingCommand() }
+      try await f.assertSource(f.originalText)
+      for _ in 0..<undoCount { commands.manager.redo(); try await commands.joinPendingCommand() }
+      try await f.assertSource(expected)
+    }
+  }
+
+  func testActualReplayedCapacityBoundaryKeepsOriginalHeadBeforeLaterKeysAndNativeUndo() async throws {
+    try await fixture(#function) { f in
+      let commands = f.commands!, source = f.session!, input = f.input!
+      let caret: UInt64 = 50_000
+      let hold = try await f.route!.holdNext(.windowAfter)
+      let task = try f.startNavigation(anchor: caret - 4096, caret: caret)
+      try await f.route!.awaitHeld(hold)
+      let old = f.view, oldClient = try XCTUnwrap(old.inputContext?.client as? PagedNativeTextInputClient)
+      var payload = ""
+      // Each original SDK event is bounded 128 units. Ninety-six events exceed
+      // the old 64-key cutoff and the actual 24KiB source arena after mounting.
+      // The key at that real reserve boundary must remain before later keys.
+      for index in 0..<96 {
+        let text = String(repeating: index.isMultiple(of: 2) ? "z" : "y", count: 128)
+        payload += text
+        let event = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero,
+          modifierFlags: [], timestamp: 0, windowNumber: f.window!.windowNumber,
+          context: nil, characters: text, charactersIgnoringModifiers: text,
+          isARepeat: false, keyCode: index.isMultiple(of: 2) ? 6 : 16))
+        old.keyDown(with: event)
+      }
+      XCTAssertEqual(commands.queuedRawKeyCount, 96); XCTAssertEqual(commands.unretainedRawKeyCount, 0)
+      XCTAssertEqual(source.generation, 0); XCTAssertNil(commands.firstFailure)
+      try await f.route!.release(hold); _ = try await task.value
+      try await commands.joinPendingCommand()
+      var expected = f.originalText
+      expected.insert(contentsOf: payload, at: expected.index(expected.startIndex, offsetBy: Int(caret)))
+      try await f.assertSource(expected)
+      XCTAssertEqual(source.generation, 96)
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, caret + UInt64(payload.utf16.count))
+      XCTAssertGreaterThanOrEqual(f.mounts.count, 2)
+      XCTAssertEqual(commands.queuedRawKeyCount, 0); XCTAssertEqual(commands.unretainedRawKeyCount, 0)
+      XCTAssertNil(commands.firstFailure); XCTAssertNil(input.firstRefusal)
+      XCTAssertLessThanOrEqual(f.view.boundedStorage.string.utf8.count, PagedWorkingWindow.hardBytes)
+      let record = source.sealedRevision
+      oldClient.insertText("OLD", replacementRange: NSRange(location: 0, length: 0))
+      XCTAssertEqual(source.sealedRevision, record); XCTAssertTrue(oldClient.isRetired)
+      let undoCount = commands.manager.undoCount
+      XCTAssertGreaterThanOrEqual(undoCount, 1); XCTAssertLessThanOrEqual(undoCount, 100)
+      for _ in 0..<undoCount { commands.manager.undo(); try await commands.joinPendingCommand() }
+      try await f.assertSource(f.originalText)
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, caret)
+      for _ in 0..<undoCount { commands.manager.redo(); try await commands.joinPendingCommand() }
+      try await f.assertSource(expected)
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, caret + UInt64(payload.utf16.count))
+    }
+  }
+
+
+  func testSameSelectionPreloadDoesNotEscrowContainedKeysPastTargetSizeAndStaleReadKeepsRealUndo() async throws {
+    try await fixture(#function) { f in
+      let source = f.session!, old = f.view, input = f.input!, commands = f.commands!
+      old.setSelectedRange(NSRange(location: 8_000, length: 0))
+      let identity = input.activeIdentity, arena = source.arenaID, generation = source.generation
+      let context = try XCTUnwrap(old.inputContext), manager = commands.manager
+      let hold = try await f.route!.holdNext(.windowAfter)
+      let loading = try f.startNavigation(anchor: 6_000, caret: nil) // actual same logical selection
+      try await f.route!.awaitHeld(hold) // the genuine backend window call already entered/joined
+      XCTAssertFalse(commands.isNavigating); XCTAssertTrue(commands.hasPendingCommand)
+      XCTAssertEqual(source.activeNavigationOperationCount, 1)
+      let window = try XCTUnwrap(f.window)
+      XCTAssertTrue(window.isKeyWindow); XCTAssertTrue(window.firstResponder === old)
+      window.sendEvent(try f.key())
+      XCTAssertEqual(source.generation, generation + 1)
+      XCTAssertTrue(source.needsRecentering, "The accepted island now exceeds targetBytes, while hardBytes still admits typing.")
+      let next = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+        timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+        context: nil, characters: "q", charactersIgnoringModifiers: "q", isARepeat: false, keyCode: 12))
+      window.sendEvent(next)
+      XCTAssertEqual(source.generation, generation + 2)
+      XCTAssertEqual(commands.queuedRawKeyCount, 0); XCTAssertEqual(commands.unretainedRawKeyCount, 0)
+      XCTAssertTrue(f.view === old); XCTAssertTrue(old.inputContext === context)
+      XCTAssertEqual(input.activeIdentity, identity); XCTAssertEqual(source.arenaID, arena)
+      XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+      try await f.route!.release(hold); try await f.requireStale(loading)
+      XCTAssertTrue(f.mounts.isEmpty); XCTAssertFalse(input.hasStagedClient)
+      XCTAssertEqual(source.activeNavigationOperationCount, 0)
+      var expected = f.originalText
+      expected.insert(contentsOf: "zq", at: expected.index(expected.startIndex, offsetBy: 8_000))
+      try await f.assertSource(expected)
+      XCTAssertTrue(commands.manager === manager); XCTAssertNil(source.persistenceFailure)
+      manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource(f.originalText)
+      manager.redo(); try await commands.joinPendingCommand(); try await f.assertSource(expected)
+      XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
     }
   }
 

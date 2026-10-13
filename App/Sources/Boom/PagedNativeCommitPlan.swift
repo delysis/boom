@@ -17,6 +17,9 @@ struct PagedNativeCommitPlan: Sendable {
     let beforeCursor: PagedNativeLocalCursor?
     let localCursorByte: Int
     let localCursorUTF16: Int
+    let localSelectionLengthUTF16: Int
+    let localFocusAtEnd: Bool
+    let localAffinity: PagedSelectionAffinity
   }
   let initialBytes: Data
   /// At most one expired meaningful baseline, 100 meaningful group states,
@@ -65,15 +68,18 @@ struct PagedNativeCommitPlan: Sendable {
       guard checkpoint.firstSequence > previousGroupSequence,
         checkpoint.firstSequence <= checkpoint.lastSequence,
         checkpoint.lastSequence <= batch.lastSequence,
-        groupIDs.insert(checkpoint.groupID).inserted,
-        checkpoint.afterBytes != previousGroupBytes else {
+        groupIDs.insert(checkpoint.groupID).inserted else {
         throw BoomError.invalid("Meaningful native checkpoints have an invalid sequence, identity or net state.")
       }
       let beforeCursor = try Self.localCursor(in: previousGroupBytes,
-        caretUTF16: checkpoint.beforeCursor.utf16Offset)
+        caretUTF16: checkpoint.beforeCursor.utf16Offset,
+        selectionLengthUTF16: checkpoint.beforeCursor.selectionLengthUTF16,
+        focusAtEnd: checkpoint.beforeCursor.focusAtEnd, affinity: checkpoint.beforeCursor.affinity)
       guard beforeCursor == checkpoint.beforeCursor else {
         throw BoomError.invalid("Native group start cursor differs from its exact before source.")
       }
+      // Adjacent chunks of one typing transaction may return to its original
+      // bytes. Preserve their real sequence resolution, but mint no Undo root.
       admitted.append(try Self.step(checkpoint, kind: .nativeGroup))
       previousGroupSequence = checkpoint.lastSequence
       previousGroupBytes = checkpoint.afterBytes
@@ -82,9 +88,15 @@ struct PagedNativeCommitPlan: Sendable {
       throw BoomError.invalid("The retained native groups do not end at the accepted batch.")
     }
     let final = try Self.makeStep(kind: .epochOnly, groupID: nil,
-      lastSequence: batch.lastSequence, afterBytes: batch.afterBytes, caretUTF16: batch.finalCaretUTF16)
+      lastSequence: batch.lastSequence, afterBytes: batch.afterBytes, caretUTF16: batch.finalCaretUTF16,
+      selectionLengthUTF16: batch.finalSelectionLengthUTF16,
+      focusAtEnd: batch.finalFocusAtEnd, affinity: batch.finalAffinity)
     if admitted.last?.lastSequence == batch.lastSequence {
-      guard admitted.last?.localCursorUTF16 == final.localCursorUTF16 else {
+      guard admitted.last?.localCursorByte == final.localCursorByte,
+        admitted.last?.localCursorUTF16 == final.localCursorUTF16,
+        admitted.last?.localSelectionLengthUTF16 == final.localSelectionLengthUTF16,
+        admitted.last?.localFocusAtEnd == final.localFocusAtEnd,
+        admitted.last?.localAffinity == final.localAffinity else {
         throw BoomError.invalid("The final native cursor differs from its retained group endpoint.")
       }
     } else { admitted.append(final) }
@@ -151,32 +163,46 @@ struct PagedNativeCommitPlan: Sendable {
     guard checkpoint.groupID != zero else { throw BoomError.invalid("Native checkpoint identity is empty.") }
     return try makeStep(kind: kind, groupID: checkpoint.groupID, lastSequence: checkpoint.lastSequence,
       afterBytes: checkpoint.afterBytes, caretUTF16: checkpoint.caretUTF16,
-      beforeCursor: kind == .nativeGroup ? checkpoint.beforeCursor : nil)
+      beforeCursor: kind == .nativeGroup ? checkpoint.beforeCursor : nil,
+      selectionLengthUTF16: checkpoint.afterSelectionLengthUTF16,
+      focusAtEnd: checkpoint.afterFocusAtEnd, affinity: checkpoint.afterAffinity)
   }
 
   private static func makeStep(kind: Step.Kind, groupID: UUID?, lastSequence: UInt64,
-    afterBytes: Data, caretUTF16: Int, beforeCursor: PagedNativeLocalCursor? = nil) throws -> Step {
-    let cursor = try localCursor(in: afterBytes, caretUTF16: caretUTF16)
+    afterBytes: Data, caretUTF16: Int, beforeCursor: PagedNativeLocalCursor? = nil,
+    selectionLengthUTF16: Int = 0, focusAtEnd: Bool = false,
+    affinity: PagedSelectionAffinity = .downstream) throws -> Step {
+    let cursor = try localCursor(in: afterBytes, caretUTF16: caretUTF16,
+      selectionLengthUTF16: selectionLengthUTF16, focusAtEnd: focusAtEnd, affinity: affinity)
     return Step(kind: kind, groupID: groupID, lastSequence: lastSequence,
       afterBytes: afterBytes, beforeCursor: beforeCursor,
-      localCursorByte: cursor.byteOffset, localCursorUTF16: cursor.utf16Offset)
+      localCursorByte: cursor.byteOffset, localCursorUTF16: cursor.utf16Offset,
+      localSelectionLengthUTF16: cursor.selectionLengthUTF16,
+      localFocusAtEnd: cursor.focusAtEnd, localAffinity: cursor.affinity)
   }
 
-  private static func localCursor(in bytes: Data, caretUTF16: Int) throws -> PagedNativeLocalCursor {
+  private static func localCursor(in bytes: Data, caretUTF16: Int,
+    selectionLengthUTF16: Int = 0, focusAtEnd: Bool = false,
+    affinity: PagedSelectionAffinity = .downstream) throws -> PagedNativeLocalCursor {
+    let end = caretUTF16.addingReportingOverflow(selectionLengthUTF16)
     guard bytes.count <= PagedWorkingWindow.hardBytes, caretUTF16 >= 0,
+      selectionLengthUTF16 >= 0, !end.overflow,
       let text = String(data: bytes, encoding: .utf8) else {
       throw BoomError.invalid("Native group checkpoint exceeds its scalar island.")
     }
-    var byte = 0, units = 0
+    var byte = 0, units = 0, startByte: Int?
     for scalar in text.unicodeScalars {
-      if units == caretUTF16 { break }
+      if units == caretUTF16 { startByte = byte }
+      if units == end.partialValue { break }
       let value = scalar.value
       units += value < 0x10000 ? 1 : 2
       byte += value < 0x80 ? 1 : value < 0x800 ? 2 : value < 0x10000 ? 3 : 4
     }
-    guard units == caretUTF16 else {
+    if units == caretUTF16 { startByte = byte }
+    guard units == end.partialValue, let startByte else {
       throw BoomError.invalid("Native group cursor splits a scalar or exceeds its island.")
     }
-    return PagedNativeLocalCursor(byteOffset: byte, utf16Offset: units)
+    return PagedNativeLocalCursor(byteOffset: startByte, utf16Offset: caretUTF16,
+      selectionLengthUTF16: selectionLengthUTF16, focusAtEnd: focusAtEnd, affinity: affinity)
   }
 }

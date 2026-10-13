@@ -1,6 +1,5 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import SwiftUI
 import XCTest
 @testable import Boom
@@ -18,7 +17,7 @@ final class NativeInputIdentityTests: XCTestCase {
     _ = NSApplication.shared
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-input-identity-" + UUID().uuidString)
     addTeardownBlock { try? FileManager.default.removeItem(at: root) }
-    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root)
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     if model.selectedChat == nil { try model.newChat() }
     model.state.autocomplete = false
@@ -35,16 +34,20 @@ final class NativeInputIdentityTests: XCTestCase {
   }
 
   @MainActor private func manuscript(_ model: WorkspaceModel, source: String) async throws
-    -> (NSWindow, NSView, MarkdownTextView) {
+    -> (NSWindow, NSView, PagedNativeTextView) {
     try model.newDocument()
+    try await model.joinWorkspaceOperation()
     let id = try XCTUnwrap(model.state.selectedDocument)
-    model.updateDocument(source, id: id, caret: source.utf16.count)
-    let host = NSHostingView(rootView: MarkdownEditor(model: model, documentID: id))
+    let host = try XCTUnwrap(model.pagedViewport)
     let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 500, height: 400))
     window.isReleasedWhenClosed = false; window.contentView = host
+    window.makeKeyAndOrderFront(nil)
+    XCTAssertTrue(window.makeFirstResponder(try XCTUnwrap(model.pagedInput?.activeView)))
+    try await NativeCheckEvidence.replacePublicDocument(model, text: source, id: id, caret: source.utf16.count)
+
     do {
       try await settle(host)
-      return (window, host, try XCTUnwrap(model.editor))
+      return (window, host, try XCTUnwrap(model.pagedInput?.activeView))
     } catch { window.close(); throw error }
   }
 
@@ -74,7 +77,7 @@ final class NativeInputIdentityTests: XCTestCase {
     XCTAssertEqual(Data(editor.string.utf8), Data(committed.text.utf8))
     let store = model.store
     try await model.shutdown()
-    let restored = try await store.load().get().1
+    let restored = try await NativeCheckEvidence.readPublicDocuments(store: model.store)
     let retained = try XCTUnwrap(restored.first(where: { $0.id == committed.id }))
     XCTAssertEqual(Data(retained.text.utf8), Data(committed.text.utf8))
   }
@@ -142,7 +145,7 @@ final class NativeInputIdentityTests: XCTestCase {
     try await model.shutdown()
     let reopened = try await WorkspaceModel(storeOverride: store, loadModels: false)
     XCTAssertEqual(Data(reopened.draft.utf8), Data(replacement.utf8),
-      "The owner-bound encrypted draft must retain the exact canonical form on restart.")
+      "The owner-bound draft must retain the exact canonical form on restart.")
     XCTAssertFalse(reopened.isBusy)
     XCTAssertTrue(reopened.selectedChat?.messages.isEmpty == true)
     try await reopened.shutdown()

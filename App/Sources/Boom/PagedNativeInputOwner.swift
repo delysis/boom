@@ -3,6 +3,17 @@ import BoomCore
 import Foundation
 import Synchronization
 
+extension PagedSelectionAffinity {
+  init(native: NSSelectionAffinity) throws {
+    switch native {
+    case .upstream: self = .upstream
+    case .downstream: self = .downstream
+    @unknown default: throw BoomError.invalid("Unknown native selection affinity.")
+    }
+  }
+  var native: NSSelectionAffinity { self == .upstream ? .upstream : .downstream }
+}
+
 /// The physical installation window is stable through ordinary storage ACKs.
 /// A new sealed-window UUID is not an instruction to rebind an input client.
 struct PagedNativeInputIdentity: Equatable {
@@ -20,6 +31,15 @@ struct PagedNativeSelectionObservation: Equatable {
   let selectionEpoch: UInt64
   let range: NSRange
   let affinity: NSSelectionAffinity
+}
+
+struct PagedNativeStateObservation {
+  let sessionID: UUID
+  let arenaID: UUID
+  let generation: UInt64
+  let caretUTF16: UInt64
+  let selectionLength: UInt64
+  let hasMarkedText: Bool
 }
 
 /// Original key events have no interpreted range. Their replay still requires
@@ -112,13 +132,17 @@ private final class PagedNativeInputObservers {
 
   fileprivate init(identity: PagedNativeInputIdentity) { self.identity = identity }
 
-  func admitsInput(in session: PagedNativeSession, requiresCommand: Bool = false) throws {
+  func admitsInput(in session: PagedNativeSession) throws {
     guard state == .active, let owner, owner.activeIdentity == identity,
       session.sessionID == identity.sessionID, session.arenaID == identity.arenaID else {
       throw BoomError.stale("This input client still belongs to its earlier source window.")
     }
-    guard !owner.isAdopting, owner.firstRefusal == nil, !requiresCommand || commandDepth > 0 else {
-      throw BoomError.stale("This input callback has no admitted source command.")
+    // A failed file/mount/command remains owned by its actual receiver. It
+    // does not prohibit characters in this still-current consistent source.
+    // An accepted source/backing mismatch is different: never type against
+    // that inconsistent TextKit projection until it is actually rebuilt.
+    guard !owner.isAdopting, owner.activeView?.boundedStorage.mutationFailure == nil else {
+      throw BoomError.stale("The physical editor has an unresolved source projection.")
     }
   }
 
@@ -157,8 +181,7 @@ private final class PagedNativeInputObservers {
   }
 }
 
-/// Physical clients for the staged-installation component. The ordinary
-/// product factory does not construct this owner yet. Keep one active view
+/// Physical clients for the file-backed editor. Keep one active view
 /// and at most one staged view; old contexts own only inert, weak-target
 /// clients. Normal reference lifetime handles their physical reclamation.
 /// Actual source/history tasks remain owned by the session and backend.
@@ -193,6 +216,196 @@ private final class PagedNativeInputObservers {
   private(set) var lastReplayTransition: PagedNativeReplayInputTransition?
   private(set) var firstRefusal: Error?
   private(set) var refusedClientIDs: Set<UUID> = []
+  private weak var completionClient: (any NativeCompletionClient)?
+  private var documentSelection: PagedNativeNavigationSelection?
+  private var documentSelectionGeneration: UInt64?
+  private var projectingDocumentSelection = false
+  private var nextInputGroupID: UUID?
+  func continueNextInputGroup(_ id: UUID) { nextInputGroupID = id }
+  func takeNextInputGroupID() -> UUID? {
+    defer { nextInputGroupID = nil }
+    return nextInputGroupID
+  }
+
+  struct TypingIntent {
+    enum Kind { case insertion, backwardDeletion, forwardDeletion }
+    let kind: Kind
+    let startsNewGroup: Bool
+    let endsGroup: Bool
+  }
+  private struct TypingGroup {
+    let id: UUID
+    let kind: TypingIntent.Kind
+    var generation: UInt64
+    var caretUTF16: UInt64
+    var lastInput: ContinuousClock.Instant
+    var ended: Bool
+  }
+  private var typingGroup: TypingGroup?
+
+  static func typingIntent(for event: NSEvent) -> TypingIntent? {
+    guard event.type == .keyDown,
+      event.modifierFlags.intersection([.command, .control, .option]).isEmpty else { return nil }
+    if event.keyCode == 51 { return TypingIntent(kind: .backwardDeletion, startsNewGroup: false, endsGroup: false) }
+    if event.keyCode == 117 { return TypingIntent(kind: .forwardDeletion, startsNewGroup: false, endsGroup: false) }
+    guard ![48, 53, 115, 116, 119, 121, 123, 124, 125, 126].contains(event.keyCode) else { return nil }
+    guard let characters = event.characters, !characters.isEmpty,
+      characters.utf16.count <= PagedNativeUndoOwner.maximumKeyUTF16,
+      !characters.unicodeScalars.contains(where: { $0.value < 32 && $0 != "\n" && $0 != "\r" && $0 != "\t" }) else {
+      return nil
+    }
+    let newline = characters.contains("\n") || characters.contains("\r")
+    let whitespace = characters.unicodeScalars.allSatisfy { CharacterSet.whitespacesAndNewlines.contains($0) }
+    return TypingIntent(kind: .insertion, startsNewGroup: newline, endsGroup: whitespace)
+  }
+
+  /// Group adjacent typing/deletion by the real document caret, irrespective
+  /// of a physical window recenter or a disk seal. Paste and menu commands
+  /// have no typing intent and therefore remain separate transactions.
+  func nativeInputGroupID(intent: TypingIntent?) -> UUID {
+    let continuation = takeNextInputGroupID()
+    guard let intent, let selection = try? currentDocumentSelection() else {
+      typingGroup = nil
+      return continuation ?? UUID()
+    }
+    let now = ContinuousClock.now
+    let previous = typingGroup
+    let canContinue = previous.map {
+      !intent.startsNewGroup && !$0.ended && $0.kind == intent.kind
+        && $0.generation == session.generation && $0.caretUTF16 == selection.utf16Offset
+        && selection.utf16Length == 0 && $0.lastInput.duration(to: now) <= .milliseconds(750)
+    } ?? false
+    let previousID = canContinue ? previous?.id : nil
+    let id = continuation ?? previousID ?? UUID()
+    typingGroup = TypingGroup(id: id, kind: intent.kind, generation: session.generation,
+      caretUTF16: selection.utf16Offset, lastInput: now, ended: intent.endsGroup)
+    return id
+  }
+  var onNativeEdit: ((PagedNativeStateObservation) -> Void)?
+  var onNativeSelection: ((PagedNativeStateObservation) -> Void)?
+
+  func installCompletionClient(_ client: (any NativeCompletionClient)?) {
+    completionClient = client
+    let model = client as? WorkspaceModel
+    activeView?.completionClient = client
+    activeView?.owner = model
+    activeView?.setMedia(model: model)
+    activeView?.didRejectInput = { _ in PerformanceTrace.event("Editor.ManagedAdmission") }
+    stagedClient?.client.view.completionClient = client
+    stagedClient?.client.view.owner = model
+    stagedClient?.client.view.setMedia(model: model)
+    stagedClient?.client.view.didRejectInput = activeView?.didRejectInput
+  }
+
+  func currentDocumentSelection() throws -> PagedNativeNavigationSelection {
+    if let documentSelection, documentSelectionGeneration == session.generation { return documentSelection }
+    let selection = try session.navigationSelection(activeView.selectedRange())
+    // A normalized NSRange supplies no independent anchor. Preserve the
+    // observed visual affinity without manufacturing direction from it.
+    return PagedNativeNavigationSelection(utf16Offset: selection.utf16Offset,
+      utf16Length: selection.utf16Length, focusAtEnd: selection.focusAtEnd,
+      affinity: try PagedSelectionAffinity(native: activeView.selectionAffinity))
+  }
+
+  /// A caret supplies its own anchor. A nonempty native range needs the
+  /// actual owned anchor; visual affinity cannot manufacture that endpoint.
+  func selectionForVisualMovement() throws -> PagedNativeNavigationSelection {
+    if let documentSelection, documentSelectionGeneration == session.generation { return documentSelection }
+    guard activeView.selectedRange().length == 0 else {
+      throw BoomError.unavailable("Visual movement requires the actual selection anchor.")
+    }
+    return try currentDocumentSelection()
+  }
+
+  func userSelectionDidChange(from view: PagedNativeTextView,
+    previousRange: NSRange?, previousGeneration: UInt64) {
+    guard view === activeView, !isAdopting, !projectingDocumentSelection else { return }
+    var previous = documentSelectionGeneration == session.generation ? documentSelection : nil
+    documentSelection = nil; documentSelectionGeneration = nil
+    do {
+      if previous == nil, previousGeneration == session.generation,
+        let previousRange, previousRange.length == 0 {
+        // A real prior caret supplies its anchor even without a logical
+        // selection cache. Admit it in this exact still-current source.
+        previous = try session.navigationSelection(previousRange)
+      }
+      let next = try session.navigationSelection(view.selectedRange())
+      let affinity = try PagedSelectionAffinity(native: view.selectionAffinity)
+      let end = next.utf16Offset + next.utf16Length
+      let focusAtEnd: Bool
+      if next.utf16Length == 0 { focusAtEnd = false }
+      else if let previous, previous.anchorUTF16 == next.utf16Offset { focusAtEnd = true }
+      else if let previous, previous.anchorUTF16 == end { focusAtEnd = false }
+      else {
+        // Both endpoints changed without an owned anchor (for example a
+        // direct AppKit range assignment). Keep this ingress unproven.
+        if view.inputCommandIsClosed { typingGroup = nil; nextInputGroupID = nil }
+        return
+      }
+      documentSelection = PagedNativeNavigationSelection(utf16Offset: next.utf16Offset,
+        utf16Length: next.utf16Length, focusAtEnd: focusAtEnd, affinity: affinity)
+      documentSelectionGeneration = session.generation
+    } catch { PerformanceTrace.event("Editor.ManagedAdmission") }
+    if view.inputCommandIsClosed { typingGroup = nil; nextInputGroupID = nil }
+  }
+
+  /// A document range is two scalar coordinates. Cocoa paints only the
+  /// intersection with its bounded island; neither selection nor Undo copies
+  /// the selected source bytes into memory.
+  func setDocumentSelection(_ selection: PagedNativeNavigationSelection) throws {
+    let coordinates = try session.documentCoordinates()
+    guard selection.utf16Offset <= coordinates.projectedUTF16,
+      selection.utf16Length <= coordinates.projectedUTF16 - selection.utf16Offset,
+      let view = activeView, let binding = view.inputBinding, binding.state == .active else {
+      throw BoomError.stale("Document selection falls outside the actual projected source.")
+    }
+    let changesLogicalSelection = try currentDocumentSelection() != selection
+    if changesLogicalSelection { try binding.requireSelectionCapacity() }
+    let beforeEpoch = binding.selectionEpoch
+    let windowEnd = coordinates.utf16Start + UInt64(coordinates.localUTF16)
+    let selectionEnd = selection.utf16Offset + selection.utf16Length
+    let start = min(windowEnd, max(coordinates.utf16Start, selection.utf16Offset))
+    let end = min(windowEnd, max(start, selectionEnd))
+    let local = NSRange(location: Int(start - coordinates.utf16Start), length: Int(end - start))
+    projectingDocumentSelection = true
+    defer { projectingDocumentSelection = false }
+    documentSelection = selection
+    documentSelectionGeneration = session.generation
+    view.endGhostBoundary(); view.clearGhost()
+    view.setSelectedRange(local, affinity: selection.affinity.native, stillSelecting: false)
+    // A distant logical endpoint may change while Cocoa paints the identical
+    // island range. It still invalidates pending input/navigation observations.
+    if changesLogicalSelection, binding.selectionEpoch == beforeEpoch { binding.recordSelectionChange() }
+    notifyNativeState(from: view, edited: false)
+  }
+
+  func notifyNativeState(from view: PagedNativeTextView, edited: Bool) {
+    guard view === activeView, !isAdopting, !canonicalActivationPending,
+      view.inputBinding?.state == .active else { return }
+    do {
+      let coordinates = try session.documentCoordinates(), range = view.selectedRange()
+      guard range.location >= 0, range.location != NSNotFound, range.length >= 0 else {
+        throw BoomError.invalid("Invalid native selection.")
+      }
+      let caret = coordinates.utf16Start.addingReportingOverflow(UInt64(range.location))
+      guard !caret.overflow else { throw BoomError.budget("Native caret exceeds document coordinates.") }
+      if documentSelectionGeneration != session.generation {
+        documentSelection = nil; documentSelectionGeneration = nil
+      }
+      let observation = PagedNativeStateObservation(sessionID: session.sessionID, arenaID: session.arenaID,
+        generation: session.generation, caretUTF16: documentSelection?.focusUTF16 ?? caret.partialValue,
+        selectionLength: documentSelection?.utf16Length ?? UInt64(range.length), hasMarkedText: view.hasMarkedText())
+      if edited, var group = typingGroup {
+        group.generation = session.generation; group.caretUTF16 = observation.caretUTF16
+        group.ended = group.ended || observation.selectionLength > 0 || observation.hasMarkedText
+        typingGroup = group
+      } else if let group = typingGroup,
+        group.generation != session.generation || group.caretUTF16 != observation.caretUTF16 || observation.selectionLength > 0 {
+        typingGroup = nil; nextInputGroupID = nil
+      }
+      if edited { onNativeEdit?(observation) } else { onNativeSelection?(observation) }
+    } catch { PerformanceTrace.event("Editor.ManagedAdmission") }
+  }
   // Presentation hooks belong to this existing physical owner. Retired clients
   // never reacquire them through a current-view lookup.
   private var documentKey: ((NSEvent, PagedNativeTextView) -> Bool)?
@@ -212,11 +425,31 @@ private final class PagedNativeInputObservers {
     return documentKey?(event, view) ?? false
   }
   func handlesDocumentCommand(_ selector: Selector) -> Bool {
-    documentCommand != nil && (selector == NSSelectorFromString("moveToBeginningOfDocument:")
+    let partialDocument: Bool
+    if let coordinates = try? session.documentCoordinates() {
+      partialDocument = coordinates.utf16Start != 0
+        || UInt64(coordinates.localUTF16) != coordinates.projectedUTF16
+    } else { partialDocument = false }
+    let selectedBeyondWindow = (documentSelection?.utf16Length ?? 0) > UInt64(activeView?.selectedRange().length ?? 0)
+    // Replacing an exact local scalar selection needs no source read or
+    // grapheme context, including a selection reaching this island's edge.
+    let localSelectionCommand = !selectedBeyondWindow && (activeView?.selectedRange().length ?? 0) > 0
+      && ["deleteBackward:", "deleteForward:", "delete:", "moveForward:", "moveBackward:"].contains(NSStringFromSelector(selector))
+    let characterCommand = partialDocument && !localSelectionCommand
+      && activeView?.hasContainedCharacterCommand(selector) != true
+      && ["moveForward:", "moveBackward:", "moveLeft:", "moveRight:",
+      "moveForwardAndModifySelection:", "moveBackwardAndModifySelection:",
+      "moveLeftAndModifySelection:", "moveRightAndModifySelection:", "deleteBackward:", "deleteForward:"].contains(NSStringFromSelector(selector))
+    let collapsingSelection = selectedBeyondWindow && (selector == NSSelectorFromString("moveForward:")
+      || selector == NSSelectorFromString("moveBackward:") || selector == NSSelectorFromString("moveLeft:")
+      || selector == NSSelectorFromString("moveRight:"))
+    return documentCommand != nil && (PagedNativeParagraphCommand(selector) != nil || characterCommand || collapsingSelection || selector == NSSelectorFromString("moveToBeginningOfDocument:")
       || selector == NSSelectorFromString("moveToEndOfDocument:")
       || selector == NSSelectorFromString("moveToBeginningOfDocumentAndModifySelection:")
       || selector == NSSelectorFromString("moveToEndOfDocumentAndModifySelection:")
-      || selector == NSSelectorFromString("selectAll:"))
+      || selector == NSSelectorFromString("selectAll:")
+      || selectedBeyondWindow && (selector == NSSelectorFromString("deleteBackward:")
+        || selector == NSSelectorFromString("deleteForward:") || selector == NSSelectorFromString("delete:")))
   }
   func dispatchDocumentCommand(_ selector: Selector,
     observed: PagedNativeSelectionObservation) throws {
@@ -225,7 +458,22 @@ private final class PagedNativeInputObservers {
       !activeView.hasMarkedText() else {
       throw BoomError.stale("Document movement lost its actual source command or physical selection.")
     }
-    try documentCommand(selector, observed)
+    if let commandOwner { try commandOwner.requestDocumentCommand(selector, from: activeView) }
+    else { try documentCommand(selector, observed) }
+  }
+
+  /// Only the existing command queue calls this after its original physical
+  /// lease/window check. Selection follows all earlier admitted input.
+  func performQueuedDocumentCommand(_ selector: Selector) throws {
+    guard let documentCommand else {
+      throw BoomError.stale("The queued document command lost its actual presentation consumer.")
+    }
+    if handlesDocumentCommand(selector) { try documentCommand(selector, observeSelection()) }
+    else {
+      // Earlier ordered edits may make the whole source fit this island.
+      // This same authorized client then performs the contained native command.
+      try activeView.performContainedDocumentCommand(selector)
+    }
   }
 
   var activeIdentity: PagedNativeInputIdentity? { activeView?.inputBinding?.identity }
@@ -319,16 +567,15 @@ private final class PagedNativeInputObservers {
     try requirePhysicalStageSource(observed)
     guard let cached = try session.joinedNavigationWindow(owner: self, toUTF16: anchor, selection: selection) else { return nil }
     let view = activeView!
-    let changesRange = cached.localSelection != observed.range
-    let epoch = observed.selectionEpoch.addingReportingOverflow(changesRange ? 1 : 0)
+    let currentSelection = try currentDocumentSelection()
+    let changesSelection = cached.localSelection != observed.range || selection != currentSelection
+    let epoch = observed.selectionEpoch.addingReportingOverflow(changesSelection ? 1 : 0)
     guard !epoch.overflow else { throw BoomError.budget("Joined native selection identity is exhausted.") }
-    if changesRange {
-      view.setSelectedRange(cached.localSelection, affinity: observed.affinity, stillSelecting: false)
-    }
+    if changesSelection { try setDocumentSelection(selection) }
     let after = try observeSelection()
     guard activeView === view, after.identity == observed.identity, after.generation == observed.generation,
       after.inputLease == observed.inputLease, after.selectionEpoch == epoch.partialValue,
-      after.range == cached.localSelection, after.affinity == observed.affinity,
+      after.range == cached.localSelection, after.affinity == selection.affinity.native,
       firstRefusal == nil, view.boundedStorage.mutationFailure == nil,
       let joined = try session.joinedNavigationWindow(owner: self, toUTF16: anchor, selection: selection),
       joined.window.windowID == cached.window.windowID, joined.localSelection == cached.localSelection else {
@@ -375,6 +622,10 @@ private final class PagedNativeInputObservers {
       let binding = makeBinding(arenaID: arena, windowID: window.windowID)
       let view = try PagedNativeTextView(frame: activeView.frame, session: session,
         inputBinding: binding, stagedTicket: history, stagedNavigationTicket: navigation)
+      view.completionClient = completionClient
+      view.owner = completionClient as? WorkspaceModel
+      view.setMedia(model: completionClient as? WorkspaceModel)
+      view.didRejectInput = activeView.didRejectInput
       binding.owner = self
       let keyboardID = activeContext?.selectedKeyboardInputSource, sourceWindow = activeView.window
       stagedClient = StagedClient(ticket: ticket, client: PhysicalClient(view: view, context: nil),
@@ -434,7 +685,14 @@ private final class PagedNativeInputObservers {
     }
     try requireAdoptionSource(stage)
     isAdopting = true; lastReplayTransition = nil
-    defer { isAdopting = false }
+    defer {
+      isAdopting = false
+      if activeIdentity?.arenaID == ticket.provisionalArenaID {
+        do { try setDocumentSelection(ticket.documentSelection) }
+        catch { activeView?.inputBinding?.recordRefusal(error) }
+      }
+      if let activeView { notifyNativeState(from: activeView, edited: false) }
+    }
     var mountFailure: Error?
     let admission = try session.withStagedHistoryInstallation(ticket) { consumer in
       advancingFoundation { [self] in
@@ -456,7 +714,16 @@ private final class PagedNativeInputObservers {
     }
     try requireAdoptionSource(stage)
     isAdopting = true; lastReplayTransition = nil
-    defer { isAdopting = false }
+    defer {
+      isAdopting = false
+      if ticket.wasConsumed, let selection = ticket.documentSelection {
+        do { try setDocumentSelection(selection) }
+        catch { activeView?.inputBinding?.recordRefusal(error) }
+      } else if ticket.wasConsumed {
+        documentSelection = nil; documentSelectionGeneration = nil
+      }
+      if let activeView { notifyNativeState(from: activeView, edited: false) }
+    }
     var mountFailure: Error?
     let window = try session.withStagedNavigationInstallation(ticket) { _, arena, _ in
       precondition(arena == stage.client.view.inputBinding?.identity.arenaID)

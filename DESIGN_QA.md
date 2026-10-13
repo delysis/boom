@@ -65,11 +65,11 @@ The Markdown editor stores plain UTF-8. A font trait changed only temporary
 display attributes, so it could never be an authoring command. All formatting
 controls must edit the Markdown source through the text view's normal undo path.
 For each keyboard shortcut and context menu action, select text, apply the
-action, inspect both the editor and decrypted document bytes, apply it again to remove
+action, inspect both the editor and exported document bytes, apply it again to remove
 the syntax, then undo. The native font palette and Writing Tools must not offer
 formatting that cannot be represented in the saved document.
 
-Test deletion inside Bloom separately from removing an indexed encrypted record
+Test deletion inside Bloom separately from removing an indexed source root
 while Bloom is closed. An absent, corrupt, or incompatible indexed record must
 stop loading with a clear error and leave the surviving records intact. Never
 replace that workspace with empty state or silently remove the indexed document.
@@ -92,7 +92,7 @@ Pointer entry or keyboard focus reveals timestamps, copy, edit and branch;
 replies also offer one feedback menu. Reserve the rail's height so entering it
 cannot reflow the transcript. Keep context-menu access as well. Check actual
 button hit regions at narrow widths and edit both roles through the pencil,
-save and discard through native icons, and verify originals remain encrypted.
+save and discard through native icons, and verify originals remain on disk.
 New messages retain their creation time across generation retries, completion,
 edits and branches; unknown historical times remain unknown. Test feedback
 selection and removal, branch boundaries, and hidden-action keyboard focus.
@@ -150,7 +150,7 @@ Repeat with playable audio and video; preparation for assistant consumption is
 automatic on explicit Send. Image description/OCR is not a paste prerequisite.
 Ordinary context menus provide intentional copy, cut and export. Delete an
 embedded object as a unit, undo, type on either side, and reopen. Verify source
-bytes, encrypted original and insertion target separately.
+bytes, original file and insertion target separately.
 
 `NativeInlineMedia` projects Rust-parsed local references through the shared
 TextKit delegate used by display, isolated measurement and ghost layouts.
@@ -165,7 +165,7 @@ media object, native Undo and complete-object deletion.
 
 Writing must pass original images and audio waveforms to the base checkpoint,
 without a chat template or a substituted description/transcript. Capture original
-identities and ordered occurrences in encrypted recipes. Supply only references
+identities and ordered occurrences in captured recipes. Supply only references
 before the caret and in selected examples; count expanded model tokens before
 admission. Context lower bounds use compiled media markers, never discarded
 filename/UUID text, and suffixes cannot bisect an embedded object. Exercise a
@@ -178,7 +178,7 @@ pages, and four sampled video frames. Preserve page/frame hashes in recipes;
 sampling a video does not establish coverage of its sound or every frame.
 
 `AttachmentQualificationSmoke` owns the checked-in public format matrix. Each
-new format adds a corpus fixture and runs the same receiving-surface, encrypted
+new format adds a corpus fixture and runs the same receiving-surface, file
 reopen, native rendering and actual model-input gates. A filename is a hint,
 never a rendering authority: retain the Rust host's detected presentation kind.
 Readable text-bearing files display their canonical content through NativeText
@@ -188,7 +188,7 @@ hover explanation; they cannot silently enter a model as empty context.
 
 Test both file URLs and external image/audio/video/PDF pasteboard bytes. macOS
 can add synthesized TIFF types to the aggregate pasteboard type list. Read the
-item's original declarations so the encrypted original and receipt refer to the
+item's original declarations so the original file and receipt refer to the
 actual supplied bytes. Preserve plain-text pasting as native editing. Repeat
 layout after data loads and require both document media and direct chat media to
 fit the receiving width; media never owns an independent fixed-width card.
@@ -268,7 +268,7 @@ not separate key handlers or suggestion overlays. Exercise the composer and inli
 editing of both speakers with real weights, context after the caret excluded,
 speaker attribution retained, repeated word acceptance/reversal, typing, Undo,
 marked text, focus loss and stale callbacks. Save is always explicit. Retain input
-recipes, seeds, token journals and cancelled attempts in encrypted storage.
+recipes, seeds, token journals and cancelled attempts in file storage.
 Branching from a user message rerolls in a new conversation. Branching from an
 assistant reply preserves that reply without generation. Keep the parent intact.
 

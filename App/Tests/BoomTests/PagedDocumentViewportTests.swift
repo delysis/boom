@@ -15,7 +15,7 @@ final class PagedDocumentViewportTests: XCTestCase {
   private func window(_ text: String, start: UInt64) -> PagedTextWindow {
     let total = start + UInt64(text.utf8.count)
     let summary = PagedTextSummary(bytes: total, utf16: total, lfCount: total)
-    let locator = PagedTextPageLocator(storeID: UUID(), recordID: UUID(), ciphertextBytes: 100)
+    let locator = PagedTextPageLocator(storeID: UUID(), offset: 0, bytes: 100)
     let root = PagedTextTreeRef(page: PagedTextPageRef(locator: locator, digest: String(repeating: "0", count: 64)),
       summary: summary, height: 0)
     return PagedTextWindow(revision: PagedTextRevision(schema: 1, ownerID: UUID(), documentID: UUID(), root: root),
@@ -80,7 +80,7 @@ final class PagedDocumentViewportTests: XCTestCase {
     XCTAssertThrowsError(try JSONDecoder().decode(PagedTextRevision.self,
       from: JSONSerialization.data(withJSONObject: missing)))
     XCTAssertThrowsError(try PagedTextSummary(bytes: 1, utf16: 0, lfCount: 0).validate())
-    let locator = PagedTextPageLocator(storeID: UUID(), recordID: UUID(), ciphertextBytes: 100)
+    let locator = PagedTextPageLocator(storeID: UUID(), offset: 0, bytes: 100)
     let emptyRoot = PagedTextTreeRef(page: PagedTextPageRef(locator: locator, digest: String(repeating: "0", count: 64)),
       summary: PagedTextSummary(bytes: 0, utf16: 0, lfCount: 0), height: 0)
     XCTAssertThrowsError(try PagedTextRevision(schema: 1, ownerID: UUID(), documentID: UUID(), root: emptyRoot).validate())

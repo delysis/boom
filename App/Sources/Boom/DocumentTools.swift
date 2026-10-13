@@ -2,8 +2,10 @@ import BoomCore
 import Foundation
 
 struct CapturedDocumentAuthority: Codable, Sendable {
+  private enum CodingKeys: String, CodingKey { case mode, target }
   let mode: InteractionMode
   let target: DocumentSnapshot?
+  var capture: BoundedDocumentCapture? = nil
   static let readOnly = CapturedDocumentAuthority(mode: .ask, target: nil)
 }
 

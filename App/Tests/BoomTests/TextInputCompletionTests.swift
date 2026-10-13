@@ -1,6 +1,5 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import SwiftUI
 import XCTest
 @testable import Boom
@@ -14,7 +13,7 @@ final class TextInputCompletionTests: XCTestCase {
     _ = NSApplication.shared
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-input-" + UUID().uuidString)
     addTeardownBlock { try? FileManager.default.removeItem(at: root) }
-    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256)), loadModels: false)
+    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: root), loadModels: false)
     if model.selectedChat == nil { try model.newChat() }
     model.authorChatMessage(.user); model.draft = "A question."; model.send()
     model.authorChatMessage(.assistant); model.draft = "An answer."; model.send()

@@ -1,18 +1,16 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import SwiftUI
 import XCTest
 @testable import Boom
 
 final class WindowPrivacyTests: XCTestCase {
-  @MainActor func testWorkspaceReopensFromEncryptionWithSystemRestorationDisabled() async throws {
+  @MainActor func testWorkspaceReopensFromFilesWithSystemRestorationDisabled() async throws {
     let app = NSApplication.shared, previous = NSApplication.shared.activationPolicy()
     app.setActivationPolicy(.prohibited); defer { app.setActivationPolicy(previous) }
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-window-privacy-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let key = SymmetricKey(size: .bits256)
-    let store = try WorkspaceStore(rootOverride: root, testKey: key)
+    let store = try WorkspaceStore(rootOverride: root)
     let document = DocumentSnapshot(title: "Private window title 🦋", text: "Window privacy manuscript canary é.\n")
     let question = ChatMessage(role: .user, text: "Window privacy question canary.")
     let chat = ChatRecord(title: "Private conversation title", messages: [question], instructions: "Window privacy instruction canary.")
@@ -20,9 +18,10 @@ final class WindowPrivacyTests: XCTestCase {
     state.documents = [DocumentIndex(id: document.id, title: document.title)]
     state.chats = [chat]; state.selectedDocument = document.id; state.selectedChat = chat.id
     state.showChat = true; state.showLibrary = false
-    try await store.save(state, documents: [document])
+    try await PagedFileEngineControlOutputs.seed(store, documents: [document])
+    try await store.saveState(state)
 
-    let fresh = try WorkspaceStore(rootOverride: root, testKey: key)
+    let fresh = try WorkspaceStore(rootOverride: root)
     let model = try await WorkspaceModel(storeOverride: fresh, loadModels: false)
     let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 1190, height: 846))
     window.isReleasedWhenClosed = false; defer { window.close() }
@@ -42,19 +41,11 @@ final class WindowPrivacyTests: XCTestCase {
     XCTAssertEqual(window.title, model.layout.isAuthor ? document.title : chat.title)
     try await model.flush(); try await model.shutdown()
 
-    let reopened = try WorkspaceStore(rootOverride: root, testKey: key)
-    let loaded = try await reopened.load().get()
-    XCTAssertEqual(loaded.1, [document]); XCTAssertEqual(loaded.0.chats, [chat])
-    XCTAssertEqual(loaded.0.selectedDocument, document.id)
-    XCTAssertEqual(loaded.0.selectedChat, chat.id)
-    for file in try FileManager.default.contentsOfDirectory(at: reopened.vault.root, includingPropertiesForKeys: nil) {
-      let bytes = try Data(contentsOf: file)
-      for text in [document.title, document.text, chat.title, question.text, chat.instructions ?? ""] where !text.isEmpty {
-        for encoding in [String.Encoding.utf8, .utf16LittleEndian, .utf16BigEndian] {
-          let needle = try XCTUnwrap(text.data(using: encoding))
-          XCTAssertNil(bytes.range(of: needle), "A fixture canary appeared in its encrypted record.")
-        }
-      }
-    }
+    let reopened = try WorkspaceStore(rootOverride: root)
+    let loaded = try await reopened.loadState()
+    let documents = try await NativeCheckEvidence.readPublicDocuments(store: reopened)
+    XCTAssertEqual(documents, [document]); XCTAssertEqual(loaded.chats, [chat])
+    XCTAssertEqual(loaded.selectedDocument, document.id)
+    XCTAssertEqual(loaded.selectedChat, chat.id)
   }
 }

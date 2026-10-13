@@ -1,128 +1,250 @@
 import BoomCore
-import CryptoKit
 import Darwin
 import Foundation
-import Security
 
-/// Native filesystem operation only. Rust owns restore admission. Both vault
-/// directories keep a name throughout publication and rollback; no move fallback.
+/// Both directories keep a name while a fresh workspace is published.
 enum AtomicDirectoryReplacement {
   static func exchange(_ first: URL, _ second: URL) throws {
     let parent = first.deletingLastPathComponent()
     guard first != second, parent == second.deletingLastPathComponent() else {
-      throw BoomError.invalid("Private replacement requires distinct sibling directories.")
+      throw BoomError.invalid("Workspace replacement requires distinct sibling directories.")
     }
-    let fd = open(parent.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-    guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-    defer { close(fd) }
-    for name in [first.lastPathComponent, second.lastPathComponent] {
-      var info = stat()
-      guard fstatat(fd, name, &info, AT_SYMLINK_NOFOLLOW) == 0 else {
+    let descriptor = open(parent.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+    guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+    var failure: Error?
+    do {
+      for name in [first.lastPathComponent, second.lastPathComponent] {
+        var info = stat()
+        guard fstatat(descriptor, name, &info, AT_SYMLINK_NOFOLLOW) == 0 else {
+          throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        guard info.st_mode & S_IFMT == S_IFDIR else {
+          throw BoomError.invalid("Workspace replacement requires real directories.")
+        }
+      }
+      guard renameatx_np(descriptor, first.lastPathComponent, descriptor, second.lastPathComponent,
+        UInt32(RENAME_SWAP | RENAME_NOFOLLOW_ANY | RENAME_RESOLVE_BENEATH)) == 0,
+        fsync(descriptor) == 0 else {
         throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
       }
-      guard info.st_mode & S_IFMT == S_IFDIR else {
-        throw BoomError.invalid("Private replacement requires real directories.")
+    } catch { failure = error }
+    let closed = close(descriptor), closeError = errno
+    if let failure {
+      guard closed == 0 else {
+        throw BoomError.unavailable("Workspace replacement failed: \(failure.localizedDescription). Directory close also failed (\(closeError)).")
       }
+      throw failure
     }
-    guard renameatx_np(fd, first.lastPathComponent, fd, second.lastPathComponent,
-      UInt32(RENAME_SWAP | RENAME_NOFOLLOW_ANY | RENAME_RESOLVE_BENEATH)) == 0 else {
-      throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-    }
+    guard closed == 0 else { throw POSIXError(POSIXErrorCode(rawValue: closeError) ?? .EIO) }
   }
 }
 
-struct BackupRecord: Codable, Sendable {
-  let kind: String
-  let id: UUID
-  let bytes: Data
-}
-struct BackupArchive: Codable, Sendable {
-  let schema: Int
-  let records: [BackupRecord]
-}
-
-/// Independently encrypted portable backup; no Keychain lookup or item.
+/// Directory backups preserve the complete quiesced workspace. The caller joins
+/// all writers before export, and closes its engine/workspace lock before restore.
+/// Every file is streamed through one 64 KiB buffer; no archive is materialized.
 enum WorkspaceBackup {
-  private static let magic = Data("BLOOM-BACKUP-1\n".utf8)
-  static let limit = 2_147_483_648
-  private static func key(_ passphrase: String, salt: Data) throws -> SymmetricKey {
-    let bytes: [UInt8] = try ProductCore.call(["op": "backup_key", "passphrase": passphrase,
-      "salt": Array(salt)])
-    return SymmetricKey(data: Data(bytes))
+  static func export(root: URL, to target: URL) throws {
+    try copyWorkspace(from: root, to: target, restoring: false)
   }
-  private static func validateInventory(_ records: [BackupRecord]) throws -> WorkspaceState {
-    guard let index = records.first(where: { $0.kind == "workspace" && $0.id == Vault.workspaceID }) else {
-      throw BoomError.invalid("The workspace index is missing.")
-    }
-    let state = try PropertyListDecoder().decode(WorkspaceState.self, from: index.bytes)
-    guard state.schema == 1 else { throw BoomError.invalid("Unsupported workspace in backup.") }
-    guard index.bytes.count <= Vault.workspaceLimit else { throw BoomError.budget("Workspace index exceeds 128 MiB.") }
-    try state.validateRetainedInput()
-    let entries = records.map { record in
-      VaultInventoryEntry(name: record.kind + "-" + record.id.uuidString + ".sealed", regular: true,
-        digest: record.kind == "attachment" ? Digest.sha256(record.bytes) : nil,
-        bytes: record.kind == "attachment" ? record.bytes.count : nil)
-    }
-    try ProductCore.validateOriginals(state)
-    try ProductCore.validateInventory(state, entries: entries, hasIndex: true)
-    return state
+
+  static func restore(from source: URL, into target: URL) throws {
+    try copyWorkspace(from: source, to: target, restoring: true)
   }
-  static func export(vault: Vault, passphrase: String, to target: URL) throws {
-    let records = try FileManager.default.contentsOfDirectory(at: vault.root,
-      includingPropertiesForKeys: nil).map { file -> BackupRecord in
-      let stem = file.deletingPathExtension().lastPathComponent
-      guard let dash = stem.firstIndex(of: "-"),
-        let kind = Vault.Kind(rawValue: String(stem[..<dash])),
-        let id = UUID(uuidString: String(stem[stem.index(after: dash)...])) else {
-        throw BoomError.invalid("Unknown private record; backup aborted without omitting it.")
+
+  private static func copyWorkspace(from source: URL, to target: URL, restoring: Bool) throws {
+    try Task.checkCancellation()
+    guard source.isFileURL, target.isFileURL else {
+      throw BoomError.invalid("Backup requires local directories.")
+    }
+    let source = source.standardizedFileURL
+    var sourceInfo = stat()
+    guard lstat(source.path, &sourceInfo) == 0, sourceInfo.st_mode & S_IFMT == S_IFDIR else {
+      throw BoomError.invalid("Backup source must be a real directory.")
+    }
+    let physicalSource = try physicalDirectory(source)
+    let target = try physicalDirectory(target.deletingLastPathComponent().standardizedFileURL)
+      .appendingPathComponent(target.lastPathComponent, isDirectory: true)
+    guard target != physicalSource, !target.path.hasPrefix(physicalSource.path + "/"),
+      !physicalSource.path.hasPrefix(target.path + "/") else {
+      throw BoomError.invalid("Backup source and destination must be separate directories.")
+    }
+    var targetInfo = stat()
+    let targetExists = lstat(target.path, &targetInfo) == 0
+    if !targetExists && errno != ENOENT { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+    if targetExists {
+      guard restoring, targetInfo.st_mode & S_IFMT == S_IFDIR else {
+        throw BoomError.denied("Backup destination already exists.")
       }
-      return BackupRecord(kind: kind.rawValue, id: id,
-        bytes: try vault.get(kind, id: id, limit: 1_100_000_000))
+      try requireFreshTarget(target)
     }
-    _ = try validateInventory(records)
-    let encoder = PropertyListEncoder(); encoder.outputFormat = .binary
-    let data = try encoder.encode(BackupArchive(schema: 1, records: records))
-    guard data.count <= limit else { throw BoomError.budget("Backup exceeds 2 GiB.") }
-    var salt = Data(count: 16)
-    let status = salt.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 16, $0.baseAddress!) }
-    guard status == errSecSuccess else { throw BoomError.unavailable("Could not create backup salt.") }
-    let header = magic + salt
-    let box = try AES.GCM.seal(data, using: key(passphrase, salt: salt), authenticating: header)
-    guard let combined = box.combined else { throw BoomError.invalid("Could not seal backup.") }
-    try (header + combined).write(to: target, options: .atomic)
-    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
+    let stage = target.deletingLastPathComponent().appendingPathComponent(".backup-" + UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: stage, withIntermediateDirectories: false,
+      attributes: [.posixPermissions: 0o700])
+    do {
+      var enumerationFailure: Error?
+      guard let files = FileManager.default.enumerator(at: physicalSource,
+        includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey],
+        errorHandler: { _, error in enumerationFailure = error; return false }) else {
+        throw BoomError.unavailable("Could not enumerate the workspace.")
+      }
+      var buffer = [UInt8](repeating: 0, count: 65_536)
+      while let file = files.nextObject() as? URL {
+        try Task.checkCancellation()
+        let values = try file.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey])
+        guard values.isSymbolicLink != true, file.path.hasPrefix(physicalSource.path + "/") else {
+          throw BoomError.invalid("Backup refuses symbolic links.")
+        }
+        let relative = String(file.path.dropFirst(physicalSource.path.count + 1))
+        let destination = stage.appendingPathComponent(relative)
+        if values.isDirectory == true {
+          try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700])
+        } else if values.isRegularFile == true {
+          try copyFile(file, to: destination, buffer: &buffer)
+        } else { throw BoomError.invalid("Backup refuses nonregular files.") }
+      }
+      if let enumerationFailure { throw enumerationFailure }
+      // Files were synchronized individually. Sync nested directories before
+      // the final root rename so their names belong to the published copy.
+      enumerationFailure = nil
+      guard let directories = FileManager.default.enumerator(at: stage,
+        includingPropertiesForKeys: [.isDirectoryKey], options: [.includesDirectoriesPostOrder],
+        errorHandler: { _, error in enumerationFailure = error; return false }) else {
+        throw BoomError.unavailable("Could not enumerate backup directories.")
+      }
+      do {
+        while let directory = directories.nextObject() as? URL {
+          if try directory.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true {
+            try synchronizeDirectory(directory)
+          }
+        }
+      }
+      if let enumerationFailure { throw enumerationFailure }
+      try synchronizeDirectory(stage)
+      try Task.checkCancellation()
+      if targetExists {
+        try requireFreshTarget(target)
+        var current = stat()
+        guard lstat(target.path, &current) == 0, current.st_dev == targetInfo.st_dev,
+          current.st_ino == targetInfo.st_ino else {
+          throw BoomError.stale("Restore destination changed during the copy.")
+        }
+        try AtomicDirectoryReplacement.exchange(stage, target)
+        try FileManager.default.removeItem(at: stage) // Only the admitted empty shell remains here.
+      } else {
+        var unexpected = stat()
+        guard lstat(target.path, &unexpected) != 0, errno == ENOENT else {
+          throw BoomError.stale("Backup destination appeared during the copy.")
+        }
+        guard renamex_np(stage.path, target.path, UInt32(RENAME_EXCL | RENAME_NOFOLLOW_ANY)) == 0 else {
+          throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        try synchronizeDirectory(target.deletingLastPathComponent())
+      }
+    } catch {
+      let original = error
+      // The source is untouched. Discard only this operation's partial copy
+      // (or the admitted empty shell after a completed directory exchange).
+      if FileManager.default.fileExists(atPath: stage.path) {
+        do { try FileManager.default.removeItem(at: stage) }
+        catch { throw BoomError.unavailable("Backup failed: \(original.localizedDescription). Cleanup also failed: \(error.localizedDescription). Copy retained at \(stage.path).") }
+      }
+      throw original
+    }
   }
-  static func restore(from source: URL, passphrase: String, into vault: Vault) throws {
-    guard try FileManager.default.contentsOfDirectory(atPath: vault.root.path).isEmpty else {
-      throw BoomError.denied("Restore requires a fresh empty workspace.")
+
+  // Foundation may shorten /private/var to /var while its enumerator returns
+  // /private/var children. Use the kernel spelling for ancestry and rename.
+  private static func physicalDirectory(_ url: URL) throws -> URL {
+    let (resolved, failure) = url.path.withCString { (realpath($0, nil), errno) }
+    guard let resolved else { throw POSIXError(POSIXErrorCode(rawValue: failure) ?? .EIO) }
+    defer { free(resolved) }
+    return URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
+  }
+
+  /// A new WorkspaceStore may already have created its empty Objects directory
+  /// and a released zero-length lock. No identity, metadata or authored file is erased.
+  private static func requireFreshTarget(_ target: URL) throws {
+    for file in try FileManager.default.contentsOfDirectory(at: target,
+      includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]) {
+      let values = try file.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+      guard values.isSymbolicLink != true else { throw BoomError.denied("Restore requires a fresh workspace.") }
+      if file.lastPathComponent == "Objects", values.isDirectory == true,
+        try FileManager.default.contentsOfDirectory(atPath: file.path).isEmpty { continue }
+      if file.lastPathComponent == ".workspace-lock", values.isRegularFile == true,
+        values.fileSize == 0 { continue }
+      throw BoomError.denied("Restore requires a fresh workspace.")
     }
-    let bytes = try RegularFile(source, limit: Int64(limit + 128)).data()
-    let headerCount = magic.count + 16
-    guard bytes.count > headerCount + 28, bytes.starts(with: magic) else { throw BoomError.invalid("Unsupported backup format.") }
-    let header = Data(bytes.prefix(headerCount)), salt = Data(header.suffix(16))
-    let decrypted = try AES.GCM.open(AES.GCM.SealedBox(combined: Data(bytes.dropFirst(headerCount))),
-      using: key(passphrase, salt: salt), authenticating: header)
-    let archive = try PropertyListDecoder().decode(BackupArchive.self, from: decrypted)
-    guard archive.schema == 1, archive.records.count <= 100_000,
-      Set(archive.records.map { $0.kind + "/" + $0.id.uuidString }).count == archive.records.count,
-      archive.records.contains(where: { $0.kind == "workspace" && $0.id == Vault.workspaceID }),
-      archive.records.allSatisfy({ Vault.Kind(rawValue: $0.kind) != nil }) else {
-      throw BoomError.invalid("Backup identities are invalid.")
+  }
+
+  private static func copyFile(_ source: URL, to target: URL, buffer: inout [UInt8]) throws {
+    let input = open(source.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+    guard input >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+    var before = stat()
+    guard fstat(input, &before) == 0, before.st_mode & S_IFMT == S_IFREG else {
+      let original = errno; _ = close(input)
+      throw POSIXError(POSIXErrorCode(rawValue: original) ?? .EIO)
     }
-    let state = try validateInventory(archive.records)
-    // Admission happens in an owned sibling directory. A failure never replaces
-    // an existing workspace or leaves a partially admitted one.
-    let stageURL = vault.root.deletingLastPathComponent().appendingPathComponent(".restore-" + UUID().uuidString)
-    defer { try? FileManager.default.removeItem(at: stageURL) }
-    let stage = try vault.sibling(at: stageURL)
-    for record in archive.records { try stage.put(record.bytes, kind: Vault.Kind(rawValue: record.kind)!, id: record.id) }
-    for document in state.documents {
-      let data = try stage.get(.document, id: document.id, limit: 2_097_152)
-      guard String(data: data, encoding: .utf8) != nil else { throw BoomError.invalid("Invalid document in backup.") }
+    let output = open(target.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
+    guard output >= 0 else {
+      let original = errno; _ = close(input)
+      throw POSIXError(POSIXErrorCode(rawValue: original) ?? .EIO)
     }
-    for voice in state.voices + state.voiceVersions {
-      guard try ProductCore.voice(voice.draft).revision == voice.revision else { throw BoomError.invalid("Invalid voice revision in backup.") }
+    var failure: Error?
+    do {
+      var copied: Int64 = 0
+      while true {
+        try Task.checkCancellation()
+        let count = buffer.withUnsafeMutableBytes { read(input, $0.baseAddress, $0.count) }
+        if count < 0 {
+          if errno == EINTR { continue }
+          throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        if count == 0 { break }
+        copied += Int64(count)
+        guard copied <= before.st_size else { throw BoomError.stale("Backup source grew during the copy.") }
+        var offset = 0
+        while offset < count {
+          let written = buffer.withUnsafeBytes { write(output, $0.baseAddress!.advanced(by: offset), count - offset) }
+          if written < 0 {
+            if errno == EINTR { continue }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+          }
+          guard written > 0 else { throw BoomError.unavailable("Backup write made no progress.") }
+          offset += written
+        }
+      }
+      var after = stat()
+      guard fstat(input, &after) == 0, copied == before.st_size,
+        before.st_dev == after.st_dev, before.st_ino == after.st_ino,
+        before.st_size == after.st_size, before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec,
+        before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec,
+        before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec,
+        before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec else {
+        throw BoomError.stale("Backup source changed during the copy.")
+      }
+      guard fsync(output) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+    } catch { failure = error }
+    let inputClosed = close(input), inputError = errno
+    let outputClosed = close(output), outputError = errno
+    if let failure {
+      guard inputClosed == 0, outputClosed == 0 else {
+        throw BoomError.unavailable("Backup failed: \(failure.localizedDescription). File close also failed: input \(inputClosed)/\(inputError), output \(outputClosed)/\(outputError).")
+      }
+      throw failure
     }
-    try AtomicDirectoryReplacement.exchange(stageURL, vault.root)
+    guard inputClosed == 0, outputClosed == 0 else {
+      throw BoomError.unavailable("Backup file close failed: input \(inputClosed)/\(inputError), output \(outputClosed)/\(outputError).")
+    }
+  }
+
+  private static func synchronizeDirectory(_ url: URL) throws {
+    let descriptor = open(url.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+    guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+    let synchronized = fsync(descriptor), syncError = errno
+    let closed = close(descriptor), closeError = errno
+    guard synchronized == 0, closed == 0 else {
+      throw BoomError.unavailable("Backup directory close failed: sync \(synchronized)/\(syncError), close \(closed)/\(closeError).")
+    }
   }
 }

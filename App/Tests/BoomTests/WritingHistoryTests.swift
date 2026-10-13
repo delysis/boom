@@ -1,5 +1,4 @@
 import BoomCore
-import CryptoKit
 import XCTest
 @testable import Boom
 
@@ -18,14 +17,15 @@ final class WritingHistoryTests: XCTestCase {
   }
   private func fixture() async throws -> (URL, WorkspaceStore, DocumentSnapshot, DocumentSnapshot, CandidateBundle, CandidateBundle) {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-history-" + UUID().uuidString)
-    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root)
     let a = DocumentSnapshot(title: "A", text: "Café 👩🏽‍💻 waits."), b = DocumentSnapshot(title: "B", text: "Another manuscript.")
     let first = try bundle(a, prose: " First captured continuation."), second = try bundle(a, prose: " Second captured continuation.")
     for value in [first, second] { try store.vault.encode(value, kind: .candidate, id: value.id) }
     var state = WorkspaceState(); state.autocomplete = false; state.selectedDocument = a.id
     state.documents = [a, b].map { DocumentIndex(id: $0.id, title: $0.title) }
     state.candidateIDs = [first.id, second.id]
-    try await store.save(state, documents: [a, b])
+    try await PagedFileEngineControlOutputs.seed(store, documents: [a, b])
+    try await store.saveState(state)
     return (root, store, a, b, first, second)
   }
   @MainActor private func finish(_ model: WorkspaceModel) async throws {
@@ -61,7 +61,7 @@ final class WritingHistoryTests: XCTestCase {
     model.showContinuations(); try await finish(model)
     XCTAssertTrue(model.showingCandidates); XCTAssertEqual(model.candidates?.id, second.id)
     let liveText = a.text + " A subsequent human edit."
-    model.updateDocument(liveText, id: a.id, caret: 7)
+    try await NativeCheckEvidence.replacePublicDocument(model, text: liveText, id: a.id, caret: 7)
     model.reviewContinuation(first.id); try await finish(model)
     XCTAssertEqual(model.selectedDocument?.text, liveText); XCTAssertEqual(model.caret, 7)
     XCTAssertEqual(model.candidates?.recipe.prompt, first.recipe.prompt)
@@ -96,7 +96,7 @@ final class WritingHistoryTests: XCTestCase {
     }
     try store.vault.encode(incompatible, kind: .candidate, id: first.id)
     let url = store.vault.recordURL(.candidate, first.id), before = try Data(contentsOf: url)
-    switch await store.load() { case .success: XCTFail("Four-row incompatible set was admitted"); case .failure: break }
+    do { _ = try await store.loadState(); XCTFail("Four-row incompatible set was admitted") } catch {}
     XCTAssertEqual(try Data(contentsOf: url), before)
   }
   @MainActor func testCorruptRecordIsRejectedWithoutReplacingBytesOrVisibleSet() async throws {

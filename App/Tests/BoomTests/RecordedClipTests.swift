@@ -1,7 +1,6 @@
 import AppKit
 import AVFoundation
 import BoomCore
-import CryptoKit
 import XCTest
 @testable import Boom
 
@@ -24,10 +23,10 @@ final class RecordedClipTests: XCTestCase {
     XCTAssertEqual(decoded.floatChannelData![0][50], Float(sin(5.0)) * 0.5, accuracy: 0.001)
     XCTAssertNil(try reader.next(flag: CancellationFlag()))
   }
-  @MainActor func testRecordingAttachesEncryptedOriginalWithoutTranscribingSendingOrOpeningSetup() async throws {
+  @MainActor func testRecordingAttachesFileOriginalWithoutTranscribingSendingOrOpeningSetup() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-recording-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root)
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     model.draft = "Keep these words."
     let bytes = try clip()
@@ -39,9 +38,9 @@ final class RecordedClipTests: XCTestCase {
     XCTAssertTrue(model.selectedChat?.messages.isEmpty == true)
     XCTAssertEqual(try store.vault.get(.attachment, id: id), bytes)
     let sealed = try Data(contentsOf: store.vault.recordURL(.attachment, id))
-    XCTAssertNil(sealed.range(of: bytes))
+    XCTAssertEqual(sealed, bytes)
     try await model.shutdown()
-    let loaded = try await store.load().get().0
+    let loaded = try await store.loadState()
     XCTAssertEqual(loaded.attachments.first { $0.id == id }, record)
     let reopened = try await WorkspaceModel(storeOverride: store, loadModels: false)
     XCTAssertEqual(reopened.pendingAttachments, [id])
@@ -52,7 +51,7 @@ final class RecordedClipTests: XCTestCase {
   @MainActor func testRecordingCannotMoveToAnotherConversationDuringCapture() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-recording-scope-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256)), loadModels: false)
+    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: root), loadModels: false)
     let capturedChat = model.state.selectedChat
     try model.newChat()
     do {

@@ -1,5 +1,4 @@
 import BoomCore
-import CryptoKit
 import XCTest
 @testable import Boom
 
@@ -7,7 +6,7 @@ final class RetainedInputTests: XCTestCase {
   private func store() throws -> WorkspaceStore {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-retained-input-" + UUID().uuidString)
     addTeardownBlock { try? FileManager.default.removeItem(at: root) }
-    return try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    return try WorkspaceStore(rootOverride: root)
   }
 
   @MainActor func testRestoredDraftNeverRetainsConsultationEditingAuthority() async throws {
@@ -52,8 +51,6 @@ final class RetainedInputTests: XCTestCase {
     model.selectChat(first)
     model.mode = .propose
     try await model.shutdown()
-    let sealed = try Data(contentsOf: store.vault.recordURL(.workspace, Vault.workspaceID))
-    XCTAssertNil(sealed.range(of: Data(text.utf8)))
     let reopened = try await WorkspaceModel(storeOverride: store, loadModels: false)
     XCTAssertEqual(reopened.draft, text)
     XCTAssertEqual(reopened.mode, .ask)
@@ -87,9 +84,9 @@ final class RetainedInputTests: XCTestCase {
     let store = try store(), model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     if model.state.selectedDocument == nil { try model.newDocument() }
     let manuscript = try XCTUnwrap(model.state.selectedDocument)
-    try model.addWritingExample(title: "Lantern", prose: "The lantern crosses the harbor.", manuscriptID: manuscript)
-    try model.addWritingExample(title: "Window", prose: "The window holds a pale reflection.", manuscriptID: manuscript)
-    try model.addWritingExample(title: "Letter", prose: "A folded letter waits on the table.", manuscriptID: manuscript)
+    try await model.addWritingExample(title: "Lantern", prose: "The lantern crosses the harbor.", manuscriptID: manuscript)
+    try await model.addWritingExample(title: "Window", prose: "The window holds a pale reflection.", manuscriptID: manuscript)
+    try await model.addWritingExample(title: "Letter", prose: "A folded letter waits on the table.", manuscriptID: manuscript)
     let ids = model.writingExampleIDs
     model.moveWritingExample(ids[1], by: -1)
     let ordered = [ids[1], ids[0], ids[2]]
@@ -122,18 +119,19 @@ final class RetainedInputTests: XCTestCase {
     try await reopened.shutdown()
   }
 
-  @MainActor func testEncryptedBackupRestoresDraftAndOrderedExamples() async throws {
+  @MainActor func testFileBackupRestoresDraftAndOrderedExamples() async throws {
     let store = try store(), model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     if model.state.selectedDocument == nil { try model.newDocument() }
     let manuscript = try XCTUnwrap(model.state.selectedDocument)
-    try model.addWritingExample(title: "Public prose", prose: "Rain follows the ferry upstream.", manuscriptID: manuscript)
+    try await model.addWritingExample(title: "Public prose", prose: "Rain follows the ferry upstream.", manuscriptID: manuscript)
     let examples = model.writingExampleIDs
     try model.newChat(); model.draft = "An unfinished question kept in the backup."
     try await model.shutdown()
-    let backup = store.root.appendingPathComponent("Public.bloombackup")
-    try await store.exportBackup(passphrase: "Public fixture passphrase.", to: backup)
+    let backup = store.root.deletingLastPathComponent().appendingPathComponent("public-draft-backup-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: backup) }
+    try await store.exportBackup(to: backup)
     let restoredStore = try self.store()
-    _ = try await restoredStore.restoreBackup(passphrase: "Public fixture passphrase.", from: backup)
+    _ = try await restoredStore.restoreBackup(from: backup)
     let reopened = try await WorkspaceModel(storeOverride: restoredStore, loadModels: false)
     XCTAssertEqual(reopened.draft, "An unfinished question kept in the backup.")
     XCTAssertEqual(reopened.writingExampleIDs, examples)
@@ -142,25 +140,7 @@ final class RetainedInputTests: XCTestCase {
     try await reopened.shutdown()
   }
 
-  @MainActor func testLegacyWorkspaceWithNoRetentionFieldsOpensWithoutImplicitActions() async throws {
-    let store = try store()
-    let document = DocumentSnapshot(title: "Legacy manuscript", text: "Previously saved authored prose.")
-    var state = WorkspaceState()
-    state.documents = [DocumentIndex(id: document.id, title: document.title)]; state.selectedDocument = document.id
-    try await store.save(state, documents: [document])
-    let bytes = try store.vault.get(.workspace, id: Vault.workspaceID)
-    let legacy = try XCTUnwrap(PropertyListSerialization.propertyList(from: bytes, format: nil) as? [String: Any])
-    XCTAssertNil(legacy["composerDrafts"]); XCTAssertNil(legacy["writingExampleIDs"])
-    let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
-    XCTAssertEqual(model.selectedDocument, document); XCTAssertEqual(model.draft, "")
-    XCTAssertTrue(model.writingExampleIDs.isEmpty)
-    XCTAssertEqual(model.state.chats.count, model.layout.isAuthor ? 0 : 1)
-    XCTAssertTrue(model.state.chats.allSatisfy { $0.messages.isEmpty })
-    XCTAssertFalse(model.isBusy)
-    try await model.shutdown()
-  }
-
-  func testInconsistentRetainedOwnerCannotBeReassignedAndCiphertextIsRetained() async throws {
+  func testInconsistentRetainedOwnerCannotBeReassignedAndMetadataIsRetained() async throws {
     let store = try store()
     let chat = ChatRecord()
     var state = WorkspaceState(); state.chats = [chat]; state.selectedChat = chat.id
@@ -168,28 +148,9 @@ final class RetainedInputTests: XCTestCase {
       text: "This has a different owner.", attachments: [], authoredRole: nil)]
     try store.vault.encode(state, kind: .workspace, id: Vault.workspaceID)
     let file = store.vault.recordURL(.workspace, Vault.workspaceID), before = try Data(contentsOf: file)
-    switch await store.load() {
-    case .success: XCTFail("An absent owner was reassigned")
-    case .failure(let error): XCTAssertTrue(error.localizedDescription.contains("ownership"))
-    }
+    do { _ = try await store.loadState(); XCTFail("An absent owner was reassigned") }
+    catch { XCTAssertTrue(error.localizedDescription.contains("ownership")) }
     XCTAssertEqual(try Data(contentsOf: file), before)
   }
 
-  func testInvalidRetainedStateRejectsRecoveryBeforeAnyDocumentRepair() async throws {
-    let store = try store(), document = DocumentSnapshot(title: "Preserved", text: "Last admitted text.")
-    var state = WorkspaceState(); state.documents = [DocumentIndex(id: document.id, title: document.title)]
-    try await store.save(state, documents: [document])
-    let file = store.documentURL(document.id), before = try Data(contentsOf: file)
-    state.writingExampleIDs = [document.id, document.id]
-    let replacement = DocumentSnapshot(id: document.id, title: document.title, text: "Not yet admitted.")
-    try store.vault.encode(WorkspaceStore.SaveJournal(schema: 1, state: state, documents: [replacement],
-      before: [document.id: document.revision]), kind: .saveJournal, id: Vault.workspaceID)
-    let journal = store.vault.recordURL(.saveJournal, Vault.workspaceID), evidence = try Data(contentsOf: journal)
-    switch await store.load() {
-    case .success: XCTFail("Inconsistent selection admitted during recovery")
-    case .failure(let error): XCTAssertTrue(error.localizedDescription.contains("selection"))
-    }
-    XCTAssertEqual(try Data(contentsOf: file), before)
-    XCTAssertEqual(try Data(contentsOf: journal), evidence)
-  }
 }

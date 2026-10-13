@@ -73,7 +73,7 @@ import Foundation
     }
     let report: [String: Any] = ["status":"complete","pid":ProcessInfo.processInfo.processIdentifier,
       "source_inventory_sha256":Bundle.main.infoDictionary?["BoomSourceSHA256"] ?? "unavailable",
-      "guide_sha256":Digest.sha256(text),"frames":frames,"keychain_lookups":VaultSession.shared.lookupCount,
+      "guide_sha256":Digest.sha256(text),"frames":frames,
       "shown_window":false,"physical_input_qualified":false]
     try JSONSerialization.data(withJSONObject: report,options: [.prettyPrinted,.sortedKeys])
       .write(to: root.appendingPathComponent("receipt.json"),options: .atomic)

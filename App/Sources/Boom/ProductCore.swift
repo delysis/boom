@@ -124,30 +124,6 @@ enum ProductCore {
   static func importBudget(files: Int, bytes: Int) throws {
     let _: Bool = try call(["op": "validate_import_budget", "files": files, "bytes": bytes])
   }
-  static func validateOriginals(_ state: WorkspaceState) throws {
-    let files = (state.importedFiles ?? [:]).map { id, file in
-      ["id": id.uuidString, "folderID": file.folderID.map { $0.uuidString as Any } ?? NSNull(),
-        "path": file.path, "originalDigest": file.originalDigest] as [String: Any]
-    }
-    let _: Bool = try call(["op": "validate_imported_originals", "documents": state.documents.map { $0.id.uuidString },
-      "folders": (state.importedFolders ?? []).map { $0.id.uuidString }, "files": files])
-  }
-  static func admitRestore(_ state: WorkspaceState, documents: [DocumentSnapshot], entries: [String], hasIndex: Bool) throws {
-    let _: Bool = try call(["op": "admit_restore", "state": object(state), "documents": object(documents),
-      "entries": entries, "hasIndex": hasIndex])
-  }
-  static func validateInventory(_ state: WorkspaceState, entries: [VaultInventoryEntry], hasIndex: Bool) throws {
-    let originals = state.attachments.map { ["id": $0.id.uuidString, "digest": $0.rootDigest] }
-    let imported = (state.importedFiles ?? [:]).map { ["id": $0.key.uuidString, "digest": $0.value.originalDigest] }
-    let replies = state.chats.flatMap { $0.messages + ($0.messageVersions ?? []) }.map { message in
-      ["id": message.id.uuidString, "role": message.role.rawValue, "state": message.state.rawValue,
-        "hasModel": message.provider != nil, "authored": message.authoredByUser == true,
-        "hasText": !message.text.isEmpty] as [String: Any]
-    }
-    let _: Bool = try call(["op": "validate_vault_inventory", "manifest": ["hasIndex": hasIndex,
-      "documents": state.documents.map { $0.id.uuidString }, "attachments": originals, "importedOriginals": imported,
-      "candidates": state.candidateIDs.map(\.uuidString), "replies": replies], "entries": object(entries)])
-  }
   static func chatTitle(_ request: String, routing: [String]) throws -> String {
     try call(["op": "chat_title", "request": request, "routing": routing])
   }
@@ -324,7 +300,8 @@ enum ProductCore {
       "captured": try captured.map { try object($0) } ?? NSNull(), "loaded": object(effective)])
   }
   static func validateWritingRecipe(_ recipe: CompletionRecipe) throws {
-    let _: Bool = try call(["op": "validate_writing_recipe", "recipe": object(recipe)])
+    try recipe.capture?.admit()
+    let _: Bool = try call(["op": "validate_writing_recipe", "recipe": recipeModelObject(recipe)])
   }
   static func writingHistory(documentID: UUID, entries: [WritingHistoryEntry]) throws -> WritingHistoryPlan {
     try call(["op": "writing_history", "documentId": documentID.uuidString, "entries": object(entries)])
@@ -340,7 +317,17 @@ enum ProductCore {
     try call(["op": "writing_evaluation_plan", "fixtures": fixtures, "seeds": seeds])
   }
   static func branchWriting(_ recipe: CompletionRecipe, continuation: String) throws -> String {
-    try call(["op": "branch_writing", "recipe": object(recipe), "continuation": continuation])
+    guard recipe.capture?.isWholeSource != false else {
+      throw BoomError.denied("A range capture cannot be branched as a whole manuscript.")
+    }
+    return try call(["op": "branch_writing", "recipe": recipeModelObject(recipe), "continuation": continuation])
+  }
+  private static func recipeModelObject(_ recipe: CompletionRecipe) throws -> [String: Any] {
+    guard var value = try object(recipe) as? [String: Any] else { throw BoomError.invalid("Invalid writing recipe.") }
+    // The Rust planner validates the bounded text/prompt. File revision/range
+    // authority stays with the native owner and is rechecked before insertion.
+    value.removeValue(forKey: "capture")
+    return value
   }
   static func residencyBudget(physical: UInt64, metal: UInt64) throws -> UInt64 {
     try call(["op": "residency_budget", "physicalBytes": physical, "metalBytes": metal])
@@ -540,6 +527,7 @@ struct CompletionRecipe: Codable, Sendable {
   let generationPolicy: ModelGenerationPolicy?
   var sourcePrompt: String? = nil
   var media: [WritingMediaReference]? = nil
+  var capture: BoundedDocumentCapture? = nil
 }
 struct WritingBatchExecution: Codable, Equatable, Sendable {
   var algorithm = "shared-prefill-fixed-batch-v1"

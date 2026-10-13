@@ -5,12 +5,13 @@ extension WorkspaceStore {
   /// Export the actual full record captured by the native caller. Later edits
   /// can proceed while <=64 KiB steps write this immutable source. The same
   /// Root keeps the admitted record until the caller's system file publication
-  /// joins; neither the editable island nor a legacy snapshot stands for it.
+  /// joins; neither the editable island nor a range snapshot stands for it.
   func exportPagedDocument(_ record: PagedDocumentRootRecord,
-    expectedHead: PagedWorkspaceHead, engine: PagedTextEngineAdapter,
+    engine: PagedTextEngineAdapter,
     publisher: PagedWorkspacePublisher, to url: URL,
     cancellation: PagedTextCancellation = PagedTextCancellation()) async throws -> URL {
-    guard engine.belongs(to: vault), publisher.belongs(to: vault),
+    guard publisher.root.standardizedFileURL == root.standardizedFileURL,
+      publisher.ownerID == engine.ownerID,
       record.document.revision.ownerID == engine.ownerID else {
       throw BoomError.denied("Export belongs to another document or private storage owner.")
     }
@@ -19,14 +20,13 @@ extension WorkspaceStore {
     let workspace = root.standardizedFileURL.resolvingSymlinksInPath()
     guard url.isFileURL, target != workspace,
       !target.path.hasPrefix(workspace.path + "/") else {
-      throw BoomError.denied("An export destination cannot replace private workspace records.")
+      throw BoomError.denied("An export destination cannot replace workspace records.")
     }
-    let capture = try await engine.loadWorkspaceDocumentRetaining(publisher,
-      documentID: record.document.id, expectedHead: expectedHead)
+    let capture = try await engine.currentDocumentRecordRetaining(publisher, documentID: record.document.id)
     var releaseAttempted = false
     var published: URL?
     do {
-      guard capture.value.record == record else {
+      guard capture.value == record else {
         throw BoomError.stale("The selected document changed before export capture.")
       }
       let destination = try await ExplicitFileExport.write(to: url, checkCancellation: {

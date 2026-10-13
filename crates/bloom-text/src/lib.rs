@@ -13,7 +13,13 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 mod bulk;
-pub use bulk::{BULK_OPERATION_COUNT, BULK_STEP_WORK, BulkProgress};
+pub use bulk::{BULK_OPERATION_COUNT, BULK_STEP_WORK, BulkProgress, GraphemeSeekProgress};
+mod paragraph;
+use paragraph::ParagraphState;
+pub use paragraph::{ParagraphBounds, ParagraphProgress, ParagraphSummary};
+mod prefix;
+use prefix::LinePrefixState;
+pub use prefix::{LinePrefixProgress, LinePrefixResult};
 
 pub const TEXT_PAGE_BYTES: usize = 64 * 1024;
 pub const INDEX_PAGE_BYTES: usize = 16 * 1024;
@@ -77,6 +83,18 @@ impl TextSummary {
     }
 }
 
+/// LF-delimited source line, retaining CRLF bytes without normalization.
+/// A CR immediately before its terminating LF is excluded from content_end.
+/// Bare CR, NEL and Unicode paragraph separators are not LF boundaries.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LineBounds {
+    pub start: TextSummary,
+    pub content_end: TextSummary,
+    pub end: TextSummary,
+    pub lf_terminated: bool,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PageKind {
@@ -92,24 +110,19 @@ impl PageKind {
     }
 }
 
-/// One explicit new storage identity. A UUID database object is never a
-/// physical file offset or SQLite rowid. Unknown/mixed fields fail closed.
+/// Immutable byte addresses in the document's append file.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub enum SQLiteStorage {
-    #[serde(rename = "sqlite_v1")]
+pub enum FileStorage {
+    #[serde(rename = "file_v1")]
     V1,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PageLocator {
-    pub storage: SQLiteStorage,
+    pub storage: FileStorage,
     pub store_id: Uuid,
-    pub record_id: Uuid,
-    pub ciphertext_bytes: u32,
-}
-impl PageLocator {
-    pub fn record_id(&self) -> Uuid { self.record_id }
-    pub fn ciphertext_bytes(&self) -> u32 { self.ciphertext_bytes }
+    pub offset: u64,
+    pub bytes: u32,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -123,6 +136,8 @@ pub struct TreeRef {
     pub page: PageRef,
     pub summary: TextSummary,
     pub height: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paragraphs: Option<ParagraphSummary>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -158,6 +173,15 @@ impl Revision {
         }
         Ok(())
     }
+}
+
+/// Bounded direct references from one authenticated immutable tree node.
+/// This is used only by cold file reclamation, never as a second node decoder.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageChildren {
+    pub children: Vec<TreeRef>,
+    pub text_pages: Vec<PageRef>,
 }
 
 /// Only an opened and checked revision can become an active document.
@@ -198,14 +222,11 @@ pub struct CacheStats {
     pub cache_hits: u64,
 }
 
-/// The existing Vault implements this interface on its storage executor.
-///
-/// Every record must be immutable and AEAD-bound to owner, document, storage
-/// incarnation, record ID, kind and size.
-/// Enforce maximum_bytes before allocating
-/// a read buffer. No keys, filesystem paths or authentication flags cross here.
-/// A write returns a candidate locator in the host's held transaction. The host
-/// publishes a durable root only after page work and the actual COMMIT join.
+/// The file host implements this interface on its storage executor. Pages are
+/// immutable addresses in the captured document's append file. Enforce
+/// maximum_bytes before allocating; no paths or file descriptors cross here.
+/// A write returns a candidate locator. The host synchronizes pages before
+/// atomically replacing the complete document/history root file.
 pub trait PageProvider {
     fn read(
         &mut self,
@@ -230,6 +251,8 @@ struct Piece {
     start: u32,
     end: u32,
     summary: TextSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    paragraphs: Option<ParagraphSummary>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", content = "items", rename_all = "snake_case")]
@@ -267,6 +290,9 @@ impl Node {
                 for piece in pieces {
                     validate_page(&piece.chunk, PageKind::Text)?;
                     piece.summary.validate()?;
+                    if let Some(part) = piece.paragraphs {
+                        part.validate(piece.summary)?;
+                    }
                     if piece.start >= piece.end
                         || piece.end as usize > TEXT_PAGE_BYTES
                         || piece.summary.bytes != u64::from(piece.end - piece.start)
@@ -295,11 +321,18 @@ fn digest(bytes: &[u8]) -> String {
 }
 fn validate_page(page: &PageRef, kind: PageKind) -> Result<()> {
     let p = &page.locator;
-    let invalid_address = p.store_id.is_nil() || p.record_id.is_nil()
-        || p.ciphertext_bytes < 28
-        || p.ciphertext_bytes as usize > kind.maximum_bytes() + 28;
-    if invalid_address || page.digest.len() != 64
-        || !page.digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+    let invalid_address = p.store_id.is_nil()
+        || p.bytes as usize > kind.maximum_bytes()
+        || p.offset
+            .checked_add(u64::from(p.bytes) + 12)
+            .is_none_or(|end| end > i64::MAX as u64);
+    if invalid_address
+        || page.digest.len() != 64
+        || !page
+            .digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
         return Err(Error::Invalid("page locator or digest"));
     }
     Ok(())
@@ -309,6 +342,9 @@ fn validate_ref(node: &TreeRef) -> Result<()> {
         return Err(Error::Invalid("tree height limit"));
     }
     node.summary.validate()?;
+    if let Some(part) = node.paragraphs {
+        part.validate(node.summary)?;
+    }
     validate_page(&node.page, PageKind::Index)
 }
 fn check_cancel(cancelled: &mut impl FnMut() -> bool) -> Result<()> {
@@ -325,6 +361,35 @@ struct CachedPage {
     kind: PageKind,
     page: PageRef,
     bytes: Arc<[u8]>,
+}
+/// One actual immutable piece; its shared backing page is at most 64 KiB.
+/// No cluster string, assembled range or extra source cache is retained.
+struct SourcePiece {
+    before: TextSummary,
+    bytes: Arc<[u8]>,
+    start: usize,
+    end: usize,
+}
+impl SourcePiece {
+    fn text(&self) -> Result<&str> {
+        std::str::from_utf8(
+            self.bytes
+                .get(self.start..self.end)
+                .ok_or(Error::Invalid("seek piece extent"))?,
+        )
+        .map_err(|_| Error::Invalid("seek piece UTF8"))
+    }
+    fn position(&self, at: u64) -> Result<TextSummary> {
+        let local = at
+            .checked_sub(self.before.bytes)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or(Error::Invalid("seek piece coordinate"))?;
+        let prefix = self
+            .text()?
+            .get(..local)
+            .ok_or(Error::Invalid("seek inside UTF8 scalar"))?;
+        self.before.checked_add(TextSummary::of(prefix))
+    }
 }
 /// Share one engine/cache across the host's active document sessions. Opening
 /// documents does not allocate another cache, read all leaves, or retain roots.
@@ -353,14 +418,6 @@ impl<S: PageProvider> TextEngine<S> {
             entries: self.cache.len(),
             ..self.stats
         }
-    }
-    /// The host calls this only after the actual SQL operation returns and its
-    /// rollback/uncertain COMMIT has fenced further source admission. This is
-    /// cache cleanup, never evidence that publication did not happen. Existing
-    /// cumulative IO counters remain intact; bulk producers are joined separately.
-    pub fn discard_page_cache_after_rollback(&mut self) {
-        self.cache.clear();
-        self.stats.charged_bytes = 0;
     }
     pub fn into_provider(self) -> S {
         self.provider
@@ -458,17 +515,35 @@ impl<S: PageProvider> TextEngine<S> {
             return Err(Error::Invalid("index owner or schema"));
         }
         page.node.validate(node.height)?;
-        if page.node.summary()? != node.summary {
+        let paragraphs = page.node.paragraphs()?;
+        if page.node.summary()? != node.summary
+            || node.paragraphs.is_some_and(|part| paragraphs != Some(part))
+        {
             return Err(Error::Invalid("index summary"));
         }
         Ok(page.node)
     }
+    pub fn page_children(&mut self, revision: &Revision, tree: &TreeRef) -> Result<PageChildren> {
+        revision.validate()?;
+        match self.node(revision, tree)? {
+            Node::Branch(children) => Ok(PageChildren {
+                children,
+                text_pages: Vec::new(),
+            }),
+            Node::Leaf(pieces) => Ok(PageChildren {
+                children: Vec::new(),
+                text_pages: pieces.into_iter().map(|piece| piece.chunk).collect(),
+            }),
+        }
+    }
+
     fn write_node(&mut self, revision: &Revision, node: Node, height: u8) -> Result<TreeRef> {
         if height > MAX_HEIGHT {
             return Err(Error::Invalid("tree height limit"));
         }
         node.validate(height)?;
         let summary = node.summary()?;
+        let paragraphs = node.paragraphs()?;
         let bytes = serde_json::to_vec(&IndexPage {
             schema: 1,
             owner_id: revision.owner_id,
@@ -480,6 +555,7 @@ impl<S: PageProvider> TextEngine<S> {
             page: self.write_page(revision, PageKind::Index, &bytes)?,
             summary,
             height,
+            paragraphs,
         })
     }
 }
@@ -495,6 +571,12 @@ impl<S: PageProvider> TextEngine<S> {
                 && last.chunk == piece.chunk
                 && last.end == piece.start
             {
+                last.paragraphs = match (last.paragraphs, piece.paragraphs) {
+                    (Some(a), Some(b)) => {
+                        Some(a.add(b, last.summary.bytes, piece.summary.bytes)?)
+                    }
+                    _ => None,
+                };
                 last.end = piece.end;
                 last.summary = last.summary.checked_add(piece.summary)?;
             } else {
@@ -523,7 +605,11 @@ impl<S: PageProvider> TextEngine<S> {
             .ok_or(Error::Invalid("piece character boundary"))?;
         let text =
             std::str::from_utf8(part).map_err(|_| Error::Invalid("piece character boundary"))?;
-        if TextSummary::of(text) != piece.summary {
+        if TextSummary::of(text) != piece.summary
+            || piece
+                .paragraphs
+                .is_some_and(|part| ParagraphSummary::of(text) != part)
+        {
             return Err(Error::Invalid("piece text summary"));
         }
         Ok(bytes)
@@ -572,12 +658,14 @@ impl<S: PageProvider> TextEngine<S> {
                             start: piece.start,
                             end: middle,
                             summary: TextSummary::of(before),
+                            paragraphs: Some(ParagraphSummary::of(before)),
                         });
                         right.push(Piece {
                             chunk: piece.chunk,
                             start: middle,
                             end: piece.end,
                             summary: TextSummary::of(after),
+                            paragraphs: Some(ParagraphSummary::of(after)),
                         });
                     }
                     position = end;
@@ -900,6 +988,40 @@ impl<S: PageProvider> TextEngine<S> {
             text,
         })
     }
+    /// A bounded prefix ending at an exact UTF16 caret, with global origins.
+    pub fn prefix_window(
+        &mut self,
+        document: &Document,
+        expected: &Revision,
+        caret: u64,
+        budget: usize,
+    ) -> Result<Window> {
+        if !(4..=WINDOW_BYTES).contains(&budget) {
+            return Err(Error::Invalid("prefix window budget"));
+        }
+        let end = self.byte_at_utf16(document, expected, caret)?;
+        let start = end.saturating_sub(budget as u64);
+        let bytes = self.read_range(expected, start..end)?;
+        let skip = bytes
+            .iter()
+            .position(|byte| byte & 0xc0 != 0x80)
+            .unwrap_or(bytes.len());
+        let actual_start = start + skip as u64;
+        let prefix = match &expected.root {
+            Some(root) => self.prefix_summary(expected, root, actual_start)?,
+            None => TextSummary::EMPTY,
+        };
+        let text = String::from_utf8(bytes[skip..].to_vec())
+            .map_err(|_| Error::Invalid("prefix window UTF8"))?;
+        Ok(Window {
+            revision: expected.clone(),
+            window_id: Uuid::new_v4(),
+            byte_start: actual_start,
+            utf16_start: prefix.utf16,
+            lf_start: prefix.lf_count,
+            text,
+        })
+    }
     /// The host owns permission and current-root CAS. Bounded captured edits
     /// must also pass exact old bytes; large explicit user deletions can rely
     /// on the complete expected root without materializing the deleted text.
@@ -922,16 +1044,23 @@ impl<S: PageProvider> TextEngine<S> {
         {
             return Err(Error::Invalid("edit bounds"));
         }
-        if let Some(old) = exact_old
-            && self.read_range(expected, range.clone())? != old
-        {
-            return Err(Error::Stale);
-        }
         // Check both scalar boundaries, including a huge deletion that never
         // loads the intervening subtrees.
         if let Some(root) = &expected.root {
             self.prefix_summary(expected, root, range.start)?;
             self.prefix_summary(expected, root, range.end)?;
+        }
+        // Identical bounded replacements do not create new pages or an empty
+        // Undo root. Large ranges only compare when the replacement itself is
+        // the same bounded length; otherwise no intervening text is read.
+        if exact_old.is_some() || range.end - range.start == inserted.len() as u64 {
+            let actual = self.read_range(expected, range.clone())?;
+            if exact_old.is_some_and(|old| actual != old) {
+                return Err(Error::Stale);
+            }
+            if actual == inserted.as_bytes() {
+                return Ok(expected.clone());
+            }
         }
         let (left, tail) = match &expected.root {
             Some(root) => self.split(expected, root, range.start)?,
@@ -1098,6 +1227,7 @@ impl<S: PageProvider> TextEngine<S> {
                 start: 0,
                 end: valid as u32,
                 summary,
+                paragraphs: Some(ParagraphSummary::of(text)),
             });
             if pieces.len() == FANOUT {
                 let leaf = self.write_node(revision, Node::Leaf(std::mem::take(&mut pieces)), 0)?;
@@ -1136,9 +1266,9 @@ impl<S: PageProvider> TextEngine<S> {
         self.import_root(revision, &mut Cursor::new(bytes), cancelled)
             .map(|(root, _)| root)
     }
-    /// Streaming validation/encryption writes complete before the returned
+    /// Streaming validation/page writes complete before the returned
     /// document can be published. Cancellation never returns a partial revision;
-    /// the host retains or reclaims its unpublished encrypted staging records.
+    /// the host retains or reclaims its unpublished staging pages.
     pub fn import_utf8(
         &mut self,
         owner: Uuid,
@@ -1161,6 +1291,183 @@ impl<S: PageProvider> TextEngine<S> {
             whole_text_sha256,
         })
     }
+    /// Locate one piece by byte summaries. The coordinate may lie inside a
+    /// scalar; only whole scalar-aligned piece bytes are exposed to the cursor.
+    fn source_piece(&mut self, revision: &Revision, at: u64) -> Result<SourcePiece> {
+        if at >= revision.summary().bytes {
+            return Err(Error::Invalid("seek outside source"));
+        }
+        let mut tree = revision
+            .root
+            .clone()
+            .ok_or(Error::Invalid("seek empty source"))?;
+        let mut before = TextSummary::EMPTY;
+        loop {
+            match self.node(revision, &tree)? {
+                Node::Branch(children) => {
+                    let mut next = None;
+                    for child in children {
+                        let end = before.checked_add(child.summary)?;
+                        if at < end.bytes {
+                            next = Some(child);
+                            break;
+                        }
+                        before = end;
+                    }
+                    tree = next.ok_or(Error::Invalid("seek branch summary"))?;
+                }
+                Node::Leaf(pieces) => {
+                    for piece in pieces {
+                        let end = before.checked_add(piece.summary)?;
+                        if at < end.bytes {
+                            let bytes = self.piece_text(revision, &piece)?;
+                            return Ok(SourcePiece {
+                                before,
+                                bytes,
+                                start: usize::try_from(piece.start).map_err(|_| {
+                                    Error::Invalid("seek piece start exceeds usize")
+                                })?,
+                                end: usize::try_from(piece.end)
+                                    .map_err(|_| Error::Invalid("seek piece end exceeds usize"))?,
+                            });
+                        }
+                        before = end;
+                    }
+                    return Err(Error::Invalid("seek leaf summary"));
+                }
+            }
+        }
+    }
+
+    /// Locate the zero-based LF ordinal without scanning unrelated text pages.
+    fn lf_position(&mut self, revision: &Revision, mut ordinal: u64) -> Result<TextSummary> {
+        if ordinal >= revision.summary().lf_count {
+            return Err(Error::Invalid("LF ordinal outside source"));
+        }
+        let mut tree = revision
+            .root
+            .clone()
+            .ok_or(Error::Invalid("LF in empty source"))?;
+        let mut before = TextSummary::EMPTY;
+        loop {
+            match self.node(revision, &tree)? {
+                Node::Branch(children) => {
+                    let mut next = None;
+                    for child in children {
+                        if ordinal < child.summary.lf_count {
+                            next = Some(child);
+                            break;
+                        }
+                        ordinal -= child.summary.lf_count;
+                        before = before.checked_add(child.summary)?;
+                    }
+                    tree = next.ok_or(Error::Invalid("LF branch summary"))?;
+                }
+                Node::Leaf(pieces) => {
+                    for piece in pieces {
+                        if ordinal >= piece.summary.lf_count {
+                            ordinal -= piece.summary.lf_count;
+                            before = before.checked_add(piece.summary)?;
+                            continue;
+                        }
+                        let bytes = self.piece_text(revision, &piece)?;
+                        let chunk = SourcePiece {
+                            before,
+                            bytes,
+                            start: usize::try_from(piece.start)
+                                .map_err(|_| Error::Invalid("LF piece start exceeds usize"))?,
+                            end: usize::try_from(piece.end)
+                                .map_err(|_| Error::Invalid("LF piece end exceeds usize"))?,
+                        };
+                        for (offset, byte) in chunk.text()?.bytes().enumerate() {
+                            if byte != b'\n' {
+                                continue;
+                            }
+                            if ordinal == 0 {
+                                let at = before
+                                    .bytes
+                                    .checked_add(
+                                        u64::try_from(offset)
+                                            .map_err(|_| Error::Invalid("LF offset exceeds u64"))?,
+                                    )
+                                    .ok_or(Error::Invalid("LF coordinate overflow"))?;
+                                return chunk.position(at);
+                            }
+                            ordinal -= 1;
+                        }
+                        return Err(Error::Invalid("LF text summary"));
+                    }
+                    return Err(Error::Invalid("LF leaf summary"));
+                }
+            }
+        }
+    }
+
+    /// Source-line endpoints around an exact scalar caret. Each endpoint uses
+    /// summaries and at most one bounded piece; a GB line is never scanned.
+    /// A caret within CRLF still belongs to the preceding LF-delimited line.
+    pub fn line_bounds(
+        &mut self,
+        document: &Document,
+        expected: &Revision,
+        utf16: u64,
+    ) -> Result<LineBounds> {
+        let at = self.byte_at_utf16(document, expected, utf16)?;
+        let origin = self.byte_position(document, expected, at)?;
+        let lf = TextSummary::of("\n");
+        let start = if origin.lf_count == 0 {
+            TextSummary::EMPTY
+        } else {
+            self.lf_position(expected, origin.lf_count - 1)?
+                .checked_add(lf)?
+        };
+        if origin.lf_count == expected.summary().lf_count {
+            return Ok(LineBounds {
+                start,
+                content_end: expected.summary(),
+                end: expected.summary(),
+                lf_terminated: false,
+            });
+        }
+        let mut content_end = self.lf_position(expected, origin.lf_count)?;
+        let end = content_end.checked_add(lf)?;
+        if content_end.bytes > start.bytes {
+            let preceding = self.source_piece(expected, content_end.bytes - 1)?;
+            let local = usize::try_from(content_end.bytes - 1 - preceding.before.bytes)
+                .map_err(|_| Error::Invalid("CRLF coordinate exceeds usize"))?;
+            if preceding.text()?.as_bytes().get(local) == Some(&b'\r') {
+                content_end.bytes -= 1;
+                content_end.utf16 -= 1;
+            }
+        }
+        Ok(LineBounds {
+            start,
+            content_end,
+            end,
+            lf_terminated: true,
+        })
+    }
+
+    /// Exact absolute byte coordinate, resolved by summaries and at most one
+    /// source page. A byte inside a UTF8 scalar is rejected.
+    pub fn byte_position(
+        &mut self,
+        document: &Document,
+        expected: &Revision,
+        offset: u64,
+    ) -> Result<TextSummary> {
+        if expected != document.revision() {
+            return Err(Error::Stale);
+        }
+        if offset > document.summary().bytes {
+            return Err(Error::Invalid("byte position"));
+        }
+        match &expected.root {
+            Some(root) => self.prefix_summary(expected, root, offset),
+            None => Ok(TextSummary::EMPTY),
+        }
+    }
+
     /// Resolve a generated navigation coordinate to its actual prefix counts.
     /// Only a half-surrogate may round by one UTF16 unit; all other failures
     /// remain errors. This visits tree summaries and at most two bounded pieces.
@@ -1176,9 +1483,13 @@ impl<S: PageProvider> TextEngine<S> {
             Ok(at) => at,
             Err(Error::Invalid("half-surrogate offset")) => {
                 let rounded = if forward {
-                    offset.checked_add(1).ok_or(Error::Invalid("position overflow"))?
+                    offset
+                        .checked_add(1)
+                        .ok_or(Error::Invalid("position overflow"))?
                 } else {
-                    offset.checked_sub(1).ok_or(Error::Invalid("position underflow"))?
+                    offset
+                        .checked_sub(1)
+                        .ok_or(Error::Invalid("position underflow"))?
                 };
                 self.byte_at_utf16(document, expected, rounded)?
             }

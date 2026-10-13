@@ -2,10 +2,9 @@ import BoomCore
 import Foundation
 
 /// One registered native controller's storage route. The existing process
-/// engine owns its queue/cache/providers; the publisher owns the same Vault
-/// and authoritative workspace head. This actor retains small identities and
+/// engine owns its queue/cache/providers and atomic complete document roots. This actor retains small identities and
 /// at most one unpublished 16KiB history island while a command is unresolved.
-actor PagedNativeStorageBackend: PagedNativeHistorySessionStorage, PagedNativeCommitInstallationStorage, PagedNativeSQLDurabilityStorage, PagedNativeDocumentNavigationStorage {
+actor PagedNativeStorageBackend: PagedNativeHistorySessionStorage, PagedNativeCommitInstallationStorage, PagedNativeFileDurabilityStorage, PagedNativeDocumentNavigationStorage, PagedNativeCapturedEditingStorage {
   private enum HistoryPhase {
     case prepared
     case inputConflict(PagedNativeHistoryInputObservation)
@@ -79,6 +78,7 @@ actor PagedNativeStorageBackend: PagedNativeHistorySessionStorage, PagedNativeCo
   private var sessionID: UUID?
   private var lastSequence: UInt64 = 0
   private var pendingCommitInstallationID: UUID?
+  private var pendingCapturedResult: PagedCapturedEditResult?
   private var committing = false
   private var pendingHistory: PendingHistory?
   private var unresolvedOutput: PagedTextRootLease?
@@ -91,7 +91,7 @@ actor PagedNativeStorageBackend: PagedNativeHistorySessionStorage, PagedNativeCo
   private var openingInFlight = false
   private var canonicalEnabled = false
 
-  /// The engine factory admits this exact record against the authenticated
+  /// The engine factory admits this exact record against the validated
   /// current head before returning the native route. Not a model-tool factory.
   init(engine: PagedTextEngineAdapter, publisher: PagedWorkspacePublisher,
     admittedRecord: PagedDocumentRootRecord, routeID: UUID, controllerCustody: PagedTextRootLease) {
@@ -104,7 +104,7 @@ actor PagedNativeStorageBackend: PagedNativeHistorySessionStorage, PagedNativeCo
   func opening(sessionID requested: UUID) async throws -> PagedNativeCanonicalOpening {
     try admitLifetime()
     guard !openingAttempted, sessionID == nil, lastSequence == 0, !committing,
-      activeWindows == 0, pendingHistory == nil, pendingCommitInstallationID == nil,
+      activeWindows == 0, pendingHistory == nil, pendingCommitInstallationID == nil, pendingCapturedResult == nil,
       requested != UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)) else {
       throw BoomError.stale("Canonical opening cannot reuse a native controller or unfinished operation.")
     }
@@ -162,6 +162,95 @@ actor PagedNativeStorageBackend: PagedNativeHistorySessionStorage, PagedNativeCo
     return acknowledgement
   }
 
+  func commitCapturedEdits(expected: PagedDocumentRootRecord, edits: [PagedTextLocalEdit],
+    sessionID: UUID, commandID: UUID, groupID: UUID, sequence: UInt64,
+    beforeCursor: PagedSealedCursor, afterSelection: PagedNativeNavigationSelection? = nil) async throws -> PagedCapturedEditResult {
+    try await commitCaptured(PagedCapturedEditInput(expected: expected, operation: .edits(edits),
+      sessionID: sessionID, commandID: commandID, groupID: groupID, sequence: sequence,
+      beforeCursor: beforeCursor, afterSelection: afterSelection))
+  }
+  func commitUserReplacement(expected: PagedDocumentRootRecord, selection: PagedNativeNavigationSelection,
+    replacement: Data, sessionID: UUID, commandID: UUID, groupID: UUID, sequence: UInt64,
+    beforeCursor: PagedSealedCursor) async throws -> PagedCapturedEditResult {
+    try await commitCaptured(PagedCapturedEditInput(expected: expected, operation: .replacement(selection, replacement),
+      sessionID: sessionID, commandID: commandID, groupID: groupID, sequence: sequence, beforeCursor: beforeCursor))
+  }
+  func commitLinePrefix(expected: PagedDocumentRootRecord, selection: PagedNativeNavigationSelection,
+    prefix: String, sessionID: UUID, commandID: UUID, groupID: UUID, sequence: UInt64,
+    beforeCursor: PagedSealedCursor) async throws -> PagedCapturedEditResult {
+    try await commitCaptured(PagedCapturedEditInput(expected: expected, operation: .linePrefix(selection, prefix),
+      sessionID: sessionID, commandID: commandID, groupID: groupID, sequence: sequence, beforeCursor: beforeCursor))
+  }
+  private func commitCaptured(_ input: PagedCapturedEditInput) async throws -> PagedCapturedEditResult {
+    try admitLifetime()
+    let next = lastSequence.addingReportingOverflow(1)
+    guard !committing, pendingHistory == nil, pendingCommitInstallationID == nil, pendingCapturedResult == nil,
+      activeWindows == 0, input.expected == sealedRecord, input.sessionID == sessionID,
+      !next.overflow, input.sequence == next.partialValue else {
+      throw BoomError.stale("Captured edit has another pending command, controller, sequence or full source.")
+    }
+    _ = try input.inputCharge()
+    committing = true
+    defer { committing = false }
+    let output: PagedTextCustodiedValue<PagedCapturedEditResult>
+    do { output = try await engine.commitCapturedEditRetaining(input, publisher: publisher) }
+    catch { preserveFailure(error); throw error }
+    do {
+      try output.value.canonicalHistory.admit(record: output.value.record, sessionID: input.sessionID,
+        engineIncarnation: engine.custodyIncarnation,
+        scope: .capturedEdit(sessionID: input.sessionID, commandID: input.commandID, sequence: input.sequence))
+      try engine.installNativeCustody(output.lease, controller: controllerCustody,
+        expected: input.expected, record: output.value.record)
+    } catch { unresolvedOutput = output.lease; throw PagedTextCustodyFailure(original: error, lease: output.lease) }
+    sealedRecord = output.value.record; lastSequence = input.sequence
+    lastJoinedHistoryCompletion = nil; pendingCapturedResult = output.value
+    return output.value
+  }
+  func finishCapturedEditInstallation(_ result: PagedCapturedEditResult) async throws {
+    try admitLifetime()
+    guard !committing, pendingHistory == nil, pendingCommitInstallationID == nil,
+      sessionID == result.sessionID, lastSequence == result.sequence, sealedRecord == result.record,
+      pendingCapturedResult == nil || pendingCapturedResult == result else {
+      throw BoomError.stale("Captured edit finish has another actual controller output.")
+    }
+    committing = true
+    defer { committing = false }
+    try await engine.finishCapturedEditCustody(controllerCustody, result: result, publisher: publisher)
+    pendingCapturedResult = nil
+  }
+
+  func graphemeBoundary(expected: PagedTextRevision, utf16Offset: UInt64, forward: Bool) async throws -> PagedTextSummary {
+    try admitOrdinaryOperation()
+    guard !committing, activeWindows < 2, expected == sealedRecord.document.revision else {
+      throw BoomError.stale("Grapheme movement has another pending or sealed source.")
+    }
+    activeWindows += 1
+    defer { activeWindows -= 1 }
+    let record = sealedRecord
+    let result: PagedTextSummary
+    do { result = try await engine.graphemeBoundary(expected, utf16Offset: utf16Offset, forward: forward) }
+    catch { preserveFailure(error); throw error }
+    try admitOrdinaryOperation()
+    guard !committing, sealedRecord == record else { throw BoomError.stale("Grapheme source changed while seeking.") }
+    return result
+  }
+
+  func paragraphBounds(expected: PagedTextRevision, utf16Offset: UInt64,
+    includeLineEndings: Bool = true) async throws -> PagedTextParagraphBounds {
+    try admitOrdinaryOperation()
+    guard !committing, activeWindows < 2, expected == sealedRecord.document.revision else {
+      throw BoomError.stale("Paragraph movement has another pending or sealed source.")
+    }
+    activeWindows += 1
+    defer { activeWindows -= 1 }
+    let record = sealedRecord
+    let result = try await engine.paragraphBounds(expected, utf16Offset: utf16Offset,
+      includeLineEndings: includeLineEndings)
+    try admitOrdinaryOperation()
+    guard !committing, sealedRecord == record else { throw BoomError.stale("Paragraph source changed while seeking.") }
+    return result
+  }
+
   func documentPosition(expected: PagedTextRevision, utf16Offset: UInt64,
     forward: Bool) async throws -> PagedTextSummary {
     try admitOrdinaryOperation()
@@ -214,10 +303,11 @@ actor PagedNativeStorageBackend: PagedNativeHistorySessionStorage, PagedNativeCo
   /// and retained by the native owner before its old-arena commit is pumped.
   func prepareHistoryMove(_ command: PagedNativeHistoryMoveCommand) async throws -> PagedNativePreparedHistoryMove {
     try admitLifetime()
+    guard pendingCapturedResult == nil else { throw BoomError.unavailable("Captured source has not joined its physical installation.") }
     if let pendingHistory { throw PagedNativeHistoryCommandConflict.pendingCommand(pendingHistory.prepared.command.commandID) }
     try command.validate()
     if canonicalEnabled, command.canonicalSelection == nil {
-      throw BoomError.stale("Canonical native command requires its exact authenticated record/direction/slot selection.")
+      throw BoomError.stale("Canonical native command requires its exact validated record/direction/slot selection.")
     }
     guard !committing, command.expectedRootRecord == sealedRecord,
       command.expectedSequence == lastSequence, sessionID == nil || sessionID == command.sessionID else {
@@ -244,7 +334,7 @@ actor PagedNativeStorageBackend: PagedNativeHistorySessionStorage, PagedNativeCo
     guard case .prepared = pending.phase else { throw conflict(for: pending) }
     try admission.validate(for: prepared)
     try admitHistoryPublication(prepared)
-    // From here failure is uncertain until authenticated inspection. Never
+    // From here failure is uncertain until validated inspection. Never
     // release the intent/pins, restore old characters, or repeat automatically.
     try engine.admitPreparedCustody(pending.custody, prepared: prepared)
     pendingHistory?.phase = .admitted(admission)
@@ -356,7 +446,7 @@ actor PagedNativeStorageBackend: PagedNativeHistorySessionStorage, PagedNativeCo
     }
     let custody = try admitFailedCommit(batch)
     committing = true; defer { committing = false }
-    let result = try await engine.resolveSQLiteOutputRetaining(custody, publisher: publisher)
+    let result = try await engine.inspectFailedNativeCommitRetaining(batch, custody: custody, publisher: publisher)
     guard result.lease == custody else { unresolvedOutput = result.lease; throw BoomError.stale("Outcome inspection returned another actual retained producer.") }
     switch result.value {
     case .native(let ack): commitBeforeVerification = nil; return .published(ack)
@@ -406,7 +496,7 @@ actor PagedNativeStorageBackend: PagedNativeHistorySessionStorage, PagedNativeCo
     return acknowledgement // Main still must consume ACK and join real finish
   }
 
-  /// Inspection joins any coherent journal recovery first. An exact before
+  /// Inspection joins any the actual file publication first. An exact before
   /// record issues a single explicit completion permit, never a blind retry.
   func inspectHistoryRecovery(_ prepared: PagedNativePreparedHistoryMove) async throws -> PagedNativeHistoryRecovery {
     if let joined = try currentJoinedHistoryCompletion(prepared) { return .published(joined.acknowledgement) }
@@ -440,7 +530,7 @@ actor PagedNativeStorageBackend: PagedNativeHistorySessionStorage, PagedNativeCo
     }
   }
 
-  /// Deliberate completion of an already admitted command, after authenticated
+  /// Deliberate completion of an already admitted command, after validated
   /// before-record inspection. Same-document changes still lose its full CAS.
   func completeVerifiedHistory(_ prepared: PagedNativePreparedHistoryMove,
     verificationID: UUID) async throws -> PagedNativeHistoryAcknowledgement {
@@ -455,7 +545,7 @@ actor PagedNativeStorageBackend: PagedNativeHistorySessionStorage, PagedNativeCo
 
   /// Main calls only after its exact provisional arena has consumed the
   /// durable acknowledgement while retaining every later accepted character.
-  /// Releasing pins does not install text and never deletes ciphertext.
+  /// Releasing pins does not install text and never deletes file bytes.
   func finishHistoryInstallation(_ prepared: PagedNativePreparedHistoryMove,
     admission: PagedNativeHistoryAdmission) async throws {
     if let joined = try currentJoinedHistoryCompletion(prepared) {
@@ -472,7 +562,7 @@ actor PagedNativeStorageBackend: PagedNativeHistorySessionStorage, PagedNativeCo
     defer { committing = false }
     try await engine.finishNativeHistoryCustody(pending.custody, controller: controllerCustody,
       prepared: prepared, admission: admission, record: sealedRecord, publisher: publisher)
-    // Set only after real registry transfer AND exact SQL receiving admission. No
+    // Set only after real registry transfer AND exact file receiving admission. No
     // fallible operation or await separates that completion from this receipt.
     lastJoinedHistoryCompletion = completed; pendingHistory = nil
   }
@@ -498,6 +588,7 @@ actor PagedNativeStorageBackend: PagedNativeHistorySessionStorage, PagedNativeCo
   }
   private func admitOrdinaryOperation() throws {
     try admitLifetime()
+    guard pendingCapturedResult == nil else { throw BoomError.unavailable("Captured source has not joined its physical installation.") }
     guard let pending = pendingHistory else { return }
     if case .inputConflict = pending.phase { return }
     throw conflict(for: pending)
@@ -583,18 +674,18 @@ actor PagedNativeStorageBackend: PagedNativeHistorySessionStorage, PagedNativeCo
 
   /// The caller must first join every UI input/flush/navigation task. This
   /// explicit shutdown freezes further route admission before its await, then
-  /// transfers the exact current record to a real authenticated coherent head.
+  /// transfers the exact current record to a real validated coherent head.
   /// No automatic deinit release, guessed success or ordinary-app hook yet.
   func detachJoinedController(sessionID expectedSession: UUID?, sequence: UInt64,
     record: PagedDocumentRootRecord) async throws {
     guard !detached, !detachInFlight, !committing, activeWindows == 0,
-      pendingHistory == nil, unresolvedOutput == nil, pendingCommitInstallationID == nil,
+      pendingHistory == nil, unresolvedOutput == nil, pendingCommitInstallationID == nil, pendingCapturedResult == nil,
       sessionID == expectedSession, lastSequence == sequence, sealedRecord == record else {
       throw BoomError.stale("Native detach has another controller, joined sequence or unresolved command/output.")
     }
     detaching = true; detachInFlight = true
     defer { detachInFlight = false }
-    // A failed transfer retains the exact engine and its journal barrier.
+    // A failed transfer retains the exact engine and its source output.
     // The owner may explicitly retry this same shutdown, never resume input.
     try await engine.transferJoinedRootToHead(controllerCustody, publisher: publisher, expected: record)
     lastJoinedHistoryCompletion = nil

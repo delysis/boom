@@ -38,6 +38,20 @@ final class PagedTextStorageExecutorTests: XCTestCase {
     XCTAssertEqual(executor.snapshot.foregroundRequests, 0)
   }
 
+  func testBackgroundExportCannotConsumeTheForegroundContinuationSlot() throws {
+    let executor = PagedTextStorageExecutor()
+    let background = try executor.reserveBulk(PagedTextCancellation())
+    defer { executor.releaseBulk(background) }
+    XCTAssertThrowsError(try executor.reserveBulk(PagedTextCancellation()))
+    let edit = try executor.reserveBulk(PagedTextCancellation(), priority: .foreground)
+    XCTAssertEqual(executor.snapshot.bulkOperations, 2)
+    XCTAssertThrowsError(try executor.reserveBulk(PagedTextCancellation(), priority: .foreground))
+    executor.releaseBulk(edit)
+    let nextEdit = try executor.reserveBulk(PagedTextCancellation(), priority: .foreground)
+    executor.releaseBulk(nextEdit)
+    XCTAssertEqual(executor.snapshot.bulkOperations, 1)
+  }
+
   func testCloseCancelsAndJoinsWholeBulkLifetimeBeforeCallbackRelease() async throws {
     let executor = PagedTextStorageExecutor(), cancellation = PagedTextCancellation()
     let lease = try executor.reserveBulk(cancellation)

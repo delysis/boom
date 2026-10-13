@@ -56,7 +56,7 @@ struct PagedNativeFoundationReconciliationPlan: Sendable {
       throw BoomError.stale("Foundation reconciliation is not this exact joined source prefix.")
     }
     switch incoming.scope {
-    case .nativeBatch, .historyPublished: break
+    case .nativeBatch, .historyPublished, .capturedEdit: break
     default: throw BoomError.invalid("Unpublished/opening history cannot reconcile an active Foundation manager.")
     }
     let nodes = actualUndo + actualRedo

@@ -1,6 +1,5 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import SwiftUI
 import XCTest
 @testable import Boom
@@ -12,18 +11,17 @@ final class ManuscriptSizingTests: XCTestCase {
     let fixture = try JSONDecoder().decode(WritingEvaluation.Fixture.self, from: Data(contentsOf: url))
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-sizing-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root)
     var state = WorkspaceState(); state.autocomplete = false; state.showChat = false
     state.documents = [.init(id: fixture.document.id, title: fixture.document.title)]
     state.selectedDocument = fixture.document.id
-    try await store.save(state, documents: [fixture.document])
-    let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    let model = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: [fixture.document])
     let host = NSHostingView(rootView: ManuscriptPane(model: model))
     let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 980, height: 846))
     window.isReleasedWhenClosed = false; window.contentView = host
     defer { window.close() }
     for _ in 0..<5 { host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
-    let editor = try XCTUnwrap(model.editor), manager = model.undoManager(fixture.document.id)
+    let editor = try XCTUnwrap(model.pagedInput?.activeView), manager = try XCTUnwrap(model.pagedCommands).manager
     manager.groupsByEvent = false; manager.removeAllActions()
     for _ in 0..<3 {
       editor.setSelectedRange(NSRange(location: fixture.caretUTF16, length: 0))
@@ -45,10 +43,10 @@ final class ManuscriptSizingTests: XCTestCase {
       host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(20))
       model.selectDocument(fixture.document.id)
       host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(20))
-      let current = try XCTUnwrap(model.editor)
+      let current = try XCTUnwrap(model.pagedInput?.activeView)
       XCTAssertEqual(current.string, liveText)
       XCTAssertEqual(model.selectedDocument?.text, liveText)
-      current.replaceDocument(fixture.document.text, action: "Restore fixture")
+      try await NativeCheckEvidence.replacePublicDocument(model, text: fixture.document.text, id: fixture.document.id, caret: fixture.caretUTF16)
       host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(20))
     }
     try await model.shutdown()

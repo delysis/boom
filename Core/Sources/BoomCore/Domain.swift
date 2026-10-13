@@ -200,6 +200,18 @@ public struct GhostStamp: Equatable, Sendable {
   public let revision: String
   public let caretUTF16: Int
   public let epoch: UInt64
+  public init(documentID: UUID, revision: String, caretUTF16: Int, epoch: UInt64) throws {
+    guard !revision.isEmpty, caretUTF16 >= 0, caretUTF16 != NSNotFound else {
+      throw BoomError.invalid("Invalid completion source identity or caret.")
+    }
+    self.documentID = documentID; self.revision = revision
+    self.caretUTF16 = caretUTF16; self.epoch = epoch
+  }
+  public func accepts(documentID: UUID, revision: String, caretUTF16: Int,
+    epoch: UInt64, hasMarkedText: Bool) -> Bool {
+    !hasMarkedText && documentID == self.documentID && revision == self.revision
+      && caretUTF16 == self.caretUTF16 && epoch == self.epoch
+  }
   public init(document: DocumentSnapshot, caretUTF16: Int, epoch: UInt64) throws {
     _ = try TextBoundary.index(caretUTF16, in: document.text)
     self.documentID = document.id

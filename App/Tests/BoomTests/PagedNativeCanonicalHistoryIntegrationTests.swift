@@ -1,13 +1,11 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import Foundation
 import XCTest
 @testable import Boom
 
-#if BLOOM_PAGED_SQL_PUBLIC_CONTROL
 // SOURCE ONLY: unparsed, uncompiled and unrun. This file requires the reviewed
-// composed SQL retirement, guarded seam and real receiving successor.
+// composed file retirement, guarded seam and real receiving successor.
 // It never constructs a source ACK or interprets visibility as durability.
 // Terminal receiving cases require one exact separately owned test process.
 private enum CanonicalPublicFault: Error, Sendable, Equatable {
@@ -16,7 +14,7 @@ private enum CanonicalPublicFault: Error, Sendable, Equatable {
 }
 
 /// Decorates the existing public scheduling route, which forwards the real
-/// encrypted backend. Only failure delivery/evidence is added; no engine,
+/// file backend. Only failure delivery/evidence is added; no engine,
 /// executor, history, timer, root pin, guardian or successful value is invented.
 private actor CanonicalPublicRoute: PagedNativeHistorySessionStorage, PagedNativeCommitInstallationStorage {
   nonisolated let gate: PagedStagedControlledStorage
@@ -99,9 +97,8 @@ private struct CanonicalPublicOpen: Sendable {
   let root: URL
   let ownerID: UUID
   let storeID: UUID
-  let vault: Vault
+  let store: WorkspaceStore
   let engine: PagedTextEngineAdapter
-  let sqlIdentity: PagedSQLPublicControlIdentity
 }
 private struct CanonicalPublicReady: Sendable {
   let opened: CanonicalPublicOpen
@@ -129,11 +126,10 @@ private struct CanonicalPublicReady: Sendable {
   let window: NSWindow
   let scroll: NSScrollView
   private var readOutputs: [PagedTextRootLease] = []
-  private var joinedWAL: PagedTextSQLMaintenanceSnapshot?
   private var retainedReopeningEngine: PagedTextEngineAdapter?
   private(set) var joinedCommandFailure: Error?
   private var notificationTokens: [NSObjectProtocol] = []
-  var view: PagedNativeTextView { input.activeView }
+  var view: PagedNativeTextView { input.activeView! }
 
   init(_ ready: CanonicalPublicReady) throws {
     // Use local graph owners while XCTest autoclosures run; do not capture
@@ -225,10 +221,9 @@ private struct CanonicalPublicReady: Sendable {
   }
   func record() async throws -> PagedDocumentRootRecord {
     guard readOutputs.count < 48 else { throw BoomError.budget("Public retained read evidence exceeds its fixed bound.") }
-    let result = try await opened.engine.loadWorkspaceRetaining(publisher)
+    let result = try await opened.engine.currentDocumentRecordRetaining(publisher, documentID: initialRecord.document.id)
     readOutputs.append(result.lease)
-    guard result.value.documents.count == 1 else { throw BoomError.invalid("Public fixture acquired another document.") }
-    return result.value.documents[0]
+    return result.value
   }
   func source(_ record: PagedDocumentRootRecord) async throws -> PagedTextWindow {
     guard readOutputs.count < 48 else { throw BoomError.budget("Public retained read evidence exceeds its fixed bound.") }
@@ -237,11 +232,11 @@ private struct CanonicalPublicReady: Sendable {
     readOutputs.append(result.lease)
     return result.value
   }
-  /// Independent read-only authentication through the SAME owner/Vault/provider.
+  /// Independent read-only authentication through the SAME owner/file provider.
   /// The full record is still held by the real controller/read output above.
   func history(_ record: PagedDocumentRootRecord) async throws -> PagedRootHistory {
-    guard readOutputs.count < 48 else { throw BoomError.budget("Public retained SQL history evidence exceeds its fixed bound.") }
-    let result = try await opened.engine._publicSQLControlHistoryRetaining(identity: opened.sqlIdentity, record: record)
+    guard readOutputs.count < 48 else { throw BoomError.budget("Public retained file history evidence exceeds its fixed bound.") }
+    let result = try await opened.engine.rootHistoryRetaining(publisher, expected: record)
     readOutputs.append(result.lease)
     return result.value
   }
@@ -282,36 +277,23 @@ private struct CanonicalPublicReady: Sendable {
       sequence: session.generation, record: current)
     for output in readOutputs { try await opened.engine.abandonJoinedRootOutput(output) }
     readOutputs.removeAll()
-    try await joinWALAfterSource()
     try await opened.engine.close()
+    try await opened.store.releaseExclusiveWorkspace()
     return current
   }
-  /// Explicitly join bounded maintenance AFTER real native/source workers and
-  /// receiving custody join. A failed COMMIT or unresolved queue remains held;
-  /// this method has no repair/reset, source replay or automatic retry.
-  private func joinWALAfterSource() async throws {
-    let joined = try await opened.engine.joinScheduledWALMaintenance()
-    joinedWAL = joined
-    if let failure = joined.failure { throw failure }
-    guard joined.storage.failedOperationID == nil,
-      joined.storage.observedWALBytes <= PagedSQLiteStore.walAdmissionBytes,
-      opened.engine.custodySnapshot.jobs == 0 else {
-      throw BoomError.stale("Actual WAL/source work remains owned; fixture close refused.")
-    }
-  }
   func reopenJoined() async throws {
-    guard retainedReopeningEngine == nil else { throw BoomError.denied("An earlier public SQL reopening remains owned.") }
+    guard retainedReopeningEngine == nil else { throw BoomError.denied("An earlier public file reopening remains owned.") }
     let expected = try await closeOwnerAndEngine()
-    let root = opened.root, ownerID = opened.ownerID, storeID = opened.storeID, vault = opened.vault
-    let nextEngine = try await PagedTextEngineAdapter.create(vault: vault, ownerID: ownerID, sqliteOpening: .existing(storeID: storeID))
+    let root = opened.root, ownerID = opened.ownerID, storeID = opened.storeID, store = opened.store
+    try await store.acquireExclusiveWorkspace()
+    let nextEngine = try await PagedTextEngineAdapter.create(root: root, ownerID: ownerID, storeID: storeID)
     retainedReopeningEngine = nextEngine // Retain a joined real opening even if identity admission refuses.
-    let identity = try await nextEngine._publicSQLControlIdentity(expectedVault: vault, expectedStoreID: storeID)
-    opened = CanonicalPublicOpen(root: root, ownerID: ownerID, storeID: storeID, vault: vault, engine: nextEngine, sqlIdentity: identity)
+    opened = CanonicalPublicOpen(root: root, ownerID: ownerID, storeID: storeID, store: store, engine: nextEngine)
     retainedReopeningEngine = nil
     publisher = try await nextEngine.makeWorkspacePublisher()
-    let loaded = try await nextEngine.loadWorkspaceRetaining(publisher)
+    let loaded = try await nextEngine.currentDocumentRecordRetaining(publisher, documentID: expected.document.id)
     readOutputs.append(loaded.lease)
-    guard loaded.value.documents == [expected] else { throw BoomError.stale("Encrypted reopen changed the complete head.") }
+    guard loaded.value == expected else { throw BoomError.stale("File reopen changed the complete head.") }
     backend = try await nextEngine.makeNativeStorage(publisher, expected: expected)
     let opening = try await backend.opening(sessionID: UUID())
     route = CanonicalPublicRoute(backend)
@@ -347,7 +329,7 @@ private struct CanonicalPublicReady: Sendable {
   private static var retainedReady: CanonicalPublicReady?
   private static var terminalFixture: CanonicalPublicFixture?
 
-  private func makeFixture(repeatedIdenticalHistory: Bool = false) async throws -> CanonicalPublicFixture {
+  private func makeFixture() async throws -> CanonicalPublicFixture {
     guard Self.retainedSetupRoot == nil, Self.retainedSetupEngine == nil,
       Self.retainedOpen == nil, Self.retainedReady == nil, Self.terminalFixture == nil else {
       throw BoomError.denied("A prior retained public fixture still owns this process.")
@@ -356,15 +338,13 @@ private struct CanonicalPublicReady: Sendable {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("public-canonical-history-" + UUID().uuidString)
     Self.retainedSetupRoot = root // Failed opening keeps its public files; no teardown deletes them.
     print("Public canonical setup: \(root.path)")
-    let created = try await Task.detached {
-      let ownerID = UUID(), storeID = UUID(), vault = try Vault(root: root, testKey: SymmetricKey(data: Data(repeating: 0x73, count: 32)))
-      let engine = try await PagedTextEngineAdapter.create(vault: vault, ownerID: ownerID, sqliteOpening: .fresh(storeID: storeID))
-      return (ownerID: ownerID, storeID: storeID, vault: vault, engine: engine)
-    }.value
-    Self.retainedSetupEngine = created.engine // Admission failure retains this actual joined opening.
-    let identity = try await created.engine._publicSQLControlIdentity(expectedVault: created.vault, expectedStoreID: created.storeID)
-    let opened = CanonicalPublicOpen(root: root, ownerID: created.ownerID, storeID: created.storeID,
-      vault: created.vault, engine: created.engine, sqlIdentity: identity)
+    let store = try WorkspaceStore(rootOverride: root)
+    try await store.acquireExclusiveWorkspace()
+    let identity = try await store.storageIdentity()
+    let engine = try await PagedTextEngineAdapter.create(root: store.root, ownerID: identity.ownerID, storeID: identity.storeID)
+    Self.retainedSetupEngine = engine
+    let opened = CanonicalPublicOpen(root: store.root, ownerID: identity.ownerID, storeID: identity.storeID,
+      store: store, engine: engine)
     Self.retainedOpen = opened
     Self.retainedSetupEngine = nil; Self.retainedSetupRoot = nil
     let importOwner = opened
@@ -387,43 +367,11 @@ private struct CanonicalPublicReady: Sendable {
     let document = PagedDocumentDescriptor(id: imported.value.revision.documentID,
       title: "Public café", revision: imported.value.revision)
     let initial = try await opened.engine.initialNativeRecordRetaining(document)
-    var record = initial.value
-    var seededOutput: PagedTextCustodiedValue<PagedDocumentRootRecord>?
-    if repeatedIdenticalHistory {
-      // Public protocol metadata references ONLY the actual imported root. The
-      // guarded writer reopens every root/scalar cursor, performs real SQL
-      // COMMIT, and returns genuine producer custody on this same engine.
-      let history = try await Task.detached {
-        let cursor = PagedSealedCursor(byteOffset: 0, utf16Offset: 0)
-        let base = try PagedRootHistory(revision: document.revision, cursor: cursor)
-        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(base)) as? [String: Any])
-        let entry = PagedRootHistoryEntry(revision: document.revision, cursor: cursor,
-          groupID: UUID(uuidString: "10000000-0000-0000-0000-000000000001")!)
-        let encoded = try JSONSerialization.jsonObject(with: JSONEncoder().encode(entry))
-        object["undo"] = Array(repeating: encoded, count: PagedRootHistory.maximumEntries)
-        object["generation"] = PagedRootHistory.maximumEntries
-        let seedBytes = try JSONSerialization.data(withJSONObject: object)
-        guard seedBytes.count <= PagedRootHistory.maximumEncodedBytes else { throw BoomError.budget("Public SQL seed exceeds its actual history encoding envelope.") }
-        try seedBytes.write(to: root.appendingPathComponent("public-seeded-history.json"), options: .withoutOverwriting)
-        let history = try JSONDecoder().decode(PagedRootHistory.self, from: seedBytes)
-        try history.validate(expected: document.revision)
-        return history
-      }.value
-      let seeded = try await opened.engine._publicSQLControlWriteHistoryRetaining(identity: opened.sqlIdentity, history: history, document: document)
-      seededOutput = seeded; record = seeded.value
-      let checked = try await opened.engine._publicSQLControlHistoryRetaining(identity: opened.sqlIdentity, record: record)
-      guard checked.value == history else { throw PagedTextCustodyFailure(original: BoomError.invalid("Actual encrypted SQL seed did not round trip exactly."), lease: checked.lease) }
-      try await opened.engine.abandonJoinedRootOutput(checked.lease)
-    }
     let publisher = try await opened.engine.makeWorkspacePublisher()
+    let record = try await opened.engine.publishInitialDocumentRetaining(publisher, imported: imported, initialized: initial)
     var state = WorkspaceState()
     state.documents = [DocumentIndex(id: document.id, title: document.title)]; state.selectedDocument = document.id
-    let workspace = try await opened.engine.initializeWorkspaceRetaining(publisher, state: state, documents: [record])
-    try await opened.engine.finishWorkspacePublication(workspace, publisher: publisher)
-    if let seededOutput { try await opened.engine.transferJoinedRootToHead(seededOutput.lease, publisher: publisher, expected: record) }
-    try await opened.engine.transferJoinedRootToHead(imported.lease, publisher: publisher, expected: record)
-    try await opened.engine.transferJoinedRootToHead(initial.lease, publisher: publisher, expected: record)
-    try await opened.engine.abandonJoinedRootOutput(workspace.lease)
+    try await opened.store.saveState(state)
     let backend = try await opened.engine.makeNativeStorage(publisher, expected: record)
     let opening = try await backend.opening(sessionID: UUID())
     let ready = CanonicalPublicReady(opened: opened, publisher: publisher,
@@ -433,14 +381,14 @@ private struct CanonicalPublicReady: Sendable {
     Self.retainedOpen = nil; Self.retainedReady = nil
     return fixture
   }
-  private func withFixture(isolatedCase: String? = nil, repeatedIdenticalHistory: Bool = false,
+  private func withFixture(isolatedCase: String? = nil,
     _ body: @MainActor (CanonicalPublicFixture) async throws -> Void) async throws {
     if let isolatedCase,
       ProcessInfo.processInfo.environment["BLOOM_PAGED_CANONICAL_ISOLATED_CASE"] != isolatedCase {
       throw BoomError.denied("Retained receiving-boundary control requires its exact separately owned disposable test process; no fixture entered.")
     }
     let failures = testRun?.failureCount ?? 0
-    let fixture = try await makeFixture(repeatedIdenticalHistory: repeatedIdenticalHistory)
+    let fixture = try await makeFixture()
     do {
       try await body(fixture)
       guard (testRun?.failureCount ?? 0) == failures else { throw BoomError.invalid("The actual canonical control recorded failed assertions.") }
@@ -454,7 +402,6 @@ private struct CanonicalPublicReady: Sendable {
         guard gate.activeCalls == 0, gate.startedCalls == gate.finishedCalls, custody.jobs == 0 else {
           throw BoomError.stale("Terminal evidence cannot precede actual public worker joins.")
         }
-        let sql = try await owner.engine.nativeSQLMaintenanceSnapshot() // Read-only; never terminal maintenance/disposition.
         let receipt: [String: String] = ["case": isolatedCase,
           "status": "actual-component-workers-joined-receiving-intent-and-input-retained",
           "source-generation": String(sourceGeneration),
@@ -462,14 +409,11 @@ private struct CanonicalPublicReady: Sendable {
           "retained-prefix": String(fixture.commands.retainedPrefix != nil),
           "actual-started-calls": String(gate.startedCalls), "actual-finished-calls": String(gate.finishedCalls),
           "actual-active-calls": String(gate.activeCalls), "live-root-custody-entries": String(custody.items.count),
-          "sqlite-wal-bytes": String(sql.storage.observedWALBytes),
-          "sqlite-failed-operation": sql.storage.failedOperationID?.uuidString ?? "none",
-          "sqlite-retirement": "retained-no-maintenance-in-terminal-case",
           "engine": "retained-no-detach-no-close-no-delete",
           "receiving-disposition": "OPEN-not-qualified-or-silently-applied"]
         try await Task.detached {
           let bytes = try JSONEncoder().encode(receipt)
-          guard bytes.count <= 16_384 else { throw BoomError.budget("Public terminal SQL receipt exceeds its fixed evidence cap.") }
+          guard bytes.count <= 16_384 else { throw BoomError.budget("Public terminal file receipt exceeds its fixed evidence cap.") }
           try bytes.write(to: owner.root.appendingPathComponent("retained-canonical-boundary.json"), options: .withoutOverwriting)
         }.value
         print("Public canonical retained boundary: \(owner.root.path)")
@@ -496,7 +440,36 @@ private struct CanonicalPublicReady: Sendable {
     }
   }
 
-  func testEncryptedReopenHydratesBothFoundationDirectionsAndExactCursors() async throws {
+  // The first control uses a synchronous XCTest entry around its async body.
+  // The actual async body is unchanged; its Task result is joined before the
+  // public expectation completes. Timeout retains the tasks and failed source.
+  private static var synchronousControlTask: Task<Void, Error>?
+  private static var synchronousControlJoin: Task<Void, Never>?
+
+  func testFileReopenHydratesBothFoundationDirectionsAndExactCursors() {
+    guard Self.synchronousControlTask == nil, Self.synchronousControlJoin == nil else {
+      XCTFail("An earlier canonical control still owns its actual async tasks."); return
+    }
+    let joined = expectation(description: "Actual canonical history body joined")
+    let work = Task { @MainActor in try await self.fileReopenHydratesBothDirectionsBody() }
+    Self.synchronousControlTask = work
+    Self.synchronousControlJoin = Task { @MainActor in
+      let result = await work.result
+      if case .failure(let error) = result {
+        XCTFail("Joined actual canonical history control failed: \(error)")
+      }
+      joined.fulfill()
+    }
+    let completion = XCTWaiter.wait(for: [joined], timeout: 120)
+    guard completion == .completed else {
+      work.cancel()
+      XCTFail("Canonical history control timed out; actual tasks and partial source retained.")
+      return
+    }
+    Self.synchronousControlTask = nil; Self.synchronousControlJoin = nil
+  }
+
+  private func fileReopenHydratesBothDirectionsBody() async throws {
     try await withFixture { f in
       let base = f.initialRecord.document.revision
       try f.replaceFirst("b"); try await f.seal(); let b = try await f.assertSource("b public🙂\n")
@@ -529,7 +502,7 @@ private struct CanonicalPublicReady: Sendable {
     }
   }
 
-  func testMovedCaretAndBackwardDeleteRestoreObservedStartAcrossEncryptedReopen() async throws {
+  func testMovedCaretAndBackwardDeleteRestoreObservedStartAcrossFileReopen() async throws {
     try await withFixture { f in
       try f.replaceFirst("b"); try await f.seal()
       f.view.setSelectedRange(NSRange(location: 2, length: 0))
@@ -773,69 +746,6 @@ private struct CanonicalPublicReady: Sendable {
     }
   }
 
-  func testAuthenticatedRepeatedSlotsAndRealOverflowRetainAnExpiredSelectedIntentAndLaterInput() async throws {
-    let name = "testAuthenticatedRepeatedSlotsAndRealOverflowRetainAnExpiredSelectedIntentAndLaterInput"
-    try await withFixture(isolatedCase: name, repeatedIdenticalHistory: true) { f in
-      let before = try await f.history(f.initialRecord)
-      XCTAssertEqual(before.undo.count, 100)
-      XCTAssertTrue(before.undo.allSatisfy { $0 == before.undo[0] })
-      XCTAssertEqual(f.commands.manager.undoCount, 100)
-      let first = try await f.route.gate.holdNext(.commitAfter)
-      try f.replaceFirst("b"); try await f.route.gate.awaitHeld(first)
-      for index in 0..<105 { try f.replaceFirst(index.isMultiple(of: 2) ? "c" : "d") }
-      let second = try await f.route.gate.holdNext(.commitAfter)
-      try await f.route.gate.release(first); try await f.route.gate.awaitHeld(second)
-      let firstSnapshot = await f.route.snapshot
-      let firstSeal = try XCTUnwrap(firstSnapshot.acknowledgements.first?.canonicalHistory)
-      XCTAssertEqual(firstSeal.undoFromBefore, Array(1..<100).map { Optional($0) } + [nil])
-      XCTAssertEqual(Array(firstSeal.undo.prefix(99)), Array(before.undo.dropFirst()))
-      f.commands.manager.undo()
-      let originalTarget = try f.top(.undo)
-      let prefix = try XCTUnwrap(f.commands.retainedPrefix)
-      XCTAssertEqual(prefix.generation, 106)
-      for index in 0..<105 { try f.replaceFirst(index.isMultiple(of: 2) ? "d" : "c") }
-      let originalInputLease = try f.input.inputLease(for: f.view)
-      weak var retainedOriginalEvent: NSEvent?
-      try autoreleasepool {
-        let event = try f.key(); retainedOriginalEvent = event
-        f.view.keyDown(with: event)
-      }
-      XCTAssertNotNil(retainedOriginalEvent) // Root must own the actual original intercepted event
-      XCTAssertEqual(f.commands.queuedRawKeyCount, 1)
-      XCTAssertEqual(f.session.generation, 211); XCTAssertEqual(f.view.string, "d public🙂\n")
-      XCTAssertFalse(try f.top(.undo) === originalTarget)
-      try await f.route.gate.release(second)
-      do { try await f.commands.joinPendingCommand(); XCTFail("The selected old Foundation intent cannot pop a different later target.") }
-      catch { guard case BoomError.stale = error else { throw error } }
-      let actual = await f.route.gate.snapshot
-      XCTAssertEqual(actual.batches.count, 2)
-      XCTAssertNotNil(actual.batches[1].historyBaseline)
-      XCTAssertEqual(actual.batches[1].groupCheckpoints.count, 100)
-      let finalSnapshot = await f.route.snapshot
-      let latest = try XCTUnwrap(finalSnapshot.acknowledgements.last?.canonicalHistory)
-      XCTAssertEqual(latest.scope.coveredSequence, 106); XCTAssertEqual(latest.undo.count, 100)
-      XCTAssertTrue(latest.undoFromBefore.allSatisfy { $0 == nil })
-      let current = try await f.record(), history = try await f.history(current), source = try await f.source(current)
-      XCTAssertEqual(latest.undo, history.undo)
-      XCTAssertEqual(Data(source.text.utf8), actual.batches[1].afterBytes)
-      XCTAssertEqual(f.view.string, "d public🙂\n")
-      XCTAssertEqual(f.commands.retainedPrefix, prefix); XCTAssertNil(f.commands.retainedPreparation)
-      XCTAssertNotNil(retainedOriginalEvent)
-      XCTAssertEqual(try f.input.inputLease(for: f.view), originalInputLease)
-      XCTAssertTrue(f.commands.hasPendingCommand); XCTAssertNotNil(f.commands.firstFailure)
-      XCTAssertEqual(f.commands.queuedRawKeyCount, 1)
-      XCTAssertNil(f.session.persistenceFailure); XCTAssertNil(f.session.historyFailure)
-      XCTAssertEqual(f.session.generation, 211)
-      XCTAssertTrue(f.opened.engine.custodySnapshot.items.contains { item in
-        if case .controller = item.purpose { return item.claims.contains(.record(current)) }; return false
-      })
-      requireRefusal { try f.commands.closeInput() }
-      requireRefusal { _ = try f.session.windowForNativeInstallation() }
-      // No receiving disposition exists yet. Do not release the reserved
-      // prefix, erase the Undo request, rebase input, detach, close or delete.
-    }
-  }
-
   func testGenuineNetZeroEpochPreservesRealRedoAndUnchangedPrimitiveAddsNoSeal() async throws {
     try await withFixture { f in
       try f.replaceFirst("b"); try await f.seal(); let b = try await f.record()
@@ -901,7 +811,7 @@ private struct CanonicalPublicReady: Sendable {
       let inspected = try await f.opened.engine.inspectNativeHistoryPublicationRetaining(prepared,
         admission: admission, publisher: f.publisher)
       try f.retainInspection(inspected)
-      guard case .published(let newACK) = inspected.value else { throw BoomError.stale("Actual encrypted inspection did not prove the published record.") }
+      guard case .published(let newACK) = inspected.value else { throw BoomError.stale("Actual file inspection did not prove the published record.") }
       let newMetadata = try XCTUnwrap(newACK.canonicalHistory)
       XCTAssertEqual(newMetadata.producer.id, inspected.lease.id)
       let producer = try XCTUnwrap(f.opened.engine.custodySnapshot.items.first { $0.id == inspected.lease.id })
@@ -1225,4 +1135,3 @@ private struct CanonicalPublicReady: Sendable {
     }
   }
 }
-#endif

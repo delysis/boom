@@ -30,7 +30,7 @@ struct WorkspaceView: View {
   private var panes: [PaneLayout.Pane] {
     var result: [PaneLayout.Pane] = []
     if model.showsLibrary {
-      result.append(.init(id: "library", content: model.usesPagedStorage ? AnyView(PagedWorkspaceLibrary(model: model)) : AnyView(LibraryView(model: model)),
+      result.append(.init(id: "library", content: AnyView(LibraryView(model: model)),
         minimum: 170, preferred: 210, maximum: 300))
     }
     if model.showsDocument {
@@ -38,7 +38,7 @@ struct WorkspaceView: View {
         minimum: 280, preferred: 580, maximum: .infinity))
     }
     if model.showsChat {
-      result.append(.init(id: "chat", content: model.usesPagedStorage ? AnyView(PagedWorkspaceComposer(model: model)) : AnyView(ChatPane(model: model)),
+      result.append(.init(id: "chat", content: AnyView(ChatPane(model: model)),
         minimum: 300, preferred: model.layout.isAuthor ? 370 : 800,
         maximum: model.layout.isAuthor ? 620 : .infinity))
     }
@@ -50,9 +50,9 @@ struct WorkspaceView: View {
         .onChange(of: geometry.size.width, initial: true) { _, width in model.fitPanes(to: width) }
     }
     .background(Color(nsColor: BoomChrome.sidebarBackground))
+    .disabled(model.editingLocked)
     .environment(\.openURL, OpenURLAction { _ in .discarded })
     .sheet(isPresented: $model.showingModels) { ModelPickerView(model: model) }
-    .sheet(item: $model.backupRequest) { BackupPassphraseView(model: model, request: $0) }
     .sheet(item: $model.editingWritingExamples) { WritingExamplesView(model: model, request: $0) }
     .alert("Bloom", isPresented: Binding(
       get: { model.errorMessage != nil }, set: { if !$0 { model.dismissError() } })
@@ -66,17 +66,10 @@ struct ManuscriptPane: View {
   var body: some View {
     GeometryReader { pane in
       VStack(spacing: 0) {
-        if model.usesPagedStorage {
-          if let viewport = model.pagedViewport {
-            PagedManuscriptView(viewport: viewport)
-              .id(ObjectIdentifier(viewport))
-              .frame(maxWidth: .infinity, maxHeight: .infinity)
-          } else {
-            Color.clear.accessibilityLabel("No bounded document selected")
-              .frame(maxWidth: .infinity, maxHeight: .infinity)
-          }
-        } else if let documentID = model.state.selectedDocument, model.documentIndices.contains(where: { $0.id == documentID }) {
-          MarkdownEditor(model: model, documentID: documentID)
+        if let viewport = model.pagedViewport {
+          PagedManuscriptView(viewport: viewport)
+            .id(ObjectIdentifier(viewport))
+            .allowsHitTesting(!model.editingLocked)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
           Color.clear.accessibilityLabel("No document selected")

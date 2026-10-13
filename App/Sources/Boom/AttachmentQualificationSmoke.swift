@@ -1,6 +1,5 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import Foundation
 import SwiftUI
 
@@ -40,7 +39,7 @@ import SwiftUI
     let watchdog = DispatchSource.makeTimerSource(queue: .global())
     watchdog.schedule(deadline: .now() + .seconds(1800)); watchdog.setEventHandler { exit(2) }; watchdog.resume(); defer { watchdog.cancel() }
     let corpus = try JSONDecoder().decode([Fixture].self, from: Data(contentsOf: fixtures.appendingPathComponent("manifest.json")))
-    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: evidence.appendingPathComponent("public-workspace"), testKey: SymmetricKey(data: Data(repeating: 0x71, count: 32))), loadModels: false)
+    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: evidence.appendingPathComponent("public-workspace")), loadModels: false)
     model.state.autocomplete = false
     let host = NSHostingView(rootView: WorkspaceView(model: model))
     let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 1440, height: 1000))
@@ -74,9 +73,9 @@ import SwiftUI
       if model.layout.isAuthor {
         try model.newDocument()
         let document = model.selectedDocument!
-        model.updateDocument("Before 🪶\n\nAfter", id: document.id, caret: 0)
+        try await NativeCheckEvidence.replacePublicDocument(model, text: "Before 🪶\n\nAfter", id: document.id, caret: 0)
         window.setContentSize(NSSize(width: 1440, height: 1000)); model.fitPanes(to: 1440); try await settle()
-        guard let editor = model.editor, let layout = editor.layoutManager, let container = editor.textContainer else { throw BoomError.invalid("Native manuscript unavailable.") }
+        guard let editor = model.pagedInput?.activeView, let layout = editor.layoutManager, let container = editor.textContainer else { throw BoomError.invalid("Native manuscript unavailable.") }
         let caret = "Before 🪶\n\n".utf16.count
         layout.ensureLayout(for: container)
         let glyph = layout.glyphIndexForCharacter(at: caret), line = layout.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil), position = layout.location(forGlyphAt: glyph)
@@ -153,8 +152,8 @@ import SwiftUI
     try await snapshot("real-audio-chat")
     let state = model.state
     try await model.shutdown()
-    let reopened = try await model.store.load().get()
-    guard reopened.0.attachments == state.attachments, reopened.0.chats == state.chats else { throw BoomError.invalid("Encrypted attachment/chat recovery changed records.") }
+    let reopened = try await model.store.loadState()
+    guard reopened.attachments == state.attachments, reopened.chats == state.chats else { throw BoomError.invalid("File attachment/chat recovery changed records.") }
     guard rows.allSatisfy({ $0.issue == nil }) else { receipt["status"]="failed"; try saveReceipt(); throw BoomError.invalid("One or more model input cells failed; all attempts retained.") }
     receipt["status"]="passed"; receipt["fixtures"]=String(rows.count); receipt["modelInputFixtures"]=String(rows.filter { $0.kind != "unavailable" }.count)
     receipt["writingModel"]=writer.identity; receipt["consultationModel"]=assistant.identity; try saveReceipt()

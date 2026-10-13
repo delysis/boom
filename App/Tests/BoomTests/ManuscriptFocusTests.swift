@@ -1,29 +1,28 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import SwiftUI
 import XCTest
 @testable import Boom
 
 final class ManuscriptFocusTests: XCTestCase {
   @MainActor private func renderedEditor(in host: NSView, window: NSWindow,
-    model: WorkspaceModel) async throws -> MarkdownTextView {
-    func find(_ view: NSView) -> MarkdownTextView? {
-      if let editor = view as? MarkdownTextView { return editor }
+    model: WorkspaceModel) async throws -> PagedNativeTextView {
+    func find(_ view: NSView) -> PagedNativeTextView? {
+      if let editor = view as? PagedNativeTextView { return editor }
       for child in view.subviews { if let editor = find(child) { return editor } }
       return nil
     }
     let deadline = ContinuousClock.now + .seconds(2)
     repeat {
       host.layoutSubtreeIfNeeded()
-      if let editor = find(host), editor.window === window, model.editor === editor,
+      if let editor = find(host), editor.window === window, model.pagedInput?.activeView === editor,
         editor.bounds.width > 0, editor.bounds.height > 0 { return editor }
       try await Task.sleep(for: .milliseconds(10))
     } while ContinuousClock.now < deadline
     throw BoomError.invalid("The public manuscript fixture did not settle into its own host and window.")
   }
 
-  @MainActor private func click(_ point: NSPoint, in editor: MarkdownTextView, window: NSWindow) throws {
+  @MainActor private func click(_ point: NSPoint, in editor: PagedNativeTextView, window: NSWindow) throws {
     guard editor.window === window else {
       throw BoomError.invalid("The public manuscript click belongs to another fixture window.")
     }
@@ -38,12 +37,11 @@ final class ManuscriptFocusTests: XCTestCase {
     defer { NSApp.setActivationPolicy(previousPolicy) }
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-native-caret-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root)
     let document = DocumentSnapshot(title: "Mouse fixture", text: "Café 👩🏽‍🚀 waits.\nThe lantern moved.")
     var state = WorkspaceState(); state.autocomplete = false; state.showChat = false
     state.documents = [DocumentIndex(id: document.id, title: document.title)]; state.selectedDocument = document.id
-    try await store.save(state, documents: [document])
-    let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    let model = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: [document])
     guard model.layout.isAuthor else { throw XCTSkip("The chat edition has no manuscript pane.") }
     for width in [1440, 760] {
       for dark in [true, false] {
@@ -105,12 +103,11 @@ final class ManuscriptFocusTests: XCTestCase {
     _ = NSApplication.shared
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-caret-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root)
     let document = DocumentSnapshot(title: "Caret fixture", text: "The harbor was quiet.")
     var state = WorkspaceState(); state.autocomplete = false; state.showChat = false
     state.documents = [DocumentIndex(id: document.id, title: document.title)]; state.selectedDocument = document.id
-    try await store.save(state, documents: [document])
-    let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    let model = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: [document])
     guard model.layout.isAuthor else { throw XCTSkip("The chat edition has no manuscript pane.") }
     let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 1190, height: 846))
     window.isReleasedWhenClosed = false
@@ -143,7 +140,7 @@ final class ManuscriptFocusTests: XCTestCase {
     XCTAssertEqual(model.selectedDocument?.text, document.text + " A lantern moved.")
     model.isBusy = false
     try await model.flush()
-    let reopened = try await store.load().get().1.first(where: { $0.id == document.id })
+    let reopened = try await NativeCheckEvidence.readPublicDocuments(model: model).first(where: { $0.id == document.id })
     XCTAssertEqual(reopened?.text, editor.string)
     try await model.shutdown()
   }

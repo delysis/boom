@@ -1,12 +1,45 @@
 import BoomCore
 import Foundation
 
+enum PagedSelectionAffinity: UInt8, Codable, Equatable, Sendable {
+  case upstream = 0, downstream = 1
+}
+
 /// A sealed source cursor. Working NSRanges are never encoded here.
 struct PagedSealedCursor: Codable, Equatable, Sendable {
   let byteOffset: UInt64
   let utf16Offset: UInt64
+  let selectionLengthUTF16: UInt64
+  let focusAtEnd: Bool
+  let affinity: PagedSelectionAffinity
+  private enum CodingKeys: String, CodingKey { case byteOffset, utf16Offset, selectionLengthUTF16, focusAtEnd, affinity }
+  init(byteOffset: UInt64, utf16Offset: UInt64, selectionLengthUTF16: UInt64 = 0,
+    focusAtEnd: Bool = false, affinity: PagedSelectionAffinity = .downstream) {
+    self.byteOffset = byteOffset; self.utf16Offset = utf16Offset
+    self.selectionLengthUTF16 = selectionLengthUTF16
+    self.focusAtEnd = focusAtEnd; self.affinity = affinity
+  }
+  // Callers admit the range against its immutable revision before reading its focus.
+  var focusUTF16: UInt64 { focusAtEnd ? utf16Offset + selectionLengthUTF16 : utf16Offset }
+  init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    byteOffset = try values.decode(UInt64.self, forKey: .byteOffset)
+    utf16Offset = try values.decode(UInt64.self, forKey: .utf16Offset)
+    selectionLengthUTF16 = try values.decodeIfPresent(UInt64.self, forKey: .selectionLengthUTF16) ?? 0
+    focusAtEnd = try values.decodeIfPresent(Bool.self, forKey: .focusAtEnd) ?? false
+    affinity = try values.decodeIfPresent(PagedSelectionAffinity.self, forKey: .affinity) ?? .downstream
+  }
+  func encode(to encoder: Encoder) throws {
+    var values = encoder.container(keyedBy: CodingKeys.self)
+    try values.encode(byteOffset, forKey: .byteOffset)
+    try values.encode(utf16Offset, forKey: .utf16Offset)
+    if selectionLengthUTF16 > 0 { try values.encode(selectionLengthUTF16, forKey: .selectionLengthUTF16) }
+    if focusAtEnd { try values.encode(true, forKey: .focusAtEnd) }
+    if affinity != .downstream { try values.encode(affinity, forKey: .affinity) }
+  }
   func validate(in revision: PagedTextRevision) throws {
-    guard byteOffset <= revision.summary.bytes, utf16Offset <= revision.summary.utf16 else {
+    guard byteOffset <= revision.summary.bytes, utf16Offset <= revision.summary.utf16,
+      selectionLengthUTF16 <= revision.summary.utf16 - utf16Offset else {
       throw BoomError.invalid("Root history cursor is outside its sealed source.")
     }
   }

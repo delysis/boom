@@ -1,6 +1,5 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import XCTest
 @testable import Boom
 
@@ -13,15 +12,14 @@ final class ExplicitExportTests: XCTestCase {
   }
   @MainActor func testExportRunsOffMainWithoutTakingForegroundAndShutdownJoinsCapturedBytes() async throws {
     let root = try fixture(), url = root.appendingPathComponent("chosen.md")
-    let store = try WorkspaceStore(rootOverride: root.appendingPathComponent("encrypted"), testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root.appendingPathComponent("workspace"))
     let initial = DocumentSnapshot(title: "Public export fixture", text: "")
     var state = WorkspaceState(); state.autocomplete = false; state.selectedDocument = initial.id
     state.documents = [DocumentIndex(id: initial.id, title: initial.title)]
-    try await store.save(state, documents: [initial])
-    let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    let model = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: [initial])
     let document = try XCTUnwrap(model.selectedDocument)
     let text = "\u{feff}Export canary Café 👩🏽‍💻\r\nCaptured bytes.\n"
-    model.updateDocument(text, id: document.id, caret: text.utf16.count)
+    try await NativeCheckEvidence.replacePublicDocument(model, text: text, id: document.id, caret: text.utf16.count)
     let captured = try XCTUnwrap(model.selectedDocument)
     let started = expectation(description: "Export serializer started"), release = DispatchSemaphore(value: 0)
     defer { release.signal() }
@@ -36,13 +34,13 @@ final class ExplicitExportTests: XCTestCase {
     }
     await fulfillment(of: [started], timeout: 2)
     XCTAssertTrue(model.isBusy, "An explicit export must not consume or cancel the foreground operation.")
-    model.updateDocument("A later human edit.", id: document.id, caret: 0)
+    try await NativeCheckEvidence.replacePublicDocument(model, text: "A later human edit.", id: document.id, caret: 0)
     try await Task.sleep(for: .milliseconds(20))
     XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     release.signal()
     try await model.shutdown()
     XCTAssertEqual(try Data(contentsOf: url), Data(text.utf8))
-    let reopened = try await store.load().get().1
+    let reopened = try await NativeCheckEvidence.readPublicDocuments(store: store)
     XCTAssertEqual(reopened.first { $0.id == document.id }?.text, "A later human edit.")
     XCTAssertNil(model.errorMessage)
   }
@@ -75,19 +73,21 @@ final class ExplicitExportTests: XCTestCase {
     try await ExplicitFileExport.write(to: url) { captured }
     XCTAssertEqual(try Data(contentsOf: url), captured)
   }
-  @MainActor func testDestinationFailureIsReportedAndWorkspaceRemainsEncrypted() async throws {
+  @MainActor func testDestinationFailureIsReportedAndWorkspaceFilesRemainUsable() async throws {
     let root = try fixture()
-    let store = try WorkspaceStore(rootOverride: root.appendingPathComponent("encrypted"), testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root.appendingPathComponent("workspace"))
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     model.exportFile(to: root.appendingPathComponent("absent/chosen.md")) { Data("Public denied export canary.".utf8) }
     try await model.shutdown()
     XCTAssertNotNil(model.errorMessage)
     XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("absent").path))
-    XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: store.root.path), ["Private"])
+    let reopened = try await store.loadState()
+    XCTAssertEqual(reopened.documents.map(\.id), model.documentIndices.map(\.id))
+    XCTAssertTrue(FileManager.default.fileExists(atPath: store.root.appendingPathComponent("workspace.json").path))
   }
   @MainActor func testLaterExportToSameDestinationPublishesAfterTheEarlierRequest() async throws {
     let root = try fixture(), url = root.appendingPathComponent("chosen.md")
-    let store = try WorkspaceStore(rootOverride: root.appendingPathComponent("encrypted"), testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root.appendingPathComponent("workspace"))
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     let first = expectation(description: "First export paused"), later = expectation(description: "Later export started")
     let release = DispatchSemaphore(value: 0)

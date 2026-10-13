@@ -1,6 +1,5 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import XCTest
 @testable import Boom
 
@@ -9,8 +8,7 @@ final class InlineMediaTests: XCTestCase {
     _ = NSApplication.shared
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-inline-" + UUID().uuidString)
     addTeardownBlock { try? FileManager.default.removeItem(at: root) }
-    return try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: root,
-      testKey: SymmetricKey(size: .bits256)), loadModels: false)
+    return try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: root), loadModels: false)
   }
   @MainActor static func image(_ color: NSColor = .systemRed) throws -> Data {
     let image = NSImage(size: NSSize(width: 720, height: 420))
@@ -27,7 +25,7 @@ final class InlineMediaTests: XCTestCase {
   @MainActor func testMediaBelongsAtPasteLocationWithOneLayoutAcrossWidthsAndEncryptedReload() async throws {
     let model = try await model()
     guard let document = model.selectedDocument else { throw XCTSkip("No manuscript in chat edition.") }
-    model.updateDocument("Before 👩‍💻\nAfter", id: document.id, caret: 0)
+    try await NativeCheckEvidence.replacePublicDocument(model, text: "Before 👩‍💻\nAfter", id: document.id, caret: 0)
     let destination = try XCTUnwrap(model.documentAttachmentDestination(id: document.id,
       range: NSRange(location: "Before 👩‍💻\n".utf16.count, length: 0)))
     let bytes = try Self.image()
@@ -66,17 +64,17 @@ final class InlineMediaTests: XCTestCase {
     XCTAssertEqual(view.selectedRange().location, typingPosition + "Typed ".utf16.count,
       "Typing before media must not jump to its far edge using stale parsed offsets.")
     XCTAssertEqual(view.string, (saved.text as NSString).replacingCharacters(in: NSRange(location: typingPosition, length: 0), with: "Typed "))
-    view.documentUndo?.undo(); XCTAssertEqual(view.string, saved.text)
+    model.pagedCommands?.manager.undo(); XCTAssertEqual(view.string, saved.text)
     let span = try XCTUnwrap(view.inlineMedia.spans.first)
     view.setSelectedRange(NSRange(location: span.location, length: 0))
     view.setSelectedRange(NSRange(location: span.location + 6, length: 0))
     XCTAssertEqual(view.selectedRange().location, NSMaxRange(span.range))
     view.deleteBackward(nil)
     XCTAssertEqual(view.string, "Before 👩‍💻\n\nAfter", "A pasted image deletes as one object, not one hidden bracket.")
-    view.documentUndo?.undo()
+    model.pagedCommands?.manager.undo()
     XCTAssertEqual(view.string, saved.text)
-    let reopened = try await model.store.load().get()
-    XCTAssertEqual(reopened.1.first(where: { $0.id == saved.id }), saved)
+    let reopened = try await NativeCheckEvidence.readPublicDocuments(model: model)
+    XCTAssertEqual(reopened.first(where: { $0.id == saved.id }), saved)
     try await model.shutdown()
   }
   @MainActor func testAudioAndVideoPasteAreImmediatelyPlayableOriginalsWithoutRecognitionOrModelSetup() async throws {
@@ -111,7 +109,7 @@ final class InlineMediaTests: XCTestCase {
     try model.replaceChatMessage("Edited words.", id: authored.id, chatID: try XCTUnwrap(model.selectedChat).id)
     XCTAssertEqual(model.selectedChat?.messages.last?.directAttachments, captured)
     try await model.flush()
-    let reopened = try await model.store.load().get().0
+    let reopened = try await model.store.loadState()
     XCTAssertEqual(reopened.chats.first(where: { $0.id == model.state.selectedChat })?.messages.last?.directAttachments, captured)
     try await model.shutdown()
   }

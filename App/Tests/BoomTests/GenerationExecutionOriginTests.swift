@@ -1,6 +1,5 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import XCTest
 @testable import Boom
 
@@ -79,15 +78,13 @@ final class GenerationExecutionOriginTests: XCTestCase {
     XCTAssertThrowsError(try candidate(origin()).coldReplayPolicy(recipe: recipe,
       loadedModel: recipe.model, loadedPolicy: changed))
   }
-  func testWarmOriginSurvivesEncryptedRecordRoundTripWithoutASeparateInventoryKind() throws {
+  func testWarmOriginSurvivesFileRecordRoundTripWithoutASeparateInventoryKind() throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-origin-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let vault = try Vault(root: root, testKey: SymmetricKey(size: .bits256))
+    let vault = try Vault(root: root)
     let recipe = try recipe(policy()), row = candidate(origin(8, miss: nil))
     let bundle = CandidateBundle(id: UUID(), recipe: recipe, origin: nil, candidates: [row], selected: 0)
     try vault.encode(bundle, kind: .candidate, id: bundle.id)
-    let ciphertext = try Data(contentsOf: vault.recordURL(.candidate, bundle.id))
-    XCTAssertNil(ciphertext.range(of: Data(row.text.utf8)))
     let restored = try vault.decode(CandidateBundle.self, kind: .candidate, id: bundle.id)
     XCTAssertEqual(restored.candidates[0].executionOrigin, row.executionOrigin)
     XCTAssertEqual(restored.recipe.generationPolicy, recipe.generationPolicy)
@@ -96,7 +93,7 @@ final class GenerationExecutionOriginTests: XCTestCase {
     _ = NSApplication.shared
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-replay-guard-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root)
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     model.state.autocomplete = false
     let recipe = try recipe(policy())

@@ -1,6 +1,5 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import XCTest
 import UniformTypeIdentifiers
 @testable import Boom
@@ -20,7 +19,7 @@ final class AttachmentFixtureTests: XCTestCase {
       defer { window.close() }
       for pass in 0..<3 {
         if pass > 0 {
-          (view as? MarkdownTextView)?.preparePlaceholder()
+          (view as? PagedNativeTextView)?.preparePlaceholder()
           (view as? ChatTextView)?.preparePlaceholder("Message")
         }
         let bitmap = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
@@ -78,7 +77,7 @@ final class AttachmentFixtureTests: XCTestCase {
     let rows = try JSONDecoder().decode([AttachmentFixture].self, from: Data(contentsOf: fixtures.appendingPathComponent("manifest.json")))
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-attachments-" + UUID().uuidString)
     addTeardownBlock { try? FileManager.default.removeItem(at: root) }
-    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256)), loadModels: false)
+    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: root), loadModels: false)
     model.state.autocomplete = false
     let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 800, height: 900))
     window.isReleasedWhenClosed = false; defer { window.close() }
@@ -98,7 +97,7 @@ final class AttachmentFixtureTests: XCTestCase {
       XCTAssertTrue(AttachmentInput.canRead(board), row.name)
       if let document = model.selectedDocument {
         let source = "Before 🪶\n\nAfter"
-        model.updateDocument(source, id: document.id, caret: 0)
+        try await NativeCheckEvidence.replacePublicDocument(model, text: source, id: document.id, caret: 0)
         editor.documentID = document.id; editor.string = source; editor.setMedia(model: model); MarkdownStyle.apply(to: editor)
         let offset = "Before 🪶\n\n".utf16.count
         let layout = try XCTUnwrap(editor.layoutManager), container = try XCTUnwrap(editor.textContainer)
@@ -159,7 +158,7 @@ final class AttachmentFixtureTests: XCTestCase {
       XCTAssertEqual(model.selectedChat?.messages.last?.directAttachments, [record.id], row.name)
       XCTAssertTrue(model.pendingAttachments.isEmpty, row.name)
     }
-    let reopened = try await model.store.load().get().0
+    let reopened = try await model.store.loadState()
     XCTAssertEqual(reopened.attachments, model.state.attachments)
     XCTAssertEqual(reopened.chats.map(\.messages), model.state.chats.map(\.messages))
     try await model.shutdown()

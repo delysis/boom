@@ -2,7 +2,6 @@ import AppKit
 import SwiftUI
 import XCTest
 import BoomCore
-import CryptoKit
 @testable import Boom
 
 final class ChatEditorTests: XCTestCase {
@@ -50,7 +49,7 @@ final class ChatEditorTests: XCTestCase {
     _ = NSApplication.shared
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-composer-sizing-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root)
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 480, height: 680))
     window.isReleasedWhenClosed = false
@@ -80,7 +79,7 @@ final class ChatEditorTests: XCTestCase {
     _ = NSApplication.shared
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-lazy-chat-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root)
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     guard model.layout.isAuthor else { throw XCTSkip("The chat edition creates its initial chat at startup.") }
     let document = try XCTUnwrap(model.selectedDocument)
@@ -107,7 +106,7 @@ final class ChatEditorTests: XCTestCase {
     _ = NSApplication.shared
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-chat-resize-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root)
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     if model.selectedChat == nil { try model.newChat() }
     let messages = [
@@ -181,17 +180,17 @@ final class ChatEditorTests: XCTestCase {
     _ = NSApplication.shared
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-document-resize-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root)
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     guard model.layout.isAuthor, let document = model.selectedDocument else { throw XCTSkip("No manuscript in the chat edition.") }
     model.state.autocomplete = false
-    model.updateDocument("# At the harbor\n\n" + String(repeating: "The river turns past the old house. 👩🏽‍💻 café e\u{301} 日本語. ", count: 100), id: document.id, caret: 0)
+    try await NativeCheckEvidence.replacePublicDocument(model, text: "# At the harbor\n\n" + String(repeating: "The river turns past the old house. 👩🏽‍💻 café e\u{301} 日本語. ", count: 100), id: document.id, caret: 0)
     let host = NSHostingView(rootView: ManuscriptPane(model: model))
     let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 840, height: 640))
     window.isReleasedWhenClosed = false; window.contentView = host
     defer { window.close() }
     settle(window)
-    let view = try XCTUnwrap(model.editor), container = try XCTUnwrap(view.textContainer), layout = try XCTUnwrap(view.layoutManager)
+    let view = try XCTUnwrap(model.pagedInput?.activeView), container = try XCTUnwrap(view.textContainer), layout = try XCTUnwrap(view.layoutManager)
     view.setSelectedRange(NSRange(location: 20, length: 3))
     let selection = view.selectedRange(), source = view.string, canUndo = view.undoManager?.canUndo
     for width in [840.0, 330.0, 600.0, 380.0, 840.0] {
@@ -220,7 +219,7 @@ final class ChatEditorTests: XCTestCase {
     _ = NSApplication.shared
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-native-edit-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root)
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     if model.selectedChat == nil { try model.newChat() }
     let id = try XCTUnwrap(model.state.selectedChat)
@@ -258,7 +257,7 @@ final class ChatEditorTests: XCTestCase {
     settle(window)
     XCTAssertNil(editingInput(in: content), "Discard must remove the editor from the visible chat.")
     try await model.shutdown()
-    let persisted = try await store.load().get().0
+    let persisted = try await store.loadState()
     XCTAssertEqual(persisted.chats.first { $0.id == id }?.instructions, "Listen before responding.")
   }
   @MainActor func testInlineEditorFitsTextAndPreservesNativeUndo() throws {
@@ -290,7 +289,7 @@ final class ChatEditorTests: XCTestCase {
     _ = NSApplication.shared
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-message-edit-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root)
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     if model.selectedChat == nil { try model.newChat() }
     model.authorChatMessage(.user); model.draft = "A question."; model.send()
@@ -323,7 +322,7 @@ final class ChatEditorTests: XCTestCase {
     _ = NSApplication.shared
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-chat-switch-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root)
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     if model.selectedChat == nil { try model.newChat() }
     let first = try XCTUnwrap(model.state.selectedChat)

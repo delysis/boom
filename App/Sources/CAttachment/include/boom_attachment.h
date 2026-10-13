@@ -22,19 +22,19 @@ BoomAttachmentBuffer bloom_media_admit(const uint8_t *data, size_t length);
 BoomAttachmentBuffer bloom_caf_wave(const uint8_t *data, size_t length);
 /* Paged text is a separate host storage boundary, never a model request.
  * Create one engine for all document sessions: it owns one bounded 8 MiB cache.
- * Calls run on a serialized storage executor. No key or pathname crosses here.
+ * Calls run on a serialized storage executor. No pathname crosses here.
  * Callbacks return 0 on success and set written <= output capacity; any other
  * status fails the operation. They cannot unwind, retain borrowed buffers or
- * reenter a request. Rust checks authenticated plaintext digests independently.
+ * reenter a request. Rust checks bounded page digests independently.
  * read_page metadata: {ownerId,documentId,kind,page,maximumBytes}; kind is text
  * or index. Output plaintext <=64KiB(text) or16KiB(index).
  * write_page metadata: {ownerId,documentId,kind}; plaintext is borrowed; reply
- * is bounded JSON {storage:"sqlite_v1",storeId,recordId,ciphertextBytes};
- * object IDs are immutable UUIDs, never physical offsets or SQLite rowids.
+ * is bounded JSON {storage:"file_v1",storeId,offset,bytes}; offsets name
+ * immutable frames in the captured document's append file.
  * Streams transfer <=64KiB/callback; read success with written=0 means EOF.
  * Cancellation is a nonblocking flag check. Operation context lives until its
  * request returns; host context lives until close returns1 (all callbacks joined).
- * Current-root CAS, permission, actual SQL COMMIT and retained-root GC are
+ * Current-root CAS, permissions, file synchronization and retained-root GC are
  * host responsibilities. A returned revision is neither durable nor a full SHA.
  * Request JSON <=2MiB; reply <=1MiB, free once with boom_attachment_free.
  * Ops: open/window/splice/delete_user_range/checkout/position/stats and the
@@ -58,7 +58,7 @@ BoomAttachmentBuffer bloom_caf_wave(const uint8_t *data, size_t length);
  * at EOF and synchronizes export output outside the engine/edit queue.
  * bulk_abort(ownerId,documentId,operationId) is idempotent for an absent token;
  * a foreign active token cannot be accessed or cancelled. Owned step errors
- * discard the session; unpublished encrypted records belong to host GC.
+ * discard the session; unpublished page frames belong to host GC.
  * Operation callback pointers are borrowed for one request only. Legacy
  * monolithic import/export/hash operations are rejected.
  */
@@ -70,8 +70,8 @@ typedef int32_t (*BloomTextStreamRead)(void *, uint8_t *, size_t, size_t *);
 typedef int32_t (*BloomTextStreamWrite)(void *, const uint8_t *, size_t, size_t *);
 typedef uint8_t (*BloomTextCancelled)(void *);
 typedef struct {
-  /* Only schema2 and tagged sqlite_v1 locators are admitted. Old scratch-file
-   * host schema1 is refused. Layout/callback borrowing and close join are unchanged.
+  /* Only schema3 and tagged file_v1 locators are admitted.
+   * Layout/callback borrowing and close join are unchanged.
    * discard_page_cache_after_rollback clears bounded cache, never proves a
    * durable outcome or aborts an owned producer. The host joins bulk_abort. */
   uint32_t schema; void *context;
@@ -86,6 +86,12 @@ uint64_t bloom_text_create(BloomTextHost host);
 uint8_t bloom_text_close(uint64_t handle);
 BoomAttachmentBuffer bloom_text_request(uint64_t handle, const uint8_t *data,
                                         size_t length, BloomTextOperation operation);
+/* One-shot read of a pinned immutable revision. No engine slot/writer mutex,
+ * write callback or publication authority. Host schema3, write_page=NULL,
+ * revision JSON<=16KiB, display<=16KiB; context borrowed only until return. */
+BoomAttachmentBuffer bloom_text_read_window(BloomTextHost host, const uint8_t *revision,
+                                           size_t length, uint64_t utf16_offset,
+                                           size_t maximum_bytes, BloomTextOperation operation);
 #ifdef __cplusplus
 }
 #endif

@@ -52,13 +52,12 @@ let package = Package(
       .product(name: "MLXHuggingFace", package: "MLXSwiftLM"),
       .product(name: "Tokenizers", package: "swift-transformers"),
     ], resources: [.process("Resources")]),
-    .systemLibrary(name: "CSQLite"),
     .target(name: "CAttachment", publicHeadersPath: "include", cSettings: rustArchiveSettings),
     .executableTarget(
       name: "Boom",
       dependencies: [
         .product(name: "BoomCore", package: "core"),
-        "CAttachment", "CSQLite",
+        "CAttachment",
         .product(name: "MLXLMCommon", package: "MLXSwiftLM"),
         .product(name: "MLXVLM", package: "MLXSwiftLM"),
         .product(name: "MLXHuggingFace", package: "MLXSwiftLM"),

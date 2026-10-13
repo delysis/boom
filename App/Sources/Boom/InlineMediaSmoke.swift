@@ -1,7 +1,6 @@
 import AppKit
 import AVFoundation
 import BoomCore
-import CryptoKit
 import Foundation
 import SwiftUI
 
@@ -22,8 +21,7 @@ import SwiftUI
     func save<T: Encodable>(_ value: T, _ name: String) throws { try encoder.encode(value).write(to: evidence.appendingPathComponent(name + ".json"), options: .atomic) }
     var receipt = ["status": "running", "source": Bundle.main.object(forInfoDictionaryKey: "BoomSourceSHA256") as? String ?? "unavailable"]
     try save(receipt, "receipt")
-    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: evidence.appendingPathComponent("public-workspace"),
-      testKey: SymmetricKey(data: Data(repeating: 0x39, count: 32))), loadModels: false)
+    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: evidence.appendingPathComponent("public-workspace")), loadModels: false)
     model.state.autocomplete = false
     func finish() async throws {
       for _ in 0..<1200 where model.isBusy { try await Task.sleep(for: .milliseconds(100)) }
@@ -41,7 +39,7 @@ import SwiftUI
     let audio = try Data(contentsOf: fixtures.appendingPathComponent("local-audio.m4a"))
     let video = try Data(contentsOf: fixtures.appendingPathComponent("local-video.mp4"))
     if let document = model.selectedDocument {
-      model.updateDocument("Before the picture.\n\nAfter the picture.\n", id: document.id, caret: 0)
+      try await NativeCheckEvidence.replacePublicDocument(model, text: "Before the picture.\n\nAfter the picture.\n", id: document.id, caret: 0)
       guard let destination = model.documentAttachmentDestination(id: document.id,
         range: NSRange(location: "Before the picture.\n\n".utf16.count, length: 0)) else { throw BoomError.invalid("No document target.") }
       model.attach([.bytes(name: "Public image.png", data: red)], to: destination); try await finish()
@@ -125,9 +123,9 @@ import SwiftUI
     }
     // The manuscript path must generate automatically after the same image,
     // retain media identities in the recipe, and leave authored bytes intact.
-    if let editor = model.editor, let document = model.selectedDocument {
+    if let editor = model.pagedInput?.activeView, let document = model.selectedDocument {
       let text = document.text + "\nThe picture shows"
-      model.updateDocument(text, id: document.id, caret: text.utf16.count); try await settle()
+      try await NativeCheckEvidence.replacePublicDocument(model, text: text, id: document.id, caret: text.utf16.count); try await settle()
       window.makeFirstResponder(editor); editor.setSelectedRange(NSRange(location: text.utf16.count, length: 0))
       model.state.autocomplete = true; model.scheduleCompletion()
       for _ in 0..<1200 {
@@ -140,7 +138,7 @@ import SwiftUI
       model.state.autocomplete = false; model.invalidateGhost()
     }
     try await model.shutdown()
-    receipt["status"] = "passed"; receipt["window"] = "unshown"; receipt["keychain"] = "unused"
+    receipt["status"] = "passed"; receipt["window"] = "unshown"; receipt["workspaceStorage"] = "files"
     receipt["model"] = runner.identity; try save(receipt, "receipt")
   }
 }

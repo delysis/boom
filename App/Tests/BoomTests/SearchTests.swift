@@ -1,6 +1,5 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import XCTest
 @testable import Boom
 
@@ -44,21 +43,20 @@ final class SearchTests: XCTestCase {
   @MainActor func testLiveSearchFindsBodiesAndReplacesStaleResultsWithoutConsumingTheDraft() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-search-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root)
     let first = DocumentSnapshot(title: "One", text: "👩‍💻 Café in the body."), second = DocumentSnapshot(title: "Two", text: "A different passage.")
     let chat = ChatRecord(title: "Conversation", messages: [ChatMessage(role: .user, text: "Café in a conversation.")])
     var state = WorkspaceState()
     state.documents = [first, second].map { DocumentIndex(id: $0.id, title: $0.title) }
     state.chats = [chat]; state.selectedDocument = first.id; state.selectedChat = chat.id
-    try await store.save(state, documents: [first, second])
-    let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    let model = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: [first, second])
     model.draft = "Keep my unfinished question."
     model.librarySearch = "missing"; model.librarySearch = "CAFÉ"
     try await waitForSearch(model, query: "CAFÉ", document: first.id)
     XCTAssertTrue(model.documentMatchesSearch(first)); XCTAssertFalse(model.documentMatchesSearch(second))
     XCTAssertTrue(model.chatMatchesSearch(chat))
     XCTAssertEqual(model.documentSearch[first.id]?.matches.ranges.first?.native, NSRange(location: 6, length: 4))
-    model.updateDocument("The match was removed.", id: first.id, caret: 0)
+    try await NativeCheckEvidence.replacePublicDocument(model, text: "The match was removed.", id: first.id, caret: 0)
     try await model.flush()
     for _ in 0..<100 where model.documentSearch[first.id] != nil { try await Task.sleep(nanoseconds: 10_000_000) }
     XCTAssertNil(model.documentSearch[first.id])

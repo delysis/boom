@@ -1,6 +1,5 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import Foundation
 import SwiftUI
 
@@ -42,20 +41,18 @@ import SwiftUI
           .write(to: evidence.appendingPathComponent(purpose.rawValue + "-manifest.json"), options: .atomic)
         try persist()
       }
-      let store = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("encrypted-workspace"),
-        testKey: SymmetricKey(data: Data(repeating: 0x6b, count: 32)))
+      let store = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("public-workspace"))
       var state = WorkspaceState(); state.autocomplete = false
       let documents = [fixture.document] + fixture.examples
       state.documents = documents.map { DocumentIndex(id: $0.id, title: $0.title) }
       state.selectedDocument = fixture.document.id
-      try await store.save(state, documents: documents)
-      let workspace = try await WorkspaceModel(storeOverride: store, loadModels: false); model = workspace
+      let workspace = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: documents); model = workspace
       guard workspace.layout.isAuthor else { throw BoomError.invalid("Use the author edition.") }
       let host = NSHostingView(rootView: WorkspaceView(model: workspace))
       let testWindow = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 1440, height: 900))
       window = testWindow; testWindow.isReleasedWhenClosed = false; testWindow.contentView = host
       for _ in 0..<10 { host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(25)) }
-      guard let editor = workspace.editor, testWindow.makeFirstResponder(editor), editor.isEditable else {
+      guard let editor = workspace.pagedInput?.activeView, testWindow.makeFirstResponder(editor), editor.isEditable else {
         throw BoomError.invalid("Mounted manuscript did not accept an insertion point.")
       }
       for example in fixture.examples { workspace.toggleWritingExample(example.id) }
@@ -177,8 +174,8 @@ import SwiftUI
       receipt["explore_reloaded_same_snapshot"] = true
       receipt["manuscript_and_native_editor_unchanged"] = true
       try await workspace.shutdown()
-      let disk = try await store.load().get()
-      guard disk.1.first(where: { $0.id == fixture.document.id }) == fixture.document else {
+      let disk = try await NativeCheckEvidence.readPublicDocuments(store: store)
+      guard disk.first(where: { $0.id == fixture.document.id }) == fixture.document else {
         throw BoomError.invalid("Encrypted manuscript differs after model transitions.")
       }
       testWindow.close(); window = nil

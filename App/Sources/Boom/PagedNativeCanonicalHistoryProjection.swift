@@ -5,7 +5,7 @@ private let pagedCanonicalZero = UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 
 /// This value is not Codable, a cache, a root lease or another
 /// source history. The existing engine produces it from the actual admitted
-/// encrypted history while its worker job already owns every referenced root.
+/// file-backed history while its worker job already owns every referenced root.
 struct PagedNativeCanonicalHistoryProjection: Sendable, Equatable {
   /// Conservative admission charge for one immutable metadata projection.
   /// This is a reservation, not a measured Swift allocator footprint.
@@ -14,13 +14,14 @@ struct PagedNativeCanonicalHistoryProjection: Sendable, Equatable {
   enum Scope: Sendable, Equatable {
     case opening(sessionID: UUID, windowID: UUID)
     case nativeBatch(sessionID: UUID, batchID: UUID, first: UInt64, last: UInt64)
+    case capturedEdit(sessionID: UUID, commandID: UUID, sequence: UInt64)
     case historyCandidate(sessionID: UUID, routeID: UUID, commandID: UUID, expected: UInt64)
     case historyPublished(sessionID: UUID, routeID: UUID, commandID: UUID,
       preparationID: UUID, expected: UInt64, admitted: UInt64)
 
     var sessionID: UUID {
       switch self {
-      case .opening(let session, _), .nativeBatch(let session, _, _, _),
+      case .opening(let session, _), .nativeBatch(let session, _, _, _), .capturedEdit(let session, _, _),
         .historyCandidate(let session, _, _, _), .historyPublished(let session, _, _, _, _, _): return session
       }
     }
@@ -28,6 +29,7 @@ struct PagedNativeCanonicalHistoryProjection: Sendable, Equatable {
       switch self {
       case .opening: return 0
       case .nativeBatch(_, _, _, let last): return last
+      case .capturedEdit(_, _, let sequence): return sequence
       case .historyCandidate(_, _, _, let expected): return expected
       case .historyPublished(_, _, _, _, _, let admitted): return admitted
       }
@@ -39,6 +41,9 @@ struct PagedNativeCanonicalHistoryProjection: Sendable, Equatable {
       case .nativeBatch(_, let batch, let first, let last):
         identities.append(batch)
         guard first > 0, first <= last else { throw BoomError.invalid("Canonical native history has an invalid batch prefix.") }
+      case .capturedEdit(_, let command, let sequence):
+        identities.append(command)
+        guard sequence > 0 else { throw BoomError.invalid("Captured edit has no accepted source sequence.") }
       case .historyCandidate(_, let route, let command, let expected):
         identities += [route, command]
         guard expected < UInt64.max else { throw BoomError.budget("Canonical history command sequence is exhausted.") }
@@ -122,7 +127,7 @@ struct PagedNativeCanonicalHistoryProjection: Sendable, Equatable {
     case .opening:
       guard beforeRecord == nil, beforeHistory == nil, resolutions.isEmpty,
         undoFromBefore.allSatisfy({ $0 == nil }), redoFromBefore.allSatisfy({ $0 == nil }) else { throw BoomError.invalid("Opening metadata cannot impersonate an accepted native seal.") }
-    case .historyCandidate, .historyPublished:
+    case .historyCandidate, .historyPublished, .capturedEdit:
       guard let beforeRecord, beforeRecord.historyGeneration < UInt64.max,
         record.historyGeneration == beforeRecord.historyGeneration + 1, resolutions.isEmpty else {
         throw BoomError.invalid("Canonical history move has another exact root/history epoch.")
@@ -186,7 +191,7 @@ struct PagedNativeCanonicalHistoryProjection: Sendable, Equatable {
   /// Every published source/history/slot/coverage field remains exact. This
   /// comparison grants neither authentication nor a new root-custody finish.
   func hasSamePublishedMetadata(as other: Self) -> Bool {
-    switch scope { case .nativeBatch, .historyPublished: break; default: return false }
+    switch scope { case .nativeBatch, .historyPublished, .capturedEdit: break; default: return false }
     return record == other.record && beforeRecord == other.beforeRecord
       && currentCursor == other.currentCursor && undo == other.undo && redo == other.redo
       && activeGroup == other.activeGroup && scope == other.scope
@@ -249,8 +254,13 @@ struct PagedNativeCanonicalOpening: Sendable {
 enum PagedNativeCanonicalSeal: Sendable {
   case native(PagedNativeCommitAcknowledgement)
   case history(PagedNativeHistoryAcknowledgement)
+  case capturedEdit(PagedCapturedEditResult)
   var projection: PagedNativeCanonicalHistoryProjection? {
-    switch self { case .native(let ack): return ack.canonicalHistory; case .history(let ack): return ack.canonicalHistory }
+    switch self {
+    case .native(let ack): return ack.canonicalHistory
+    case .history(let ack): return ack.canonicalHistory
+    case .capturedEdit(let result): return result.canonicalHistory
+    }
   }
 }
 
@@ -290,6 +300,13 @@ struct PagedNativeHistorySlotLineage {
         }
       }
       redo.removeAll()
+    }
+    if priorRevision == after.current, priorActive != checkpoint.groupID {
+      guard undo.count == after.undo.count, redo.count == after.redo.count else {
+        throw BoomError.invalid("Neutral native lineage changed retained history.")
+      }
+      bindings.append(Binding(checkpoint: checkpoint, index: nil))
+      return
     }
     guard undo.count == after.undo.count, redo.count == after.redo.count,
       let entry = after.undo.last, entry.groupID == checkpoint.groupID else {

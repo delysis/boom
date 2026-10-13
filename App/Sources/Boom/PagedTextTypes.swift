@@ -19,45 +19,26 @@ struct PagedTextSummary: Codable, Equatable, Sendable {
     }
   }
 }
-/// One new storage format. Immutable UUID objects are neither file offsets
-/// nor SQLite rowids. Historical append-file fixtures are not product formats.
+/// Byte addresses in one immutable append file for the captured document.
 struct PagedTextPageLocator: Codable, Equatable, Sendable {
-  private enum Storage: String, Codable, Sendable { case sqliteV1 = "sqlite_v1" }
-  private enum CodingKeys: String, CodingKey {
-    case storage, storeID = "storeId", recordID = "recordId", ciphertextBytes
-  }
-  private struct LocatorKey: CodingKey {
-    let stringValue: String
-    let intValue: Int? = nil
-    init?(stringValue: String) { self.stringValue = stringValue }
-    init?(intValue: Int) { return nil }
-  }
+  private enum Storage: String, Codable, Sendable { case fileV1 = "file_v1" }
+  private enum CodingKeys: String, CodingKey { case storage, storeID = "storeId", offset, bytes }
   private let storage: Storage
   let storeID: UUID
-  let recordID: UUID
-  let ciphertextBytes: UInt32
-  init(storeID: UUID, recordID: UUID, ciphertextBytes: UInt32) {
-    storage = .sqliteV1; self.storeID = storeID; self.recordID = recordID; self.ciphertextBytes = ciphertextBytes
-  }
-  init(from decoder: Decoder) throws {
-    let keys = Set(try decoder.container(keyedBy: LocatorKey.self).allKeys.map(\.stringValue))
-    guard keys == ["storage", "storeId", "recordId", "ciphertextBytes"] else {
-      throw BoomError.invalid("Unknown or incomplete SQLite locator fields.")
-    }
-    let values = try decoder.container(keyedBy: CodingKeys.self)
-    storage = try values.decode(Storage.self, forKey: .storage)
-    storeID = try values.decode(UUID.self, forKey: .storeID)
-    recordID = try values.decode(UUID.self, forKey: .recordID)
-    ciphertextBytes = try values.decode(UInt32.self, forKey: .ciphertextBytes)
+  let offset: UInt64
+  let bytes: UInt32
+  init(storeID: UUID, offset: UInt64, bytes: UInt32) {
+    storage = .fileV1; self.storeID = storeID; self.offset = offset; self.bytes = bytes
   }
   func admit(storeID: UUID) throws {
-    guard self.storeID == storeID else { throw BoomError.denied("Page belongs to another SQLite incarnation.") }
+    guard self.storeID == storeID else { throw BoomError.denied("Page belongs to another file store.") }
   }
   func validate(maximumPlaintextBytes: Int) throws {
     let empty = UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
-    guard storeID != empty, recordID != empty, maximumPlaintextBytes > 0, maximumPlaintextBytes <= 65_536,
-      ciphertextBytes >= 28, UInt64(ciphertextBytes) <= UInt64(maximumPlaintextBytes) + 28 else {
-      throw BoomError.invalid("Invalid bounded SQLite page locator.")
+    let end = offset.addingReportingOverflow(UInt64(bytes) + 12)
+    guard storeID != empty, maximumPlaintextBytes > 0, maximumPlaintextBytes <= 65_536,
+      bytes <= UInt32(maximumPlaintextBytes), !end.overflow, end.partialValue <= UInt64(Int64.max) else {
+      throw BoomError.invalid("Invalid bounded file page locator.")
     }
   }
 }

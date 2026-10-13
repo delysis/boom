@@ -8,7 +8,7 @@ final class PagedWindowCoordinatesTests: XCTestCase {
   private func window(_ text: String, start: UInt64 = 0, total: UInt64? = nil) -> PagedTextWindow {
     let bytes = start + UInt64(text.utf8.count)
     let summary = PagedTextSummary(bytes: total ?? bytes, utf16: total ?? bytes, lfCount: total ?? bytes)
-    let locator = PagedTextPageLocator(storeID: UUID(), recordID: UUID(), ciphertextBytes: 100)
+    let locator = PagedTextPageLocator(storeID: UUID(), offset: 0, bytes: 100)
     let root = PagedTextTreeRef(page: PagedTextPageRef(locator: locator, digest: String(repeating: "0", count: 64)),
       summary: summary, height: 0)
     return PagedTextWindow(revision: PagedTextRevision(schema: 1, ownerID: UUID(), documentID: UUID(), root: root),

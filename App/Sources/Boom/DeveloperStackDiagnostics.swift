@@ -21,14 +21,15 @@ enum DeveloperStackDiagnostics {
     let operations: UInt32
     let utf8Bytes: UInt64
     init(kind: UInt32, operations: UInt32, utf8Bytes: UInt64) throws {
-      guard operations == 1_000,
+      guard operations == (kind == 4 || kind == 5 ? 200 : 1_000),
         (kind == 1 && utf8Bytes == 72_196) || (kind == 2 && utf8Bytes == 72_196)
-          || (kind == 3 && utf8Bytes == (1 << 30)) else { throw Wire.Failure.admission }
+          || (kind == 3 && utf8Bytes == (1 << 30))
+          || (kind == 4 && utf8Bytes == 72_196) || (kind == 5 && utf8Bytes == (1 << 30)) else { throw Wire.Failure.admission }
       self.kind = kind; self.operations = operations; self.utf8Bytes = utf8Bytes
     }
-    var boundedSQL: Bool { kind != 1 }
-    var diskLimit: UInt64 { kind == 1 ? 4 << 20 : kind == 2 ? 64 << 20 : 8 << 30 }
-    var lifetimeSeconds: UInt64 { kind == 1 ? 120 : kind == 2 ? 220 : 740 }
+    var isMixed: Bool { kind == 4 || kind == 5 }
+    var diskLimit: UInt64 { kind == 1 ? 4 << 20 : kind == 2 || kind == 4 ? 64 << 20 : 8 << 30 }
+    var lifetimeSeconds: UInt64 { kind == 1 ? 120 : kind == 2 || kind == 4 ? 220 : 740 }
   }
   private struct Stage {
     let id: UInt32
@@ -115,6 +116,10 @@ enum DeveloperStackDiagnostics {
     Stage(id: 78, name: "Editor.ManagedLayout"),
     Stage(id: 79, name: "Editor.ManagedDraw"),
     Stage(id: 80, name: "Editor.ManagedHistoryReconcile"),
+    Stage(id: 81, name: "Editor.PublicMixedOperation"),
+    Stage(id: 82, name: "Editor.PublicInputDispatch"),
+    Stage(id: 83, name: "Editor.PublicReadyWait"),
+    Stage(id: 84, name: "Editor.PublicRaster"),
   ]
   private static let runtime = AtomicLazyReference<Session>()
   private static let bootstrapping = Atomic<Bool>(false)
@@ -129,7 +134,7 @@ enum DeveloperStackDiagnostics {
   private static let entryLifetime = AtomicLazyReference<EntryLifetime>()
 
   private struct Fixture: Codable {
-    let kind: UInt32 // 1 = legacy72K, 2 = ordinary SQL72K, 3 = physical SQL1GiB.
+    let kind: UInt32 // 1 = legacy72K; 2/3 = paired file72K/1GiB; 4/5 = mixed file72K/1GiB.
     let operations: UInt32
     let utf8Bytes: UInt64
   }

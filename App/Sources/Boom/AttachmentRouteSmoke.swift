@@ -17,14 +17,15 @@ import Foundation
     }
     try require(!model.isBusy, "Attachment import did not finish.")
     if let error = model.errorMessage { throw BoomError.invalid(error) }
-    try model.flush()
+    try await model.flush()
   }
 
   static func run() async throws {
     guard let root = ProcessInfo.processInfo.environment["BOOM_UI_TEST_ROOT"],
       root.hasPrefix("/"), !FileManager.default.fileExists(atPath: root)
     else { throw BoomError.denied("Supply a new absolute BOOM_UI_TEST_ROOT.") }
-    let model = try WorkspaceModel()
+    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: URL(fileURLWithPath: root)), loadModels: false)
+    _ = try await NativeCheckEvidence.readPublicDocuments(model: model)
     guard let first = model.selectedDocument else {
       throw BoomError.invalid("No initial document.")
     }
@@ -38,7 +39,9 @@ import Foundation
     }
     let firstDestination = model.documentAttachmentDestination(id: first.id, range: NSRange(location: 0, length: 0))!
     try model.newDocument()
-    let second = model.selectedDocument!.id
+    try await model.joinWorkspaceOperation()
+    _ = try await NativeCheckEvidence.readPublicDocuments(model: model)
+    let second = model.selectedDocumentID!
     model.attach(fileInput, to: firstDestination)
     try await finish(model)
     guard let savedFirst = model.documents.first(where: { $0.id == first.id }) else {
@@ -51,8 +54,8 @@ import Foundation
     let linked = AttachmentLink.ids(in: savedFirst.text)
     try require(linked.count == 1 && model.state.attachments.first(where: { $0.id == linked[0] })?.text
       .contains("owner is the first document") == true, "Document file was not converted locally.")
-    try require(try model.store.load().get().1.first(where: { $0.id == first.id })?.text
-      == savedFirst.text, "Document link did not persist.")
+    let persisted = try await NativeCheckEvidence.readPublicDocuments(model: model)
+    try require(persisted.first(where: { $0.id == first.id })?.text == savedFirst.text, "Document link did not persist.")
 
     guard let bitmap = NSBitmapImageRep(
       bitmapDataPlanes: nil, pixelsWide: 1, pixelsHigh: 1, bitsPerSample: 8,

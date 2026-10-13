@@ -110,6 +110,9 @@ struct InlineMediaSpan: Decodable {
   private weak var observedSource: NSTextStorage?
   private var characterVersion = UUID()
   private var cachedMarkup: (version: UUID, value: ProductCore.MarkupProjection)?
+  /// Partial source cannot establish remote Markdown fences or definitions.
+  /// Such views keep literal source visible until its parse context is known.
+  var hasCompleteMarkupContext: Bool { true }
   /// Character edits invalidate source consumers; display attributes do not.
   /// Rebinding a text container also starts a new source identity.
   var sourceVersion: UUID {
@@ -128,6 +131,10 @@ struct InlineMediaSpan: Decodable {
   /// One projection belongs to the exact native character version. Attribute
   /// updates may reuse its small span arrays; no source buffer is cached.
   var markupProjection: ProductCore.MarkupProjection {
+    guard hasCompleteMarkupContext else {
+      return ProductCore.MarkupProjection(markdown: [], media: [],
+        hasWikiMarker: false, hasAttachmentMarker: false)
+    }
     let version = sourceVersion
     let pendingCharacters = textStorage?.editedMask.contains(.editedCharacters) == true
     if !pendingCharacters, let cachedMarkup, cachedMarkup.version == version { return cachedMarkup.value }
@@ -278,6 +285,9 @@ struct InlineMediaSpan: Decodable {
     let records = model?.state.attachments ?? []
     let ids = Set(spans.map(\.id))
     for id in Array(items.keys) where !ids.contains(id) { tasks.removeValue(forKey: id)?.cancel(); items.removeValue(forKey: id) }
+    // No active media can depend on unrelated workspace attachment records.
+    // Project still removes any old media attributes and presentation hosts.
+    if ids.isEmpty { project(); return }
     for record in records where ids.contains(record.id) {
       if items[record.id]?.record != record {
         tasks.removeValue(forKey: record.id)?.cancel(); items[record.id] = InlineMediaItem(record)

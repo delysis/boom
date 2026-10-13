@@ -116,8 +116,11 @@ struct PagedNativePreparedHistoryMove: Sendable, Equatable {
     }
     let globalByte = window.byteStart.addingReportingOverflow(UInt64(byte))
     let globalUnit = window.utf16Start.addingReportingOverflow(UInt64(units))
+    // This island proves the exact focus scalar. The real worker independently
+    // admits the normalized lower byte and a distant other endpoint in its tree.
     guard units == localCaretUTF16, !globalByte.overflow, !globalUnit.overflow,
-      globalByte.partialValue == cursor.byteOffset, globalUnit.partialValue == cursor.utf16Offset else {
+      globalUnit.partialValue == cursor.focusUTF16,
+      (cursor.focusUTF16 != cursor.utf16Offset || globalByte.partialValue == cursor.byteOffset) else {
       throw BoomError.invalid("Prepared history cursor splits a scalar or differs from its exact source coordinates.")
     }
   }

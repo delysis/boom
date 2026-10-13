@@ -1,5 +1,4 @@
 import BoomCore
-import CryptoKit
 import XCTest
 @testable import Boom
 
@@ -7,7 +6,7 @@ final class ChatVoiceTests: XCTestCase {
   private func store() throws -> WorkspaceStore {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-chat-voice-" + UUID().uuidString)
     addTeardownBlock { try? FileManager.default.removeItem(at: root) }
-    return try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    return try WorkspaceStore(rootOverride: root)
   }
   @MainActor func testOrdinaryChatPinsAndEditsWithoutRewritingCapturedVersions() async throws {
     let store = try store(), model = try await WorkspaceModel(storeOverride: store, loadModels: false)
@@ -35,7 +34,7 @@ final class ChatVoiceTests: XCTestCase {
     XCTAssertEqual(model.selectedChat?.messages.last?.authoredByUser, true)
     XCTAssertEqual(edited.examples[0].assistant, "Pause and listen.")
     try await model.shutdown()
-    let loaded = try await store.load().get().0
+    let loaded = try await store.loadState()
     XCTAssertEqual(loaded.voices, [edited])
     XCTAssertEqual(loaded.chats.first { $0.id == chatID }?.messageVersions, [original])
     model.unpinChat(chatID)
@@ -52,7 +51,7 @@ final class ChatVoiceTests: XCTestCase {
       sources: [source], provider: "Captured model", speaker: voice.speaker, authoredByUser: true)
     let chat = ChatRecord(title: "Consultation", messages: [original])
     state.chats = [chat]; state.selectedChat = chat.id
-    try await store.save(state, documents: [])
+    try await store.saveState(state)
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     try model.replaceChatMessage("My revision", id: original.id, chatID: chat.id)
     let edited = try XCTUnwrap(model.selectedChat?.messages.first)
@@ -61,7 +60,7 @@ final class ChatVoiceTests: XCTestCase {
     XCTAssertEqual(edited.context, original.context); XCTAssertEqual(edited.sources, original.sources)
     XCTAssertEqual(edited.editedFrom, original.id); XCTAssertEqual(edited.authoredByUser, true)
     try await model.shutdown()
-    let loaded = try await store.load().get().0
+    let loaded = try await store.loadState()
     XCTAssertEqual(loaded.chats[0].messages[0], edited)
     XCTAssertEqual(loaded.chats[0].messageVersions, [original])
   }

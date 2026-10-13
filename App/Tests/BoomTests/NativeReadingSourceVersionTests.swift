@@ -1,6 +1,5 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import SwiftUI
 import XCTest
 @testable import Boom
@@ -165,15 +164,14 @@ final class NativeReadingSourceVersionTests: XCTestCase {
     _ = NSApplication.shared
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-reading-version-" + UUID().uuidString)
     addTeardownBlock { try? FileManager.default.removeItem(at: root) }
-    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root)
     let document = DocumentSnapshot(title: "Public fixture", text: "Public manuscript.")
     let message = ChatMessage(role: .assistant, text: "A retained public chat answer.")
     let chat = ChatRecord(messages: [message], attachedDocumentID: document.id)
     var state = WorkspaceState(); state.autocomplete = false
     state.documents = [DocumentIndex(id: document.id, title: document.title)]
     state.chats = [chat]; state.selectedChat = chat.id; state.selectedDocument = document.id
-    try await store.save(state, documents: [document])
-    let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    let model = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: [document])
     let messageVersion = try XCTUnwrap(model.selectedChat?.messages.first).readingVersion
     let first = candidate(text: "A retained public continuation.", state: .complete)
     let second = candidate(text: "A sibling continuation.")

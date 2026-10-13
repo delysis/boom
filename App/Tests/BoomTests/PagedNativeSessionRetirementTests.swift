@@ -488,8 +488,8 @@ private actor PagedRetirementHeldStorage: PagedNativeCommitInstallationStorage, 
 
   init(initial: PagedTextWindow, record: PagedDocumentRootRecord) { self.initial = initial; current = record }
   nonisolated static func page(_ hex: String = "a") -> PagedTextPageRef {
-    PagedTextPageRef(locator: PagedTextPageLocator(storeID: UUID(), recordID: UUID(),
-      ciphertextBytes: 128), digest: String(repeating: hex, count: 64))
+    PagedTextPageRef(locator: PagedTextPageLocator(storeID: UUID(), offset: 0,
+      bytes: 128), digest: String(repeating: hex, count: 64))
   }
   nonisolated static func capture(_ text: String, owner: UUID, document: UUID) -> PagedTextWindow {
     let revision = PagedTextRevision(schema: 1, ownerID: owner, documentID: document,

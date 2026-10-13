@@ -1,5 +1,4 @@
 import BoomCore
-import CryptoKit
 import Foundation
 import XCTest
 @testable import Boom
@@ -42,18 +41,16 @@ final class ConsultationHistoryContractTests: XCTestCase {
       routing: ["other"])
     XCTAssertEqual(Data(live.messages[1].content.utf8), Data(plan.messages[1].content.utf8))
   }
-  func testCapturedBodyAndVersionSurviveEncryptedReceiptRoundTrip() throws {
+  func testCapturedBodyAndVersionSurviveFileReceiptRoundTrip() throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-history-contract-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let vault = try Vault(root: root, testKey: SymmetricKey(size: .bits256))
+    let vault = try Vault(root: root)
     let plan = try ProductCore.prompt(voice: nil, history: [], instructions: "", context: context,
       request: request, routing: ["reader"])
     let receipt = ConsultationReceipt(operationID: UUID(), seed: 42, state: .complete, failure: nil,
       model: "public-history-test", voice: nil, plan: plan, sources: [], promptDigest: Digest.sha256(plan.rawPrompt),
       tokenIDs: [], stopReason: "output_limit", firstTokenSeconds: nil, elapsedSeconds: 0, generationPolicy: nil)
     let id = UUID(); try vault.encode(receipt, kind: .receipt, id: id)
-    let ciphertext = try Data(contentsOf: vault.recordURL(.receipt, id))
-    XCTAssertNil(ciphertext.range(of: Data(context.utf8)))
     let restored = try vault.decode(ConsultationReceipt.self, kind: .receipt, id: id)
     XCTAssertEqual(restored.plan.promptContract, .referenceHistoryV2)
     XCTAssertEqual(Data(restored.plan.rawPrompt.utf8), Data(plan.rawPrompt.utf8))

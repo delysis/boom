@@ -2,6 +2,7 @@
 //! retained between calls. Two fixed-size sessions share the ordinary page cache.
 use super::*;
 use std::io;
+use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete};
 
 pub const BULK_OPERATION_COUNT: usize = 2;
 /// Decode/advance/copy work has its own bound: a file made of tiny pieces must
@@ -14,6 +15,16 @@ pub struct BulkProgress {
     pub processed_bytes: u64,
     pub validated_bytes: u64,
     pub complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphemeSeekProgress {
+    pub complete: bool,
+    pub result: Option<TextSummary>,
+    /// Retained backing page bytes, including unused bytes of a split piece.
+    pub buffered_bytes: usize,
+    pub examined_bytes: u64,
 }
 
 pub(super) struct Registry {
@@ -35,6 +46,9 @@ struct Job {
 enum State {
     Import(Box<ImportState>),
     Stream(Box<StreamState>),
+    Grapheme(Box<GraphemeSeekState>),
+    Paragraph(Box<ParagraphState>),
+    LinePrefix(Box<LinePrefixState>),
 }
 impl Registry {
     fn available(&self) -> Result<usize> {
@@ -88,12 +102,174 @@ impl Registry {
         }
         Ok((slot, self.slots[slot].take().ok_or(Error::Stale)?))
     }
+    fn take_grapheme(&mut self, revision: &Revision, id: Uuid) -> Result<(usize, Job)> {
+        let slot = self.index(revision.owner_id, revision.document_id, id)?;
+        match self.slots[slot].as_ref().map(|job| &job.state) {
+            Some(State::Grapheme(state)) if state.revision == *revision => {}
+            Some(State::Grapheme(_)) => return Err(Error::Stale),
+            _ => return Err(Error::Invalid("bulk operation kind")),
+        }
+        Ok((slot, self.slots[slot].take().ok_or(Error::Stale)?))
+    }
     fn restore(&mut self, slot: usize, job: Job) -> Result<()> {
         if self.slots[slot].is_some() {
             return Err(Error::Invalid("bulk operation slot changed"));
         }
         self.slots[slot] = Some(job);
         Ok(())
+    }
+    fn take_paragraph(&mut self, revision: &Revision, id: Uuid) -> Result<(usize, Job)> {
+        let slot = self.index(revision.owner_id, revision.document_id, id)?;
+        match self.slots[slot].as_ref().map(|job| &job.state) {
+            Some(State::Paragraph(state)) if state.revision == *revision => {}
+            Some(State::Paragraph(_)) => return Err(Error::Stale),
+            _ => return Err(Error::Invalid("bulk operation kind")),
+        }
+        Ok((slot, self.slots[slot].take().ok_or(Error::Stale)?))
+    }
+    fn take_prefix(&mut self, revision: &Revision, id: Uuid) -> Result<(usize, Job)> {
+        let slot = self.index(revision.owner_id, revision.document_id, id)?;
+        match self.slots[slot].as_ref().map(|job| &job.state) {
+            Some(State::LinePrefix(state)) if state.revision == *revision => {}
+            Some(State::LinePrefix(_)) => return Err(Error::Stale),
+            _ => return Err(Error::Invalid("bulk operation kind")),
+        }
+        Ok((slot, self.slots[slot].take().ok_or(Error::Stale)?))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum GraphemeFetch {
+    Piece(u64),
+    Context(usize),
+}
+struct GraphemeSeekState {
+    revision: Revision,
+    cursor: GraphemeCursor,
+    forward: bool,
+    piece: Option<SourcePiece>,
+    fetch: Option<GraphemeFetch>,
+    ready: Option<TextSummary>,
+    examined: u64,
+}
+impl GraphemeSeekState {
+    fn progress(&self) -> GraphemeSeekProgress {
+        GraphemeSeekProgress {
+            complete: self.ready.is_some(),
+            result: self.ready,
+            buffered_bytes: self.piece.as_ref().map_or(0, |piece| piece.bytes.len()),
+            examined_bytes: self.examined,
+        }
+    }
+    /// One piece/context fetch OR one cursor advance per call. A long cluster
+    /// returns to the actual host/engine lane rather than yielding while locked.
+    fn step<S: PageProvider>(
+        &mut self,
+        engine: &mut TextEngine<S>,
+    ) -> Result<GraphemeSeekProgress> {
+        if self.ready.is_some() {
+            return Ok(self.progress());
+        }
+        if let Some(fetch) = self.fetch.take() {
+            // Drop the prior backing page before fetching context or a next
+            // piece. The cursor only retains its small algorithm state. After
+            // context admission, reload the original piece on a later step.
+            let resume_at = match fetch {
+                GraphemeFetch::Context(_) => Some(
+                    self.piece
+                        .take()
+                        .ok_or(Error::Invalid("grapheme context lost its piece"))?
+                        .before
+                        .bytes,
+                ),
+                GraphemeFetch::Piece(_) => {
+                    self.piece = None;
+                    None
+                }
+            };
+            let at = match fetch {
+                GraphemeFetch::Piece(at) => at,
+                GraphemeFetch::Context(end) => u64::try_from(
+                    end.checked_sub(1)
+                        .ok_or(Error::Invalid("grapheme context at start"))?,
+                )
+                .map_err(|_| Error::Invalid("grapheme context exceeds u64"))?,
+            };
+            let piece = engine.source_piece(&self.revision, at)?;
+            self.examined = self
+                .examined
+                .checked_add(
+                    u64::try_from(piece.text()?.len())
+                        .map_err(|_| Error::Invalid("grapheme piece exceeds u64"))?,
+                )
+                .ok_or(Error::Invalid("grapheme examined bytes overflow"))?;
+            match fetch {
+                GraphemeFetch::Piece(_) => self.piece = Some(piece),
+                GraphemeFetch::Context(end) => {
+                    let start = usize::try_from(piece.before.bytes)
+                        .map_err(|_| Error::Invalid("grapheme context exceeds usize"))?;
+                    let count = end
+                        .checked_sub(start)
+                        .ok_or(Error::Invalid("grapheme context range"))?;
+                    let context = piece
+                        .text()?
+                        .get(..count)
+                        .ok_or(Error::Invalid("grapheme context UTF8 extent"))?;
+                    self.cursor.provide_context(context, start);
+                    self.fetch = Some(GraphemeFetch::Piece(
+                        resume_at.ok_or(Error::Invalid("grapheme context lost its origin"))?,
+                    ));
+                }
+            }
+            return Ok(self.progress());
+        }
+        let piece = self
+            .piece
+            .as_ref()
+            .ok_or(Error::Invalid("grapheme seek lost its piece"))?;
+        let start = usize::try_from(piece.before.bytes)
+            .map_err(|_| Error::Invalid("grapheme start exceeds usize"))?;
+        let query = if self.forward {
+            self.cursor.next_boundary(piece.text()?, start)
+        } else {
+            self.cursor.prev_boundary(piece.text()?, start)
+        };
+        match query {
+            Ok(Some(at)) => {
+                self.ready = Some(piece.position(
+                    u64::try_from(at).map_err(|_| Error::Invalid("grapheme result exceeds u64"))?,
+                )?)
+            }
+            Ok(None) => {
+                self.ready = Some(if self.forward {
+                    self.revision.summary()
+                } else {
+                    TextSummary::EMPTY
+                })
+            }
+            Err(GraphemeIncomplete::PreContext(end)) => {
+                self.fetch = Some(GraphemeFetch::Context(end))
+            }
+            Err(GraphemeIncomplete::NextChunk) => {
+                self.fetch = Some(GraphemeFetch::Piece(
+                    u64::try_from(self.cursor.cur_cursor())
+                        .map_err(|_| Error::Invalid("grapheme next chunk exceeds u64"))?,
+                ))
+            }
+            Err(GraphemeIncomplete::PrevChunk) => {
+                self.fetch = Some(GraphemeFetch::Piece(
+                    piece
+                        .before
+                        .bytes
+                        .checked_sub(1)
+                        .ok_or(Error::Invalid("grapheme previous chunk before start"))?,
+                ))
+            }
+            Err(GraphemeIncomplete::InvalidOffset) => {
+                return Err(Error::Invalid("grapheme chunk does not cover cursor"));
+            }
+        }
+        Ok(self.progress())
     }
 }
 
@@ -157,6 +333,10 @@ impl ImportState {
             start: 0,
             end: count as u32,
             summary: self.page_summary,
+            paragraphs: Some(ParagraphSummary::of(
+                std::str::from_utf8(&self.buffer[..count])
+                    .map_err(|_| Error::Invalid("import paragraph UTF8"))?,
+            )),
         });
         if self.pieces.len() == FANOUT {
             self.flush_pieces(engine)?;
@@ -482,6 +662,179 @@ impl StreamState {
 impl<S: PageProvider> TextEngine<S> {
     pub fn active_bulk_operations(&self) -> usize {
         self.bulk.slots.iter().flatten().count()
+    }
+    pub fn line_prefix_begin(
+        &mut self,
+        revision: Revision,
+        start: u64,
+        end: u64,
+        prefix: String,
+    ) -> Result<Uuid> {
+        self.bulk.available()?;
+        let state = LinePrefixState::new(self, revision, start, end, prefix)?;
+        self.bulk.insert(
+            state.revision.owner_id,
+            state.revision.document_id,
+            State::LinePrefix(Box::new(state)),
+        )
+    }
+    pub fn line_prefix_step(
+        &mut self,
+        revision: &Revision,
+        id: Uuid,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<LinePrefixProgress> {
+        revision.validate()?;
+        let (slot, mut job) = self.bulk.take_prefix(revision, id)?;
+        check_cancel(cancelled)?;
+        let State::LinePrefix(state) = &mut job.state else {
+            return Err(Error::Invalid("bulk operation kind"));
+        };
+        let progress = state.step(self)?;
+        check_cancel(cancelled)?;
+        self.bulk.restore(slot, job)?;
+        Ok(progress)
+    }
+    pub fn line_prefix_finish(
+        &mut self,
+        revision: &Revision,
+        id: Uuid,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<LinePrefixResult> {
+        revision.validate()?;
+        let (_, job) = self.bulk.take_prefix(revision, id)?;
+        check_cancel(cancelled)?;
+        let State::LinePrefix(state) = job.state else {
+            return Err(Error::Invalid("bulk operation kind"));
+        };
+        state
+            .ready
+            .ok_or(Error::Invalid("line prefix has not completed"))
+    }
+    pub fn paragraph_bounds_begin(
+        &mut self,
+        revision: Revision,
+        utf16: u64,
+        include_line_endings: bool,
+    ) -> Result<Uuid> {
+        self.bulk.available()?;
+        let state = ParagraphState::new(self, revision, utf16, include_line_endings)?;
+        self.bulk.insert(
+            state.revision.owner_id,
+            state.revision.document_id,
+            State::Paragraph(Box::new(state)),
+        )
+    }
+    pub fn paragraph_bounds_step(
+        &mut self,
+        revision: &Revision,
+        id: Uuid,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<ParagraphProgress> {
+        revision.validate()?;
+        let (slot, mut job) = self.bulk.take_paragraph(revision, id)?;
+        check_cancel(cancelled)?;
+        let State::Paragraph(state) = &mut job.state else {
+            return Err(Error::Invalid("bulk operation kind"));
+        };
+        let progress = state.step(self)?;
+        check_cancel(cancelled)?;
+        self.bulk.restore(slot, job)?;
+        Ok(progress)
+    }
+    pub fn paragraph_bounds_finish(
+        &mut self,
+        revision: &Revision,
+        id: Uuid,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<ParagraphBounds> {
+        revision.validate()?;
+        let (_, job) = self.bulk.take_paragraph(revision, id)?;
+        check_cancel(cancelled)?;
+        let State::Paragraph(state) = job.state else {
+            return Err(Error::Invalid("bulk operation kind"));
+        };
+        state
+            .ready
+            .ok_or(Error::Invalid("paragraph bounds have not completed"))
+    }
+    /// Capture an immutable revision and exact scalar origin. Only the next
+    /// boundary in the requested direction is sought; no source is changed.
+    pub fn grapheme_seek_begin(
+        &mut self,
+        revision: Revision,
+        utf16: u64,
+        forward: bool,
+    ) -> Result<Uuid> {
+        self.bulk.available()?;
+        let document = self.open(revision)?;
+        let length = usize::try_from(document.summary().bytes)
+            .map_err(|_| Error::Invalid("grapheme source exceeds usize"))?;
+        let at = self.byte_at_utf16(&document, document.revision(), utf16)?;
+        let revision = document.revision;
+        let offset =
+            usize::try_from(at).map_err(|_| Error::Invalid("grapheme origin exceeds usize"))?;
+        let endpoint = if forward {
+            offset == length
+        } else {
+            offset == 0
+        };
+        let ready = endpoint.then_some(if forward {
+            revision.summary()
+        } else {
+            TextSummary::EMPTY
+        });
+        let fetch = if endpoint {
+            None
+        } else {
+            Some(GraphemeFetch::Piece(if forward { at } else { at - 1 }))
+        };
+        let owner = revision.owner_id;
+        let document = revision.document_id;
+        let state = GraphemeSeekState {
+            revision,
+            cursor: GraphemeCursor::new(offset, length, true),
+            forward,
+            piece: None,
+            fetch,
+            ready,
+            examined: 0,
+        };
+        self.bulk
+            .insert(owner, document, State::Grapheme(Box::new(state)))
+    }
+    pub fn grapheme_seek_step(
+        &mut self,
+        revision: &Revision,
+        id: Uuid,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<GraphemeSeekProgress> {
+        revision.validate()?;
+        let (slot, mut job) = self.bulk.take_grapheme(revision, id)?;
+        check_cancel(cancelled)?;
+        let State::Grapheme(state) = &mut job.state else {
+            return Err(Error::Invalid("bulk operation kind"));
+        };
+        let progress = state.step(self)?;
+        check_cancel(cancelled)?;
+        self.bulk.restore(slot, job)?;
+        Ok(progress)
+    }
+    pub fn grapheme_seek_finish(
+        &mut self,
+        revision: &Revision,
+        id: Uuid,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<TextSummary> {
+        revision.validate()?;
+        let (_, job) = self.bulk.take_grapheme(revision, id)?;
+        check_cancel(cancelled)?;
+        let State::Grapheme(state) = job.state else {
+            return Err(Error::Invalid("bulk operation kind"));
+        };
+        state
+            .ready
+            .ok_or(Error::Invalid("grapheme seek has not completed"))
     }
     pub fn import_begin(
         &mut self,

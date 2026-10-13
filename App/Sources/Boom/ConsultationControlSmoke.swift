@@ -1,6 +1,5 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import Foundation
 import SwiftUI
 
@@ -28,8 +27,6 @@ import SwiftUI
     let state: WorkspaceState
     let documents: [DocumentSnapshot]
   }
-  private static let key = SymmetricKey(data: Data(repeating: 0x62, count: 32))
-  private static let passphrase = "public consultation control fixture passphrase"
 
   static func run(arguments: [String]) async throws {
     func argument(_ name: String) throws -> String {
@@ -74,7 +71,7 @@ import SwiftUI
     }
   }
   private static func store(_ evidence: URL) throws -> WorkspaceStore {
-    try WorkspaceStore(rootOverride: evidence.appendingPathComponent("encrypted-workspace"), testKey: key)
+    try WorkspaceStore(rootOverride: evidence.appendingPathComponent("public-workspace"))
   }
   private static func followups(pack: URL, evidence: URL, automatic: Bool) async throws {
     let store = try store(evidence)
@@ -83,8 +80,8 @@ import SwiftUI
     var state = WorkspaceState()
     state.documents = [DocumentIndex(id: document.id, title: document.title)]
     state.selectedDocument = document.id; state.chats = [chat]; state.selectedChat = chat.id
-    try await store.save(state, documents: [document])
-    let model = try await WorkspaceModel(storeOverride: store, loadModels: automatic)
+    let model = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: [document])
+    if automatic { model.prepareModels() }
     let host = NSHostingView(rootView: WorkspaceView(model: model))
     let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 1440, height: 900))
     window.isReleasedWhenClosed = false; window.contentView = host
@@ -92,7 +89,7 @@ import SwiftUI
     host.layoutSubtreeIfNeeded()
     // This unshown diagnostic receives no AppKit user events to close automatic
     // event groups. Exercise the editor's explicit transaction groups instead.
-    model.undoManager(document.id).groupsByEvent = false
+    model.pagedCommands!.manager.groupsByEvent = false
     if !automatic { model.loadPack(pack, purpose: .consultation) }
     try await finish(model, evidence: evidence, phase: "loading", recorder: nil)
     guard model.canInfer, !automatic || !model.layout.isAuthor || model.baseReady else {
@@ -110,9 +107,9 @@ import SwiftUI
       try await finish(model, evidence: evidence, phase: phase, recorder: nil)
       try await model.flush()
       let expected = before.text.replacingOccurrences(of: replacement.0, with: replacement.1)
-      let persisted = try await store.load().get().1.first { $0.id == document.id }
+      let persisted = try await NativeCheckEvidence.readPublicDocuments(model: model).first { $0.id == document.id }
       guard model.mode == .edit, model.selectedDocument?.text == expected, persisted?.text == expected,
-        model.editor.map({ $0.string == expected }) ?? !model.layout.isAuthor,
+        model.pagedInput?.activeView.map({ $0.string == expected }) ?? !model.layout.isAuthor,
         let message = model.selectedChat?.messages.last, message.state == .complete else {
         throw BoomError.invalid("The real follow-up failed to edit the exact document.")
       }
@@ -132,12 +129,12 @@ import SwiftUI
       throw BoomError.invalid("Expected two individually recorded applied edits.")
     }
     for text in ["The harbor was bright.", document.text] {
-      model.undoManager(document.id).undo()
+      model.pagedCommands!.manager.undo()
       try await model.flush()
-      try await write(["expected": text, "observed": model.selectedDocument?.text ?? "", "editor": model.editor?.string ?? ""],
+      try await write(["expected": text, "observed": model.selectedDocument?.text ?? "", "editor": model.pagedInput?.activeView?.string ?? ""],
         to: evidence.appendingPathComponent("undo-" + Digest.sha256(text) + ".json"))
       guard model.selectedDocument?.text == text,
-        try await store.load().get().1.first(where: { $0.id == document.id })?.text == text else {
+        try await NativeCheckEvidence.readPublicDocuments(model: model).first(where: { $0.id == document.id })?.text == text else {
         throw BoomError.invalid("Follow-up Undo did not restore exact document bytes.")
       }
     }
@@ -158,8 +155,7 @@ import SwiftUI
     var state = WorkspaceState(); state.autocomplete = false
     state.documents = [DocumentIndex(id: document.id, title: document.title)]
     state.selectedDocument = document.id
-    try await store.save(state, documents: [document])
-    let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    let model = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: [document])
     let host = NSHostingView(rootView: WorkspaceView(model: model))
     let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 1440, height: 900))
     window.isReleasedWhenClosed = false; window.contentView = host
@@ -225,11 +221,11 @@ import SwiftUI
     try await render(model, name: "discussion", evidence: evidence)
     guard model.documents == [document] else { throw BoomError.invalid("Read-only consultation changed the attached document.") }
     try await model.shutdown()
-    let loaded = try await store.load().get()
+    let loaded = (try await store.loadState(), try await NativeCheckEvidence.readPublicDocuments(store: store))
     let captured = Capture(initialVoices: initial, editedVoices: edited,
       rounds: [separate, discussed], state: loaded.0, documents: loaded.1)
     try await write(captured, to: evidence.appendingPathComponent("capture.json"))
-    try await store.exportBackup(passphrase: passphrase, to: evidence.appendingPathComponent("complete.bloombackup"))
+    try await store.exportBackup(to: evidence.appendingPathComponent("complete.bloombackup"))
     print("Named voices, ordinary-chat editing, separate answers and discussion passed with real MLX.")
   }
   private static func createVoice(_ model: WorkspaceModel, name: String, slug: String,
@@ -375,15 +371,14 @@ import SwiftUI
     guard reopened.state.voices == capture.state.voices, reopened.state.chats == capture.state.chats,
       reopened.documents == capture.documents else { throw BoomError.invalid("Native controller relaunch changed consultation records.") }
     try await reopened.shutdown()
-    let restored = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("restored-workspace"),
-      testKey: SymmetricKey(data: Data(repeating: 0x63, count: 32)))
-    _ = try await restored.restoreBackup(passphrase: passphrase, from: evidence.appendingPathComponent("complete.bloombackup"))
+    let restored = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("restored-workspace"))
+    _ = try await restored.restoreBackup(from: evidence.appendingPathComponent("complete.bloombackup"))
     try await verify(restored, capture: capture)
     try await receipt("passed", evidence: evidence)
     print("Separate-process relaunch and fresh-key backup restore preserved named voices, examples, speakers, replies and journals.")
   }
   private static func verify(_ store: WorkspaceStore, capture: Capture) async throws {
-    let loaded = try await store.load().get()
+    let loaded = (try await store.loadState(), try await NativeCheckEvidence.readPublicDocuments(store: store))
     guard try canonical(loaded.0) == canonical(capture.state), loaded.1 == capture.documents,
       (capture.initialVoices + capture.editedVoices).allSatisfy({ capture.state.voiceVersions.contains($0) }) else {
       throw BoomError.invalid("Workspace, documents or immutable voice revisions changed across relaunch/restore.")

@@ -1,6 +1,5 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import Darwin
 import Foundation
 import Metal
@@ -9,7 +8,7 @@ import SwiftUI
 import Synchronization
 
 /// Explicit public fixtures, actual paired MLX allocations and production
-/// encrypted checkpoints. No shown window, user workspace, Keychain or network.
+/// file checkpoints. No shown window, user workspace, Keychain or network.
 @MainActor enum ApplicationMemorySmoke {
   final class Probe: @unchecked Sendable {
     private let lock = NSLock()
@@ -174,7 +173,7 @@ import Synchronization
       "network_permission": "outbound denied by the invoking OS sandbox",
       "keychain_dialogs_qualified": false, "physical_keyboard_or_ime_qualified": false,
       "swap_before": swap(), "sample_interval_ms": 20,
-      "durable_encrypted_checkpoint_overhead_included": true,
+      "durable_file_checkpoint_overhead_included": true,
       "producer_priority_scope": "explicit operations request user-initiated task priority; autocomplete requests background priority; receipts record effective task priority, not OS thread QoS",
       "inference_activity_scope": "GPU lease through producer joining; explicit operations request user-initiated activity while allowing idle system sleep; autocomplete requests background activity",
       "clock_scope": "ContinuousClock includes system sleep; SuspendingClock excludes system sleep; recorded wall-clock gates are unchanged"]
@@ -190,14 +189,12 @@ import Synchronization
       guard let consultationPack = consultationPackOverride ?? ModelPacks.cached(.consultation) else {
         throw BoomError.unavailable("Both cached model packs are required.")
       }
-      let store = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("encrypted-workspace"),
-        testKey: SymmetricKey(data: Data(repeating: 0x6a, count: 32)))
+      let store = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("public-workspace"))
       let initialDocument = DocumentSnapshot(title: "Public memory and typing fixture", text: "Public fixture")
       var state = WorkspaceState(); state.autocomplete = false; state.showChat = false
       state.documents = [DocumentIndex(id: initialDocument.id, title: initialDocument.title)]
       state.selectedDocument = initialDocument.id
-      try await store.save(state, documents: [initialDocument])
-      let workspace = try await WorkspaceModel(storeOverride: store, loadModels: false); model = workspace
+      let workspace = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: [initialDocument]); model = workspace
       guard workspace.layout.isAuthor else { throw BoomError.unavailable("Use the author edition for this diagnostic.") }
       receipt["residency_scope"] = "production controller; keep both when context fits, otherwise release inactive weights and reload the same snapshot"
       let clock = ContinuousClock()
@@ -255,16 +252,20 @@ import Synchronization
         throw BoomError.budget("The runtime leaves insufficient context for the registered 4K trial.")
       }
       let short = try await writingPrefix(512)
-      workspace.updateDocument(try await writingPrefix(16_128), id: initialDocument.id, caret: 0)
+      try await NativeCheckEvidence.replacePublicDocument(workspace, text: try await writingPrefix(16_128), id: initialDocument.id, caret: 0)
       try await workspace.flush()
       guard let document = workspace.selectedDocument else { throw BoomError.invalid("Public document disappeared.") }
       let host = NSHostingView(rootView: WorkspaceView(model: workspace))
       let testWindow = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 1190, height: 846))
       window = testWindow; testWindow.isReleasedWhenClosed = false; testWindow.contentView = host
       for _ in 0..<10 { host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(25)) }
-      guard let editor = workspace.editor, testWindow.makeFirstResponder(editor), editor.isEditable else {
+      guard let editor = workspace.pagedInput?.activeView, testWindow.makeFirstResponder(editor), editor.isEditable else {
         throw BoomError.invalid("The production offscreen editor did not accept keyboard focus.")
       }
+      guard editor.string.utf8.count <= PagedWorkingWindow.hardBytes else {
+        throw BoomError.budget("The paired-memory control exceeded its native editing-island bound.")
+      }
+      let initialIsland = Data(editor.string.utf8)
       workspace.isBusy = true
       typing = Task { @MainActor in
         var delays: [Double] = []
@@ -293,7 +294,12 @@ import Synchronization
             "deletion_seconds": inserted.duration(to: deleted).timeInterval,
             "layout_seconds": deleted.duration(to: ended).timeInterval,
             "combined_seconds": delays.last!])
-          guard editor.string == document.text, editor.isEditable,
+          guard editor.string.utf8.elementsEqual(initialIsland), editor.isEditable,
+            workspace.pagedInput?.activeView === editor, workspace.pagedViewport?.textView === editor,
+            workspace.pagedSession === editor.session, editor.inputBinding?.state == .active,
+            editor.inputBinding?.identity.arenaID == editor.session.arenaID,
+            editor.boundedStorage.mutationFailure == nil,
+            workspace.pagedSelectedRecord?.document.id == document.id,
             testWindow.firstResponder === editor else { throw BoomError.invalid("Native typing changed fixture bytes or lost focus.") }
           if started.duration(to: clock.now) > .seconds(2) { throw BoomError.unavailable("Native typing stalled.") }
         }

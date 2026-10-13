@@ -17,10 +17,8 @@ struct PagedRootHistoryStore: Sendable {
     self.pages = pages
   }
 
-  /// Writes encrypted, unpublished history records through this same provider.
-  /// SQLite candidate/publication work commits them with the source pages; no
-  /// external append synchronization participates in that database route.
-  /// The host retains actual transaction/producer custody on a failed outcome.
+  /// Writes unpublished history records through this same provider.
+  /// The complete document root is replaced only after these pages synchronize.
   func writeNew(_ history: PagedRootHistory,
     document: PagedDocumentDescriptor) throws -> PagedDocumentRootRecord {
     try admit(document)
@@ -48,8 +46,8 @@ struct PagedRootHistoryStore: Sendable {
     return record
   }
 
-  /// The expected record comes from the authenticated catalog. Loading history
-  /// authenticates its metadata; the host/engine still validates source roots.
+  /// The expected record comes from the current document root. Loading history
+  /// validates its metadata; the host/engine still validates source roots.
   func load(_ expected: PagedDocumentRootRecord) throws -> PagedRootHistory {
     try admit(expected.document)
     try expected.validate()
@@ -69,9 +67,9 @@ struct PagedRootHistoryStore: Sendable {
       let required = min(Self.segmentBytes, remaining)
       // The manifest count/total bounds are admitted before this arithmetic.
       // Every segment except the last is full; empty/short coverage cannot be
-      // hidden by a valid aggregate digest or valid AEAD alone.
+      // hidden by a valid aggregate digest or valid page frame alone.
       guard required > 0,
-        Int(segment.locator.ciphertextBytes) - 28 == required else {
+        Int(segment.locator.bytes) == required else {
         throw BoomError.invalid("Root history segment has an incorrect extent.")
       }
       bytes.append(try authenticated(segment, maximumBytes: Self.segmentBytes))
@@ -86,7 +84,7 @@ struct PagedRootHistoryStore: Sendable {
     try document.validate()
     guard document.revision.ownerID == pages.ownerID,
       document.id == pages.documentID else {
-      throw BoomError.denied("Root history belongs to a different private source.")
+      throw BoomError.denied("Root history belongs to a different source.")
     }
   }
 
@@ -102,9 +100,9 @@ struct PagedRootHistoryStore: Sendable {
     try page.validate(maximumPlaintextBytes: maximumBytes)
     let bytes = try pages.read(ownerID: pages.ownerID, documentID: pages.documentID,
       kind: .index, page: page, maximumPlaintextBytes: maximumBytes)
-    // The provider checks AEAD/framing. Its read path delegates the PageRef
+    // The provider checks framing and the page digest. Its read path delegates the PageRef
     // digest check to consumers; history performs that exact check here.
-    guard bytes.count == Int(page.locator.ciphertextBytes) - 28,
+    guard bytes.count == Int(page.locator.bytes),
       Digest.sha256(bytes) == page.digest else {
       throw BoomError.invalid("Root history page differs from its authenticated reference.")
     }

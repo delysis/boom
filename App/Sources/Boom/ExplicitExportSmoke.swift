@@ -1,6 +1,5 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import Foundation
 
 /// Explicit public fixture. No model generation, Keychain item, shown window,
@@ -17,8 +16,7 @@ import Foundation
     try FileManager.default.createDirectory(at: evidence, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
     let chosen = evidence.appendingPathComponent("explicit-exports")
     try FileManager.default.createDirectory(at: chosen, withIntermediateDirectories: false)
-    let key = SymmetricKey(data: Data(repeating: 0x6f, count: 32))
-    let store = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("encrypted-workspace"), testKey: key)
+    let store = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("public-workspace"))
     let text = "\u{feff}Public export privacy canary Café 👩🏽‍💻\r\nCaptured manuscript bytes.\n"
     let document = DocumentSnapshot(title: "Public export manuscript", text: text)
     let original = Data(text.utf8)
@@ -32,8 +30,7 @@ import Foundation
     state.documents = [DocumentIndex(id: document.id, title: document.title)]; state.selectedDocument = document.id
     state.chats = [chat]; state.selectedChat = chat.id; state.voices = [voice]; state.voiceVersions = [voice]
     state.importedFiles = [document.id: ImportedFile(folderID: nil, path: "Public.md", originalDigest: Digest.sha256(original))]
-    try await store.save(state, documents: [document])
-    let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    let model = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: [document])
     // Occupy the ordinary foreground slot. Exports must remain independent,
     // and shutdown must join their writes as well as the cancelled foreground.
     model.work("Public export foreground fixture") { flag in
@@ -62,7 +59,7 @@ import Foundation
     do { try await cancelled.value; throw BoomError.invalid("Cancelled export was published.") }
     catch is CancellationError {}
     guard model.isBusy else { throw BoomError.invalid("Export displaced the foreground operation.") }
-    model.updateDocument("Public export later-edit canary: this stays in the encrypted manuscript.", id: document.id, caret: 0)
+    try await NativeCheckEvidence.replacePublicDocument(model, text: "Public export later-edit canary: this stays in the file-backed manuscript.", id: document.id, caret: 0)
     try await model.shutdown()
     if let error = model.errorMessage { throw BoomError.invalid(error) }
     guard !FileManager.default.fileExists(atPath: rejected.path),
@@ -71,22 +68,23 @@ import Foundation
       try JSONDecoder().decode(Voice.self, from: Data(contentsOf: chosen.appendingPathComponent("voice.json"))) == voice else {
       throw BoomError.invalid("Explicit exports changed their captured bytes or revision.")
     }
-    let reopened = try WorkspaceStore(rootOverride: store.root, testKey: key)
-    let (loaded, documents) = try await reopened.load().get()
+    let reopened = try WorkspaceStore(rootOverride: store.root)
+    let loaded = try await reopened.loadState()
+    let documents = try await NativeCheckEvidence.readPublicDocuments(store: reopened)
     guard loaded.chats == state.chats, loaded.voices == state.voices,
-      documents.first?.text == "Public export later-edit canary: this stays in the encrypted manuscript.",
+      documents.first?.text == "Public export later-edit canary: this stays in the file-backed manuscript.",
       try reopened.vault.get(.attachment, id: document.id) == original else {
-      throw BoomError.invalid("Export changed the encrypted workspace or original.")
+      throw BoomError.invalid("Export changed the file workspace or original.")
     }
-    let passphrase = "public explicit export fixture passphrase"
-    try await reopened.exportBackup(passphrase: passphrase, to: evidence.appendingPathComponent("complete.bloombackup"))
-    let restored = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("restored-workspace"), testKey: SymmetricKey(size: .bits256))
-    let (restoredState, restoredDocuments) = try await restored.restoreBackup(passphrase: passphrase, from: evidence.appendingPathComponent("complete.bloombackup"))
+    try await reopened.exportBackup(to: evidence.appendingPathComponent("complete.bloombackup"))
+    let restored = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("restored-workspace"))
+    try await restored.restoreBackup(from: evidence.appendingPathComponent("complete.bloombackup"))
+    let restoredState = try await restored.loadState()
+    let restoredDocuments = try await NativeCheckEvidence.readPublicDocuments(store: restored)
     guard restoredDocuments == documents, restoredState.chats == loaded.chats, restoredState.voices == loaded.voices,
       try restored.vault.get(.attachment, id: document.id) == original else {
       throw BoomError.invalid("Explicit export backup restore changed the private records.")
     }
-    guard VaultSession.shared.lookupCount == 0 else { throw BoomError.invalid("The public export fixture requested a Keychain key.") }
     let files = try FileManager.default.contentsOfDirectory(at: chosen, includingPropertiesForKeys: nil)
     var exports: [[String: Any]] = []
     for file in files.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
@@ -98,12 +96,11 @@ import Foundation
       "worker_serialization_off_ui_thread": true, "foreground_slot_preserved": true,
       "captured_bytes_preserved": true, "shutdown_joined_exports": true, "cancelled_export_absent": true,
       "same_destination_request_order_preserved": true,
-      "encrypted_relaunch_and_backup_restore": true, "real_keychain_qualified": false,
-      "keychain_lookups": VaultSession.shared.lookupCount,
+      "file_relaunch_and_backup_restore": true,
       "physical_interaction_qualified": false, "save_panel_interaction_qualified": false,
       "model_generation_qualified": false, "os_cache_audit_qualified": false]
     let bytes = try JSONSerialization.data(withJSONObject: receipt, options: [.prettyPrinted, .sortedKeys])
     try await detachedWork { try bytes.write(to: evidence.appendingPathComponent("verification.json"), options: .atomic) }
-    print("Captured explicit exports, background serialization, encrypted relaunch and backup restore passed.")
+    print("Captured explicit exports, background serialization, file relaunch and backup restore passed.")
   }
 }

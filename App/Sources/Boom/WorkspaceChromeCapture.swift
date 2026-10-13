@@ -1,19 +1,17 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import SwiftUI
 
 /// Capture complete native chrome, not a hand-built imitation of the toolbar.
 /// This public fixture stays offscreen and never opens a human vault.
 @MainActor enum WorkspaceChromeCapture {
   static func run(evidence: URL) async throws {
-    let store = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("chrome-workspace"),
-      testKey: SymmetricKey(data: Data(repeating: 37, count: 32)))
+    let store = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("chrome-workspace"))
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     model.state.autocomplete = false
     if let document = model.selectedDocument {
       model.renameDocument(document.id, to: "Harbor notes")
-      model.updateDocument("# At the harbor\n\nThe boats were still tied up when Mara arrived.\n\nShe set the spool on the bench and opened her hand.",
+      try await NativeCheckEvidence.replacePublicDocument(model, text: "# At the harbor\n\nThe boats were still tied up when Mara arrived.\n\nShe set the spool on the bench and opened her hand.",
         id: document.id, caret: 0)
     }
     if model.selectedChat == nil { try model.newChat(about: model.state.selectedDocument) }
@@ -72,14 +70,14 @@ import SwiftUI
           let longText = document.text + "\n\n" + (1...40).map {
             "\($0). The tide carried the boats past the harbor wall. Mara watched until the last light disappeared."
           }.joined(separator: "\n\n")
-          model.updateDocument(longText, id: document.id, caret: 0)
+          try await NativeCheckEvidence.replacePublicDocument(model, text: longText, id: document.id, caret: 0)
           try await settle(); try capture("workspace-\(dark ? "dark" : "light")-long-top")
-          if let editor = model.editor {
+          if let editor = model.pagedInput?.activeView {
             let end = NSRange(location: editor.string.utf16.count, length: 0)
             editor.setSelectedRange(end); editor.scrollRangeToVisible(end)
           }
           try await settle(); try capture("workspace-\(dark ? "dark" : "light")-long-end")
-          model.updateDocument(document.text, id: document.id, caret: 0)
+          try await NativeCheckEvidence.replacePublicDocument(model, text: document.text, id: document.id, caret: 0)
           try await settle()
         }
       }
@@ -87,7 +85,7 @@ import SwiftUI
       try await model.shutdown()
       try JSONSerialization.data(withJSONObject: ["status": "passed", "observations": observations,
         "sourceInventorySHA256": Bundle.main.infoDictionary?["BoomSourceSHA256"] ?? "unavailable",
-        "pid": ProcessInfo.processInfo.processIdentifier, "keychainLookups": VaultSession.shared.lookupCount,
+        "pid": ProcessInfo.processInfo.processIdentifier,
         "window": "unshown"], options: [.prettyPrinted, .sortedKeys])
         .write(to: evidence.appendingPathComponent("chrome-receipt.json"), options: .atomic)
     } catch {

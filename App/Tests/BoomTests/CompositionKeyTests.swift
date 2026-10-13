@@ -1,6 +1,5 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import XCTest
 @testable import Boom
 
@@ -104,16 +103,18 @@ final class CompositionKeyTests: XCTestCase {
     defer { NSApp.setActivationPolicy(policy) }
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-composition-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root)
     let document = DocumentSnapshot(title: "Public fixture", text: "Café waits.")
     var state = WorkspaceState(); state.autocomplete = false
     state.documents = [DocumentIndex(id: document.id, title: document.title)]; state.selectedDocument = document.id
-    try await store.save(state, documents: [document])
-    let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
-    let editor = MarkdownTextView(frame: NSRect(x: 0, y: 0, width: 500, height: 300))
-    editor.owner = model; editor.documentID = document.id; editor.string = document.text
+    let model = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: [document])
+    let editor = try XCTUnwrap(model.pagedInput?.activeView)
+    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 500, height: 300))
+    window.isReleasedWhenClosed = false; window.contentView = try XCTUnwrap(model.pagedViewport)
+    defer { window.close() }
+    XCTAssertTrue(window.makeFirstResponder(editor))
     editor.setSelectedRange(NSRange(location: document.text.utf16.count, length: 0))
-    model.editor = editor; model.movedCaret(document.text.utf16.count, hasMarkedText: false)
+    model.movedCaret(document.text.utf16.count, hasMarkedText: false)
     // Explicitly authored test suggestion, not represented as model output.
     model.resumeGhost(" A public suggestion.", documentID: document.id, caret: document.text.utf16.count, sources: [])
     let stamp = try XCTUnwrap(model.ghostStamp)
@@ -133,7 +134,7 @@ final class CompositionKeyTests: XCTestCase {
     XCTAssertEqual(editor.string, document.text); XCTAssertEqual(model.selectedDocument, document)
     XCTAssertEqual(editor.selectedRange().location, stamp.caretUTF16)
     try await model.shutdown()
-    let restored = try await store.load().get().1
+    let restored = try await NativeCheckEvidence.readPublicDocuments(store: store)
     XCTAssertEqual(restored, [document])
   }
 }

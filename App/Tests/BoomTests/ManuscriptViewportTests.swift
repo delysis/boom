@@ -1,6 +1,5 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import SwiftUI
 import XCTest
 @testable import Boom
@@ -44,11 +43,10 @@ final class ManuscriptViewportTests: XCTestCase {
     }
     _ = NSApplication.shared
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-editor-tail-" + UUID().uuidString)
-    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root)
     var state = WorkspaceState(); state.autocomplete = false; state.showChat = false
     state.documents = [.init(id: document.id, title: document.title)]; state.selectedDocument = document.id
-    try await store.save(state, documents: [document])
-    let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    let model = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: [document])
     guard model.layout.isAuthor else {
       try await model.shutdown(); try FileManager.default.removeItem(at: root)
       throw XCTSkip("The Chat edition has no manuscript pane.")
@@ -62,7 +60,7 @@ final class ManuscriptViewportTests: XCTestCase {
     var producerStarted = false, producerJoined = true
     do {
       for _ in 0..<10 { host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(25)) }
-      let editor = try XCTUnwrap(model.editor)
+      let editor = try XCTUnwrap(model.pagedInput?.activeView)
       guard window.makeFirstResponder(editor) else { throw BoomError.invalid("Editor focus was unavailable.") }
       model.isBusy = true
       editor.setSelectedRange(NSRange(location: location, length: 0)); editor.scrollRangeToVisible(editor.selectedRange())
@@ -185,18 +183,17 @@ final class ManuscriptViewportTests: XCTestCase {
     _ = NSApplication.shared
     for repetition in 0..<3 {
       let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-viewport-" + UUID().uuidString)
-      let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+      let store = try WorkspaceStore(rootOverride: root)
       var state = WorkspaceState(); state.autocomplete = false; state.showChat = false
       state.documents = [.init(id: document.id, title: document.title)]
       state.selectedDocument = document.id
-      try await store.save(state, documents: [document])
-      let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+      let model = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: [document])
       guard model.layout.isAuthor else { throw XCTSkip("The Chat edition has no manuscript pane.") }
       let host = NSHostingView(rootView: WorkspaceView(model: model))
       let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 1190, height: 846))
       window.isReleasedWhenClosed = false; window.contentView = host
       for _ in 0..<10 { host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(25)) }
-      let editor = try XCTUnwrap(model.editor)
+      let editor = try XCTUnwrap(model.pagedInput?.activeView)
       XCTAssertTrue(window.makeFirstResponder(editor)); model.isBusy = true
       let clock = ContinuousClock()
       var samples: [[String: Double]] = []
@@ -282,7 +279,7 @@ private struct EditorTailPartial: Codable, Sendable {
 }
 
 @MainActor private final class EditorTailRun {
-  let editor: MarkdownTextView
+  let editor: PagedNativeTextView
   let host: NSHostingView<WorkspaceView>
   let window: NSWindow
   let model: WorkspaceModel
@@ -297,7 +294,7 @@ private struct EditorTailPartial: Codable, Sendable {
   private(set) var validatedEvents = 0
   private(set) var partialEvents: [EditorTailPartial] = []
 
-  init(editor: MarkdownTextView, host: NSHostingView<WorkspaceView>, window: NSWindow,
+  init(editor: PagedNativeTextView, host: NSHostingView<WorkspaceView>, window: NSWindow,
     model: WorkspaceModel, location: Int, originalLength: Int) throws {
     self.editor = editor; self.host = host; self.window = window; self.model = model
     self.location = location; self.originalLength = originalLength
