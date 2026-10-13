@@ -198,7 +198,7 @@ enum DeveloperStackWire {
     private func challenge(tag: Tag = .challenge, value: UInt64 = 0) throws {
       let status = received.withUnsafeMutableBytes {
         mach_msg($0.baseAddress!.assumingMemoryBound(to: mach_msg_header_t.self),
-          mach_msg_option_t(MACH_RCV_MSG | MACH_RCV_TIMEOUT) | UInt32(MACH_RCV_TRAILER_AUDIT) << 24,
+          mach_msg_option_t(MACH_RCV_MSG | MACH_RCV_TIMEOUT) | mach_msg_option_t(MACH_RCV_TRAILER_AUDIT) << 24,
           0, mach_msg_size_t(receiveBytes), reply, 10_000, 0)
       }
       guard status == MACH_MSG_SUCCESS else { throw Failure.deadline }

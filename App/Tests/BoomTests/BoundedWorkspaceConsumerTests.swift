@@ -42,10 +42,18 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
     window.isReleasedWhenClosed = false
     window.contentView = NSHostingView(rootView: WorkspaceView(model: model))
     Self.failedWindow = window
-    window.layoutIfNeeded(); window.makeKeyAndOrderFront(nil)
-    let view = try XCTUnwrap(model.pagedInput?.activeView)
-    XCTAssertTrue(window.makeFirstResponder(view)); XCTAssertTrue(window.firstResponder === view)
+    try focusCurrentEditor(model)
     return model
+  }
+  private func focusCurrentEditor(_ model: WorkspaceModel) throws {
+    let window = try XCTUnwrap(Self.failedWindow)
+    window.contentView?.layoutSubtreeIfNeeded()
+    window.makeKeyAndOrderFront(nil)
+    let view = try XCTUnwrap(model.pagedInput?.activeView)
+    guard model.pagedViewport?.textView === view, view.window === window,
+      window.isKeyWindow, window.makeFirstResponder(view), window.firstResponder === view else {
+      throw BoomError.unavailable("The ordinary editor did not acquire native focus: mounted=\(view.window === window), currentViewport=\(model.pagedViewport?.textView === view), keyWindow=\(window.isKeyWindow), firstResponder=\(window.firstResponder === view).")
+    }
   }
   private func joinedClose(_ model: WorkspaceModel) async throws {
     try await model.joinWorkspaceOperation()
@@ -111,7 +119,7 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
     let imported = try XCTUnwrap(model.pagedSelectedRecord)
     XCTAssertEqual(imported.document.revision.summary.bytes, 3_145_728)
     XCTAssertNil(model.selectedDocument, "The real paged source is never a DocumentSnapshot/viewport substitution.")
-    Self.failedWindow?.layoutIfNeeded()
+    try focusCurrentEditor(model)
     let viewport = try XCTUnwrap(model.pagedViewport)
     try viewport.requestScroll(toUTF16: imported.document.revision.summary.utf16 - 16)
     try await viewport.joinPresentation()

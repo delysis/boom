@@ -353,6 +353,13 @@ import Foundation
     let absolute = output.value.utf16Start.addingReportingOverflow(UInt64(local))
     guard !absolute.overflow else { throw BoomError.budget("Scroll selection coordinate overflowed.") }
     let anchor = absolute.partialValue > 4096 ? absolute.partialValue - 4096 : 0
+    // The read surface never becomes a keyboard client. An explicit selection
+    // acquires the actual editable client before navigation captures its lease.
+    guard let view = input.activeView, textView === view,
+      let window = view.window, self.window === window, window.isKeyWindow,
+      window.makeFirstResponder(view), window.firstResponder === view else {
+      throw BoomError.stale("The visible selection could not focus its actual editable client.")
+    }
     try owner.requestDocumentNavigation(toUTF16: anchor,
       selectingUTF16: PagedNativeNavigationSelection(utf16Offset: absolute.partialValue, utf16Length: 0), expected: current)
     revealEditableWindow()

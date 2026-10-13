@@ -267,8 +267,13 @@ import XCTest
       let oldClient = try XCTUnwrap(old.inputContext?.client as? PagedNativeTextInputClient)
       let record = source.canonicalHistory!.record
       try host.requestScroll(toUTF16: 48_000); try await host.joinPresentation()
+      // Selecting the read surface must acquire its editable physical client
+      // even when the document was not the current keyboard responder.
+      XCTAssertTrue(f.window!.makeFirstResponder(nil))
+      XCTAssertFalse(try f.input!.observeSelection().inputLease.isFirstResponder)
       try host.selectVisibleUTF16(2_000)
       try await commands.joinPendingCommand(); try await host.joinPresentation()
+      XCTAssertTrue(f.window!.firstResponder === f.view)
       XCTAssertFalse(f.view === old); XCTAssertEqual(old.inputBinding?.state, .retired); XCTAssertTrue(oldClient.isRetired)
       XCTAssertEqual(try source.navigationSelection(f.view.selectedRange()).utf16Offset, 50_000)
       XCTAssertEqual(source.canonicalHistory?.record, record); XCTAssertEqual(source.generation, 0)

@@ -74,6 +74,7 @@ let package = Package(
             "-L" + libraryDirectory,
             "-lboom_attachment_ffi",
           ] + nativeLinkFlags.flatMap { ["-Xlinker", $0] }),
+        .linkedLibrary("bsm", .when(platforms: [.macOS])),
         .linkedFramework("AppKit"), .linkedFramework("Security"),
         .linkedFramework("SystemConfiguration"),
         .linkedFramework("AVFoundation"), .linkedFramework("Speech"),

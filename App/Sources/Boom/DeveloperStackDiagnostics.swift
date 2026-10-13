@@ -17,8 +17,18 @@ enum DeveloperStackDiagnostics {
     let event: UInt64
   }
   struct PublicEditorPlan: Sendable {
+    let kind: UInt32
     let operations: UInt32
     let utf8Bytes: UInt64
+    init(kind: UInt32, operations: UInt32, utf8Bytes: UInt64) throws {
+      guard operations == 1_000,
+        (kind == 1 && utf8Bytes == 72_196) || (kind == 2 && utf8Bytes == 72_196)
+          || (kind == 3 && utf8Bytes == (1 << 30)) else { throw Wire.Failure.admission }
+      self.kind = kind; self.operations = operations; self.utf8Bytes = utf8Bytes
+    }
+    var boundedSQL: Bool { kind != 1 }
+    var diskLimit: UInt64 { kind == 1 ? 4 << 20 : kind == 2 ? 64 << 20 : 8 << 30 }
+    var lifetimeSeconds: UInt64 { kind == 1 ? 120 : kind == 2 ? 220 : 740 }
   }
   private struct Stage {
     let id: UInt32
@@ -111,12 +121,15 @@ enum DeveloperStackDiagnostics {
   private final class EntryLifetime: Sendable {
     let own: Wire.Identity
     let parent: Wire.Identity
+    // Until the exact source/image/parent plan is admitted, retain the old
+    // 120-second startup ceiling. Only one fixed recipe may extend this bound.
+    let maximumNanoseconds = Atomic<UInt64>(120_000_000_000)
     init(own: Wire.Identity, parent: Wire.Identity) { self.own = own; self.parent = parent }
   }
   private static let entryLifetime = AtomicLazyReference<EntryLifetime>()
 
   private struct Fixture: Codable {
-    let kind: UInt32 // 1 = programmatically generated public editor text.
+    let kind: UInt32 // 1 = legacy72K, 2 = ordinary SQL72K, 3 = physical SQL1GiB.
     let operations: UInt32
     let utf8Bytes: UInt64
   }
@@ -152,7 +165,7 @@ enum DeveloperStackDiagnostics {
     let candidate = EntryLifetime(own: own, parent: parent)
     let registered = entryLifetime.storeIfNil(candidate)
     guard registered.own == own, registered.parent == parent else { throw Wire.Failure.identity }
-    if registered === candidate { startLifetimeGuardian(parent) }
+    if registered === candidate { startLifetimeGuardian(candidate) }
   }
 
   /// Startup/explicit registration only; not called from PerformanceTrace.
@@ -164,7 +177,7 @@ enum DeveloperStackDiagnostics {
   @MainActor static func bootstrapForOwnedPublicFixture(recipe: URL,
     prepare: @MainActor (PublicEditorPlan) async throws -> Void) async throws -> PublicEditorPlan {
     let admission = try admitOwnedFixture(recipe)
-    let plan = PublicEditorPlan(operations: admission.plan.fixture.operations,
+    let plan = try PublicEditorPlan(kind: admission.plan.fixture.kind, operations: admission.plan.fixture.operations,
       utf8Bytes: admission.plan.fixture.utf8Bytes)
     try await prepare(plan)
     return try startAdmittedFixture(admission)
@@ -187,15 +200,17 @@ enum DeveloperStackDiagnostics {
     let plan = try JSONDecoder().decode(Plan.self, from: bytes)
     guard plan.schema == Wire.version, plan.owner == parent, plan.nonce.count == 16,
       plan.nonce.contains(where: { $0 != 0 }), plan.arguments == CommandLine.arguments,
-      plan.fixture.kind == 1, plan.fixture.operations == 1_000,
-      plan.fixture.utf8Bytes == 72_196,
       plan.executable == processImage(own.pid),
       plan.ownerExecutable == processImage(parent.pid) else { throw Wire.Failure.admission }
+    let fixture = try PublicEditorPlan(kind: plan.fixture.kind,
+      operations: plan.fixture.operations, utf8Bytes: plan.fixture.utf8Bytes)
     try verifyFile(plan.executable, sha256: plan.executableSHA256, maximum: 128 << 20, owner: nil)
     try verifyFile(plan.ownerExecutable, sha256: plan.ownerExecutableSHA256, maximum: 32 << 20, owner: nil)
     try verifyFile(plan.sourceInventory, sha256: plan.sourceInventorySHA256, maximum: 64 << 10, owner: own.uid)
     guard try Wire.Identity.current(getpid()) == own,
-      try Wire.Identity.current(getppid()) == parent else { throw Wire.Failure.identity }
+      try Wire.Identity.current(getppid()) == parent, let lifetime = entryLifetime.load(),
+      lifetime.own == own, lifetime.parent == parent else { throw Wire.Failure.identity }
+    lifetime.maximumNanoseconds.store(fixture.lifetimeSeconds * 1_000_000_000, ordering: .releasing)
     return Admission(plan: plan, own: own, parent: parent)
   }
   @MainActor private static func startAdmittedFixture(_ admission: Admission) throws -> PublicEditorPlan {
@@ -210,7 +225,8 @@ enum DeveloperStackDiagnostics {
     try session.waitForStart()
     guard runtime.storeIfNil(session) === session else { throw Wire.Failure.admission }
     session.startDrain()
-    return PublicEditorPlan(operations: plan.fixture.operations, utf8Bytes: plan.fixture.utf8Bytes)
+    return try PublicEditorPlan(kind: plan.fixture.kind, operations: plan.fixture.operations,
+      utf8Bytes: plan.fixture.utf8Bytes)
   }
 
   /// Only after the public main-thread fixture has ended all measured phases.
@@ -461,17 +477,18 @@ enum DeveloperStackDiagnostics {
     }
   }
 
-  private static func startLifetimeGuardian(_ parent: Wire.Identity) {
+  private static func startLifetimeGuardian(_ lifetime: EntryLifetime) {
     let deadline = mach_absolute_time()
     Thread.detachNewThread {
       var timebase = mach_timebase_info_data_t()
       guard mach_timebase_info(&timebase) == KERN_SUCCESS, timebase.denom != 0 else { _exit(71) }
       while true {
-        guard let actual = try? Wire.Identity.current(pid_t(parent.pid)),
-          actual.sameLifetime(as: parent) else { _exit(71) }
+        guard let actual = try? Wire.Identity.current(pid_t(lifetime.parent.pid)),
+          actual.sameLifetime(as: lifetime.parent) else { _exit(71) }
         let elapsed = mach_absolute_time() - deadline
         let scaled = elapsed.multipliedReportingOverflow(by: UInt64(timebase.numer))
-        guard !scaled.overflow, scaled.partialValue / UInt64(timebase.denom) < 120_000_000_000 else { _exit(71) }
+        guard !scaled.overflow, scaled.partialValue / UInt64(timebase.denom)
+          < lifetime.maximumNanoseconds.load(ordering: .acquiring) else { _exit(71) }
         usleep(50_000)
       }
     }
