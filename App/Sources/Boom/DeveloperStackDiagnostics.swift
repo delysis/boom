@@ -97,6 +97,14 @@ enum DeveloperStackDiagnostics {
     Stage(id: 70, name: "Text.Measurement"),
     Stage(id: 71, name: "Workspace.Flush"),
     Stage(id: 72, name: "Editor.PublicTypingCycle"),
+    Stage(id: 73, name: "Editor.ManagedInput"),
+    Stage(id: 74, name: "Editor.ManagedAdmission"),
+    Stage(id: 75, name: "Editor.ManagedSourceMutation"),
+    Stage(id: 76, name: "Editor.ManagedBackingMutation"),
+    Stage(id: 77, name: "Editor.ManagedTextKitNotification"),
+    Stage(id: 78, name: "Editor.ManagedLayout"),
+    Stage(id: 79, name: "Editor.ManagedDraw"),
+    Stage(id: 80, name: "Editor.ManagedHistoryReconcile"),
   ]
   private static let runtime = AtomicLazyReference<Session>()
   private static let bootstrapping = Atomic<Bool>(false)

@@ -16,6 +16,7 @@ final class PagedNativeTextStorage: NSTextStorage {
   private var editingDepth = 0
   private var characterGateOpen = false
   private var nativeGroupID = UUID()
+  fileprivate var performanceEvent: UInt64 = 0
   private(set) var mutationFailure: Error?
   var didRejectMutation: (@MainActor (Error) -> Void)?
   var nativeSelection: (@MainActor () throws -> PagedWorkingSelection)?
@@ -89,8 +90,12 @@ final class PagedNativeTextStorage: NSTextStorage {
     guard MainActor.assumeIsolated({ inputBinding?.state != .retired }) else { return }
     do {
       // Scalar and reserve admission precede both source and Cocoa mutation.
-      try MainActor.assumeIsolated { try admits(range, replacement: replacement) }
-      try MainActor.assumeIsolated { try inputBinding?.admitsInput(in: session, requiresCommand: true) }
+      do {
+        let trace = PerformanceTrace.begin("Editor.ManagedAdmission", event: performanceEvent)
+        defer { PerformanceTrace.end("Editor.ManagedAdmission", trace) }
+        try MainActor.assumeIsolated { try admits(range, replacement: replacement) }
+        try MainActor.assumeIsolated { try inputBinding?.admitsInput(in: session, requiresCommand: true) }
+      }
       let ownsTransaction = editingDepth == 0
       if ownsTransaction { beginEditing() }
       defer { if ownsTransaction { endEditing() } }
@@ -98,14 +103,27 @@ final class PagedNativeTextStorage: NSTextStorage {
         try MainActor.assumeIsolated { try session.nativeCharacterTransactionWillBegin() }
         characterGateOpen = true
       }
-      let accepted = try MainActor.assumeIsolated {
-        try session.replace(range, with: replacement, groupID: nativeGroupID,
-          beforeSelection: nativeSelection?())
+      let accepted: Bool
+      do {
+        let trace = PerformanceTrace.begin("Editor.ManagedSourceMutation", event: performanceEvent)
+        defer { PerformanceTrace.end("Editor.ManagedSourceMutation", trace) }
+        accepted = try MainActor.assumeIsolated {
+          try session.replace(range, with: replacement, groupID: nativeGroupID,
+            beforeSelection: nativeSelection?())
+        }
       }
       guard accepted else { return }
       let insertedUnits = replacement.utf16.count
-      backing.replaceCharacters(in: range, with: replacement)
-      edited(.editedCharacters, range: range, changeInLength: insertedUnits - range.length)
+      do {
+        let trace = PerformanceTrace.begin("Editor.ManagedBackingMutation", event: performanceEvent)
+        defer { PerformanceTrace.end("Editor.ManagedBackingMutation", trace) }
+        backing.replaceCharacters(in: range, with: replacement)
+      }
+      do {
+        let trace = PerformanceTrace.begin("Editor.ManagedTextKitNotification", event: performanceEvent)
+        defer { PerformanceTrace.end("Editor.ManagedTextKitNotification", trace) }
+        edited(.editedCharacters, range: range, changeInLength: insertedUnits - range.length)
+      }
     } catch {
       mutationFailure = error
       MainActor.assumeIsolated { inputBinding?.recordRefusal(error); didRejectMutation?(error) }
@@ -159,6 +177,8 @@ final class PagedNativeTextStorage: NSTextStorage {
   let boundedStorage: PagedNativeTextStorage
   let inputBinding: PagedNativeInputBinding?
   private var inputCommandDepth = 0
+  private var performanceInputActive = false
+  private(set) var performanceEvent: UInt64 = 0
   private var commandSelection: PagedWorkingSelection?
   private var pendingDocumentCommand: (selector: Selector, observation: PagedNativeSelectionObservation)?
   private var selectionMutationDepth = 0
@@ -300,12 +320,16 @@ final class PagedNativeTextStorage: NSTextStorage {
     inputCommand { super.insertText(string, replacementRange: replacementRange) }
   }
   override func keyDown(with event: NSEvent) {
+    let trace = beginInputTiming()
+    defer { endInputTiming(trace) }
     guard admitsCommandDispatch() else { return }
     if inputBinding?.owner?.commandOwner?.interceptRawKey(event, from: self) == true { return }
     if inputBinding?.owner?.interceptDocumentKey(event, from: self) == true { return }
     inputCommand { super.keyDown(with: event) }
   }
   override func doCommand(by selector: Selector) {
+    let trace = beginInputTiming()
+    defer { endInputTiming(trace) }
     guard admitsCommandDispatch() else { return }
     if let owner = inputBinding?.owner?.commandOwner {
       if selector == NSSelectorFromString("undo:") { owner.request(.undo); return }
@@ -402,8 +426,31 @@ final class PagedNativeTextStorage: NSTextStorage {
     catch { rejectInput(error); return false }
   }
 
+  // keyDown can call doCommand/insertText/IME primitives. Only its outer
+  // synchronous scope owns a span; nested calls retain that observation ID.
+  private func beginInputTiming() -> PerformanceTrace.Span? {
+    guard !performanceInputActive, inputBinding?.state != .retired else { return nil }
+    let event = PerformanceTrace.nextEditorEvent()
+    guard event != 0, let trace = PerformanceTrace.begin("Editor.ManagedInput", event: event) else { return nil }
+    performanceInputActive = true
+    performanceEvent = event; boundedStorage.performanceEvent = event
+    return trace
+  }
+  private func endInputTiming(_ trace: PerformanceTrace.Span?) {
+    guard let trace else { return }
+    PerformanceTrace.end("Editor.ManagedInput", trace)
+    performanceInputActive = false
+  }
+  override func draw(_ dirtyRect: NSRect) {
+    let trace = PerformanceTrace.begin("Editor.ManagedDraw", event: performanceEvent)
+    defer { PerformanceTrace.end("Editor.ManagedDraw", trace) }
+    super.draw(dirtyRect)
+  }
+
   private func inputCommand(_ operation: () -> Void) {
     guard inputBinding?.state != .retired else { return }
+    let trace = beginInputTiming()
+    defer { endInputTiming(trace) }
     var bindingOpened = false
     do {
       try boundedStorage.admitsCurrentArena()

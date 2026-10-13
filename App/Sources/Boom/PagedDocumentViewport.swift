@@ -136,6 +136,9 @@ import Foundation
     view.sizeToFit()
   }
   override func layout() {
+    let trace = managedInput == nil ? nil : PerformanceTrace.begin("Editor.ManagedLayout",
+      event: (textView as? PagedNativeTextView)?.performanceEvent ?? 0)
+    defer { PerformanceTrace.end("Editor.ManagedLayout", trace) }
     super.layout()
     scrollSurface?.frame = contentView.frame
     guard managedInput != nil else { return }

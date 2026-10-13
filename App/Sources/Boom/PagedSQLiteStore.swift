@@ -171,7 +171,7 @@ final class PagedSQLiteStore: @unchecked Sendable {
   private var rootFD: Int32
   private var directoryFD: Int32
   private var identity: (UInt64, UInt64) = (0, 0)
-  private let path: String
+  private var path: String
   private let freshOpening: Bool
   private var openingStarted = false
   private var preflightFD: Int32 = -1
@@ -232,11 +232,7 @@ final class PagedSQLiteStore: @unchecked Sendable {
     self.vault = vault; self.ownerID = ownerID; self.engineIncarnation = engineIncarnation
     storeID = id; self.queue = queue; freshOpening = fresh
     rootFD = -1; directoryFD = -1
-    // SQLite NOFOLLOW rejects ancestor aliases such as macOS /var -> /private/var.
-    // Resolve the already-existing Vault root, keeping the no-follow open and
-    // the descriptor/private-mode/database-inode admission below unchanged.
-    path = vault.root.resolvingSymlinksInPath()
-      .appendingPathComponent("paged-sqlite-v3/store.sqlite").path
+    path = vault.root.appendingPathComponent("paged-sqlite-v3/store.sqlite").path
   }
   var isSourceAdmitted: Bool {
     dispatchPrecondition(condition: .onQueue(queue)); return connectionPolicyAdmitted
@@ -290,6 +286,17 @@ final class PagedSQLiteStore: @unchecked Sendable {
     preflightFD = -1
     if let admissionFailure { throw admissionFailure }
     identity = (UInt64(truncatingIfNeeded: before.st_dev), UInt64(before.st_ino))
+    // NOFOLLOW also rejects ancestor aliases. Resolve the admitted, existing
+    // database with the OS and keep its literal path: Foundation can shorten
+    // /private/var back to /var, reintroducing that symlink.
+    guard let physical = Darwin.realpath(path, nil) else {
+      throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    defer { free(physical) }
+    guard let canonical = String(validatingCString: physical) else {
+      throw BoomError.invalid("SQLite physical filename is not UTF-8.")
+    }
+    path = canonical
     // The actual pointer is stored BEFORE interpreting the return code. There
     // is no local `opened` pointer, ignored defer or close_v2 ownership gap.
     let sqliteOpenFlags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_PRIVATECACHE | SQLITE_OPEN_NOFOLLOW

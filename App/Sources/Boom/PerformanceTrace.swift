@@ -57,6 +57,20 @@ enum PerformanceTrace {
     return id
     #endif
   }
+  // One opt-in Main-actor observation sequence, independent of document/source
+  // generations. Disabled tracing does not advance it or read a clock.
+  @MainActor private static var editorEvent: UInt64 = 0
+  @MainActor static func nextEditorEvent() -> UInt64 {
+    #if BLOOM_DEVELOPER_STACK_DIAGNOSTICS
+    guard enabled && log.signpostsEnabled || DeveloperStackDiagnostics.isReady else { return 0 }
+    #else
+    guard enabled, log.signpostsEnabled else { return 0 }
+    #endif
+    guard editorEvent < UInt64.max else { return 0 }
+    editorEvent += 1
+    return editorEvent
+  }
+
   /// A diagnostic event number correlates a slow edit with its nested stages.
   /// It identifies only the observation, never a document or source value.
   static func begin(_ name: StaticString, event: UInt64) -> Span? {

@@ -358,6 +358,10 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
 
   private func reconcileCanonicalSeal(_ receipt: PagedNativeCanonicalSeal,
     subscription: PagedNativeGroupSubscription) throws {
+    // This synchronous work follows an awaited commit. Do not assign a later
+    // input event to that acknowledgement or include storage waiting as CPU work.
+    let trace = PerformanceTrace.begin("Editor.ManagedHistoryReconcile")
+    defer { PerformanceTrace.end("Editor.ManagedHistoryReconcile", trace) }
     guard subscription === groupSubscription, subscription.ownerID == input.ownerID,
       subscription.sessionID == input.session.sessionID,
       let incoming = receipt.projection, let previous = canonicalHistory,
