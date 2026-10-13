@@ -247,14 +247,26 @@ final class PagedTextRootCustody: @unchecked Sendable {
     }
   }
   func finishCapturedInstallation(_ controller: PagedTextRootLease, result: PagedCapturedEditResult) throws {
-    try update(controller) { e in
+    try state.withLock { s in
+      var e = try require(controller, s)
       guard e.current == result.record, e.session == result.sessionID, e.sequence == result.sequence,
         let saved = e.capturedResult, saved == result, saved.window.text.utf8.elementsEqual(result.window.text.utf8),
         e.pendingBatch == nil || e.pendingBatch == result.commandID, e.publicationComplete else {
         throw BoomError.stale("Captured installation has another actual output.")
       }
+      if let input = e.capturedInput, case .importedReplacement(_, let imported) = input.operation {
+        guard imported.lease != controller,
+          imported.value.revision.documentID == result.record.document.id else {
+          throw BoomError.stale("Streamed paste installation has another actual imported source.")
+        }
+        try admitJoinedSource(imported.lease, revision: imported.value.revision, state: s)
+        // Physical adoption and the same complete root have joined. Consume
+        // the real import output here, together with this receiving transition.
+        remove(imported.lease.id, &s)
+      }
       e.pendingBatch = nil; e.capturedInput = nil; e.claims = [.record(result.record)]
       e.reservation = PagedWorkingWindow.hardBytes + Self.maximumNativeMetadataBytes
+      s.entries[controller.id] = e
     }
   }
   func borrowNativeAcknowledgement(_ controller: PagedTextRootLease, batch: PagedNativeCommitBatch) throws -> PagedNativeCommitAcknowledgement {
@@ -324,6 +336,17 @@ final class PagedTextRootCustody: @unchecked Sendable {
   }
   func adoptUnclaimed(_ id: UUID) throws -> PagedTextRootLease { let lease = mint(id); _ = try state.withLock { try require(lease, $0) }; return lease }
   func claims(_ lease: PagedTextRootLease) throws -> [PagedTextRootClaim] { try state.withLock { try require(lease, $0).claims } }
+  func admitJoinedSource(_ lease: PagedTextRootLease, revision: PagedTextRevision) throws {
+    try state.withLock { try admitJoinedSource(lease, revision: revision, state: $0) }
+  }
+  private func admitJoinedSource(_ lease: PagedTextRootLease, revision: PagedTextRevision, state: State) throws {
+    let e = try require(lease, state)
+    guard case .operation = e.purpose, e.joined, !e.isJob, e.bulk == nil,
+      e.error == nil, e.phase == .output, e.pendingBatch == nil,
+      e.claims.contains(.source(revision)), e.claims.contains(.writerDocument(revision.documentID)) else {
+      throw BoomError.stale("Streamed editing requires its actual joined immutable source output.")
+    }
+  }
   func abandonJoined(_ lease: PagedTextRootLease) throws {
     try state.withLock { s in let e = try require(lease, s); guard e.joined, !e.isJob, e.bulk == nil,
       e.phase != .unresolved, e.pendingBatch == nil else { throw BoomError.stale("Unresolved input/output cannot be released.") }

@@ -53,6 +53,9 @@ protocol PagedNativeCapturedEditingStorage: PagedNativeSessionStorage {
   func commitUserReplacement(expected: PagedDocumentRootRecord, selection: PagedNativeNavigationSelection,
     replacement: Data, sessionID: UUID, commandID: UUID, groupID: UUID, sequence: UInt64,
     beforeCursor: PagedSealedCursor) async throws -> PagedCapturedEditResult
+  func commitImportedReplacement(expected: PagedDocumentRootRecord, selection: PagedNativeNavigationSelection,
+    imported: PagedTextCustodiedValue<PagedTextImportedRevision>, sessionID: UUID, commandID: UUID,
+    groupID: UUID, sequence: UInt64, beforeCursor: PagedSealedCursor) async throws -> PagedCapturedEditResult
   func commitLinePrefix(expected: PagedDocumentRootRecord, selection: PagedNativeNavigationSelection,
     prefix: String, sessionID: UUID, commandID: UUID, groupID: UUID, sequence: UInt64,
     beforeCursor: PagedSealedCursor) async throws -> PagedCapturedEditResult
@@ -65,6 +68,7 @@ struct PagedCapturedEditInput: Sendable {
   enum Operation: Sendable {
     case edits([PagedTextLocalEdit])
     case replacement(PagedNativeNavigationSelection, Data)
+    case importedReplacement(PagedNativeNavigationSelection, PagedTextCustodiedValue<PagedTextImportedRevision>)
     case linePrefix(PagedNativeNavigationSelection, String)
   }
   static let maximumEdits = 32
@@ -102,6 +106,7 @@ struct PagedCapturedEditInput: Sendable {
     case .replacement(_, let replacement):
       guard replacement.count <= Self.maximumInputBytes else { throw BoomError.budget("Replacement exceeds its fixed source buffer.") }
       bytes = replacement.count
+    case .importedReplacement: break // one bounded tree/lease value, no body buffer
     case .linePrefix(_, let prefix):
       guard !prefix.isEmpty, prefix.utf8.count <= 256,
         !prefix.unicodeScalars.contains(where: { [0x0A, 0x0D, 0x85, 0x2028, 0x2029].contains($0.value) }) else {

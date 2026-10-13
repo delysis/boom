@@ -2523,3 +2523,91 @@ fn prefix_wrong_scope_and_actual_cancelled_builder_preserve_current_and_other_jo
     assert_eq!(contents(&mut engine, &doc)?, text + "later");
     Ok(())
 }
+
+#[test]
+fn imported_tree_replacement_keeps_unaffected_source_and_reads_only_join_paths() -> Result<()> {
+    let owner = Uuid::new_v4();
+    let id = Uuid::new_v4();
+    let mut engine = TextEngine::with_cache_budget(MemoryPages::new(), 96 * 1024);
+    let original = engine
+        .import_utf8(owner, id, &mut "left🙂end".as_bytes(), &mut || false)?
+        .document;
+    let before = original.revision().clone();
+    let pattern = "e\u{301}🙂\n".as_bytes().to_vec();
+    let bytes = (48 * TEXT_PAGE_BYTES / pattern.len() * pattern.len()) as u64;
+    let imported = engine
+        .import_utf8(
+            owner,
+            id,
+            &mut Repeated {
+                pattern: pattern.clone(),
+                position: 0,
+                remaining: bytes,
+            },
+            &mut || false,
+        )?
+        .document;
+    let insertion = imported.revision().clone();
+    let mut edited = engine.open(before.clone())?;
+    let reads = engine.stats().read_bytes;
+    let result = engine.replace_user_tree(&mut edited, &before, 4..8, &insertion, &mut || false)?;
+    assert!(
+        engine.stats().read_bytes - reads < 8 * TEXT_PAGE_BYTES as u64,
+        "Composition must not read the inserted multi-megabyte body"
+    );
+    assert_eq!(result.summary().bytes, 7 + bytes);
+    let start = engine.window(&edited, &result, 0, 4 + pattern.len())?;
+    assert_eq!(
+        start.text,
+        format!(
+            "left{}",
+            std::str::from_utf8(&pattern).expect("The fixed Unicode pattern is UTF-8")
+        )
+    );
+    let end = engine.window(&edited, &result, 4 + bytes, 4)?;
+    assert_eq!(end.text, "end");
+    assert_eq!(contents(&mut engine, &original)?, "left🙂end");
+    let unchanged = edited.revision().clone();
+    assert!(
+        engine
+            .replace_user_tree(&mut edited, &unchanged, 0..0, &insertion, &mut || true)
+            .is_err()
+    );
+    assert_eq!(edited.revision(), &unchanged);
+    let mut cancellation_checks = 0;
+    assert!(
+        engine
+            .replace_user_tree(&mut edited, &unchanged, 0..1, &insertion, &mut || {
+                cancellation_checks += 1;
+                cancellation_checks == 2
+            })
+            .is_err(),
+        "Cancellation after the real split must not replace the accepted root"
+    );
+    assert_eq!(cancellation_checks, 2);
+    assert_eq!(edited.revision(), &unchanged);
+    assert!(engine.stats().charged_bytes <= 96 * 1024);
+    let foreign = engine
+        .import_utf8(owner, Uuid::new_v4(), &mut "x".as_bytes(), &mut || false)?
+        .document;
+    assert!(
+        engine
+            .replace_user_tree(
+                &mut edited,
+                &unchanged,
+                0..0,
+                foreign.revision(),
+                &mut || false
+            )
+            .is_err()
+    );
+    assert_eq!(edited.revision(), &unchanged);
+    assert!(
+        engine
+            .replace_user_tree(&mut edited, &unchanged, 5..6, &insertion, &mut || false)
+            .is_err(),
+        "A start inside a multibyte scalar is not an admitted source range"
+    );
+    assert_eq!(edited.revision(), &unchanged);
+    Ok(())
+}

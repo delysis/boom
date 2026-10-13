@@ -49,10 +49,7 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
     return try root(parent: URL(fileURLWithPath: path, isDirectory: true))
   }
   private func open(_ root: URL, requiresActualKeyWindow: Bool = true) async throws -> WorkspaceModel {
-    let application = NSApplication.shared
-    guard application.setActivationPolicy(.regular) else {
-      throw BoomError.unavailable("The public native control could not activate its ordinary application.")
-    }
+    try PagedNativeFixtureApplication.bootstrap()
     let store = try await Task.detached { try WorkspaceStore(rootOverride: root) }.value
     let model: WorkspaceModel
     do { model = try await WorkspaceModel(storeOverride: store, loadModels: false) }
@@ -706,6 +703,215 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
     guard (testRun?.failureCount ?? 0) == failures else {
       throw BoomError.invalid("Actual visual-arrow assertions failed; source, Cocoa target and physical owners retained.")
     }
+    try await joinedClose(model); try await removeJoinedScratch(scratch)
+  }
+
+  func testActualStreamedClipboardCutPasteUndoRedoKeepsWholeSourceAndOriginalGlobalSelection() async throws {
+    let failures = testRun?.failureCount ?? 0
+    let scratch = try root(), model = try await open(scratch)
+    let source = try await writeSource(scratch, edgeText: "e\u{301}👩🏽‍💻")
+    try await model.importDocuments([source], flag: CancellationFlag())
+    try await focusCurrentEditor(model)
+    let original = try XCTUnwrap(model.pagedSelectedRecord)
+    let engine = try XCTUnwrap(model.pagedEngine), commands = try XCTUnwrap(model.pagedCommands)
+    let digest = try await engine.wholeTextSha256(original.document.revision)
+    let selection = PagedNativeNavigationSelection(utf16Offset: 0,
+      utf16Length: original.document.revision.summary.utf16, focusAtEnd: false, affinity: .upstream)
+    try XCTUnwrap(model.pagedInput).setDocumentSelection(selection)
+    let attachments = model.pendingAttachments
+    // Deliver actual Cocoa commands through the lexical native scope. Cut
+    // waits for the streamed file's real pasteboard publication before delete.
+    try XCTUnwrap(model.pagedInput?.activeView).doCommand(by: NSSelectorFromString("cut:"))
+    try await commands.joinPendingCommand(); try await model.flush()
+    let cut = try XCTUnwrap(model.pagedSelectedRecord)
+    XCTAssertEqual(cut.document.revision.summary.bytes, 0)
+    let clipboard = try XCTUnwrap(try PagedClipboardTextFile.read(.general))
+    let fileBytes = try await Task.detached {
+      let opened = try clipboard.open()
+      let count = opened.expectedBytes
+      try opened.close()
+      return count
+    }.value
+    XCTAssertEqual(fileBytes, original.document.revision.summary.bytes)
+    XCTAssertNil(NSPasteboard.general.string(forType: .string), "Large Copy publishes a real file, not an eager GB text buffer.")
+    try XCTUnwrap(model.pagedInput?.activeView).doCommand(by: NSSelectorFromString("paste:"))
+    try await commands.joinPendingCommand(); try await model.flush()
+    let pasted = try XCTUnwrap(model.pagedSelectedRecord)
+    XCTAssertEqual(pasted.document.revision.summary, original.document.revision.summary)
+    XCTAssertEqual(pasted.historyGeneration, cut.historyGeneration + 1, "The imported tree is one canonical Paste group.")
+    let pastedDigest = try await engine.wholeTextSha256(pasted.document.revision)
+    XCTAssertEqual(pastedDigest, digest)
+    XCTAssertEqual(model.pendingAttachments, attachments, "Our explicit text-file marker must not become an attachment.")
+    XCTAssertLessThanOrEqual(try XCTUnwrap(model.pagedInput?.activeView).string.utf8.count, PagedWorkingWindow.hardBytes)
+    XCTAssertEqual(engine.custodySnapshot.jobs, 0)
+    XCTAssertFalse(engine.custodySnapshot.items.contains { item in
+      if case .operation = item.purpose { return true }; return false
+    }, "The real import output is consumed by the physical installation join.")
+
+    commands.manager.undo(); try await commands.joinPendingCommand(); try await model.flush()
+    XCTAssertEqual(model.pagedSelectedRecord?.document.revision, cut.document.revision)
+    commands.manager.undo(); try await commands.joinPendingCommand(); try await model.flush()
+    XCTAssertEqual(model.pagedSelectedRecord?.document.revision, original.document.revision)
+    XCTAssertEqual(try XCTUnwrap(model.pagedInput).currentDocumentSelection(), selection)
+    commands.manager.redo(); try await commands.joinPendingCommand(); try await model.flush()
+    XCTAssertEqual(model.pagedSelectedRecord?.document.revision, cut.document.revision)
+    commands.manager.redo(); try await commands.joinPendingCommand(); try await model.flush()
+    XCTAssertEqual(model.pagedSelectedRecord?.document.revision, pasted.document.revision)
+    let redoneDigest = try await engine.wholeTextSha256(try XCTUnwrap(model.pagedSelectedRecord).document.revision)
+    XCTAssertEqual(redoneDigest, digest)
+    XCTAssertLessThanOrEqual(try XCTUnwrap(model.pagedInput?.activeView).string.utf8.count, PagedWorkingWindow.hardBytes)
+    guard (testRun?.failureCount ?? 0) == failures else { throw BoomError.invalid("Actual streamed Paste assertions failed; source/window retained.") }
+    try await joinedClose(model); try await removeJoinedScratch(scratch)
+  }
+
+  func testActualClipboardTextIntentCapturesOriginalDescriptorAcrossBoardAndPathChanges() async throws {
+    let failures = testRun?.failureCount ?? 0
+    let scratch = try root(), source = try await writeSource(scratch)
+    let board = NSPasteboard(name: NSPasteboard.Name("Bloom-text-intent-\(UUID().uuidString)"))
+    let plainURL = NSPasteboardItem()
+    XCTAssertTrue(plainURL.setString(source.absoluteString, forType: .fileURL))
+    board.clearContents(); XCTAssertTrue(board.writeObjects([plainURL]))
+    XCTAssertNil(try PagedClipboardTextFile.read(board), "An unmarked file URL remains ordinary attachment Paste.")
+    let explicit = try XCTUnwrap(try PagedClipboardTextFile.read(board, explicitlyPlainText: true))
+    try explicit.admitCurrent()
+    try PagedClipboardTextFile.write(source, to: board)
+    XCTAssertThrowsError(try explicit.admitCurrent(), "A different board generation cannot reuse an uncaptured Paste intent.")
+    let marked = try XCTUnwrap(try PagedClipboardTextFile.read(board))
+    try marked.admitCurrent()
+    let opened = try await Task.detached { try marked.open() }.value
+    // New clipboard content is independent of the descriptor already owned
+    // by the accepted Paste. Only a new uncaptured use of marked is stale.
+    board.clearContents(); XCTAssertTrue(board.setString("different", forType: .string))
+    XCTAssertThrowsError(try marked.admitCurrent())
+    try await Task.detached {
+      var closeAttempted = false
+      do {
+        let old = scratch.appendingPathComponent("retained-original-source.md")
+        try FileManager.default.moveItem(at: source, to: old)
+        guard FileManager.default.createFile(atPath: source.path, contents: Data("replacement".utf8)) else {
+          throw BoomError.unavailable("Could not prepare the distinct public filename witness.")
+        }
+        try opened.admit()
+        guard opened.expectedBytes == 3_145_728,
+          try opened.file.read(upToCount: 64) == Data(repeating: UInt8(97), count: 64) else {
+          throw BoomError.invalid("Captured Paste did not retain the original descriptor bytes.")
+        }
+        // An in-place write to that SAME captured inode remains a torn-input
+        // refusal; changing the pathname was not a new source capability.
+        let writer = try FileHandle(forWritingTo: old)
+        var writerCloseAttempted = false
+        do {
+          try writer.write(contentsOf: Data("changed".utf8)); try writer.synchronize()
+          writerCloseAttempted = true; try writer.close()
+        } catch {
+          let original = error
+          if !writerCloseAttempted {
+            do { try writer.close() }
+            catch { throw BoundedWorkspaceCleanupFailure(original: original, cleanup: error) }
+          }
+          throw original
+        }
+        do { try opened.admit(); throw BoomError.invalid("The captured inode's in-place mutation was admitted.") }
+        catch let error as BoomError {
+          guard case .stale = error else { throw error }
+        }
+        closeAttempted = true; try opened.close()
+      } catch {
+        let original = error
+        if !closeAttempted {
+          do { try opened.close() }
+          catch { throw BoundedWorkspaceCleanupFailure(original: original, cleanup: error) }
+        }
+        throw original
+      }
+    }.value
+    board.clearContents()
+    guard (testRun?.failureCount ?? 0) == failures else { throw BoomError.invalid("Actual clipboard capture assertions failed; public files retained.") }
+    try await removeJoinedScratch(scratch)
+  }
+
+  func testActualStaleClipboardBeforeCaptureLeavesLaterNativeTypingAndUndoUsable() async throws {
+    let failures = testRun?.failureCount ?? 0
+    let scratch = try diagnosticRoot(), model = try await open(scratch, requiresActualKeyWindow: false)
+    let source = try await writeSource(scratch)
+    let input = try XCTUnwrap(model.pagedInput), view = try XCTUnwrap(input.activeView)
+    let commands = try XCTUnwrap(model.pagedCommands), session = try XCTUnwrap(model.pagedSession)
+    let record = try XCTUnwrap(model.pagedSelectedRecord), generation = session.generation
+    let capture = try await model.captureDocument(record.document.id)
+    let before = try XCTUnwrap(capture.completeSnapshot).text
+    let board = NSPasteboard(name: NSPasteboard.Name("Bloom-before-Paste-\(UUID().uuidString)"))
+    try PagedClipboardTextFile.write(source, to: board)
+    let original = try XCTUnwrap(try PagedClipboardTextFile.read(board))
+    board.clearContents(); XCTAssertTrue(board.setString("new clipboard", forType: .string))
+    XCTAssertThrowsError(try model.pasteDocumentTextFile(original, from: view))
+    XCTAssertEqual(model.pagedSelectedRecord, record); XCTAssertEqual(session.generation, generation)
+    XCTAssertNil(input.firstRefusal); XCTAssertNil(view.inputBinding?.firstRefusal)
+    XCTAssertNil(view.boundedStorage.mutationFailure); XCTAssertNil(model.errorMessage)
+    view.setSelectedRange(NSRange(location: before.utf16.count, length: 0))
+    view.insertText("p", replacementRange: NSRange(location: NSNotFound, length: 0))
+    try await commands.joinPendingCommand(); try await model.flush()
+    let edited = try await model.captureDocument(record.document.id)
+    XCTAssertEqual(edited.completeSnapshot?.text, before + "p")
+    commands.manager.undo(); try await commands.joinPendingCommand(); try await model.flush()
+    let undone = try await model.captureDocument(record.document.id)
+    XCTAssertEqual(undone.completeSnapshot?.text, before)
+    XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure); XCTAssertNil(model.errorMessage)
+    board.clearContents()
+    guard (testRun?.failureCount ?? 0) == failures else { throw BoomError.invalid("Before-capture clipboard assertions failed; public source retained.") }
+    try await joinedClose(model); try await removeJoinedScratch(scratch)
+  }
+
+  func testActualCompletedPasteImportCancellationJoinsOutputWithoutSourceOrHistoryMutation() async throws {
+    let failures = testRun?.failureCount ?? 0
+    let scratch = try root(), model = try await open(scratch)
+    let source = try await writeSource(scratch)
+    let engine = try XCTUnwrap(model.pagedEngine), commands = try XCTUnwrap(model.pagedCommands)
+    let original = try XCTUnwrap(model.pagedSelectedRecord)
+    let selected = try XCTUnwrap(model.pagedInput).currentDocumentSelection()
+    var discarded = false
+    let task = try commands.requestDocumentImportedReplacement(selected, importing: { record in
+      let opened = try await Task.detached { try PagedClipboardTextFile.Opened(url: source) }.value
+      let output: PagedTextCustodiedValue<PagedTextImportedRevision>
+      do {
+        output = try await engine.importUTF8Retaining(documentID: record.document.id, from: opened.file,
+          expectedBytes: opened.expectedBytes, priority: .foreground)
+      } catch {
+        let original = error
+        do { try opened.close() }
+        catch { throw BoundedWorkspaceCleanupFailure(original: original, cleanup: error) }
+        throw original
+      }
+      var closeAttempted = false
+      do {
+        try await Task.detached { try opened.admit() }.value
+        closeAttempted = true; try await Task.detached { try opened.close() }.value
+      }
+      catch {
+        var original: Error = error
+        if !closeAttempted {
+          do { try await Task.detached { try opened.close() }.value }
+          catch { original = BoundedWorkspaceCleanupFailure(original: original, cleanup: error) }
+        }
+        do { try await engine.abandonJoinedRootOutput(output.lease) }
+        catch { throw PagedTextCustodyHandoffFailure(original: original, handoff: error, lease: output.lease) }
+        throw original
+      }
+      withUnsafeCurrentTask { $0?.cancel() } // after the actual completed import, before native writer admission
+      return output
+    }, discard: { lease in
+      try await engine.abandonJoinedRootOutput(lease); discarded = true
+    })
+    do { _ = try await task.value; XCTFail("Cancelled source preparation must not publish Paste.") }
+    catch is CancellationError { }
+    XCTAssertTrue(discarded, "The actual joined import lease needs an explicit abandonment.")
+    XCTAssertEqual(model.pagedSelectedRecord, original)
+    XCTAssertEqual(try XCTUnwrap(model.pagedInput).currentDocumentSelection(), selected)
+    XCTAssertEqual(engine.custodySnapshot.jobs, 0)
+    XCTAssertFalse(engine.custodySnapshot.items.contains { item in
+      if case .operation = item.purpose { return true }; return false
+    })
+    try await model.flush()
+    guard (testRun?.failureCount ?? 0) == failures else { throw BoomError.invalid("Actual cancelled Paste assertions failed; source/window retained.") }
     try await joinedClose(model); try await removeJoinedScratch(scratch)
   }
 

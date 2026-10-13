@@ -18,6 +18,14 @@ private final class ScrollWriterHold: @unchecked Sendable {
   var isHeld: Bool { held.load(ordering: .relaxed) }
 }
 
+private struct ScrollClickJoinFailure: Error, LocalizedError {
+  let original: Error
+  let cleanup: Error
+  var errorDescription: String? {
+    "\(original.localizedDescription) Actual task join also failed: \(cleanup.localizedDescription)"
+  }
+}
+
 @MainActor final class PagedNativeScrollProjectionTests: XCTestCase {
   private static var failedOutputs: PagedFileEngineControlOutputs?
   private static var nativeOwners: (PagedNativeSession, PagedNativeInputOwner,
@@ -208,6 +216,141 @@ private final class ScrollWriterHold: @unchecked Sendable {
       try commands.closeInput(); window.contentView = nil; window.close()
       await route.closeAndJoin()
       try await backend.detachJoinedController(sessionID: session.sessionID, sequence: session.generation, record: saved)
+      Self.nativeOwners = nil
+    }
+  }
+
+  func testActualContainedScrollClickKeepsShiftAnchorAndLaterTypingWhileWriterIsHeld() async throws {
+    try await fixture { outputs, publisher in
+      let failures = testRun?.failureCount ?? 0
+      try PagedNativeFixtureApplication.bootstrap()
+      let text = String(repeating: "public é🙂\n", count: 4_000)
+      let imported = try await outputs.imported(Data(text.utf8))
+      let original = try await outputs.publish(imported, title: "Public dirty local click", publisher: publisher)
+      let backend = try await outputs.engine.makeNativeStorage(publisher, expected: original)
+      let opening = try await backend.opening(sessionID: UUID())
+      let route = PagedStagedControlledStorage(backend)
+      let session = try PagedNativeSession(opening: opening, storage: route)
+      let input = try PagedNativeInputOwner(frame: NSRect(x: 0, y: 0, width: 640, height: 320), session: session)
+      let commands = try PagedNativeUndoOwner(input: input)
+      let view = try XCTUnwrap(input.activeView)
+      let viewport = try PagedDocumentViewport(frame: view.frame, input: input)
+      try viewport.enableDocumentNavigation(engine: outputs.engine, publisher: publisher)
+      commands.mountView = { old, new in try viewport.mountManagedView(from: old, to: new) }
+      let window = NSWindow(contentRect: viewport.frame, styleMask: [.titled, .closable], backing: .buffered, defer: false)
+      window.isReleasedWhenClosed = false; window.contentView = viewport
+      Self.nativeOwners = (session, input, commands, route, backend, window)
+      try await PagedNativeFixtureApplication.focus(view, in: window)
+      guard viewport.textView === view else { throw BoomError.stale("The public click control changed its mounted client.") }
+      let gate = ScrollWriterHold(expectation(description: "actual writer body entered for local click"))
+      let writer = Task { try await outputs.engine.storageExecutorForTesting.run { gate.enter() } }
+      var reads: [Task<Void, Error>] = [] // exactly the two entered presentation joins below
+      var failure: Error?
+      @MainActor func readWhileHeld() async throws {
+        guard reads.count < 2 else { throw BoomError.invalid("The local click control exceeded its two real reads.") }
+        try viewport.requestScroll(toUTF16: 0)
+        let complete = expectation(description: "dirty copied scroll returned while writer remains entered")
+        let read = Task { defer { complete.fulfill() }; try await viewport.joinPresentation() }
+        reads.append(read)
+        guard await XCTWaiter.fulfillment(of: [complete], timeout: 5) == .completed else {
+          throw BoomError.unavailable("Local click display remained coupled to the held writer.")
+        }
+        try await read.value
+        XCTAssertTrue(gate.isHeld)
+      }
+      do {
+        guard await XCTWaiter.fulfillment(of: [gate.entered], timeout: 5) == .completed else {
+          throw BoomError.unavailable("The actual public writer body did not enter.")
+        }
+        view.setSelectedRange(NSRange(location: 4, length: 0))
+        view.insertText("X", replacementRange: view.selectedRange())
+        let accepted = session.generation, arena = session.arenaID
+        XCTAssertGreaterThan(accepted, opening.history.scope.coveredSequence)
+        XCTAssertLessThan(session.localUTF16Count, 30_000)
+        XCTAssertEqual(session.sealedRevision, original.document.revision)
+        // Actual global anchor lies beyond the native island; focus is local.
+        try input.setDocumentSelection(PagedNativeNavigationSelection(utf16Offset: 0,
+          utf16Length: 30_000, focusAtEnd: false, affinity: .upstream))
+        try await readWhileHeld()
+        let displayed = try XCTUnwrap(viewport.visibleScrollWindow)
+        XCTAssertEqual(displayed.utf16Start, 0); XCTAssertTrue(displayed.text.hasPrefix("publXic"))
+        XCTAssertFalse(commands.hasPendingCommand)
+        try viewport.selectVisibleUTF16(5, extending: true)
+        let extended = try input.currentDocumentSelection()
+        XCTAssertEqual(extended.utf16Offset, 5); XCTAssertEqual(extended.utf16Length, 29_995)
+        XCTAssertEqual(extended.anchorUTF16, 30_000); XCTAssertFalse(extended.focusAtEnd)
+        XCTAssertEqual(extended.affinity, .upstream)
+        XCTAssertEqual(session.generation, accepted); XCTAssertEqual(session.arenaID, arena)
+        XCTAssertEqual(session.activeNavigationOperationCount, 0); XCTAssertFalse(commands.hasPendingCommand)
+        XCTAssertTrue(input.activeView === view); XCTAssertTrue(viewport.textView === view)
+        XCTAssertNil(viewport.visibleScrollWindow); XCTAssertEqual(session.sealedRevision, original.document.revision)
+        // A second real display/click sets the caret, then ordinary native
+        // typing is accepted BEFORE this actual executor/writer is released.
+        try await readWhileHeld()
+        try viewport.selectVisibleUTF16(5)
+        let clicked = try input.currentDocumentSelection()
+        XCTAssertEqual(clicked.utf16Offset, 5); XCTAssertEqual(clicked.utf16Length, 0)
+        XCTAssertEqual(session.generation, accepted); XCTAssertEqual(session.arenaID, arena)
+        XCTAssertEqual(session.activeNavigationOperationCount, 0); XCTAssertFalse(commands.hasPendingCommand)
+        view.insertText("Y", replacementRange: view.selectedRange())
+        XCTAssertEqual(session.generation, accepted + 1); XCTAssertTrue(view.string.hasPrefix("publXYic"))
+        XCTAssertTrue(gate.isHeld); XCTAssertEqual(session.sealedRevision, original.document.revision)
+        XCTAssertNil(input.firstRefusal); XCTAssertNil(view.boundedStorage.mutationFailure)
+      } catch { failure = error }
+      // Join EVERY real task, including a timed-out read, on both paths. No
+      // failed public fixture is closed/deleted while an entered writer lives.
+      gate.release()
+      do { try await writer.value } catch {
+        if let original = failure { failure = ScrollClickJoinFailure(original: original, cleanup: error) }
+        else { failure = error }
+      }
+      for read in reads {
+        do { try await read.value } catch {
+          if let original = failure { failure = ScrollClickJoinFailure(original: original, cleanup: error) }
+          else { failure = error }
+        }
+      }
+      // A faulty old path may have entered a real navigation Task despite
+      // the local-click oracle. Join it and ordinary accepted edits too;
+      // retain any source refusal, without retry/repair or failed teardown.
+      do { try await commands.joinPendingCommand() } catch {
+        if let original = failure { failure = ScrollClickJoinFailure(original: original, cleanup: error) }
+        else { failure = error }
+      }
+      do { _ = try await session.flush(through: session.generation) } catch {
+        if let original = failure { failure = ScrollClickJoinFailure(original: original, cleanup: error) }
+        else { failure = error }
+      }
+      if let failure { throw failure }
+      guard (testRun?.failureCount ?? 0) == failures else {
+        throw BoomError.invalid("Held local-click assertions failed; actual source/input owners retained.")
+      }
+      let saved = outputs.retain(try await outputs.engine.currentDocumentRecordRetaining(publisher,
+        documentID: original.document.id))
+      let expected = NSMutableString(string: text)
+      expected.insert("XY", at: 4)
+      let digest = try await outputs.engine.wholeTextSha256(saved.document.revision)
+      XCTAssertEqual(digest, Digest.sha256(Data((expected as String).utf8)))
+      let undo = NSSelectorFromString("undo:"), item = NSMenuItem(title: "Undo", action: undo, keyEquivalent: "z")
+      for _ in 0..<2 {
+        let active = try XCTUnwrap(input.activeView)
+        guard window.isKeyWindow, let responder = window.firstResponder, responder === active,
+          active.validateUserInterfaceItem(item), responder.tryToPerform(undo, with: item) else {
+          throw BoomError.unavailable("The public local-click responder did not retain actual canonical Undo.")
+        }
+        try await commands.joinPendingCommand(); _ = try await session.flush(through: session.generation)
+      }
+      XCTAssertEqual(session.sealedRevision, original.document.revision)
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, 4)
+      XCTAssertNil(session.persistenceFailure); XCTAssertNil(input.firstRefusal)
+      guard (testRun?.failureCount ?? 0) == failures else {
+        throw BoomError.invalid("Local-click source/Undo assertions failed; native and file owners retained.")
+      }
+      try await viewport.closePresentation(); try commands.closeInput()
+      window.contentView = nil; window.close(); await route.closeAndJoin()
+      let final = outputs.retain(try await outputs.engine.currentDocumentRecordRetaining(publisher,
+        documentID: original.document.id))
+      try await backend.detachJoinedController(sessionID: session.sessionID, sequence: session.generation, record: final)
       Self.nativeOwners = nil
     }
   }

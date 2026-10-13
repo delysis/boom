@@ -239,6 +239,16 @@ actor PagedStagedControlledStorage: PagedNativeHistorySessionStorage, PagedNativ
         groupID: groupID, sequence: sequence, beforeCursor: beforeCursor)
     }
   }
+  func commitImportedReplacement(expected: PagedDocumentRootRecord, selection: PagedNativeNavigationSelection,
+    imported: PagedTextCustodiedValue<PagedTextImportedRevision>, sessionID: UUID, commandID: UUID,
+    groupID: UUID, sequence: UInt64, beforeCursor: PagedSealedCursor) async throws -> PagedCapturedEditResult {
+    let backend = backend
+    return try await forward(before: .capturedBefore, after: .capturedAfter) {
+      try await backend.commitImportedReplacement(expected: expected, selection: selection,
+        imported: imported, sessionID: sessionID, commandID: commandID,
+        groupID: groupID, sequence: sequence, beforeCursor: beforeCursor)
+    }
+  }
   func commitLinePrefix(expected: PagedDocumentRootRecord, selection: PagedNativeNavigationSelection,
     prefix: String, sessionID: UUID, commandID: UUID, groupID: UUID, sequence: UInt64,
     beforeCursor: PagedSealedCursor) async throws -> PagedCapturedEditResult {

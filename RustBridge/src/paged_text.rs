@@ -350,6 +350,12 @@ enum Request {
         byte_end: u64,
         new_text: String,
     },
+    ReplaceUserTree {
+        revision: Revision,
+        byte_start: u64,
+        byte_end: u64,
+        retained: Revision,
+    },
     BytePosition {
         revision: Revision,
         byte_start: u64,
@@ -602,6 +608,21 @@ fn execute(
                 byte_start..byte_end,
                 None,
                 &new_text,
+                &mut cancelled
+            )?))
+        }
+        Request::ReplaceUserTree {
+            revision,
+            byte_start,
+            byte_end,
+            retained,
+        } => {
+            let mut document = engine.open(revision.clone())?;
+            Ok(json!(engine.replace_user_tree(
+                &mut document,
+                &revision,
+                byte_start..byte_end,
+                &retained,
                 &mut cancelled
             )?))
         }

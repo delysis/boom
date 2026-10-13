@@ -198,6 +198,7 @@ final class PagedNativeTextStorage: NSTextStorage {
   private var pendingDocumentCommand: (selector: Selector, observation: PagedNativeSelectionObservation)?
   private var pendingDocumentReplacement: (selection: PagedNativeNavigationSelection, bytes: Data)?
   private var pendingDocumentClipboard: Bool?
+  private var pendingDocumentTextPaste: PagedClipboardTextFile?
   private var pendingDocumentWrapping: (selection: PagedNativeNavigationSelection, prefix: String, suffix: String, toggles: Bool, name: String)?
   private var typingIntent: PagedNativeInputOwner.TypingIntent?
   private var selectionMutationDepth = 0
@@ -463,7 +464,29 @@ final class PagedNativeTextStorage: NSTextStorage {
   }
 
   override func paste(_ sender: Any?) {
+    do {
+      if let source = try PagedClipboardTextFile.read(.general) {
+        try requestTextFilePaste(source); return
+      }
+    } catch { didRejectInput?(error); return }
     inputCommand { super.paste(sender) }
+  }
+
+  override func pasteAsPlainText(_ sender: Any?) {
+    do {
+      if let source = try PagedClipboardTextFile.read(.general, explicitlyPlainText: true) {
+        try requestTextFilePaste(source); return
+      }
+    } catch { didRejectInput?(error); return }
+    inputCommand { super.pasteAsPlainText(sender) }
+  }
+
+  private func requestTextFilePaste(_ source: PagedClipboardTextFile) throws {
+    guard let owner else { throw BoomError.stale("Text paste lost its document workspace.") }
+    if inputCommandDepth > 0 {
+      guard pendingDocumentTextPaste == nil else { throw BoomError.stale("Text paste already owns this native command.") }
+      pendingDocumentTextPaste = source
+    } else { _ = try owner.pasteDocumentTextFile(source, from: self) }
   }
 
   private func requestClipboard(cutting: Bool) throws {
@@ -739,6 +762,11 @@ final class PagedNativeTextStorage: NSTextStorage {
         if let cutting = pendingDocumentClipboard {
           pendingDocumentClipboard = nil
           do { try requestClipboard(cutting: cutting) }
+          catch { didRejectInput?(error) }
+        }
+        if let source = pendingDocumentTextPaste {
+          pendingDocumentTextPaste = nil
+          do { try requestTextFilePaste(source) }
           catch { didRejectInput?(error) }
         }
         if let pending = pendingDocumentReplacement {

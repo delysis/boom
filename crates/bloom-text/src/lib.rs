@@ -1083,6 +1083,57 @@ impl<S: PageProvider> TextEngine<S> {
         document.revision = after.clone();
         Ok(after)
     }
+    /// Compose a previously imported tree into an exact user range. Import
+    /// and publication remain host-owned; no selected or inserted body is
+    /// materialized here, and unrelated source subtrees are shared.
+    pub fn replace_user_tree(
+        &mut self,
+        document: &mut Document,
+        expected: &Revision,
+        range: Range<u64>,
+        inserted: &Revision,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<Revision> {
+        if expected != document.revision() {
+            return Err(Error::Stale);
+        }
+        if inserted.owner_id != expected.owner_id || inserted.document_id != expected.document_id {
+            return Err(Error::Invalid("replacement tree owner"));
+        }
+        check_cancel(cancelled)?;
+        if range.start > range.end || range.end > expected.summary().bytes {
+            return Err(Error::Invalid("replacement tree range"));
+        }
+        self.open(inserted.clone())?;
+        if let Some(root) = &expected.root {
+            self.prefix_summary(expected, root, range.start)?;
+            self.prefix_summary(expected, root, range.end)?;
+        }
+        if range.start == range.end && inserted.root.is_none() {
+            return Ok(expected.clone());
+        }
+        let (left, tail) = match &expected.root {
+            Some(root) => self.split(expected, root, range.start)?,
+            None => (None, None),
+        };
+        let right = match tail {
+            Some(root) => self.split(expected, &root, range.end - range.start)?.1,
+            None => None,
+        };
+        check_cancel(cancelled)?;
+        let prefix = self.join(expected, left, inserted.root.clone())?;
+        let joined = self.join(expected, prefix, right)?;
+        let root = self.collapse_root(expected, joined)?;
+        check_cancel(cancelled)?;
+        let result = Revision {
+            root,
+            ..expected.clone()
+        };
+        result.validate()?;
+        document.revision = result.clone();
+        Ok(result)
+    }
+
     /// Undo/redo checks ownership and the expected current revision, then opens
     /// only the retained root. The host retains history on disk, not this engine.
     pub fn checkout(

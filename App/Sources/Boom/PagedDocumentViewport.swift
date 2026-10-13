@@ -323,12 +323,10 @@ import Foundation
   }
   private func selectScrollPoint(_ point: NSPoint, extending: Bool) {
     do {
-      guard let view = scrollText, let manager = view.layoutManager, let container = view.textContainer else {
+      guard let view = scrollText, view.layoutManager != nil, view.textContainer != nil else {
         throw BoomError.stale("The visible source window has no bounded native layout.")
       }
-      let glyph = manager.glyphIndex(for: NSPoint(x: point.x - view.textContainerOrigin.x,
-        y: point.y - view.textContainerOrigin.y), in: container)
-      let local = manager.numberOfGlyphs == 0 ? 0 : manager.characterIndexForGlyph(at: min(glyph, manager.numberOfGlyphs - 1))
+      let local = view.characterIndexForInsertion(at: point)
       try selectVisibleUTF16(local, extending: extending)
     } catch { failPresentation(error) }
   }
@@ -359,6 +357,19 @@ import Foundation
         utf16Length: max(fixed, absolute.partialValue) - min(fixed, absolute.partialValue),
         focusAtEnd: absolute.partialValue >= fixed, affinity: original.affinity)
     } else { selection = PagedNativeNavigationSelection(utf16Offset: absolute.partialValue, utf16Length: 0) }
+    let nativeEnd = current.utf16Start.addingReportingOverflow(UInt64(current.localUTF16))
+    if !nativeEnd.overflow, !owner.hasPendingCommand, input.session.isCurrent(snapshot),
+      selection.focusUTF16 >= current.utf16Start, selection.focusUTF16 <= nativeEnd.partialValue,
+      let focus = Int(exactly: selection.focusUTF16 - current.utf16Start) {
+      // The copied display and this dirty native island name the SAME exact
+      // source generation. Selection is not a new window or a durable grant.
+      // Keep an outside Shift anchor; only its actual focus must be mounted.
+      _ = try input.session.nativeSelection(NSRange(location: focus, length: 0))
+      try input.setDocumentSelection(selection)
+      revealEditableWindow()
+      view.scrollRangeToVisible(NSRange(location: focus, length: 0))
+      return
+    }
     try owner.requestDocumentNavigation(toUTF16: anchor, selectingUTF16: selection, expected: current)
     revealEditableWindow()
   }

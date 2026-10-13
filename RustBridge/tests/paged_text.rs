@@ -733,6 +733,80 @@ fn paragraph_prefix_steps(host: &mut Host, original: &Value) {
     );
 }
 
+fn imported_tree_replacement(host: &mut Host, original: &Value) {
+    let operation = current_operation(host, false);
+    let before_bytes = original["root"]["summary"]["bytes"]
+        .as_u64()
+        .expect("bounded source summary");
+    let pasted = response(
+        host.handle,
+        json!({"op":"replace_user_tree", "revision":original,
+            "byteStart":0, "byteEnd":0, "retained":original}),
+        operation,
+    );
+    assert_eq!(pasted["ok"], true, "{pasted}");
+    assert_eq!(
+        pasted["value"]["root"]["summary"]["bytes"],
+        2 * before_bytes
+    );
+    let first = response(
+        host.handle,
+        json!({"op":"window", "revision":original, "byteStart":0, "maximumBytes":16}),
+        operation,
+    );
+    let second = response(
+        host.handle,
+        json!({"op":"window", "revision":pasted["value"], "byteStart":before_bytes, "maximumBytes":16}),
+        operation,
+    );
+    assert_eq!(first["value"]["text"], second["value"]["text"]);
+    assert_eq!(
+        response(
+            host.handle,
+            json!({"op":"checkout", "revision":pasted["value"], "retained":original}),
+            operation
+        )["value"],
+        *original
+    );
+    // The original source begins with NFD e + acute. Byte 2 is inside
+    // that combining scalar and cannot stand in for a captured endpoint.
+    assert_eq!(
+        response(
+            host.handle,
+            json!({"op":"replace_user_tree", "revision":original,
+            "byteStart":2, "byteEnd":3, "retained":original}),
+            operation
+        )["ok"],
+        false
+    );
+    let mut foreign = original.clone();
+    foreign["documentId"] = json!(Uuid::new_v4());
+    assert_eq!(
+        response(
+            host.handle,
+            json!({"op":"replace_user_tree", "revision":original,
+            "byteStart":0, "byteEnd":0, "retained":foreign}),
+            operation
+        )["ok"],
+        false
+    );
+    host.cancelled = true;
+    assert_eq!(
+        response(
+            host.handle,
+            json!({"op":"replace_user_tree", "revision":original,
+            "byteStart":0, "byteEnd":0, "retained":original}),
+            operation
+        )["error"]["code"],
+        "cancelled"
+    );
+    host.cancelled = false;
+    assert_eq!(
+        response(host.handle, json!({"op":"stats"}), operation)["value"]["activeBulkOperations"],
+        0
+    );
+}
+
 #[test]
 fn callback_streams_preserve_unicode_exact_edits_and_joined_context_lifetime() {
     let source = "e\u{301} é 🧑\u{200d}💻\r\n\0 tail";
@@ -997,6 +1071,7 @@ fn callback_streams_preserve_unicode_exact_edits_and_joined_context_lifetime() {
     );
     fragment_seek_steps(&mut host, &revision);
     paragraph_prefix_steps(&mut host, &revision);
+    imported_tree_replacement(&mut host, &revision);
     assert_eq!(bloom_text_close(handle), 1);
     assert_eq!(
         response(handle, json!({"op":"stats"}), operation)["error"]["code"],

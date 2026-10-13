@@ -272,8 +272,7 @@ private final class PagedTextOperationContext: @unchecked Sendable {
     if importing {
       guard offset == initial.st_size, fileOffset == offset, stagedOffset == staged.count,
         initial.st_size == after.st_size,
-        initial.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec, initial.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec,
-        initial.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec, initial.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec else {
+        initial.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec, initial.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec else {
         throw BoomError.stale("Text import changed during execution; unpublished pages retained.")
       }
     } else {
@@ -576,8 +575,13 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
     if case .linePrefix(let selection, let prefix) = input.operation {
       return try await commitLinePrefixRetaining(input, selection: selection, prefix: prefix, publisher: publisher)
     }
+    var claims: [PagedTextRootClaim] = [.record(input.expected), .writerDocument(input.expected.document.id), .workspace]
+    if case .importedReplacement(_, let imported) = input.operation {
+      try rootCustody.admitJoinedSource(imported.lease, revision: imported.value.revision)
+      claims.append(.source(imported.value.revision))
+    }
     return try await rootOutput(purpose: .capturedEdit(sessionID: input.sessionID, commandID: input.commandID, sequence: input.sequence),
-      claims: [.record(input.expected), .writerDocument(input.expected.document.id), .workspace],
+      claims: claims,
       payloadBytes: PagedWorkingWindow.targetBytes, metadataBytes: PagedTextRootCustody.maximumNativeMetadataBytes,
       outputClaims: { [.record(input.expected), .record($0.record), .writerDocument(input.expected.document.id), .workspace] },
       outputBytes: { $0.window.text.utf8.count + PagedNativeCanonicalHistoryProjection.chargedBytes }, capturedInput: input) {
@@ -713,7 +717,7 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
       let _: UInt64 = try execute(Request(op: "position", revision: input.expected.document.revision, utf16Offset: selectionEnd))
     }
     switch input.operation {
-    case .replacement, .linePrefix:
+    case .replacement, .importedReplacement, .linePrefix:
       guard input.afterSelection == nil else { throw BoomError.invalid("This command uses its actual transformed source selection.") }
     case .edits: break
     }
@@ -764,6 +768,26 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
         byteStart: startByte, byteEnd: endByte, newText: new), writes: true)
       let afterByte = startByte.addingReportingOverflow(UInt64(replacement.count))
       guard !afterByte.overflow else { throw BoomError.budget("Replacement cursor exceeds source coordinates.") }
+      endpoint = afterByte.partialValue
+    case .importedReplacement(let selection, let imported):
+      let insertion = imported.value.revision
+      try rootCustody.admitJoinedSource(imported.lease, revision: insertion)
+      try insertion.validate(); try admit(insertion); try validateDigest(imported.value.wholeTextSha256)
+      let end = selection.utf16Offset.addingReportingOverflow(selection.utf16Length)
+      guard !end.overflow, end.partialValue <= candidate.summary.utf16,
+        insertion.documentID == candidate.documentID else {
+        throw BoomError.stale("Streamed paste has another actual document or global selection.")
+      }
+      let startByte: UInt64 = try execute(Request(op: "position", revision: candidate, utf16Offset: selection.utf16Offset))
+      let endByte: UInt64 = try execute(Request(op: "position", revision: candidate, utf16Offset: end.partialValue))
+      // Empty insertion at an empty selection remains the existing verified
+      // no-op; it must not be marked as an entered page writer.
+      if startByte != endByte || insertion.summary.bytes != 0 {
+        candidate = try execute(Request(op: "replace_user_tree", revision: candidate,
+          retained: insertion, byteStart: startByte, byteEnd: endByte), writes: true)
+      }
+      let afterByte = startByte.addingReportingOverflow(insertion.summary.bytes)
+      guard !afterByte.overflow else { throw BoomError.budget("Streamed paste cursor exceeds source coordinates.") }
       endpoint = afterByte.partialValue
     case .linePrefix:
       throw BoomError.invalid("Line prefix must enter its bounded source continuation.")
@@ -1347,11 +1371,12 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
   }
 
   func importUTF8Retaining(documentID: UUID, from file: FileHandle, expectedBytes requestedBytes: UInt64? = nil,
-    cancellation: PagedTextCancellation = PagedTextCancellation()) async throws -> PagedTextCustodiedValue<PagedTextImportedRevision> {
+    cancellation: PagedTextCancellation = PagedTextCancellation(),
+    priority: PagedTextStorageExecutor.Priority = .background) async throws -> PagedTextCustodiedValue<PagedTextImportedRevision> {
     let rootLease = try rootCustody.reserve(engine: self, purpose: .operation(UUID()),
       claims: [.writerDocument(documentID)])
     let bulkLease: UUID
-    do { bulkLease = try executor.reserveBulk(cancellation); try rootCustody.start(rootLease) }
+    do { bulkLease = try executor.reserveBulk(cancellation, priority: priority); try rootCustody.start(rootLease) }
     catch { _ = try rootCustody.joinedFailure(rootLease, error: error); throw error }
     defer { executor.releaseBulk(bulkLease) }
     do {
@@ -1361,7 +1386,7 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
         }
         guard let expectedBytes = context.expectedBytes else { throw BoomError.invalid("Import has no captured file extent.") }
         if let requestedBytes, requestedBytes != expectedBytes { throw BoomError.stale("The imported file extent changed.") }
-        let operationID: UUID = try await onQueue(priority: .background, cancellation: cancellation, custody: rootLease) {
+        let operationID: UUID = try await onQueue(priority: priority, cancellation: cancellation, custody: rootLease) {
           let id: UUID = try self.execute(Request(op: "import_begin", ownerID: self.ownerID,
             documentID: documentID, expectedBytes: expectedBytes), cancellation: cancellation, writes: false)
           try self.rootCustody.beganBulk(rootLease, operationID: id)
@@ -1369,9 +1394,9 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
         }
         do {
           try await pump(Request(op: "import_step", ownerID: ownerID, documentID: documentID, operationID: operationID),
-            expectedBytes: expectedBytes, context: context, writes: true, custody: rootLease)
+            expectedBytes: expectedBytes, context: context, writes: true, custody: rootLease, priority: priority)
           try await performStreamIO { try context.finish() }
-          return try await onQueue(priority: .background, cancellation: cancellation, custody: rootLease) {
+          return try await onQueue(priority: priority, cancellation: cancellation, custody: rootLease) {
             let result: PagedTextImportedRevision = try self.execute(Request(op: "import_finish", ownerID: self.ownerID,
               documentID: documentID, operationID: operationID), cancellation: cancellation, writes: true)
             try result.revision.validate(); try self.validateDigest(result.wholeTextSha256)
@@ -1451,12 +1476,12 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
   }
 
   private func pump(_ request: Request, expectedBytes: UInt64, context: PagedTextOperationContext,
-    writes: Bool, custody: PagedTextRootLease) async throws {
+    writes: Bool, custody: PagedTextRootLease, priority: PagedTextStorageExecutor.Priority = .background) async throws {
     var previous = PagedTextBulkProgress(processedBytes: 0, validatedBytes: 0, complete: false)
     while !previous.complete {
       if context.needsInputRead { try await performStreamIO { try context.prepareInput() } }
       let captured = previous
-      previous = try await onQueue(priority: .background, cancellation: context.cancellation, custody: custody) {
+      previous = try await onQueue(priority: priority, cancellation: context.cancellation, custody: custody) {
         let progress: PagedTextBulkProgress = try self.execute(request, cancellation: context.cancellation,
           writes: writes, context: context)
         guard progress.processedBytes >= captured.processedBytes,

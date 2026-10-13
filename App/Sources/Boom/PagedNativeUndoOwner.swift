@@ -656,6 +656,23 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
       })
   }
 
+  /// The existing command task owns the real imported tree until its physical
+  /// receiving join. Cancellation before writer admission explicitly releases
+  /// that output; a failed publication keeps both original source leases.
+  @discardableResult
+  func requestDocumentImportedReplacement(_ selection: PagedNativeNavigationSelection,
+    importing: @escaping @MainActor (PagedDocumentRootRecord) async throws -> PagedTextCustodiedValue<PagedTextImportedRevision>,
+    discard: @escaping @MainActor (PagedTextRootLease) async throws -> Void)
+    throws -> Task<PagedDocumentRootRecord, Error> {
+    try beginCapturedEdit(expected: nil, actionName: "Paste", reportFailure: true,
+      preparingOperation: { record in
+        let imported = try await importing(record)
+        return (.importedReplacement(selection, imported), nil)
+      }, discardPreparedOperation: { operation in
+        if case .importedReplacement(_, let imported) = operation { try await discard(imported.lease) }
+      })
+  }
+
   func replaceSelectionBeforeRawKey(_ event: NSEvent, from view: PagedNativeTextView,
     selection: PagedNativeNavigationSelection) throws {
     guard event.type == .keyDown, view === input.activeView,
@@ -683,7 +700,8 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
     operation: PagedCapturedEditInput.Operation? = nil, actionName: String, reportFailure: Bool = false,
     continueTyping: Bool = false, sourceOnly: Bool = false, groupID capturedGroup: UUID? = nil,
     preparingOperation: (@MainActor (PagedDocumentRootRecord) async throws ->
-      (PagedCapturedEditInput.Operation, PagedNativeNavigationSelection?))? = nil)
+      (PagedCapturedEditInput.Operation, PagedNativeNavigationSelection?))? = nil,
+    discardPreparedOperation: (@MainActor (PagedCapturedEditInput.Operation) async throws -> Void)? = nil)
     throws -> Task<PagedDocumentRootRecord, Error> {
     guard (operation == nil) != (preparingOperation == nil) else {
       throw BoomError.invalid("Explicit editing requires exactly one operation source.")
@@ -705,6 +723,7 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
       let startingFailureSerial = receivingFailureSerial
       var reservation: PagedNativePrefixReservation? = prefix
       var writerEntered = false
+      var preparedOperation: PagedCapturedEditInput.Operation?
       defer {
         capturedEditTask = nil; capturedActionName = nil
         if phase == .idle { pump() }
@@ -721,6 +740,7 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
         if let preparingOperation { prepared = try await preparingOperation(sealed.rootRecord) }
         else if let operation { prepared = (operation, nil) }
         else { throw BoomError.invalid("Explicit editing lost its operation.") }
+        preparedOperation = prepared.0
         try Task.checkCancellation()
         guard try input.observeSelection() == observed, firstFailure == nil else {
           throw BoomError.stale("The native selection changed before explicit editing.")
@@ -743,6 +763,10 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
         case .replacement(let range, let bytes):
           result = try await route.commitUserReplacement(expected: sealed.rootRecord, selection: range,
             replacement: bytes, sessionID: input.session.sessionID, commandID: commandID,
+            groupID: groupID, sequence: next.partialValue, beforeCursor: beforeCursor)
+        case .importedReplacement(let range, let imported):
+          result = try await route.commitImportedReplacement(expected: sealed.rootRecord, selection: range,
+            imported: imported, sessionID: input.session.sessionID, commandID: commandID,
             groupID: groupID, sequence: next.partialValue, beforeCursor: beforeCursor)
         case .linePrefix(let range, let prefix):
           result = try await route.commitLinePrefix(expected: sealed.rootRecord, selection: range,
@@ -767,6 +791,14 @@ struct PagedNativeReceivingDispositionReceipt: Sendable {
         if let reservation {
           do { try input.session.releasePrefix(reservation) }
           catch { fail(PagedNativeNavigationOwnerFailure(original: original, cleanup: error)); throw original }
+        }
+        if !writerEntered || original is PagedCapturedEditUnchanged,
+          let preparedOperation, let discardPreparedOperation {
+          do { try await discardPreparedOperation(preparedOperation) }
+          catch {
+            let retained = PagedNativeNavigationOwnerFailure(original: original, cleanup: error)
+            fail(retained); throw retained
+          }
         }
         if let unchanged = original as? PagedCapturedEditUnchanged {
           try input.session.completeUnchangedCapturedEdit(unchanged)

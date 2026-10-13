@@ -2424,6 +2424,63 @@ private struct BoundedConsultationContext: Sendable {
     } catch { report(error) }
   }
 
+  /// File paste enters the same physical command fence as selected-source
+  /// replacement. Its imported tree stays live until the real mounted result
+  /// joins; no manuscript-sized String or clipboard buffer is constructed.
+  @discardableResult
+  func pasteDocumentTextFile(_ clipboard: PagedClipboardTextFile, from view: PagedNativeTextView)
+    throws -> Task<PagedDocumentRootRecord, Error> {
+    try requirePagedOperation(); try clipboard.admitCurrent()
+    guard let input = pagedInput, input.activeView === view, let commands = pagedCommands,
+      let session = pagedSession, view.session === session, view.isEditable, !view.hasMarkedText() else {
+      throw BoomError.stale("Text paste has another physical document input client.")
+    }
+    let selected = try input.currentDocumentSelection(), observed = try input.observeSelection()
+    let (engine, _) = try pagedOwners()
+    return try commands.requestDocumentImportedReplacement(selected, importing: { [weak self] record in
+      guard let self, self.pagedInput === input, input.activeView === view,
+        self.pagedSession === session, record.document.id == self.selectedDocumentID,
+        try input.observeSelection() == observed, try input.currentDocumentSelection() == selected else {
+        throw BoomError.stale("Text paste changed before capturing its original source and selection.")
+      }
+      try clipboard.admitCurrent(); try Task.checkCancellation()
+      let scoped = clipboard.url.startAccessingSecurityScopedResource()
+      defer { if scoped { clipboard.url.stopAccessingSecurityScopedResource() } }
+      let opened = try await detachedWork { try clipboard.open() }
+      let cancellation = PagedTextCancellation()
+      var imported: PagedTextCustodiedValue<PagedTextImportedRevision>?
+      var closeAttempted = false
+      do {
+        let output = try await withTaskCancellationHandler {
+          try await engine.importUTF8Retaining(documentID: record.document.id, from: opened.file,
+            expectedBytes: opened.expectedBytes, cancellation: cancellation, priority: .foreground)
+        } onCancel: { cancellation.cancel() }
+        imported = output
+        try await detachedWork { try opened.admit() }
+        closeAttempted = true
+        try await detachedWork { try opened.close() }
+        try Task.checkCancellation()
+        guard self.pagedInput === input, self.pagedSession === session, input.activeView === view,
+          try input.observeSelection() == observed, try input.currentDocumentSelection() == selected else {
+          throw BoomError.stale("Text paste changed while its immutable file tree was imported.")
+        }
+        return output
+      } catch {
+        var original: Error = error
+        if !closeAttempted {
+          closeAttempted = true
+          do { try await detachedWork { try opened.close() } }
+          catch { original = WorkspacePagedImportFailure(original: original, cleanup: error, url: clipboard.url) }
+        }
+        if let imported {
+          do { try await engine.abandonJoinedRootOutput(imported.lease) }
+          catch { throw PagedTextCustodyHandoffFailure(original: original, handoff: error, lease: imported.lease) }
+        }
+        throw original
+      }
+    }, discard: { lease in try await engine.abandonJoinedRootOutput(lease) })
+  }
+
   private func publishClipboardSelection(capture: PagedTextCustodiedValue<PagedDocumentRootRecord>,
     engine: PagedTextEngineAdapter, publisher: PagedWorkspacePublisher,
     start: UInt64, end: UInt64, expectedChange: Int) throws -> Task<Void, Error> {
@@ -2488,8 +2545,7 @@ private struct BoundedConsultationContext: Sendable {
           preparedFile = file
           try Task.checkCancellation()
           guard pasteboard.changeCount == expectedChange else { throw BoomError.stale("The clipboard changed while the selected file was prepared.") }
-          pasteboard.clearContents()
-          guard pasteboard.writeObjects([file as NSURL]) else { throw BoomError.unavailable("The selected text file was not written to the clipboard.") }
+          try PagedClipboardTextFile.write(file, to: pasteboard)
           status = "Copied file"
         }
         releaseAttempted = true
@@ -3353,7 +3409,10 @@ extension WorkspaceModel {
     }
     commands.didFail = { [weak self, weak commands] error in
       if commands?.firstFailure != nil { self?.failPagedSource(error) }
-      else { self?.report(error) }
+      else {
+        self?.status = error.localizedDescription
+        PerformanceTrace.event("Editor.ManagedAdmission")
+      }
     }
     session.didFail = { [weak self] error in self?.failPagedSource(error) }
     session.didSeal = { [weak self, weak session] _ in

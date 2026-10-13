@@ -67,6 +67,8 @@ import SwiftUI
     private var expectedDigest: Data?
     private var documentID: UUID?
     private var completed: UInt32 = 0
+    private var lastWarmSlot: UInt32?
+    private var completedWarmSlots: UInt32 = 0
     private var sourceVerified = false, shutdownJoined = false
     private var importJoined = false, selectionJoined = false, preparationExportJoined = false, finalExportJoined = false
     private var generatedBytes: UInt64 = 0
@@ -178,7 +180,11 @@ import SwiftUI
         guard window.isKeyWindow else { throw BoomError.unavailable("Mixed diagnostics have no actual key window.") }
         try prepareBitmap(for: view, window: window, target: model.pagedViewport)
         // Exercise lazy TextKit/IME/action/navigation loads BEFORE module donation.
-        for index in 0..<20 { try await performMixedOperation(UInt32(index), measured: false) }
+        for index in 0..<20 {
+          lastWarmSlot = UInt32(index)
+          try await performMixedOperation(UInt32(index), measured: false)
+          completedWarmSlots += 1
+        }
         _ = try currentMixedView()
       }
       if plan.isMixed { host.layoutSubtreeIfNeeded() }
@@ -498,7 +504,39 @@ import SwiftUI
         model.errorMessage == nil, model.writingIssue == nil,
         model.completionRunner == nil, model.selectedMLXRunner == nil,
         !model.autocompleteEnabled else {
-        throw BoomError.invalid("Ordinary public source/native/model binding changed.")
+        let model = workspace, view = managedEditor
+        let failed = [
+          ("missing", model == nil || view == nil || documentID == nil),
+          ("document", model?.selectedDocumentID != documentID || model?.pagedSelectedRecord?.document.id != documentID),
+          ("viewport", model?.pagedViewport?.textView !== view),
+          ("input", model?.pagedInput?.activeView !== view),
+          ("session", model?.pagedSession !== view?.session),
+          ("owner", view?.inputBinding?.owner !== model?.pagedInput),
+          ("binding", view?.inputBinding?.state != .active || view?.inputBinding?.identity != model?.pagedInput?.activeIdentity),
+          ("arena", view?.inputBinding?.identity.arenaID != view?.session.arenaID),
+          ("transaction", view?.inputCommandIsClosed != true),
+          ("mutation", view?.boundedStorage.mutationFailure != nil),
+          ("refusal", view?.inputBinding?.firstRefusal != nil),
+          ("extent", (view?.boundedStorage.length ?? Int.max) > PagedWorkingWindow.hardBytes),
+          ("editable", view?.isEditable != true),
+          ("marked", view?.hasMarkedText() != false),
+          ("error", model?.errorMessage != nil),
+          ("writing", model?.writingIssue != nil),
+          ("model", model?.completionRunner != nil || model?.selectedMLXRunner != nil || model?.autocompleteEnabled != false),
+        ].filter { $0.1 }.map { $0.0 }.joined(separator: ",")
+        let originals: [(String, Error?)] = [
+          ("mutation", view?.boundedStorage.mutationFailure),
+          ("bindingRefusal", view?.inputBinding?.firstRefusal),
+          ("inputRefusal", model?.pagedInput?.firstRefusal),
+          ("commandFailure", model?.pagedCommands?.firstFailure),
+        ]
+        let underlying = originals.compactMap { label, error -> String? in
+          guard let error else { return nil }
+          let kind = String(String(reflecting: type(of: error)).prefix(128))
+          let reason = String(decoding: error.localizedDescription.utf8.prefix(512), as: UTF8.self)
+          return "\(label)=\(kind):\(reason)"
+        }.joined(separator: ";")
+        throw BoomError.invalid("Ordinary public source/native/model binding changed: \(failed); warmSlot=\(lastWarmSlot.map(String.init) ?? "none"); warmCompleted=\(completedWarmSlots); original=\(underlying).")
       }
     }
 
@@ -666,7 +704,9 @@ import SwiftUI
         "requested_cycles": plan.operations, "completed_cycles": completed,
         "operation_program": plan.isMixed ? "mixed-v1" : "head-paired-v1",
         "mixed_slots": plan.isMixed ? Self.mixedSlots : [],
-        "mixed_warmed_before_donation": plan.isMixed,
+        "mixed_warmed_before_donation": plan.isMixed && completedWarmSlots == 20,
+        "mixed_warm_completed": completedWarmSlots,
+        "mixed_warm_last_slot": lastWarmSlot.map { $0 as Any } ?? NSNull(),
         "synchronous_cpu_stage": "Editor.PublicInputDispatch",
         "ready_wait_stage": "Editor.PublicReadyWait",
         "end_to_ready_stage": "Editor.PublicMixedOperation",
