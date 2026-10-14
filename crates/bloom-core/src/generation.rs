@@ -119,43 +119,82 @@ pub struct IndependentTextCohortOrigin {
     pub prefill: CohortPrefillGeometry,
 }
 impl IndependentTextCohortOrigin {
-    fn validate(&self, prompt_tokens: usize, cached_tokens: usize, expected: &Identity) -> Result<(), Error> {
-        require(self.schema == 1 && !self.cohort_id.is_nil()
-            && (2..=4).contains(&self.rows.len()) && self.row < self.rows.len()
-            && hash(&self.policy_digest) && hash(&self.mask_digest)
-            && (1..=16_384).contains(&self.prompt_width)
-            && (1..=128).contains(&self.cache_widths.len())
-            && self.cache_widths.iter().all(|width| *width <= 16_384)
-            && matches!(self.prefill.chunking.as_str(), "balanced" | "remainder" | "unchunked")
-            && (1..=16_384).contains(&self.prefill.token_ceiling)
-            && self.prefill.chunk_stride.is_none_or(|stride| (1..=16_384).contains(&stride)),
-            "Invalid independent text cohort geometry; records retained.")?;
+    fn validate(
+        &self,
+        prompt_tokens: usize,
+        cached_tokens: usize,
+        expected: &Identity,
+    ) -> Result<(), Error> {
+        require(
+            self.schema == 1
+                && !self.cohort_id.is_nil()
+                && (2..=4).contains(&self.rows.len())
+                && self.row < self.rows.len()
+                && hash(&self.policy_digest)
+                && hash(&self.mask_digest)
+                && (1..=16_384).contains(&self.prompt_width)
+                && (1..=128).contains(&self.cache_widths.len())
+                && self.cache_widths.iter().all(|width| *width <= 16_384)
+                && matches!(
+                    self.prefill.chunking.as_str(),
+                    "balanced" | "remainder" | "unchunked"
+                )
+                && (1..=16_384).contains(&self.prefill.token_ceiling)
+                && self
+                    .prefill
+                    .chunk_stride
+                    .is_none_or(|stride| (1..=16_384).contains(&stride)),
+            "Invalid independent text cohort geometry; records retained.",
+        )?;
         let own = &self.rows[self.row];
-        require(own.prompt_tokens == prompt_tokens && own.cached_tokens == cached_tokens
-            && own.operation_id == expected.operation_id && own.attempt_id == expected.attempt_id
-            && own.record_id == expected.record_id && own.seed == expected.seed
-            && own.output_limit == expected.max_tokens && own.request_digest == expected.request_digest
-            && expected.batch.is_none(),
-            "Independent cohort does not match this captured attempt; records retained.")?;
+        require(
+            own.prompt_tokens == prompt_tokens
+                && own.cached_tokens == cached_tokens
+                && own.operation_id == expected.operation_id
+                && own.attempt_id == expected.attempt_id
+                && own.record_id == expected.record_id
+                && own.seed == expected.seed
+                && own.output_limit == expected.max_tokens
+                && own.request_digest == expected.request_digest
+                && expected.batch.is_none(),
+            "Independent cohort does not match this captured attempt; records retained.",
+        )?;
         for (index, row) in self.rows.iter().enumerate() {
-            require(!row.operation_id.is_nil() && !row.attempt_id.is_nil()
-                && !row.namespace.is_nil() && !row.record_id.is_nil()
-                && hash(&row.request_digest) && hash(&row.prepared_token_digest)
-                && hash(&row.sampling_digest) && hash(&row.cache_history_digest)
-                && (1..=16_384).contains(&row.prompt_tokens) && row.cached_tokens < row.prompt_tokens
-                && (1..=4096).contains(&row.output_limit)
-                && row.cache_lengths.len() == self.cache_widths.len()
-                && row.cache_padding.len() == self.cache_widths.len()
-                && self.rows[..index].iter().all(|prior| prior.attempt_id != row.attempt_id),
-                "Invalid independent cohort row; records retained.")?;
-            require(self.cache_widths.iter().enumerate().all(|(layer, width)|
-                row.cache_lengths[layer] <= *width
-                    && row.cache_padding[layer] == *width - row.cache_lengths[layer]),
-                "Invalid independent cohort padding; records retained.")?;
+            require(
+                !row.operation_id.is_nil()
+                    && !row.attempt_id.is_nil()
+                    && !row.namespace.is_nil()
+                    && !row.record_id.is_nil()
+                    && hash(&row.request_digest)
+                    && hash(&row.prepared_token_digest)
+                    && hash(&row.sampling_digest)
+                    && hash(&row.cache_history_digest)
+                    && (1..=16_384).contains(&row.prompt_tokens)
+                    && row.cached_tokens < row.prompt_tokens
+                    && (1..=4096).contains(&row.output_limit)
+                    && row.cache_lengths.len() == self.cache_widths.len()
+                    && row.cache_padding.len() == self.cache_widths.len()
+                    && self.rows[..index]
+                        .iter()
+                        .all(|prior| prior.attempt_id != row.attempt_id),
+                "Invalid independent cohort row; records retained.",
+            )?;
+            require(
+                self.cache_widths.iter().enumerate().all(|(layer, width)| {
+                    row.cache_lengths[layer] <= *width
+                        && row.cache_padding[layer] == *width - row.cache_lengths[layer]
+                }),
+                "Invalid independent cohort padding; records retained.",
+            )?;
         }
-        require(self.rows.iter().map(|row| row.prompt_tokens - row.cached_tokens).max()
+        require(
+            self.rows
+                .iter()
+                .map(|row| row.prompt_tokens - row.cached_tokens)
+                .max()
                 == Some(self.prompt_width),
-            "Independent cohort mask width differs from its actual suffixes; records retained.")
+            "Independent cohort mask width differs from its actual suffixes; records retained.",
+        )
     }
 }
 
@@ -210,8 +249,10 @@ fn valid(checkpoint: &Checkpoint, expected: &Identity) -> Result<(), Error> {
     if let Some(origin) = &progress.execution_origin {
         origin.validate(progress.prompt_tokens, expected)?;
         if let Some(cohort) = &origin.independent_cohort {
-            require(cohort.rows[cohort.row].prepared_token_digest == progress.prompt_digest,
-                "Cohort prompt digest differs from the actual row checkpoint; records retained.")?;
+            require(
+                cohort.rows[cohort.row].prepared_token_digest == progress.prompt_digest,
+                "Cohort prompt digest differs from the actual row checkpoint; records retained.",
+            )?;
         }
     }
     if let Some(batch) = &expected.batch {
@@ -582,58 +623,99 @@ mod tests {
     }
 
     #[test]
-    fn independent_origins_bind_row_identity_and_prepared_digest_without_laundering_geometry() -> Result<(), Error> {
+    fn independent_origins_bind_row_identity_and_prepared_digest_without_laundering_geometry()
+    -> Result<(), Error> {
         let mut next = checkpoint();
         next.identity.kind = Kind::Consultation;
         let row = IndependentTextCohortRow {
-            operation_id: next.identity.operation_id, attempt_id: next.identity.attempt_id,
-            namespace: Uuid::from_u128(20), record_id: next.identity.record_id,
+            operation_id: next.identity.operation_id,
+            attempt_id: next.identity.attempt_id,
+            namespace: Uuid::from_u128(20),
+            record_id: next.identity.record_id,
             request_digest: next.identity.request_digest.clone(),
             prepared_token_digest: next.progress.prompt_digest.clone(),
-            prompt_tokens: 12, cached_tokens: 0, seed: next.identity.seed,
-            output_limit: next.identity.max_tokens, sampling_digest: "c".repeat(64),
-            cache_parent_id: None, cache_history_digest: "d".repeat(64),
-            cache_lengths: vec![0], cache_padding: vec![4],
+            prompt_tokens: 12,
+            cached_tokens: 0,
+            seed: next.identity.seed,
+            output_limit: next.identity.max_tokens,
+            sampling_digest: "c".repeat(64),
+            cache_parent_id: None,
+            cache_history_digest: "d".repeat(64),
+            cache_lengths: vec![0],
+            cache_padding: vec![4],
         };
         let mut peer = row.clone();
-        peer.operation_id = Uuid::from_u128(7); peer.attempt_id = Uuid::from_u128(8);
-        peer.namespace = Uuid::from_u128(21); peer.record_id = Uuid::from_u128(9);
-        peer.prompt_tokens = 10; peer.cached_tokens = 4; peer.cache_lengths = vec![4];
-        peer.cache_padding = vec![0]; peer.cache_parent_id = Some(Uuid::from_u128(30));
+        peer.operation_id = Uuid::from_u128(7);
+        peer.attempt_id = Uuid::from_u128(8);
+        peer.namespace = Uuid::from_u128(21);
+        peer.record_id = Uuid::from_u128(9);
+        peer.prompt_tokens = 10;
+        peer.cached_tokens = 4;
+        peer.cache_lengths = vec![4];
+        peer.cache_padding = vec![0];
+        peer.cache_parent_id = Some(Uuid::from_u128(30));
         let cohort = IndependentTextCohortOrigin {
-            schema: 1, cohort_id: Uuid::from_u128(31), row: 0, rows: vec![row, peer],
-            policy_digest: "e".repeat(64), prompt_width: 12, mask_digest: "f".repeat(64),
-            cache_widths: vec![4], prefill: CohortPrefillGeometry {
-                chunking: "remainder".into(), token_ceiling: 512, chunk_stride: Some(11),
+            schema: 1,
+            cohort_id: Uuid::from_u128(31),
+            row: 0,
+            rows: vec![row, peer],
+            policy_digest: "e".repeat(64),
+            prompt_width: 12,
+            mask_digest: "f".repeat(64),
+            cache_widths: vec![4],
+            prefill: CohortPrefillGeometry {
+                chunking: "remainder".into(),
+                token_ceiling: 512,
+                chunk_stride: Some(11),
             },
         };
         next.progress.execution_origin = Some(ExecutionOrigin {
-            schema: 1, cache_algorithm: "independent-text-cohort-v1".into(),
-            cached_prompt_tokens: 0, cache_miss_reason: Some("no_active_supported_prefix".into()),
+            schema: 1,
+            cache_algorithm: "independent-text-cohort-v1".into(),
+            cached_prompt_tokens: 0,
+            cache_miss_reason: Some("no_active_supported_prefix".into()),
             independent_cohort: Some(cohort),
         });
         let wire = serde_json::to_value(&next).map_err(|e| Error(e.to_string()))?;
-        let restored: Checkpoint = serde_json::from_value(wire.clone()).map_err(|e| Error(e.to_string()))?;
-        assert_eq!(restored.progress.execution_origin, next.progress.execution_origin);
+        let restored: Checkpoint =
+            serde_json::from_value(wire.clone()).map_err(|e| Error(e.to_string()))?;
+        assert_eq!(
+            restored.progress.execution_origin,
+            next.progress.execution_origin
+        );
         validate(&next.identity, None, restored)?;
         for field in ["seed", "attemptID", "preparedTokenDigest", "cachePadding"] {
             let mut changed = wire.clone();
-            changed["progress"]["executionOrigin"]["independentCohort"]["rows"][0][field] = match field {
-                "seed" => serde_json::json!(1),
-                "attemptID" => serde_json::json!(Uuid::from_u128(88)),
-                "preparedTokenDigest" => serde_json::json!("0".repeat(64)),
-                _ => serde_json::json!([0]),
-            };
+            changed["progress"]["executionOrigin"]["independentCohort"]["rows"][0][field] =
+                match field {
+                    "seed" => serde_json::json!(1),
+                    "attemptID" => serde_json::json!(Uuid::from_u128(88)),
+                    "preparedTokenDigest" => serde_json::json!("0".repeat(64)),
+                    _ => serde_json::json!([0]),
+                };
             let changed = serde_json::from_value(changed).map_err(|e| Error(e.to_string()))?;
             assert!(validate(&next.identity, None, changed).is_err(), "{field}");
         }
         let mut changed = next.clone();
-        changed.progress.execution_origin.as_mut().unwrap().independent_cohort.as_mut().unwrap().row = 1;
+        changed
+            .progress
+            .execution_origin
+            .as_mut()
+            .unwrap()
+            .independent_cohort
+            .as_mut()
+            .unwrap()
+            .row = 1;
         assert!(validate(&next.identity, None, changed).is_err());
         // Subsequent checkpoints cannot silently erase a heterogeneous cohort
         // and claim a scalar cold execution for a previously admitted row.
         let mut scalar = next.clone();
-        scalar.progress.execution_origin.as_mut().unwrap().independent_cohort = None;
+        scalar
+            .progress
+            .execution_origin
+            .as_mut()
+            .unwrap()
+            .independent_cohort = None;
         assert!(validate(&next.identity, Some(&next), scalar).is_err());
         Ok(())
     }

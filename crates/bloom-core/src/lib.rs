@@ -1390,9 +1390,23 @@ pub fn execute(request: Request) -> Result<Value, Error> {
             width,
             prefill.unwrap_or_default(),
         )?),
-        Request::IndependentKvAllocation { configuration, prompts, cached, outputs, prefill, initial, value_bytes } =>
-            serde_json::to_value(memory::independent_kv_allocation(
-                &configuration, &prompts, &cached, &outputs, prefill, initial, value_bytes)?),
+        Request::IndependentKvAllocation {
+            configuration,
+            prompts,
+            cached,
+            outputs,
+            prefill,
+            initial,
+            value_bytes,
+        } => serde_json::to_value(memory::independent_kv_allocation(
+            &configuration,
+            &prompts,
+            &cached,
+            &outputs,
+            prefill,
+            initial,
+            value_bytes,
+        )?),
         Request::IncrementalKvAdmission {
             application_bytes,
             used_bytes,

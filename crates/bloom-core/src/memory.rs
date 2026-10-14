@@ -190,18 +190,27 @@ pub fn independent_kv_allocation(
     config.validate()?;
     prefill.validate()?;
     let width = prompts.len();
-    require((2..=4).contains(&width) && cached.len() == width && outputs.len() == width
-        && matches!(value_bytes, 2 | 4),
-        "Invalid independent cache shape.")?;
+    require(
+        (2..=4).contains(&width)
+            && cached.len() == width
+            && outputs.len() == width
+            && matches!(value_bytes, 2 | 4),
+        "Invalid independent cache shape.",
+    )?;
     let mut prefix = 0;
     let mut suffix = 0;
     let mut output = 0;
     let mut hydration = 0;
     for ((prompt, count), limit) in prompts.iter().zip(cached).zip(outputs) {
-        require(*prompt > 0 && *count < *prompt && (1..=4096).contains(limit)
-            && prompt.checked_add(*limit).is_some_and(|total|
-                total <= CONTEXT_CEILING.min(config.max_position_embeddings)),
-            "Independent row exceeds its actual context ceiling.")?;
+        require(
+            *prompt > 0
+                && *count < *prompt
+                && (1..=4096).contains(limit)
+                && prompt.checked_add(*limit).is_some_and(|total| {
+                    total <= CONTEXT_CEILING.min(config.max_position_embeddings)
+                }),
+            "Independent row exceeds its actual context ceiling.",
+        )?;
         prefix = prefix.max(*count);
         suffix = suffix.max(prompt - count);
         output = output.max(*limit);
@@ -216,10 +225,14 @@ pub fn independent_kv_allocation(
     let forward = config.row_bytes(padded, prefill) * 2 * width as u64;
     let merge = if initial && prefix > 0 {
         config.row_bytes(prefix, prefill) * 3 * width as u64 + hydration
-    } else { 0 };
+    } else {
+        0
+    };
     // Existing row algebra is for 2-byte values. A cold Gemma request reserves
     // float32; after submission its real parent dtype supplies this multiplier.
-    forward.checked_add(merge).and_then(|bytes| bytes.checked_mul(value_bytes / 2))
+    forward
+        .checked_add(merge)
+        .and_then(|bytes| bytes.checked_mul(value_bytes / 2))
         .ok_or_else(|| Error("Independent allocation overflowed.".into()))
 }
 
@@ -601,20 +614,35 @@ mod tests {
         let config = gemma();
         let p = Prefill::default();
         let prompts = [511, 512, 513];
-        let cold = independent_kv_allocation(&config, &prompts, &[0, 0, 0], &[8, 8, 8], p, true, 2)?;
-        let ragged = independent_kv_allocation(&config, &prompts, &[510, 0, 0], &[8, 8, 8], p, true, 2)?;
-        let next = independent_kv_allocation(&config, &prompts, &[510, 0, 0], &[8, 8, 8], p, false, 2)?;
-        assert_eq!(independent_kv_allocation(&config, &prompts, &[510, 0, 0], &[8, 8, 8], p, true, 4)?, ragged * 2);
-        assert!(independent_kv_allocation(&config, &prompts, &[0, 0, 0], &[8, 8, 8], p, true, 1).is_err());
+        let cold =
+            independent_kv_allocation(&config, &prompts, &[0, 0, 0], &[8, 8, 8], p, true, 2)?;
+        let ragged =
+            independent_kv_allocation(&config, &prompts, &[510, 0, 0], &[8, 8, 8], p, true, 2)?;
+        let next =
+            independent_kv_allocation(&config, &prompts, &[510, 0, 0], &[8, 8, 8], p, false, 2)?;
+        assert_eq!(
+            independent_kv_allocation(&config, &prompts, &[510, 0, 0], &[8, 8, 8], p, true, 4)?,
+            ragged * 2
+        );
+        assert!(
+            independent_kv_allocation(&config, &prompts, &[0, 0, 0], &[8, 8, 8], p, true, 1)
+                .is_err()
+        );
         assert!(ragged > cold && ragged > next);
         assert_eq!(next, config.row_bytes(510 + 513 + 8, p) * 6);
         let used = 24 * GIB - WORKING_RESERVE - ragged;
         assert!(incremental_kv_readmission(24 * GIB, used, WORKING_RESERVE, ragged)?.admitted);
         assert!(!incremental_kv_readmission(24 * GIB, used + 1, WORKING_RESERVE, ragged)?.admitted);
         for cached in [&[511, 0, 0][..], &[0, 0][..]] {
-            assert!(independent_kv_allocation(&config, &prompts, cached, &[8, 8, 8], p, true, 2).is_err());
+            assert!(
+                independent_kv_allocation(&config, &prompts, cached, &[8, 8, 8], p, true, 2)
+                    .is_err()
+            );
         }
-        assert!(independent_kv_allocation(&config, &[16_384, 512], &[0, 0], &[1, 8], p, true, 2).is_err());
+        assert!(
+            independent_kv_allocation(&config, &[16_384, 512], &[0, 0], &[1, 8], p, true, 2)
+                .is_err()
+        );
         Ok(())
     }
 }
