@@ -94,9 +94,32 @@ final class FolderImportTests: XCTestCase {
     let outside = root.appendingPathComponent("outside.md")
     try Data("outside-canary".utf8).write(to: outside)
     try FileManager.default.createSymbolicLink(at: source.appendingPathComponent("link.md"), withDestinationURL: outside)
+    let chosen = try FolderImport.chosenFiles(source, flag: CancellationFlag())
+    XCTAssertEqual(chosen.map(\.path), ["Drafts/章.md", "empty.txt"])
+    XCTAssertEqual(chosen.first?.url, file.standardizedFileURL.resolvingSymlinksInPath())
     let imported = try FolderImport.read(source, flag: CancellationFlag())
     XCTAssertEqual(imported.map(\.path), ["Drafts/章.md", "empty.txt"])
     XCTAssertEqual(try XCTUnwrap(imported.first).original, bytes)
     XCTAssertEqual(try Data(contentsOf: file), bytes)
+  }
+
+  func testPagedFolderEnumerationHasNoTextSizeLimitAndHonorsCancellation() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-paged-folder-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let large = root.appendingPathComponent("large.md")
+    XCTAssertTrue(FileManager.default.createFile(atPath: large.path, contents: nil))
+    let handle = try FileHandle(forWritingTo: large)
+    // A sparse real file proves enumeration does not read, decode, or apply
+    // the obsolete in-memory transport limit to paged source metadata.
+    try handle.truncate(atOffset: 1_073_741_824); try handle.close()
+    let chosen = try FolderImport.chosenFiles(root, flag: CancellationFlag())
+    XCTAssertEqual(chosen.map(\.path), ["large.md"])
+    XCTAssertEqual(try large.resourceValues(forKeys: [.fileSizeKey]).fileSize, 1_073_741_824)
+    let cancelled = CancellationFlag(); cancelled.cancel()
+    XCTAssertThrowsError(try FolderImport.chosenFiles(root, flag: cancelled))
+    let linkedRoot = root.appendingPathComponent("linked")
+    try FileManager.default.createSymbolicLink(at: linkedRoot, withDestinationURL: root)
+    XCTAssertThrowsError(try FolderImport.chosenFiles(linkedRoot, flag: CancellationFlag()))
   }
 }

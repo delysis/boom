@@ -2567,38 +2567,16 @@ private struct BoundedConsultationContext: Sendable {
       guard let self else { return }
       let scoped = root.startAccessingSecurityScopedResource()
       defer { if scoped { root.stopAccessingSecurityScopedResource() } }
-      let files = try await detachedWork {
-        let keys: [URLResourceKey] = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
-        var failure: Error?
-        guard let iterator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys,
-          options: [.skipsHiddenFiles], errorHandler: { _, error in failure = error; return false }) else {
-          throw BoomError.unavailable("The chosen folder cannot be read.")
-        }
-        var files: [(URL, String)] = [], entries = 0
-        while let object = iterator.nextObject() {
-          guard let url = object as? URL else { continue }
-          try flag.check(); entries += 1
-          guard entries <= 4_096 else { throw BoomError.budget("Import at most 4,096 folder entries at a time.") }
-          let values = try url.resourceValues(forKeys: Set(keys))
-          if values.isSymbolicLink == true { iterator.skipDescendants(); continue }
-          let relative = String(url.path.dropFirst(root.path.count + 1))
-          guard relative.split(separator: "/").count <= 16 else { throw BoomError.budget("The folder exceeds 16 levels.") }
-          guard values.isRegularFile == true, ["md", "markdown", "txt"].contains(url.pathExtension.lowercased()) else { continue }
-          guard files.count < 512 else { throw BoomError.budget("Import at most 512 text files at a time.") }
-          files.append((url, relative))
-        }
-        if let failure { throw failure }
-        return files.sorted { $0.1 < $1.1 }
-      }
+      let files = try await detachedWork { try FolderImport.chosenFiles(root, flag: flag) }
       let folder = ImportedFolder(id: UUID(), name: root.lastPathComponent)
       self.state.importedFolders = (self.state.importedFolders ?? []) + [folder]
-      for (url, path) in files {
+      for chosen in files {
         try flag.check()
         let id = UUID()
-        try await self.importPagedDocument(url, title: url.deletingPathExtension().lastPathComponent,
+        try await self.importPagedDocument(chosen.url, title: chosen.url.deletingPathExtension().lastPathComponent,
           documentID: id, selecting: false, flag: flag)
         if let imported = self.state.importedFiles?[id] {
-          self.state.importedFiles?[id] = ImportedFile(folderID: folder.id, path: path,
+          self.state.importedFiles?[id] = ImportedFile(folderID: folder.id, path: chosen.path,
             originalDigest: imported.originalDigest, originalRevision: imported.originalRevision)
         }
       }
