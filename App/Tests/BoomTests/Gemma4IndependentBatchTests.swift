@@ -412,7 +412,7 @@ struct Gemma4IndependentBatchTests {
             let manager = PromptPrefixCache(temporaryParent: parent)
             let cohort = try manager.makeTextCohort(prompts.indices.map {
                 .init(owner: owners[$0], tokens: prompts[$0], joinedBinding: nil)
-            }, prefill: .init(stepSize: 4), allowSnapshot: nil, admit: { _ in },
+            }, prefill: .init(stepSize: 4, chunking: .remainder), allowSnapshot: nil, admit: { _ in },
                 outputLimits: [2, 2], makeCache: { try model.newCache(parameters: nil) })
             defer { cohort.discard(); manager.clear(reason: "operand_test_joined") }
             cohort.bindForwardOperands(model: Digest.sha256("tiny-local-real-text-forward"),
@@ -422,6 +422,9 @@ struct Gemma4IndependentBatchTests {
             eval(output.logits, cohort.cache)
             cohort.finishedPreparation(); cohort.markCacheSubmitted()
             Stream.defaultStream.synchronize()
+            for row in prompts.indices {
+                #expect(cohort.captureLane(row, emitted: [], stop: nil, finished: true))
+            }
             await manager.joinTextCohortSpill(cohort, cancelled: false)
             #expect(manager.publishTextCohort(cohort, retention: prompts.indices.map {
                 .init(completion: .init(row: $0, emittedTokenIDs: []), acknowledged: nil, proof: nil, authorization: nil)
@@ -447,7 +450,7 @@ struct Gemma4IndependentBatchTests {
             let reversedOwners = [owners[1], owners[0]]
             let reversed = try manager.makeTextCohort(reversedQueries.indices.map {
                 .init(owner: reversedOwners[$0], tokens: reversedQueries[$0], joinedBinding: nil)
-            }, prefill: .init(stepSize: 4), allowSnapshot: nil, admit: { _ in },
+            }, prefill: .init(stepSize: 4, chunking: .remainder), allowSnapshot: nil, admit: { _ in },
                 outputLimits: [2, 2], makeCache: { try model.newCache(parameters: nil) })
             defer { reversed.discard() }
             #expect(reversed.rows.map(\.cachedTokenCount) == [8, 6])
@@ -458,6 +461,9 @@ struct Gemma4IndependentBatchTests {
             eval(secondOutput.logits, reversed.cache)
             reversed.finishedPreparation(); reversed.markCacheSubmitted()
             Stream.defaultStream.synchronize()
+            for row in reversedQueries.indices {
+                #expect(reversed.captureLane(row, emitted: [], stop: nil, finished: true))
+            }
             await manager.joinTextCohortSpill(reversed, cancelled: false)
             #expect(manager.publishTextCohort(reversed, retention: reversedQueries.indices.map {
                 .init(completion: .init(row: $0, emittedTokenIDs: []), acknowledged: nil, proof: nil, authorization: nil)
@@ -472,11 +478,11 @@ struct Gemma4IndependentBatchTests {
             // published ready bytes remain indexed; no extra KV archive is made.
             let unrelated = try manager.makeSession(owner: .init(namespace: UUID(), entity: UUID(), route: .writing),
                 input: LMInput(tokens: MLXArray([Int32(2), 3])), promptTokenIDs: [2, 3],
-                prefill: .init(stepSize: 4), useActiveNative: true, makeCache: { try model.newCache(parameters: nil) })
+                prefill: .init(stepSize: 4, chunking: .remainder), useActiveNative: true, makeCache: { try model.newCache(parameters: nil) })
             defer { unrelated.discardStagedAnchors() }
             let query = Array(prompts[0].prefix(6)) + [30]
             let warm = try manager.makeSession(owner: owners[0], input: LMInput(tokens: MLXArray(query.map(Int32.init))),
-                promptTokenIDs: query, prefill: .init(stepSize: 4), useActiveNative: true,
+                promptTokenIDs: query, prefill: .init(stepSize: 4, chunking: .remainder), useActiveNative: true,
                 makeCache: { try model.newCache(parameters: nil) })
             defer { warm.discardStagedAnchors() }
             #expect(warm.cachedTokenCount == 6)
