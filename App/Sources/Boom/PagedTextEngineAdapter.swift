@@ -1406,7 +1406,10 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
     cancellation: PagedTextCancellation, priority: PagedTextStorageExecutor.Priority) async throws -> String {
     let rootLease = try rootCustody.reserve(engine: self, purpose: .operation(UUID()), claims: [.source(revision)])
     let bulkLease: UUID
-    do { bulkLease = try executor.reserveBulk(cancellation, priority: priority); try rootCustody.start(rootLease) }
+    // Export/hash still share the single bulk-stream slot, leaving the other
+    // for native movement. Foreground export priority applies only to each
+    // bounded queue quantum, not to an additional whole-stream reservation.
+    do { bulkLease = try executor.reserveBulk(cancellation); try rootCustody.start(rootLease) }
     catch { _ = try rootCustody.joinedFailure(rootLease, error: error); throw error }
     defer { executor.releaseBulk(bulkLease) }
     do {
