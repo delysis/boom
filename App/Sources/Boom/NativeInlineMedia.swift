@@ -52,10 +52,23 @@ struct InlineMediaSpan: Decodable {
 /// independently. Null glyphs conceal reference syntax without changing a
 /// single source position, revision, selection mapping or Undo operation.
 @MainActor final class InlineMediaLayout: NSObject, @preconcurrency NSLayoutManagerDelegate {
+  // The live projection writes this beside its attribute transaction. An
+  // isolated measurement reconciles it when copying attributed runs. Unknown
+  // storage stays conservative until then; ordinary text skips glyph scans.
+  fileprivate var hasMedia = true
+  func invalidateMediaPresence() { hasMedia = true }
+  func reconcileMediaPresence(in storage: NSAttributedString) {
+    var present = false
+    storage.enumerateAttribute(.mediaItem, in: NSRange(location: 0, length: storage.length),
+      options: .longestEffectiveRangeNotRequired) { value, _, stop in
+      if value != nil { present = true; stop.pointee = true }
+    }
+    hasMedia = present
+  }
   func layoutManager(_ manager: NSLayoutManager, shouldGenerateGlyphs glyphs: UnsafePointer<CGGlyph>,
     properties props: UnsafePointer<NSLayoutManager.GlyphProperty>, characterIndexes indexes: UnsafePointer<Int>,
     font: NSFont, forGlyphRange range: NSRange) -> Int {
-    guard let storage = manager.textStorage else { return 0 }
+    guard hasMedia, let storage = manager.textStorage else { return 0 }
     guard let first = (0..<range.length).first(where: { index in
       indexes[index] >= 0 && indexes[index] < storage.length
         && storage.attribute(.mediaItem, at: indexes[index], effectiveRange: nil) != nil
@@ -73,19 +86,19 @@ struct InlineMediaSpan: Decodable {
   }
   func layoutManager(_ manager: NSLayoutManager, shouldUse action: NSLayoutManager.ControlCharacterAction,
     forControlCharacterAt index: Int) -> NSLayoutManager.ControlCharacterAction {
-    manager.textStorage?.attribute(.mediaStart, at: index, effectiveRange: nil) != nil ? .whitespace : action
+    hasMedia && manager.textStorage?.attribute(.mediaStart, at: index, effectiveRange: nil) != nil ? .whitespace : action
   }
   func layoutManager(_ manager: NSLayoutManager, boundingBoxForControlGlyphAt glyphIndex: Int,
     for container: NSTextContainer, proposedLineFragment rect: NSRect, glyphPosition: NSPoint,
     characterIndex index: Int) -> NSRect {
-    guard let item = manager.textStorage?.attribute(.mediaItem, at: index, effectiveRange: nil) as? InlineMediaItem else { return .zero }
+    guard hasMedia, let item = manager.textStorage?.attribute(.mediaItem, at: index, effectiveRange: nil) as? InlineMediaItem else { return .zero }
     let size = item.size(available: container.size.width - container.lineFragmentPadding * 2)
     return NSRect(origin: .zero, size: size)
   }
   func layoutManager(_ manager: NSLayoutManager, shouldSetLineFragmentRect line: UnsafeMutablePointer<NSRect>,
     lineFragmentUsedRect used: UnsafeMutablePointer<NSRect>, baselineOffset baseline: UnsafeMutablePointer<CGFloat>,
     in container: NSTextContainer, forGlyphRange glyphs: NSRange) -> Bool {
-    guard let storage = manager.textStorage else { return false }
+    guard hasMedia, let storage = manager.textStorage else { return false }
     let characters = manager.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
     var height: CGFloat = 0
     storage.enumerateAttribute(.mediaStart, in: characters) { value, range, _ in
@@ -326,6 +339,7 @@ struct InlineMediaSpan: Decodable {
       if let item = value as? InlineMediaItem { existing.append((range, item)) }
     }
     if existing.count == desired.count && zip(existing, desired).allSatisfy({ $0.0 == $1.0 && $0.1 === $1.1 }) {
+      layout.hasMedia = !existing.isEmpty
       positionViews(); return
     }
     let registered = view.undoManager?.isUndoRegistrationEnabled == true
@@ -339,6 +353,8 @@ struct InlineMediaSpan: Decodable {
       storage.addAttribute(.mediaItem, value: item, range: span.range)
       storage.addAttribute(.mediaStart, value: true, range: NSRange(location: span.location, length: 1))
     }
+    // Publish before endEditing can ask the delegate to regenerate glyphs.
+    layout.hasMedia = !desired.isEmpty
     storage.endEditing()
     positionViews()
   }

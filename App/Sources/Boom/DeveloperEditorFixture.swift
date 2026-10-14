@@ -73,6 +73,10 @@ import SwiftUI
     private var importJoined = false, selectionJoined = false, preparationExportJoined = false, finalExportJoined = false
     private var generatedBytes: UInt64 = 0
     private var footprintBefore: UInt64 = 0, footprintAfter: UInt64 = 0, peakFootprint: UInt64 = 0
+    private var startupBefore: [String: Any]?, startupAfter: [String: Any]?
+    private var startupUndoAttempted = false, startupUndoJoined = false
+    private var primingBefore: [String: Any]?, primingAfterInsert: [String: Any]?, primingAfterDelete: [String: Any]?
+    private var vmBefore: [String: Any]?, vmAfter: [String: Any]?
 
     init(recipe: URL, plan: DeveloperStackDiagnostics.PublicEditorPlan) throws {
       guard plan.operations == (plan.isMixed ? 200 : Self.cycles) else {
@@ -157,6 +161,10 @@ import SwiftUI
       documentID = id
       try await model.selectPagedDocument(initialDocument)
       try await model.selectPagedDocument(id); selectionJoined = true
+      guard let importedRevision = model.pagedSelectedRecord?.document.revision,
+        importedRevision.summary.bytes == extent, importedRevision.summary.utf16 == extent else {
+        throw BoomError.invalid("Ordinary public import differs from its generated ASCII source.")
+      }
       let host = NSHostingView(rootView: WorkspaceView(model: model)); self.host = host
       let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 1190, height: 846))
       self.window = window; window.isReleasedWhenClosed = false; window.contentView = host
@@ -172,13 +180,44 @@ import SwiftUI
         throw BoomError.invalid("Ordinary managed public editor focus was unavailable.")
       }
       managedEditor = view
-      view.setSelectedRange(NSRange(location: 0, length: 0))
-      view.insertText("x", replacementRange: view.selectedRange())
-      view.insertText("", replacementRange: NSRange(location: 0, length: 1))
+      var primingView = view
+      if plan.isMixed {
+        startupBefore = try nativePreparationState(view)
+        if view.session.generation != 0 {
+          // An incidental key in this explicitly public window is real input.
+          // Exercise its actual responder Undo once before the fixed recipe;
+          // never guess a deletion or accept a shifted source baseline.
+          try await joinMixedInput(0, measured: false)
+          let current = try currentMixedView()
+          guard let history = current.session.canonicalHistory,
+            current.session.generation == 1, history.record.historyGeneration == 1,
+            history.undo.count == 1, history.redo.isEmpty,
+            history.undo[0].revision == importedRevision,
+            history.record.document.revision != importedRevision else {
+            throw BoomError.invalid("Public startup input is not exactly one admitted edit of the imported source.")
+          }
+          startupUndoAttempted = true
+          try await mixedResponder(false, event: 0, measured: false)
+          startupUndoJoined = true
+          primingView = try currentMixedView()
+          guard primingView.session.canonicalHistory?.record.document.revision == importedRevision,
+            model.pagedSelectedRecord?.document.revision == importedRevision,
+            try primingView.session.documentCoordinates().projectedUTF16 == extent else {
+            throw BoomError.invalid("The actual startup Undo did not restore the original public source.")
+          }
+        }
+        startupAfter = try nativePreparationState(primingView)
+      }
+      primingView.setSelectedRange(NSRange(location: 0, length: 0))
+      if plan.isMixed { primingBefore = try nativePreparationState(primingView) }
+      primingView.insertText("x", replacementRange: primingView.selectedRange())
+      if plan.isMixed { primingAfterInsert = try nativePreparationState(primingView) }
+      primingView.insertText("", replacementRange: NSRange(location: 0, length: 1))
+      if plan.isMixed { primingAfterDelete = try nativePreparationState(primingView) }
       host.layoutSubtreeIfNeeded()
       if plan.isMixed {
         guard window.isKeyWindow else { throw BoomError.unavailable("Mixed diagnostics have no actual key window.") }
-        try prepareBitmap(for: view, window: window, target: model.pagedViewport)
+        try prepareBitmap(for: primingView, window: window, target: model.pagedViewport)
         // Exercise lazy TextKit/IME/action/navigation loads BEFORE module donation.
         for index in 0..<20 {
           lastWarmSlot = UInt32(index)
@@ -195,6 +234,50 @@ import SwiftUI
       try requireManagedSource()
       try await verifyOrdinaryExport(named: "prepared-export.txt"); preparationExportJoined = true
       _ = try diskExtent(reservingReceipt: true)
+      vmBefore = currentVMCategories()
+    }
+
+    // Fixed scalar provenance only, outside timed operations; no source bytes.
+    private func nativePreparationState(_ view: PagedNativeTextView) throws -> [String: Any] {
+      let source = try view.session.documentCoordinates(), selected = view.selectedRange()
+      return ["session": source.sessionID.uuidString, "arena": source.arenaID.uuidString,
+        "generation": source.generation, "projected_utf16": source.projectedUTF16,
+        "local_utf16": source.localUTF16, "local_bytes": source.localBytes,
+        "selection_location": selected.location, "selection_length": selected.length,
+        "actual_active_view": workspace?.pagedInput?.activeView === view,
+        "actual_viewport_view": workspace?.pagedViewport?.textView === view,
+        "actual_first_responder": window?.firstResponder === view,
+        "command_closed": view.inputCommandIsClosed]
+    }
+
+    // The same fixed current-task API as ModelResidency, sampled once before
+    // donation and once after capture. Ledgers are categories, not allocation
+    // owners; resident bytes and compressed/footprint accounting differ.
+    private func currentVMCategories() -> [String: Any] {
+      var info = task_vm_info_data_t()
+      var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+      let capacity = Int(count)
+      let status = withUnsafeMutablePointer(to: &info) { pointer in
+        pointer.withMemoryRebound(to: integer_t.self, capacity: capacity) {
+          task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+        }
+      }
+      guard status == KERN_SUCCESS, Int(count) == capacity else {
+        return ["available": false, "kernel_result": status, "returned_count": count]
+      }
+      return ["available": true, "kernel_result": status, "returned_count": count,
+        "resident_bytes": info.resident_size, "internal_bytes": info.internal,
+        "external_bytes": info.external, "reusable_bytes": info.reusable,
+        "compressed_bytes": info.compressed, "physical_footprint_bytes": info.phys_footprint,
+        "kernel_lifetime_peak_footprint_bytes": info.ledger_phys_footprint_peak,
+        "purgeable_nonvolatile_bytes": info.ledger_purgeable_nonvolatile,
+        "purgeable_nonvolatile_compressed_bytes": info.ledger_purgeable_novolatile_compressed,
+        "media_footprint_bytes": info.ledger_tag_media_footprint,
+        "media_compressed_bytes": info.ledger_tag_media_footprint_compressed,
+        "graphics_footprint_bytes": info.ledger_tag_graphics_footprint,
+        "graphics_compressed_bytes": info.ledger_tag_graphics_footprint_compressed,
+        "neural_footprint_bytes": info.ledger_tag_neural_footprint,
+        "neural_compressed_bytes": info.ledger_tag_neural_footprint_compressed]
     }
 
     private func observeOrdinary(_ requested: DeveloperStackDiagnostics.PublicEditorPlan) async throws {
@@ -634,6 +717,7 @@ import SwiftUI
     }
 
     func verifyAfterCapture() async throws {
+      vmAfter = currentVMCategories()
       try requireManagedSource()
       if let workspace { try await workspace.flush() }
       try await verifyOrdinaryExport(named: "final-export.txt"); finalExportJoined = true
@@ -707,6 +791,15 @@ import SwiftUI
         "mixed_warmed_before_donation": plan.isMixed && completedWarmSlots == 20,
         "mixed_warm_completed": completedWarmSlots,
         "mixed_warm_last_slot": lastWarmSlot.map { $0 as Any } ?? NSNull(),
+        "startup_input_before": startupBefore ?? ["available": false],
+        "startup_input_after": startupAfter ?? ["available": false],
+        "startup_incidental_undo_attempted": startupUndoAttempted,
+        "startup_incidental_undo_joined": startupUndoJoined,
+        "priming_before": primingBefore ?? ["available": false],
+        "priming_after_insert": primingAfterInsert ?? ["available": false],
+        "priming_after_delete": primingAfterDelete ?? ["available": false],
+        "vm_categories_before_capture": vmBefore ?? ["available": false],
+        "vm_categories_after_capture": vmAfter ?? ["available": false],
         "synchronous_cpu_stage": "Editor.PublicInputDispatch",
         "ready_wait_stage": "Editor.PublicReadyWait",
         "end_to_ready_stage": "Editor.PublicMixedOperation",

@@ -39,7 +39,9 @@ import AppKit
     let replacement = source.attributedSubstring(from: range)
     if previous.length == replacement.length,
       storage.attributedSubstring(from: previous).isEqual(to: replacement) { return }
+    mediaLayout.invalidateMediaPresence()
     storage.replaceCharacters(in: previous, with: replacement)
+    mediaLayout.reconcileMediaPresence(in: storage)
     measured.removeAll(keepingCapacity: true)
   }
   func height(of source: NSTextStorage, width: CGFloat, insets: NSSize, fragmentPadding: CGFloat) -> CGFloat {
@@ -59,7 +61,10 @@ import AppKit
     if needsSnapshot || !source.editedMask.isEmpty {
       needsSnapshot = !source.editedMask.isEmpty
       if !storage.isEqual(to: source) {
-        storage.setAttributedString(source); measured.removeAll(keepingCapacity: true)
+        mediaLayout.invalidateMediaPresence()
+        storage.setAttributedString(source)
+        mediaLayout.reconcileMediaPresence(in: storage)
+        measured.removeAll(keepingCapacity: true)
       }
     }
     let contentWidth = max(1, width - insets.width * 2)
