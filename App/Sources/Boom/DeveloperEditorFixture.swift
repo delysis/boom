@@ -12,6 +12,40 @@ import SwiftUI
 /// Fixed ordinary file recipes; no physical input/IME or
 /// compositor acceptance. The guarded stack route requires owned admission;
 /// the normal memory route accepts only the two fixed public recipes.
+/// Fixture-only hold after the actual production copy wrote its first64KiB.
+/// Its signal records entry; the returned production Task owns completion.
+private final class DeveloperBackupCopyHold: @unchecked Sendable {
+  let signals: AsyncStream<Void>
+  private let entered: AsyncStream<Void>.Continuation
+  private let documentName: String
+  private let releaseSignal = DispatchSemaphore(value: 0)
+  private let lock = NSLock()
+  private var observation: (source: URL, staged: URL, bytes: UInt64)?
+  private var held = false, expired = false
+  init(documentID: UUID) {
+    documentName = documentID.uuidString.lowercased()
+    let stream = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+    signals = stream.stream; entered = stream.continuation
+  }
+  func copied(_ source: URL, _ staged: URL, _ bytes: UInt64) throws {
+    guard source.lastPathComponent == "pages",
+      source.deletingLastPathComponent().lastPathComponent == documentName, bytes >= 65_536 else { return }
+    lock.lock()
+    guard observation == nil else { lock.unlock(); return }
+    observation = (source, staged, bytes); held = true
+    lock.unlock(); entered.yield(())
+    let timedOut = releaseSignal.wait(timeout: .now() + .seconds(10)) != .success
+    lock.lock(); held = false; expired = timedOut; lock.unlock()
+    if timedOut { throw BoomError.unavailable("Actual public backup copy missed its fixed10s release deadline.") }
+  }
+  func release() { releaseSignal.signal(); entered.finish() }
+  var isHeld: Bool { lock.lock(); defer { lock.unlock() }; return held }
+  var didTimeOut: Bool { lock.lock(); defer { lock.unlock() }; return expired }
+  var actualFiles: (source: URL, staged: URL, bytes: UInt64)? {
+    lock.lock(); defer { lock.unlock() }; return observation
+  }
+}
+
 @MainActor enum DeveloperEditorFixture {
   // Preserve the actual partial Model/window/source on any failed cleanup.
   // This is the existing fixture receiver, not another lifetime or root owner.
@@ -115,7 +149,19 @@ import SwiftUI
     private var primingBefore: [String: Any]?, primingAfterInsert: [String: Any]?, primingAfterDelete: [String: Any]?
     private var vmBefore: [String: Any]?, vmAfter: [String: Any]?
     private var applicationBeforeFocus: [String: Any]?, applicationAfterFocus: [String: Any]?
+    private var reactivationCount = 0, lastReactivationEvent: UInt64 = 0
+    private var reactivationTotalSeconds: Double = 0, reactivationMaximumSeconds: Double = 0
     private var normalTimings: [[String: Any]] = []
+    private var liveBackupVerified = false, cancelledBackupVerified = false, backupColdRestoreVerified = false
+    private var backupControlStage = "unentered", backupPhaseActive = false, backupOriginalClosed = false
+    private var backupCapturedRecord: PagedDocumentRootRecord?
+    private var backupCapturedSelection: PagedNativeNavigationSelection?
+    private var backupCapturedDigest: String?, backupAttachmentID: UUID?
+    private var backupOriginalIncarnation: UUID?, backupOriginalSessionID: UUID?
+    private var backupRestored: WorkspaceModel?
+    private var backupRestoredHost: NSHostingView<WorkspaceView>?
+    private var backupRestoredWindow: NSWindow?
+    private var backupRestoreCloseAttempted = false
     private var heldWriterVerified = false
     private var heldWriterFailureState: [String: Any]?
     private var warmMarkedStates: [[String: Any]] = []
@@ -298,6 +344,7 @@ import SwiftUI
       try requireManagedSource()
       try await verifyOrdinaryExport(named: "prepared-export.txt"); preparationExportJoined = true
       if plan.isMixed || normalMemory { try await verifyHeldWriterEditing() }
+      if plan.utf8Bytes == 72_196 && (plan.isMixed || normalMemory) { try await verifyLiveBackupControls() }
       _ = try diskExtent(reservingReceipt: true)
       vmBefore = currentVMCategories()
     }
@@ -454,6 +501,307 @@ import SwiftUI
       try await model.flush(); managedEditor = model.pagedInput?.activeView
       try await verifyOrdinaryExport(named: "held-save-export.txt")
       try requireManagedSource(); heldWriterVerified = true; heldSave = nil
+    }
+
+    // Functional preparation only; this port uses the existing public72K
+    // graph and actual production backup Tasks, before any timing/donation.
+    private func verifyLiveBackupControls() async throws {
+      guard plan.utf8Bytes == 72_196, let model = workspace, let window,
+        let engine = model.pagedEngine, let session = model.pagedSession,
+        let input = model.pagedInput, let commands = model.pagedCommands,
+        let viewport = model.pagedViewport, let documentID else {
+        throw BoomError.invalid("Public backup controls lost their fixed ordinary graph.")
+      }
+      let scratch = root.appendingPathComponent("backup-controls", isDirectory: true)
+      guard mkdir(scratch.path, 0o700) == 0 else { throw BoomError.invalid("Backup control scratch is not fresh.") }
+      backupPhaseActive = true
+      try await verifyCancelledBackup(model: model, scratch: scratch)
+      try await mixedCaret(0, event: 0, measured: false)
+      let original = try commands.captureLogicalHistory().snapshot, originalDraft = model.draft
+      let view = try currentMixedView(), manager = commands.manager
+      let context = view.inputContext, vault = model.store.vault
+      let attachmentID = UUID(), attachmentBytes = Data("Public backup attachment".utf8)
+      view.insertText("é🙂", replacementRange: view.selectedRange())
+      model.draft = "Snapshot owner draft"
+      try await detachedWork { try vault.put(attachmentBytes, kind: .attachment, id: attachmentID) }
+      try await commands.joinPendingCommand(); try await model.flush()
+      guard let captured = model.pagedSelectedRecord else { throw BoomError.invalid("Backup source record is absent.") }
+      let capturedSelection = try input.currentDocumentSelection()
+      let capturedDigest = try await engine.wholeTextSha256(captured.document.revision)
+      guard captured.document.revision.summary.bytes == plan.utf8Bytes + 6 else {
+        throw BoomError.invalid("Public backup source edit has another extent.")
+      }
+      let backup = scratch.appendingPathComponent("snapshot")
+      let hold = DeveloperBackupCopyHold(documentID: documentID)
+      defer { hold.release() }
+      _ = try diskExtent(reservingReceipt: true, forBackupPreparation: true,
+        reservingWorkspaceCopies: 2, reservingDirectories: 1)
+      let export = try model.exportWorkspaceBackup(to: backup, progress: { try hold.copied($0, $1, $2) }, temporaryParent: scratch)
+      var exportJoined = false
+      do {
+        backupControlStage = "live-copy-held"
+        let files = try await receiveBackupHold(hold)
+        _ = try diskExtent(reservingReceipt: true, forBackupPreparation: true)
+        guard files.bytes == 65_536, model.pagedEngine === engine, model.pagedSession === session,
+          model.pagedInput === input, model.pagedViewport === viewport, model.pagedCommands === commands,
+          input.activeView === view, view.inputContext === context, commands.manager === manager,
+          window.firstResponder === view, window.isKeyWindow, view.isEditable, !model.isBusy,
+          !FileManager.default.fileExists(atPath: backup.path) else {
+          throw BoomError.invalid("Actual live clone copy changed its native graph or focus.")
+        }
+        view.setSelectedRange(NSRange(location: 0, length: 0))
+        view.insertText("X", replacementRange: view.selectedRange())
+        try await commands.joinPendingCommand(); try await model.flush()
+        guard session.sealedGeneration == session.generation,
+          session.sealedRootRecord.document.revision.summary.bytes == captured.document.revision.summary.bytes + 1,
+          try currentMixedView().string.hasPrefix("Xé🙂"), hold.isHeld else {
+          throw BoomError.invalid("Actual live publication did not complete while clone copy was held.")
+        }
+        try await mixedResponder(false, event: 0, measured: false)
+        guard try session.captureLogicalState().source.summary.bytes == captured.document.revision.summary.bytes,
+          try currentMixedView().string.hasPrefix("é🙂"), hold.isHeld else {
+          throw BoomError.invalid("Actual key responder Undo failed while clone copy was held.")
+        }
+        try await mixedResponder(true, event: 0, measured: false)
+        let redone = try currentMixedView()
+        guard redone.string.hasPrefix("Xé🙂"), redone.undoManager === manager,
+          model.pagedEngine === engine, model.pagedSession === session, model.pagedInput === input,
+          model.pagedViewport === viewport, model.pagedCommands === commands, hold.isHeld else {
+          throw BoomError.invalid("Actual key responder Redo changed the backup's live graph.")
+        }
+        model.draft = "Later owner draft"
+        try await detachedWork { try vault.put(Data("Later attachment bytes".utf8), kind: .attachment, id: attachmentID) }
+        try await model.flush()
+        redone.setMarkedText("漢", selectedRange: NSRange(location: 1, length: 0),
+          replacementRange: NSRange(location: NSNotFound, length: 0))
+        guard redone.hasMarkedText(), session.isPinned else { throw BoomError.invalid("Actual backup composition did not enter.") }
+        let anchor = try session.documentCoordinates().projectedUTF16 - 4
+        try viewport.requestScroll(toUTF16: anchor); try await viewport.joinPresentation()
+        guard let tail = viewport.visibleScrollWindow,
+          tail.snapshot.isSame(try session.captureLogicalRead().source), tail.text.utf8.count <= 16_384,
+          tail.start.utf16 <= anchor, tail.start.utf16 + tail.summary.utf16 >= anchor,
+          redone.hasMarkedText(), session.isPinned, window.firstResponder === redone,
+          window.isKeyWindow, hold.isHeld else {
+          throw BoomError.invalid("Actual marked live scroll did not complete while clone copy was held.")
+        }
+        redone.unmarkText(); try await commands.joinPendingCommand(); try await model.flush()
+        guard try currentMixedView().string.hasPrefix("X漢é🙂"), hold.isHeld else {
+          throw BoomError.invalid("Actual backup composition did not retain its text before copy release.")
+        }
+        hold.release(); exportJoined = true
+        guard try await export.value == backup, !hold.didTimeOut else {
+          throw BoomError.invalid("Actual clone export did not join its published destination.")
+        }
+      } catch {
+        let original = error; hold.release()
+        if !exportJoined, case .failure(let cleanup) = await export.result {
+          throw BoomError.unavailable(original.localizedDescription + "; actual backup join: " + cleanup.localizedDescription)
+        }
+        throw original
+      }
+
+      backupCapturedRecord = captured; backupCapturedSelection = capturedSelection
+      backupCapturedDigest = capturedDigest; backupAttachmentID = attachmentID
+      backupOriginalIncarnation = session.engineIncarnation; backupOriginalSessionID = session.sessionID
+      try await mixedResponder(false, event: 0, measured: false) // 漢
+      try await mixedResponder(false, event: 0, measured: false) // X
+      try await mixedResponder(false, event: 0, measured: false) // é🙂
+      guard try commands.captureLogicalHistory().snapshot.isSame(original) else {
+        throw BoomError.invalid("Live backup controls did not restore the original logical source.")
+      }
+      model.draft = originalDraft; try await model.flush()
+      try await detachedWork { try FileManager.default.removeItem(at: vault.recordURL(.attachment, attachmentID)) }
+      try await verifyOrdinaryExport(named: "backup-baseline-export.txt")
+      liveBackupVerified = true; backupPhaseActive = false
+      backupControlStage = "await-original-close"
+    }
+
+    // The real original shutdown must release the sole Engine slot first.
+    private func verifyColdBackupRestore() async throws {
+      guard backupOriginalClosed else {
+        throw BoomError.invalid("Cold backup restore lacks its actually closed original graph/snapshot.")
+      }
+      backupPhaseActive = true
+      do { try await receiveColdBackupRestore() }
+      catch {
+        let original = error
+        if backupRestored != nil, !backupRestoreCloseAttempted {
+          do { try await closeBackupRestoredGraph() }
+          catch { throw BoomError.unavailable(original.localizedDescription + "; actual restored close: " + error.localizedDescription) }
+        }
+        throw original
+      }
+    }
+
+    private func receiveColdBackupRestore() async throws {
+      guard let captured = backupCapturedRecord, let capturedSelection = backupCapturedSelection,
+        let capturedDigest = backupCapturedDigest, let attachmentID = backupAttachmentID,
+        let documentID, let expectedDigest, let backupOriginalIncarnation, let backupOriginalSessionID else {
+        throw BoomError.invalid("Cold backup restore lost its retained snapshot fields.")
+      }
+      let scratch = root.appendingPathComponent("backup-controls", isDirectory: true)
+      let backup = scratch.appendingPathComponent("snapshot"), restoredRoot = scratch.appendingPathComponent("restored")
+      let attachmentBytes = Data("Public backup attachment".utf8)
+      backupControlStage = "cold-restore"
+      _ = try diskExtent(reservingReceipt: true, forBackupPreparation: true,
+        reservingWorkspaceCopies: 1, reservingDirectories: 2)
+      let restoredStore = try WorkspaceStore(rootOverride: restoredRoot)
+      try await restoredStore.restoreBackup(from: backup)
+      let restored: WorkspaceModel
+      do { restored = try await WorkspaceModel(storeOverride: restoredStore, loadModels: false) }
+      catch let failure as WorkspacePagedStartupFailure { backupRestored = failure.model; throw failure.original }
+      backupRestored = restored
+      restored.setAutocomplete(false)
+      let restoredWindow = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 1190, height: 846))
+      backupRestoredWindow = restoredWindow; restoredWindow.isReleasedWhenClosed = false
+      let restoredHost = NSHostingView(rootView: WorkspaceView(model: restored))
+      backupRestoredHost = restoredHost; restoredWindow.contentView = restoredHost
+      for _ in 0..<10 { restoredHost.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(25)) }
+      try await receiveActualKeyWindow(restoredWindow)
+      guard let restoredInput = restored.pagedInput, let restoredView = restoredInput.activeView,
+        let restoredEngine = restored.pagedEngine, let restoredSession = restored.pagedSession,
+        let restoredCommands = restored.pagedCommands,
+        restoredSession.engineIncarnation != backupOriginalIncarnation,
+        restoredSession.sessionID != backupOriginalSessionID,
+        restoredView.window === restoredWindow, restoredWindow.makeFirstResponder(restoredView),
+        restoredWindow.firstResponder === restoredView, restoredWindow.isKeyWindow,
+        restored.pagedSelectedRecord == captured,
+        try restoredInput.currentDocumentSelection() == capturedSelection,
+        restored.draft == "Snapshot owner draft" else {
+        throw BoomError.invalid("Actual cold backup graph/source/cursor/draft differs from its captured snapshot.")
+      }
+      let restoredAttachment = try await detachedWork { try restoredStore.vault.get(.attachment, id: attachmentID) }
+      let restoredDigest = try await restoredEngine.wholeTextSha256(captured.document.revision)
+      guard let imported = restored.state.importedFiles?[documentID]?.originalRevision else {
+        throw BoomError.invalid("Cold backup lost its actual imported original revision.")
+      }
+      let originalDigest = try await restoredEngine.wholeTextSha256(imported)
+      guard restoredAttachment == attachmentBytes, restoredDigest == capturedDigest,
+        originalDigest == expectedDigest.map({ String(format: "%02x", $0) }).joined(),
+        imported.summary.bytes == plan.utf8Bytes, restoredCommands.manager.canUndo,
+        NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil) else {
+        throw BoomError.invalid("Cold backup bytes/original source or actual responder Undo differs.")
+      }
+      try await restoredCommands.joinPendingCommand(); try await restored.flush()
+      guard let restoredBefore = restored.pagedSelectedRecord else { throw BoomError.invalid("Cold restored Undo has no source record.") }
+      let restoredBeforeDigest = try await restoredEngine.wholeTextSha256(restoredBefore.document.revision)
+      guard restoredBeforeDigest == originalDigest else { throw BoomError.invalid("Cold backup Undo did not restore its complete original bytes.") }
+      try await closeBackupRestoredGraph()
+      _ = try diskExtent(reservingReceipt: true, forBackupPreparation: true)
+      try await detachedWork { try FileManager.default.removeItem(at: scratch) }
+      backupColdRestoreVerified = true; backupPhaseActive = false; backupControlStage = "complete"
+    }
+
+    private func receiveBackupHold(_ hold: DeveloperBackupCopyHold) async throws -> (source: URL, staged: URL, bytes: UInt64) {
+      try await withThrowingTaskGroup(of: Void.self) { group in
+        defer { group.cancelAll() }
+        group.addTask {
+          var iterator = hold.signals.makeAsyncIterator()
+          guard let _ = await iterator.next() else { throw BoomError.unavailable("Actual backup copy did not enter its hold.") }
+        }
+        group.addTask {
+          try await Task.sleep(for: .seconds(10)); hold.release()
+          throw BoomError.unavailable("Actual backup copy did not enter within its fixed10s preparation bound.")
+        }
+        try await group.next()
+      }
+      guard hold.isHeld, let files = hold.actualFiles else { throw BoomError.invalid("Actual backup hold has no completed byte-copy observation.") }
+      return files
+    }
+
+    private func closeBackupRestoredGraph() async throws {
+      guard let restored = backupRestored else { return }
+      guard !backupRestoreCloseAttempted else { throw BoomError.unavailable("A failed restored graph close remains retained; no close retry.") }
+      backupRestoreCloseAttempted = true
+      try await restored.shutdown()
+      backupRestoredWindow?.close()
+      backupRestored = nil; backupRestoredHost = nil; backupRestoredWindow = nil
+    }
+
+    private func verifyCancelledBackup(model: WorkspaceModel, scratch: URL) async throws {
+      guard let engine = model.pagedEngine, let session = model.pagedSession, let input = model.pagedInput,
+        let commands = model.pagedCommands, let viewport = model.pagedViewport, let documentID else {
+        throw BoomError.invalid("Backup cancellation lost its ordinary graph.")
+      }
+      let original = try commands.captureLogicalHistory().snapshot
+      let refused = scratch.appendingPathComponent("chosen-directory"), sentinel = refused.appendingPathComponent("retained")
+      let sentinelBytes = Data("Retained chosen directory".utf8)
+      try await detachedWork {
+        try FileManager.default.createDirectory(at: refused, withIntermediateDirectories: false,
+          attributes: [.posixPermissions: 0o700]); try sentinelBytes.write(to: sentinel)
+      }
+      let unrelated = try model.exportPagedDocument(to: refused)
+      guard case .failure(let unrelatedFailure) = await unrelated.result,
+        let refusal = unrelatedFailure as? BoomError,
+        case .denied(let reason) = refusal, reason == "Export cannot replace a symlink, directory or device." else {
+        throw BoomError.invalid("Actual chosen-directory export did not preserve its expected refusal.")
+      }
+      model.dismissError()
+      let backup = scratch.appendingPathComponent("retry"), hold = DeveloperBackupCopyHold(documentID: documentID)
+      defer { hold.release() }
+      _ = try diskExtent(reservingReceipt: true, forBackupPreparation: true,
+        reservingWorkspaceCopies: 2, reservingDirectories: 1)
+      let cancelled = try model.exportWorkspaceBackup(to: backup, progress: { try hold.copied($0, $1, $2) }, temporaryParent: scratch)
+      var cancelledJoined = false
+      do {
+        backupControlStage = "cancel-copy-held"
+        let files = try await receiveBackupHold(hold)
+        _ = try diskExtent(reservingReceipt: true, forBackupPreparation: true)
+        let clone = files.source.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let container = clone.deletingLastPathComponent()
+        let stage = files.staged.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        guard files.bytes == 65_536, clone.lastPathComponent == "Workspace",
+          stage.lastPathComponent.hasPrefix(".backup-"), hold.isHeld,
+          model.pagedEngine === engine, model.pagedSession === session, model.pagedInput === input,
+          model.pagedCommands === commands, model.pagedViewport === viewport else {
+          throw BoomError.invalid("Actual backup retry was poisoned by unrelated export or changed its graph.")
+        }
+        let view = try currentMixedView()
+        view.setSelectedRange(NSRange(location: 0, length: 0)); view.insertText("Y", replacementRange: view.selectedRange())
+        try await commands.joinPendingCommand(); try await model.flush()
+        guard let later = model.pagedSelectedRecord, try currentMixedView().string.hasPrefix("Y"), hold.isHeld else {
+          throw BoomError.invalid("Actual later input/save did not finish before cancelling clone copy.")
+        }
+        model.cancelExport(to: backup); hold.release(); cancelledJoined = true
+        guard case .failure(let cancellation) = await cancelled.result, cancellation is CancellationError,
+          !hold.didTimeOut, !FileManager.default.fileExists(atPath: backup.path),
+          !FileManager.default.fileExists(atPath: stage.path),
+          !FileManager.default.fileExists(atPath: container.path) else {
+          throw BoomError.invalid("Actual cancelled clone export did not join cancellation and clean only its files.")
+        }
+        _ = try diskExtent(reservingReceipt: true, forBackupPreparation: true,
+          reservingWorkspaceCopies: 2, reservingDirectories: 1)
+        let retry = try model.exportWorkspaceBackup(to: backup, temporaryParent: scratch)
+        guard try await retry.value == backup else { throw BoomError.invalid("Actual backup retry returned another destination.") }
+        let copiedRoot = try await detachedWork {
+          let path = backup.appendingPathComponent("documents/" + documentID.uuidString.lowercased() + "/document-root.json")
+          let value = try JSONDecoder().decode(PagedDocumentRootRecord.self, from: RegularFile(path, limit: 16_384).data())
+          try value.validate(); return value
+        }
+        guard copiedRoot == later, case .failure(let retained) = await unrelated.result,
+          (retained as NSError).domain == (unrelatedFailure as NSError).domain,
+          (retained as NSError).code == (unrelatedFailure as NSError).code,
+          retained.localizedDescription == unrelatedFailure.localizedDescription,
+          try await detachedWork({ try RegularFile(sentinel, limit: 4_096).data() }) == sentinelBytes else {
+          throw BoomError.invalid("Actual backup retry differs or replaced the original retained export failure/files.")
+        }
+      } catch {
+        let original = error; hold.release()
+        if !cancelledJoined, case .failure(let cleanup) = await cancelled.result, !(cleanup is CancellationError) {
+          throw BoomError.unavailable(original.localizedDescription + "; actual cancelled backup join: " + cleanup.localizedDescription)
+        }
+        throw original
+      }
+      try await mixedResponder(false, event: 0, measured: false)
+      guard try commands.captureLogicalHistory().snapshot.isSame(original) else {
+        throw BoomError.invalid("Backup cancellation control did not restore its actual prior source.")
+      }
+      try await model.flush()
+      try await detachedWork {
+        try FileManager.default.removeItem(at: backup)
+        try FileManager.default.removeItem(at: refused)
+      }
+      cancelledBackupVerified = true
     }
 
     func writeNormalMemorySummary(maximumSampledCurrent: UInt64, kernelLifetimePeak: UInt64, samples: Int) throws {
@@ -616,12 +964,15 @@ import SwiftUI
     }
 
     private func joinMixedInput(_ event: UInt64, measured: Bool) async throws {
-      guard let model = workspace, let commands = model.pagedCommands else {
+      guard let model = workspace, let commands = model.pagedCommands, let viewport = model.pagedViewport else {
         throw BoomError.stale("Mixed input lost its existing command owner.")
       }
       try await mixedReady(event, measured: measured) {
         try await commands.joinPendingCommand()
-        try await model.flush()
+        try await viewport.joinPresentation()
+        // Warm controls retain durable checkpoints. Measured UI readiness
+        // joins actual commands/presentation; final save/export stays outside.
+        if !measured { try await model.flush() }
       }
       _ = try currentMixedView()
     }
@@ -833,9 +1184,43 @@ import SwiftUI
         guard input.session.generation > generation else { throw BoomError.invalid("Mixed edit did not advance the native source.") }
       }
       guard model.pagedInput === input, model.pagedCommands === commands, model.pagedViewport === viewport,
-        model.pagedSelectedRecord?.document.revision.summary.bytes == extent else {
+        try input.session.captureLogicalState().source.summary.bytes == extent else {
         throw BoomError.invalid("Mixed operation did not retain its graph or restored source extent.")
       }
+    }
+
+    // A genuine readiness acquisition between operations is not an input
+    // retry. The existing110s observation deadline includes every such gap.
+    private func receiveMixedReadiness(event: UInt64) async throws {
+      guard let model = workspace, let input = model.pagedInput,
+        let commands = model.pagedCommands, let viewport = model.pagedViewport,
+        let window, let host, let view = input.activeView,
+        viewport.textView === view, view.window === window, window.firstResponder === view else {
+        throw BoomError.stale("Mixed readiness lost its actual mounted graph or responder before activation.")
+      }
+      if NSApp.isRunning, NSApp.isActive, NSApp.keyWindow === window, window.isKeyWindow { return }
+      managedEditor = view; try requireManagedSource()
+      let session = input.session, before = try session.captureLogicalState()
+      let selection = try input.currentDocumentSelection(), nativeRange = view.selectedRange()
+      let affinity = view.selectionAffinity, binding = input.activeIdentity
+      let start = ContinuousClock().now
+      reactivationCount += 1; lastReactivationEvent = event
+      defer {
+        let elapsed = start.duration(to: ContinuousClock().now).timeInterval
+        reactivationTotalSeconds += elapsed
+        reactivationMaximumSeconds = max(reactivationMaximumSeconds, elapsed)
+      }
+      try await receiveActualKeyWindow(window)
+      guard workspace === model, self.host === host, self.window === window,
+        model.pagedInput === input, model.pagedSession === session,
+        model.pagedCommands === commands, model.pagedViewport === viewport,
+        input.activeView === view, viewport.textView === view, input.activeIdentity == binding,
+        session.isCurrent(before), try input.currentDocumentSelection() == selection,
+        view.selectedRange() == nativeRange, view.selectionAffinity == affinity,
+        window.firstResponder === view, window.isKeyWindow, NSApp.keyWindow === window else {
+        throw BoomError.stale("Actual readiness re-entry changed the graph/source/generation/selection; no input was retried.")
+      }
+      try requireManagedSource()
     }
 
     private func renderMixedSurface(event: UInt64, measured: Bool) throws {
@@ -853,15 +1238,18 @@ import SwiftUI
       guard requested.kind == plan.kind, requested.operations == plan.operations,
         requested.utf8Bytes == plan.utf8Bytes, plan.isMixed, host != nil,
         let window, workspace != nil else { throw BoomError.invalid("Mixed public preparation is incomplete.") }
+      let clock = ContinuousClock(), deadline = ContinuousClock().now.advanced(by: .seconds(Self.observationSeconds))
+      try await receiveMixedReadiness(event: 0)
       _ = try currentMixedView()
       footprintBefore = ModelResidency.memoryAccounting().current
       guard footprintBefore > 0 else { throw BoomError.unavailable("Public process footprint is unavailable.") }
-      let clock = ContinuousClock(), deadline = ContinuousClock().now.advanced(by: .seconds(Self.observationSeconds))
       for index in 0..<requested.operations {
         try Task.checkCancellation()
         guard clock.now < deadline else { throw BoomError.unavailable("Mixed observation exceeded its fixed bound.") }
         try await Task.sleep(until: clock.now.advanced(by: .milliseconds(250)), clock: clock)
         guard clock.now < deadline else { throw BoomError.unavailable("Mixed observation expired before its next operation.") }
+        try await receiveMixedReadiness(event: UInt64(index) + 1)
+        guard clock.now < deadline else { throw BoomError.unavailable("Mixed readiness consumed the fixed observation deadline; no input was retried.") }
         let operation = PerformanceTrace.begin("Editor.PublicMixedOperation", event: UInt64(index) + 1)
         do {
           defer { PerformanceTrace.end("Editor.PublicMixedOperation", operation) }
@@ -1043,25 +1431,37 @@ import SwiftUI
         }
       }
       if let workspace {
-        do { try await workspace.shutdown() }
+        do { try await workspace.shutdown(); backupOriginalClosed = true }
         catch { failures.append("Actual workspace close: " + error.localizedDescription) }
       }
       guard failures.isEmpty else { throw BoomError.unavailable(failures.joined(separator: "; ")) }
       window?.close() // do not detach a failed actual native/window receiver
+      if liveBackupVerified { try await verifyColdBackupRestore() }
       shutdownJoined = true
     }
 
     /// Ordinary recipes admit32files,16directories/depth6 and their fixed
     /// byte ceilings, including
     /// the owner's public TMPDIR. Never inspect a directory during typing.
-    private func diskExtent(reservingReceipt: Bool) throws -> UInt64 {
+    private func diskExtent(reservingReceipt: Bool, forBackupPreparation: Bool = false,
+      reservingWorkspaceCopies: Int = 0, reservingDirectories: Int = 0) throws -> UInt64 {
+      // Only the fixed short backup setup/restore may hold three same-volume
+      // workspace trees. Steady observations retain the original16-dir bound.
+      let directoryLimit = forBackupPreparation && plan.utf8Bytes == 72_196 ? 20 : 16
+      guard (0...2).contains(reservingWorkspaceCopies), (0...2).contains(reservingDirectories),
+        forBackupPreparation || (reservingWorkspaceCopies == 0 && reservingDirectories == 0) else {
+        throw BoomError.invalid("Backup preparation reservation differs from its fixed phase.")
+      }
       var pending: [(URL, Int)] = [(root, 0), (temporaryRoot, 0)]
       var files = 0, directories = 0, bytes: UInt64 = 0
+      var workspaceFiles = 0, workspaceDirectories = 0, workspaceBytes: UInt64 = 0
+      let workspaceRoot = root.appendingPathComponent("workspace", isDirectory: true)
       while let (directory, depth) = pending.popLast() {
-        guard depth < 6, directories < 16 else {
+        guard depth < 6, directories < directoryLimit else {
           throw BoomError.budget("Public fixture directory bound exceeded.")
         }
         directories += 1
+        if directory == workspaceRoot || directory.path.hasPrefix(workspaceRoot.path + "/") { workspaceDirectories += 1 }
         let children = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
         guard children.count <= 32 else { throw BoomError.budget("Public fixture entry bound exceeded.") }
         for child in children {
@@ -1077,6 +1477,9 @@ import SwiftUI
             let next = bytes.addingReportingOverflow(UInt64(info.st_size))
             guard !next.overflow else { throw BoomError.budget("Public fixture disk extent overflowed.") }
             bytes = next.partialValue
+            if child.path.hasPrefix(workspaceRoot.path + "/") {
+              workspaceFiles += 1; workspaceBytes += UInt64(info.st_size)
+            }
           default: throw BoomError.invalid("Public fixture contains a nonregular entry.")
           }
           guard files <= (reservingReceipt ? 31 : 32),
@@ -1085,16 +1488,23 @@ import SwiftUI
           }
         }
       }
+      let reservedBytes = bytes.addingReportingOverflow(workspaceBytes * UInt64(reservingWorkspaceCopies))
+      guard !reservedBytes.overflow,
+        files + workspaceFiles * reservingWorkspaceCopies <= (reservingReceipt ? 31 : 32),
+        directories + workspaceDirectories * reservingWorkspaceCopies + reservingDirectories <= directoryLimit,
+        reservedBytes.partialValue <= plan.diskLimit - (reservingReceipt ? 16_384 : 0) else {
+        throw BoomError.budget("Actual workspace copies would exceed the fixed backup preparation disk envelope.")
+      }
       return bytes
     }
 
     func writeReceipt(captureFinished: Bool, failures: [String]) throws {
-      let extent = try diskExtent(reservingReceipt: true)
+      let extent = try diskExtent(reservingReceipt: true, forBackupPreparation: backupPhaseActive)
       let receipt: [String: Any] = [
         "schema": 1, "status": failures.isEmpty && (normalMemory || captureFinished) && shutdownJoined && sourceVerified
           && completed == plan.operations ? "complete" : "incomplete",
         "requested_cycles": plan.operations, "completed_cycles": completed,
-        "operation_program": plan.isMixed ? "mixed-v1" : "head-paired-v1",
+        "operation_program": plan.isMixed ? "mixed-v2" : "head-paired-v1",
         "mixed_slots": plan.isMixed ? Self.mixedSlots : [],
         "mixed_warmed_before_donation": plan.isMixed && completedWarmSlots == 20,
         "mixed_warm_completed": completedWarmSlots, "warm_marked_states": warmMarkedStates,
@@ -1110,12 +1520,23 @@ import SwiftUI
         "vm_categories_after_capture": vmAfter ?? ["available": false],
         "application_before_focus": applicationBeforeFocus ?? ["available": false],
         "application_after_focus": applicationAfterFocus ?? ["available": false],
+        "reactivation_count": reactivationCount, "last_reactivation_event": lastReactivationEvent,
+        "reactivation_gap_total_seconds": reactivationTotalSeconds,
+        "reactivation_gap_maximum_seconds": reactivationMaximumSeconds,
+        "reactivation_outside_operation_spans": true,
+        "mixed_ready_includes_durability_join": false,
+        "mixed_final_durability_export_outside_operation_spans": true,
         "synchronous_cpu_stage": "Editor.PublicInputDispatch",
         "ready_wait_stage": "Editor.PublicReadyWait",
         "end_to_ready_stage": "Editor.PublicMixedOperation",
         "offscreen_sdk_diagnostic": true, "normal_release_memory_observation": normalMemory,
         "bitmap_raster_exercised": !normalMemory, "actual_held_writer_control_passed": heldWriterVerified,
         "held_writer_failure_state": heldWriterFailureState ?? ["available": false],
+        "actual_live_backup_control_passed": liveBackupVerified,
+        "actual_backup_cancel_retry_control_passed": cancelledBackupVerified,
+        "actual_backup_cold_restore_control_passed": backupColdRestoreVerified,
+        "backup_control_stage": backupControlStage, "backup_preparation_directory_cap": 20,
+        "backup_control_scope": "Public72K App-run only; live controls before measurement, cold restore after original shutdown. No GiB backup claim.",
         "slow_dispatch_threshold_ns": 8_000_000,
         "fixture_kind": plan.kind, "storage_route": "files",
         "primitive_replacements_per_cycle": plan.isMixed ? (NSNull() as Any) : (2 as Any), "public_utf8_bytes": plan.utf8Bytes,

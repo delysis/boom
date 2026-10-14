@@ -14,7 +14,7 @@ struct InlineMediaSpan: Decodable {
   var range: NSRange { NSRange(location: location, length: length) }
 }
 
-/// Immutable display data. Encrypted originals stay in the vault; thumbnails
+/// Immutable display data. Original files stay in the workspace; thumbnails
 /// and playable bytes exist only while a surface owns their presentation.
 @MainActor final class InlineMediaItem: NSObject {
   let record: AttachmentRecord
@@ -68,6 +68,11 @@ struct InlineMediaSpan: Decodable {
   func layoutManager(_ manager: NSLayoutManager, shouldGenerateGlyphs glyphs: UnsafePointer<CGGlyph>,
     properties props: UnsafePointer<NSLayoutManager.GlyphProperty>, characterIndexes indexes: UnsafePointer<Int>,
     font: NSFont, forGlyphRange range: NSRange) -> Int {
+    // Existing diagnostic stage: low bit is media presence, remaining bits
+    // are glyph count. No text or attributed-buffer copies enter the trace.
+    let event = UInt64(clamping: range.length) << 1 | (hasMedia ? 1 : 0)
+    let trace = PerformanceTrace.begin("Editor.MediaLayout", event: event)
+    defer { PerformanceTrace.end("Editor.MediaLayout", trace) }
     guard hasMedia, let storage = manager.textStorage else { return 0 }
     guard let first = (0..<range.length).first(where: { index in
       indexes[index] >= 0 && indexes[index] < storage.length

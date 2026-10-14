@@ -3279,7 +3279,7 @@ private struct BoundedConsultationContext: Sendable {
     }
   }
   @discardableResult
-  func exportWorkspaceBackup(to url: URL, progress: WorkspaceBackup.CopyProgress? = nil) throws -> Task<URL, Error> {
+  func exportWorkspaceBackup(to url: URL, progress: WorkspaceBackup.CopyProgress? = nil, temporaryParent: URL? = nil) throws -> Task<URL, Error> {
     try requirePagedOperation()
     guard canBackupWorkspace, recordingAttachmentTask == nil else {
       throw BoomError.unavailable("Another workspace capture or recording is still being saved.")
@@ -3321,7 +3321,7 @@ private struct BoundedConsultationContext: Sendable {
         if self.pagedSession?.isPinned == true { try await self.saveWorkspaceMetadata() }
         else { try await self.flush() }
         try flag.check()
-        let snapshot = try await engine.captureWorkspaceBackup(vault: vault, cancellation: flag)
+        let snapshot = try await engine.captureWorkspaceBackup(vault: vault, cancellation: flag, temporaryParent: temporaryParent)
         captured = true
         self.finishWorkspaceBackupCapture(id)
         // This Task/registry owns the clone until export AND disposal join.

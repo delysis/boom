@@ -80,12 +80,28 @@ enum WorkspaceBackup {
   /// Caller holds the existing Engine writer queue and Vault lock. Native
   /// clones are required: unsupported filesystems never fall back to a long
   /// byte copy while those source writers are excluded.
-  static func captureForExport(root: URL, cancellation: CancellationFlag) throws -> CapturedDirectory {
+  static func captureForExport(root: URL, cancellation: CancellationFlag, temporaryParent: URL? = nil) throws -> CapturedDirectory {
     let source = try physicalDirectory(root)
-    // Cocoa provides a temporary directory on this volume. Its existence is
-    // not promised after app exit; no workspace sibling scavenger is needed.
-    let directory = try FileManager.default.url(for: .itemReplacementDirectory,
-      in: .userDomainMask, appropriateFor: source, create: true).standardizedFileURL
+    let directory: URL
+    if let temporaryParent {
+      // The public App fixture supplies only its admitted0700 same-volume
+      // parent. Ordinary exports continue to use Foundation's crash-cleaned temp.
+      let parent = try physicalDirectory(temporaryParent)
+      var parentInfo = stat(), sourceInfo = stat()
+      guard parent == temporaryParent.standardizedFileURL, parent != source,
+        !parent.path.hasPrefix(source.path + "/"),
+        lstat(parent.path, &parentInfo) == 0, lstat(source.path, &sourceInfo) == 0,
+        parentInfo.st_mode & S_IFMT == S_IFDIR,
+        parentInfo.st_uid == getuid(), parentInfo.st_mode & 0o777 == 0o700,
+        parentInfo.st_dev == sourceInfo.st_dev else {
+        throw BoomError.denied("Backup fixture clone parent is not its physical owned same-volume directory.")
+      }
+      directory = parent.appendingPathComponent(".backup-source-" + UUID().uuidString, isDirectory: true)
+      guard mkdir(directory.path, 0o700) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+    } else {
+      directory = try FileManager.default.url(for: .itemReplacementDirectory,
+        in: .userDomainMask, appropriateFor: source, create: true).standardizedFileURL
+    }
     var container = stat()
     guard lstat(directory.path, &container) == 0, container.st_mode & S_IFMT == S_IFDIR else {
       throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)

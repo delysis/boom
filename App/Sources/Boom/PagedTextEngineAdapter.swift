@@ -895,7 +895,7 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
   /// Capture only: the live SDK/source/read lane stays open. The complete
   /// physical document head is published within one writer job; ACK receiving
   /// afterwards changes custody, not these files or the metadata index.
-  func captureWorkspaceBackup(vault: Vault, cancellation: CancellationFlag) async throws -> WorkspaceBackup.CapturedDirectory {
+  func captureWorkspaceBackup(vault: Vault, cancellation: CancellationFlag, temporaryParent: URL? = nil) async throws -> WorkspaceBackup.CapturedDirectory {
     guard vault.root.deletingLastPathComponent().standardizedFileURL.path == sourceRoot.standardizedFileURL.path else {
       throw BoomError.denied("Backup has another actual workspace namespace.")
     }
@@ -907,7 +907,7 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
           try cancellation.check(); try self.router.files().requireQueue()
           // Fixed lock order: existing writer queue, then Vault's mutex.
           // Vault's synchronous operations never call back into Engine.
-          let captured = try vault.captureBackupSource(cancellation: cancellation)
+          let captured = try vault.captureBackupSource(cancellation: cancellation, temporaryParent: temporaryParent)
           do { try self.rootCustody.finishRead(lease) }
           catch {
             try WorkspaceBackup.discard(captured, preserving: error)
