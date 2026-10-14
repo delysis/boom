@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import BoomCore
+import SwiftUI
 import XCTest
 @testable import Boom
 
@@ -709,5 +710,152 @@ final class InlineMediaTests: XCTestCase {
       return XCTFail("The actual native pasteboard lost the original Bloom or PNG representation.")
     }
     XCTAssertEqual(name, "public-original.bin"); XCTAssertEqual(original, bytes); XCTAssertEqual(image, bytes)
+  }
+
+  @MainActor private func attachmentReader(in root: NSView) -> NativeReadingTextView? {
+    if let reader = root as? NativeReadingTextView { return reader }
+    for child in root.subviews { if let reader = attachmentReader(in: child) { return reader } }
+    return nil
+  }
+
+  @MainActor func testActualAttachmentCardUsesVisibleReaderGeometryAndNoOriginalReadAcrossDraftUpdates() async throws {
+    try PagedNativeFixtureApplication.bootstrap()
+    let failures = testRun?.failureCount ?? 0
+    let root = try PagedNativeFixtureApplication.scratchRoot(prefix: "public-attachment-card-geometry-")
+    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: root), loadModels: false)
+    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: 80, y: 80, width: 340, height: 560))
+    window.isReleasedWhenClosed = false
+    var active: NativeReadingTextView?
+    do {
+      let texts = ["# Heading\n\n**bold** café🙂\n\nSecond short paragraph.",
+        String(repeating: "**bold** café🙂 has its complete scrollable Markdown content.\n\n", count: 1800)]
+      for (index, text) in texts.enumerated() {
+        let record = AttachmentRecord(id: UUID(), name: "reader-\(index).txt", rootDigest: Digest.sha256("public-original"),
+          text: text, coverage: "Public complete extraction", presentation: .document)
+        model.state.attachments.append(record)
+        // No original exists: the actual document presentation is the retained
+        // canonical extraction, and must not start an unnecessary original read.
+        XCTAssertFalse(FileManager.default.fileExists(atPath: model.store.vault.recordURL(.attachment, record.id).path))
+        let hosting = NSHostingView(rootView: InlineAttachmentView(model: model, record: record))
+        hosting.setFrameSize(NSSize(width: 300, height: 540)); hosting.layoutSubtreeIfNeeded()
+        let reader = try XCTUnwrap(attachmentReader(in: hosting)); active = reader
+        let before = reader.contentHeight(at: 300)
+        XCTAssertNil(reader.window); XCTAssertTrue(reader.subviews.compactMap { $0 as? InlineMediaHost }.isEmpty)
+        XCTAssertLessThan(before, 60, "The real same-width measurement has cached the unseen marker's24-point geometry.")
+        window.contentView = hosting; window.orderFront(nil)
+        for _ in 0..<100 where reader.subviews.compactMap({ $0 as? InlineMediaHost }).isEmpty {
+          hosting.layoutSubtreeIfNeeded(); reader.inlineMedia.positionViews()
+          try await Task.sleep(for: .milliseconds(10))
+        }
+        await reader.inlineMedia.joinPendingLoads()
+        XCTAssertNil(reader.inlineMedia.lastFailure)
+        let media = try XCTUnwrap(reader.subviews.compactMap { $0 as? InlineMediaHost }.first)
+        let scroll = try XCTUnwrap(media.subviews.compactMap { $0 as? NativeTextScrollView }.first)
+        let actual = reader.contentHeight(at: 300)
+        XCTAssertGreaterThan(actual, before, "First visibility must invalidate both the cached width and actual marker layout.")
+        if index == 0 { XCTAssertLessThan(actual, 220); XCTAssertLessThan(media.frame.height, 220) }
+        else { XCTAssertGreaterThanOrEqual(actual, 480); XCTAssertEqual(media.frame.height, 480) }
+        XCTAssertEqual(scroll.reader.string, text)
+        let strong = (scroll.reader.string as NSString).range(of: "bold")
+        let font = try XCTUnwrap(scroll.reader.textStorage?.attribute(.font, at: strong.location, effectiveRange: nil) as? NSFont)
+        XCTAssertTrue(NSFontManager.shared.traits(of: font).contains(.boldFontMask))
+        for _ in 0..<12 {
+          model.draft += "x"
+          hosting.layoutSubtreeIfNeeded(); await Task.yield()
+          XCTAssertTrue(attachmentReader(in: hosting) === reader)
+          XCTAssertTrue(reader.subviews.compactMap { $0 as? InlineMediaHost }.first === media)
+          XCTAssertTrue(media.subviews.compactMap { $0 as? NativeTextScrollView }.first === scroll)
+          XCTAssertEqual(reader.contentHeight(at: 300), actual)
+        }
+        let end = NSRange(location: text.utf16.count, length: 0)
+        scroll.reader.setSelectedRange(end); scroll.reader.scrollRangeToVisible(end)
+        XCTAssertEqual(scroll.reader.selectedRange(), end); XCTAssertEqual(scroll.reader.string, text)
+        XCTAssertEqual(media.item.record, record); XCTAssertNil(media.item.file)
+        guard (testRun?.failureCount ?? 0) == failures else {
+          throw BoomError.invalid("Actual same-width attachment geometry/full reading assertions failed; graph retained.")
+        }
+        reader.inlineMedia.stop(); await reader.inlineMedia.joinPendingLoads()
+        window.contentView = nil; active = nil
+      }
+      guard (testRun?.failureCount ?? 0) == failures else {
+        throw BoomError.invalid("Actual pending/direct attachment geometry or full reading assertions failed; graph retained.")
+      }
+      try await model.shutdown(); window.close(); try FileManager.default.removeItem(at: root)
+    } catch {
+      if let active { active.inlineMedia.stop(); await active.inlineMedia.joinPendingLoads() }
+      precondition(Self.failedDisplayCopyControls.count < 8)
+      Self.failedDisplayCopyControls.append((model, window, error)); throw error
+    }
+  }
+
+  @MainActor func testActualAttachmentCardDigestReplacementCannotCopyRetiredOriginalAndKeepsNativeMenus() async throws {
+    try PagedNativeFixtureApplication.bootstrap()
+    let failures = testRun?.failureCount ?? 0
+    let root = try PagedNativeFixtureApplication.scratchRoot(prefix: "public-attachment-card-rebind-")
+    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: root), loadModels: false)
+    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: 80, y: 80, width: 340, height: 300))
+    window.isReleasedWhenClosed = false
+    var active: NativeReadingTextView?
+    do {
+      let bytes = try Self.image(), id = UUID(), vault = model.store.vault
+      try await detachedWork { try vault.put(bytes, kind: .attachment, id: id) }
+      let original = AttachmentRecord(id: id, name: "old.png", rootDigest: Digest.sha256(bytes),
+        text: "", coverage: "Public original", presentation: .image)
+      model.state.attachments.append(original)
+      var removed = 0
+      let hosting = NSHostingView(rootView: InlineAttachmentView(model: model, record: original, remove: { removed += 1 }))
+      window.contentView = hosting; window.orderFront(nil)
+      hosting.setFrameSize(NSSize(width: 300, height: 280)); hosting.layoutSubtreeIfNeeded()
+      let reader = try XCTUnwrap(attachmentReader(in: hosting)); active = reader
+      for _ in 0..<100 where reader.inlineMedia.currentRanges.isEmpty {
+        hosting.layoutSubtreeIfNeeded(); reader.inlineMedia.refresh()
+        try await Task.sleep(for: .milliseconds(10))
+      }
+      reader.inlineMedia.positionViews(); await reader.inlineMedia.joinPendingLoads()
+      XCTAssertNil(reader.inlineMedia.lastFailure)
+      let retired = try XCTUnwrap(reader.subviews.compactMap { $0 as? InlineMediaHost }.first)
+      XCTAssertNotNil(retired.item.image)
+      let event = try XCTUnwrap(NSEvent.mouseEvent(with: .rightMouseDown, location: NSPoint(x: 10, y: 10),
+        modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+      let oldMenu = try XCTUnwrap(retired.menu(for: event))
+      XCTAssertTrue(oldMenu.items.contains(where: { $0.title == "Copy" }))
+      XCTAssertTrue(oldMenu.items.contains(where: { $0.title == "Export original…" }))
+      let oldRemove = try XCTUnwrap(oldMenu.items.first(where: { $0.title == "Remove" }))
+      let changed = AttachmentRecord(id: id, name: "current.png", rootDigest: Digest.sha256("a different unavailable original"),
+        text: "", coverage: "Public changed record", presentation: .image)
+      let index = try XCTUnwrap(model.state.attachments.firstIndex(where: { $0.id == id }))
+      model.state.attachments[index] = changed
+      hosting.rootView = InlineAttachmentView(model: model, record: changed, remove: { removed += 1 })
+      hosting.layoutSubtreeIfNeeded(); reader.inlineMedia.refresh(); reader.inlineMedia.positionViews()
+      await reader.inlineMedia.joinPendingLoads()
+      XCTAssertTrue(attachmentReader(in: hosting) === reader)
+      let current = try XCTUnwrap(reader.subviews.compactMap { $0 as? InlineMediaHost }.first)
+      XCTAssertFalse(current === retired); XCTAssertNil(retired.superview)
+      XCTAssertEqual(current.item.record, changed); XCTAssertNil(current.item.image)
+      XCTAssertNotNil(current.item.failure)
+      if let action = oldRemove.action { _ = NSApp.sendAction(action, to: oldRemove.target, from: oldRemove) }
+      XCTAssertEqual(removed, 0, "A captured old host/menu cannot remove a changed current attachment.")
+      NSPasteboard.general.clearContents(); NSPasteboard.general.setString("previous-original", forType: .string)
+      reader.setSelectedRange(try XCTUnwrap(reader.inlineMedia.currentRanges.first))
+      reader.copy(nil); await reader.inlineMedia.joinPendingLoads()
+      XCTAssertEqual(NSPasteboard.general.string(forType: .string), "previous-original")
+      XCTAssertNotNil(reader.inlineMedia.lastFailure)
+      XCTAssertEqual(try vault.get(.attachment, id: id), bytes)
+      let currentMenu = try XCTUnwrap(current.menu(for: event))
+      XCTAssertTrue(currentMenu.items.contains(where: { $0.title == "Copy" }))
+      XCTAssertTrue(currentMenu.items.contains(where: { $0.title == "Export original…" }))
+      let remove = try XCTUnwrap(currentMenu.items.first(where: { $0.title == "Remove" }))
+      if let action = remove.action { _ = NSApp.sendAction(action, to: remove.target, from: remove) }
+      XCTAssertEqual(removed, 1)
+      guard (testRun?.failureCount ?? 0) == failures else {
+        throw BoomError.invalid("Actual attachment digest, stale menu or original-publication assertions failed; graph retained.")
+      }
+      reader.inlineMedia.stop(); await reader.inlineMedia.joinPendingLoads()
+      try await model.shutdown(); window.close(); try FileManager.default.removeItem(at: root)
+    } catch {
+      if let active { active.inlineMedia.stop(); await active.inlineMedia.joinPendingLoads() }
+      precondition(Self.failedDisplayCopyControls.count < 8)
+      Self.failedDisplayCopyControls.append((model, window, error)); throw error
+    }
   }
 }

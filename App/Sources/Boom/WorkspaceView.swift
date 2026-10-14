@@ -330,6 +330,7 @@ struct ChatPane: View {
   @StateObject private var voice = VoiceInput()
   @State private var composerFocusRequest = 0
   @State private var composerHeight: CGFloat = 36
+  @State private var pendingAttachmentHeight: CGFloat = 24
   @State private var voiceChatID: UUID?
   @State private var voiceDocumentID: UUID?
   @State private var voiceDraft = ""
@@ -723,7 +724,7 @@ struct ChatPane: View {
         }
         if !model.pendingAttachments.isEmpty {
           ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
               ForEach(model.pendingAttachments, id: \.self) { id in
                 if let attachment = model.state.attachments.first(where: { $0.id == id }) {
                   InlineAttachmentView(model: model, record: attachment,
@@ -731,17 +732,15 @@ struct ChatPane: View {
                 }
               }
             }
-          }.frame(height: model.pendingAttachments.compactMap { id in
-            model.state.attachments.first(where: { $0.id == id }).map { record -> CGFloat in
-              switch record.kind {
-              case .audio: 44
-              case .image: 180
-              case .video, .pdf: 220
-              case .document: NativeScrollableText.height(of: record.text, width: 300)
-              case .unavailable: 24
-              }
+            .fixedSize(horizontal: false, vertical: true)
+            .onGeometryChange(for: CGFloat.self) { geometry in
+              ceil(geometry.size.height)
+            } action: { height in
+              guard height.isFinite, height > 0 else { return }
+              let actual = max(24, height)
+              if pendingAttachmentHeight != actual { pendingAttachmentHeight = actual }
             }
-          }.max() ?? 44)
+          }.frame(height: pendingAttachmentHeight)
         }
         if let role = model.authoredChatRole {
           HStack {

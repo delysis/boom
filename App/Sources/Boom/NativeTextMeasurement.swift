@@ -44,6 +44,10 @@ import AppKit
     mediaLayout.reconcileMediaPresence(in: storage)
     measured.removeAll(keepingCapacity: true)
   }
+  func invalidateMediaGeometry() {
+    measured.removeAll(keepingCapacity: true)
+    layout.invalidateLayout(forCharacterRange: NSRange(location: 0, length: storage.length), actualCharacterRange: nil)
+  }
   func height(of source: NSTextStorage, width: CGFloat, insets: NSSize, fragmentPadding: CGFloat) -> CGFloat {
     let trace = PerformanceTrace.begin("Text.Measurement")
     defer { PerformanceTrace.end("Text.Measurement", trace) }

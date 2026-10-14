@@ -345,6 +345,7 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
 @MainActor final class NativeInlineMedia {
   weak var view: NativeMediaTextView?
   weak var model: WorkspaceModel?
+  var attachmentRemoval: (() -> Void)?
   let layout = InlineMediaLayout()
   private(set) var spans: [InlineMediaSpan] = []
   private var items: [UUID: InlineMediaItem] = [:]
@@ -651,6 +652,7 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
           // marker with finite measured geometry instead of the placeholder.
           _ = item.size(available: container.size.width - container.lineFragmentPadding * 2)
           manager.invalidateLayout(forCharacterRange: span.range, actualCharacterRange: nil)
+          view.mediaChanged()
         }
       }
       host.sourceRange = span.range
@@ -795,11 +797,16 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
     let menu = NSMenu()
     var actions = [("Copy", #selector(copyReference(_:))), ("Export original…", #selector(exportOriginal(_:)))]
     if owner?.isEditable == true { actions.insert(("Cut", #selector(cutReference(_:))), at: 1) }
+    if owner?.inlineMedia.attachmentRemoval != nil { actions.append(("Remove", #selector(removeReference(_:)))) }
     for (title, action) in actions {
       let entry = NSMenuItem(title: title, action: action, keyEquivalent: "")
       entry.target = self; entry.representedObject = captured; menu.addItem(entry)
     }
     return menu
+  }
+  @objc private func removeReference(_ sender: Any?) {
+    guard let owner = menuOwner(sender), owner.inlineMedia.model?.state.attachments.contains(item.record) == true else { return }
+    owner.inlineMedia.attachmentRemoval?()
   }
   @objc private func copyReference(_ sender: Any?) { menuOwner(sender)?.copy(sender) }
   @objc private func cutReference(_ sender: Any?) {

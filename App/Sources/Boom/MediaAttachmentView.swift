@@ -301,38 +301,15 @@ struct InlineAttachmentView: View {
   @ObservedObject var model: WorkspaceModel
   let record: AttachmentRecord
   var remove: (() -> Void)? = nil
-  @State private var bytes: Data?
-  @State private var failure: String?
-  private var kind: AttachmentKind { record.kind }
+
   var body: some View {
-    Group {
-      if let bytes {
-        AttachmentMediaView(name: record.name, bytes: bytes, presentation: kind, text: record.text)
-          .frame(minWidth: 0, idealWidth: kind == .unavailable ? 24 : kind == .audio ? 260 : kind == .image ? 240 : 300,
-            maxWidth: kind == .unavailable ? 24 : kind == .audio ? 260 : kind == .image ? 240 : 300)
-          .frame(height: kind == .document ? nil : kind == .unavailable ? 24 : kind == .audio ? 44 : kind == .image ? 180 : 220)
-      } else if let failure {
-        Image(systemName: "exclamationmark.triangle").foregroundStyle(.secondary).help(failure)
-      } else { ProgressView().controlSize(.small) }
-    }
-    .accessibilityLabel(record.name)
-    .help(kind == .unavailable ? record.coverage : record.name)
-    .contextMenu {
-      if let remove { Button("Remove", action: remove) }
-      Button("Export original…") {
-        guard let bytes else { return }
-        let panel = NSSavePanel(); panel.nameFieldStringValue = record.name
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        model.exportFile(to: url) { bytes }
-      }.disabled(bytes == nil)
-    }
-    .task(id: record.rootDigest) {
-      do {
-        let vault = model.store.vault, id = record.id, digest = record.rootDigest
-        let data = try await detachedWork { try vault.get(.attachment, id: id, limit: 67_108_864) }
-        guard Digest.sha256(data) == digest else { throw BoomError.invalid("Attachment original changed.") }
-        try Task.checkCancellation(); bytes = data
-      } catch is CancellationError {} catch { failure = error.localizedDescription }
-    }
+    // The controlled marker reuses the actual native media owner and its
+    // source-bound worker/menu. It never retains an original Data value or
+    // constructs a second extracted-document reader for SwiftUI measurement.
+    NativeText(text: "[Attachment](boom-attachment:\(record.id.uuidString))",
+      mediaModel: model, attachmentRemoval: remove)
+      .frame(minWidth: 24, idealWidth: 300, maxWidth: 320)
+      .accessibilityLabel(record.name)
+      .help(record.kind == .unavailable ? record.coverage : record.name)
   }
 }

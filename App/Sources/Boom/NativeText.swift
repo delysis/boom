@@ -53,12 +53,13 @@ struct NativeText: NSViewRepresentable {
   var pointSize: CGFloat = 14
   var selectable = true
   var mediaModel: WorkspaceModel? = nil
+  var attachmentRemoval: (() -> Void)? = nil
 
   init(text: String, presentation: Presentation = .markdown, pointSize: CGFloat = 14,
-    selectable: Bool = true, mediaModel: WorkspaceModel? = nil) {
+    selectable: Bool = true, mediaModel: WorkspaceModel? = nil, attachmentRemoval: (() -> Void)? = nil) {
     self.text = text; readingVersion = nil
     self.presentation = presentation; self.pointSize = pointSize
-    self.selectable = selectable; self.mediaModel = mediaModel
+    self.selectable = selectable; self.mediaModel = mediaModel; self.attachmentRemoval = attachmentRemoval
   }
   init(message: ChatMessage, presentation: Presentation = .markdown, pointSize: CGFloat = 14,
     selectable: Bool = true, mediaModel: WorkspaceModel? = nil) {
@@ -74,7 +75,9 @@ struct NativeText: NSViewRepresentable {
   }
   func makeNSView(context: Context) -> NativeReadingTextView { NativeReadingTextView(frame: .zero) }
   func updateNSView(_ view: NativeReadingTextView, context: Context) {
-    view.isSelectable = selectable; view.setMedia(model: mediaModel)
+    view.isSelectable = selectable
+    view.inlineMedia.attachmentRemoval = attachmentRemoval
+    view.setMedia(model: mediaModel)
     view.setSource(text, readingVersion: readingVersion, presentation: presentation, pointSize: pointSize)
   }
   func sizeThatFits(_ proposal: ProposedViewSize, nsView view: NativeReadingTextView, context: Context) -> CGSize? {
@@ -139,7 +142,7 @@ final class NativeTextScrollView: NSScrollView {
 final class NativeReadingTextView: NativeMediaTextView {
   private let displayStorage: NSTextStorage
   private let displayLayout: NSLayoutManager
-  private lazy var measurement = NativeTextMeasurement()
+  private var measurement: NativeTextMeasurement?
   fileprivate var isAttachmentViewport = false
   private var presentation = NativeText.Presentation.markdown
   private var pointSize: CGFloat = 14
@@ -214,7 +217,15 @@ final class NativeReadingTextView: NativeMediaTextView {
   }
   func contentHeight(at width: CGFloat) -> CGFloat {
     guard let textStorage else { return 18 }
-    return measurement.height(of: textStorage, width: width, insets: .zero, fragmentPadding: 0)
+    if measurement == nil { measurement = NativeTextMeasurement() }
+    return measurement?.height(of: textStorage, width: width, insets: .zero, fragmentPadding: 0) ?? 18
+  }
+  override func mediaChanged() {
+    // A media item's measured geometry can change while the exact attributed
+    // marker still holds the same object. Invalidate the existing measurement
+    // layout as well as its width result; no new source snapshot is needed.
+    measurement?.invalidateMediaGeometry()
+    super.mediaChanged()
   }
 
   /// The actual visible reader is also its geometry authority. Lay out only
