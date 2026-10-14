@@ -1,21 +1,14 @@
-#if BLOOM_DEVELOPER_STACK_DIAGNOSTICS
+import BoomCore
 import CryptoKit
 import Darwin
 import Dispatch
 import Foundation
 import Synchronization
 
-/// This opt-in developer API has no normal-build implementation or startup.
-/// Root-owned Application code must invoke bootstrap only from its dedicated
-/// public fixture branch. This file never opens a document/workspace/model.
+/// Fixed recipe values are shared with the explicit normal-memory fixture.
+/// Capture transport and bootstrap exist only in the guarded build. Application
+/// invokes that bootstrap only from its owned public branch; no workspace opens here.
 enum DeveloperStackDiagnostics {
-  typealias Wire = DeveloperStackWire
-  struct Token: Sendable {
-    let sequence: UInt64
-    let tid: UInt64
-    let stage: UInt32
-    let event: UInt64
-  }
   struct PublicEditorPlan: Sendable {
     let kind: UInt32
     let operations: UInt32
@@ -24,12 +17,26 @@ enum DeveloperStackDiagnostics {
       guard operations == (kind == 4 || kind == 5 ? 200 : 1_000),
         (kind == 1 && utf8Bytes == 72_196) || (kind == 2 && utf8Bytes == 72_196)
           || (kind == 3 && utf8Bytes == (1 << 30))
-          || (kind == 4 && utf8Bytes == 72_196) || (kind == 5 && utf8Bytes == (1 << 30)) else { throw Wire.Failure.admission }
+          || (kind == 4 && utf8Bytes == 72_196) || (kind == 5 && utf8Bytes == (1 << 30)) else {
+        #if BLOOM_DEVELOPER_STACK_DIAGNOSTICS
+        throw DeveloperStackWire.Failure.admission
+        #else
+        throw BoomError.invalid("Public editor recipe is outside its fixed kind/operation/byte bounds.")
+        #endif
+      }
       self.kind = kind; self.operations = operations; self.utf8Bytes = utf8Bytes
     }
     var isMixed: Bool { kind == 4 || kind == 5 }
     var diskLimit: UInt64 { kind == 1 ? 4 << 20 : kind == 2 || kind == 4 ? 64 << 20 : 8 << 30 }
     var lifetimeSeconds: UInt64 { kind == 1 ? 120 : kind == 2 || kind == 4 ? 220 : 740 }
+  }
+  #if BLOOM_DEVELOPER_STACK_DIAGNOSTICS
+  typealias Wire = DeveloperStackWire
+  struct Token: Sendable {
+    let sequence: UInt64
+    let tid: UInt64
+    let stage: UInt32
+    let event: UInt64
   }
   private struct Stage {
     let id: UInt32
@@ -560,5 +567,5 @@ enum DeveloperStackDiagnostics {
       && left.st_ctimespec.tv_sec == right.st_ctimespec.tv_sec
       && left.st_ctimespec.tv_nsec == right.st_ctimespec.tv_nsec
   }
+  #endif
 }
-#endif

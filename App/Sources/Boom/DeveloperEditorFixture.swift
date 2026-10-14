@@ -1,5 +1,4 @@
-#if BLOOM_DEVELOPER_STACK_DIAGNOSTICS
-#if BOOM_UI_TEST
+#if BLOOM_DEVELOPER_STACK_DIAGNOSTICS && BOOM_UI_TEST
 #error("Owned public editor diagnostics cannot use the UI test workspace override.")
 #endif
 import AppKit
@@ -11,11 +10,13 @@ import SwiftUI
 
 /// One explicit public, warmed, model-free observation of the ordinary editor.
 /// Fixed ordinary file recipes; no physical input/IME or
-/// compositor acceptance. Only explicit owned developer admission can enter.
+/// compositor acceptance. The guarded stack route requires owned admission;
+/// the normal memory route accepts only the two fixed public recipes.
 @MainActor enum DeveloperEditorFixture {
   // Preserve the actual partial Model/window/source on any failed cleanup.
   // This is the existing fixture receiver, not another lifetime or root owner.
   private static var failedFixture: Prepared?
+  #if BLOOM_DEVELOPER_STACK_DIAGNOSTICS
   static func run(recipe: URL) async throws {
     var fixture: Prepared?
     var connected = false, finished = false
@@ -50,9 +51,45 @@ import SwiftUI
     guard failures.isEmpty else { throw BoomError.unavailable(failures.joined(separator: "; ")) }
   }
 
+  #endif
+
+  /// Same physical public source and ordinary graph as the owned stack fixture.
+  /// Normal Release: no transport, suspension, model or cached-bitmap path.
+  static func runMemory(arguments: [String]) async throws {
+    guard arguments.count == 5, arguments[1] == "--editor-memory-smoke",
+      ["short", "gib"].contains(arguments[2]), arguments[3] == "--evidence",
+      arguments[4].hasPrefix("/") else { throw BoomError.invalid("Invalid fixed normal editor observation arguments.") }
+    let evidence = URL(fileURLWithPath: arguments[4], isDirectory: true)
+    guard mkdir(evidence.path, 0o700) == 0 else {
+      throw BoomError.invalid("Normal public evidence directory must be fresh and exclusively owned.")
+    }
+    let plan = try DeveloperStackDiagnostics.PublicEditorPlan(kind: arguments[2] == "short" ? 2 : 3,
+      operations: 1_000, utf8Bytes: arguments[2] == "short" ? 72_196 : 1 << 30)
+    let fixture = try Prepared(recipe: evidence.appendingPathComponent("normal-editor-recipe.json"),
+      plan: plan, normalMemory: true)
+    let probe = try ApplicationMemorySmoke.Probe(fixture.memorySamplesURL, observeModelAllocations: false)
+    var failures: [String] = []
+    do {
+      probe.mark("preparation"); try await fixture.prepare()
+      probe.mark("steady-native-input-layout"); try await fixture.observe(plan)
+      probe.mark("verify-and-close"); try await fixture.verifyAfterCapture()
+    } catch { failures.append(error.localizedDescription) }
+    do { try await fixture.shutdown() } catch { failures.append("Workspace shutdown: " + error.localizedDescription) }
+    do {
+      let observed = try probe.finish()
+      try fixture.writeNormalMemorySummary(maximumSampledCurrent: probe.maximumSampledCurrentFootprint(),
+        kernelLifetimePeak: observed.0, samples: observed.1)
+    } catch { failures.append("Memory observation: " + error.localizedDescription) }
+    do { try fixture.writeReceipt(captureFinished: false, failures: failures) }
+    catch { failures.append("Public fixture receipt: " + error.localizedDescription) }
+    if !failures.isEmpty { failedFixture = fixture }
+    guard failures.isEmpty else { throw BoomError.unavailable(failures.joined(separator: "; ")) }
+  }
+
   @MainActor private final class Prepared {
     private static let cycles: UInt32 = 1_000
     private static let observationSeconds: Int64 = 110
+    private let normalMemory: Bool
     private let plan: DeveloperStackDiagnostics.PublicEditorPlan
     private let root: URL
     private let temporaryRoot: URL
@@ -78,14 +115,25 @@ import SwiftUI
     private var primingBefore: [String: Any]?, primingAfterInsert: [String: Any]?, primingAfterDelete: [String: Any]?
     private var vmBefore: [String: Any]?, vmAfter: [String: Any]?
     private var applicationBeforeFocus: [String: Any]?, applicationAfterFocus: [String: Any]?
+    private var normalTimings: [[String: Any]] = []
+    private var heldWriterVerified = false
+    private var heldSave: Task<Void, Error>?
+    var memorySamplesURL: URL { root.appendingPathComponent("memory-samples.jsonl") }
 
-    init(recipe: URL, plan: DeveloperStackDiagnostics.PublicEditorPlan) throws {
+    init(recipe: URL, plan: DeveloperStackDiagnostics.PublicEditorPlan, normalMemory: Bool = false) throws {
       guard plan.operations == (plan.isMixed ? 200 : Self.cycles) else {
         throw BoomError.invalid("Public editor plan differs from its fixed source recipe.")
       }
-      self.plan = plan
+      self.plan = plan; self.normalMemory = normalMemory
       root = recipe.deletingLastPathComponent().appendingPathComponent("public-editor-workspace", isDirectory: true)
-      temporaryRoot = recipe.deletingLastPathComponent().appendingPathComponent("public-editor-tmp", isDirectory: true)
+      if normalMemory {
+        guard let path = ProcessInfo.processInfo.environment["TMPDIR"], !path.isEmpty, path.hasPrefix("/") else {
+          throw BoomError.invalid("Normal public fixture requires its actual absolute caller TMPDIR.")
+        }
+        temporaryRoot = URL(fileURLWithPath: path, isDirectory: true)
+      } else {
+        temporaryRoot = recipe.deletingLastPathComponent().appendingPathComponent("public-editor-tmp", isDirectory: true)
+      }
       // Atomic fresh-directory admission; no reuse or cleanup of an existing path.
       guard mkdir(root.path, 0o700) == 0 else {
         throw BoomError.invalid("Public fixture directory already exists or cannot be created.")
@@ -169,7 +217,7 @@ import SwiftUI
       let host = NSHostingView(rootView: WorkspaceView(model: model)); self.host = host
       let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 1190, height: 846))
       self.window = window; window.isReleasedWhenClosed = false; window.contentView = host
-      if plan.isMixed {
+      if plan.isMixed || normalMemory {
         if NSApp.activationPolicy() != .regular {
           _ = NSApp.setActivationPolicy(.regular)
         }
@@ -179,14 +227,14 @@ import SwiftUI
         window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
       }
       for _ in 0..<10 { host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(25)) }
-      if plan.isMixed { try await receiveActualKeyWindow(window) }
+      if plan.isMixed || normalMemory { try await receiveActualKeyWindow(window) }
       guard let view = model.pagedViewport?.textView as? PagedNativeTextView,
         model.pagedInput?.activeView === view, window.makeFirstResponder(view), view.isEditable else {
         throw BoomError.invalid("Ordinary managed public editor focus was unavailable.")
       }
       managedEditor = view
       var primingView = view
-      if plan.isMixed {
+      if plan.isMixed || normalMemory {
         startupBefore = try nativePreparationState(view)
         if view.session.generation != 0 {
           // An incidental key in this explicitly public window is real input.
@@ -240,11 +288,14 @@ import SwiftUI
       }
       if plan.isMixed { host.layoutSubtreeIfNeeded() }
       let preparedView = managedEditor ?? view
-      if !plan.isMixed { try prepareBitmap(for: preparedView, window: window) }
-      try rasterize(preparedView, target: plan.isMixed ? model.pagedViewport : nil)
+      if !normalMemory {
+        if !plan.isMixed { try prepareBitmap(for: preparedView, window: window) }
+        try rasterize(preparedView, target: plan.isMixed ? model.pagedViewport : nil)
+      }
       try await model.flush() // actual canonical/worker join, not a delay or flag
       try requireManagedSource()
       try await verifyOrdinaryExport(named: "prepared-export.txt"); preparationExportJoined = true
+      if plan.isMixed || normalMemory { try await verifyHeldWriterEditing() }
       _ = try diskExtent(reservingReceipt: true)
       vmBefore = currentVMCategories()
     }
@@ -292,6 +343,110 @@ import SwiftUI
       guard NSApp.isRunning, NSApp.isActive, NSApp.keyWindow === window, window.isKeyWindow else {
         throw BoomError.unavailable("The actual public App did not retain its received key-window state.")
       }
+    }
+
+    /// Functional preparation only. All controls finish before stack donation
+    /// or steady timing, and every actual writer/save Task joins on all paths.
+    private func verifyHeldWriterEditing() async throws {
+      guard let model = workspace, let engine = model.pagedEngine, let input = model.pagedInput,
+        let viewport = model.pagedViewport, let commands = model.pagedCommands else {
+        throw BoomError.invalid("Held writer control lost its actual ordinary owners.")
+      }
+      let view = try currentMixedView(), session = view.session
+      let original = try commands.captureLogicalHistory().snapshot
+      let savedGeneration = session.sealedGeneration
+      let release = DispatchSemaphore(value: 0)
+      let (signals, entered) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+      let executor = engine.storageExecutorForTesting
+      let writer = Task {
+        defer { entered.finish() }
+        try await executor.run { entered.yield(()); release.wait() }
+      }
+      var failure: Error?
+      do {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+          defer { group.cancelAll() }
+          group.addTask { @MainActor [self] in
+            var iterator = signals.makeAsyncIterator()
+            guard let _ = await iterator.next() else { throw BoomError.unavailable("Actual writer body did not enter.") }
+            view.setSelectedRange(NSRange(location: 1, length: 0))
+            let beforeSelection = try input.currentDocumentSelection()
+            view.insertText("X", replacementRange: view.selectedRange())
+            let afterSelection = try input.currentDocumentSelection()
+            let edited = try session.captureLogicalState().source, editedGeneration = session.generation
+            heldSave = try model.beginPagedWorkspaceSave() // actual owned reservation, before yielding
+            guard model.pagedInput === input, try currentMixedView().session === session,
+              NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil),
+              session.generation == editedGeneration + 1,
+              try session.captureLogicalState().source.isSame(original),
+              try input.currentDocumentSelection() == beforeSelection else {
+              throw BoomError.invalid("Resident responder Undo waited or restored another logical source.")
+            }
+            _ = try currentMixedView() // actual physical focus after the resident Undo mount
+            guard NSApp.sendAction(NSSelectorFromString("redo:"), to: nil, from: nil),
+              session.generation == editedGeneration + 2,
+              try session.captureLogicalState().source.isSame(edited),
+              try input.currentDocumentSelection() == afterSelection else {
+              throw BoomError.invalid("Resident responder Redo waited or restored another logical source.")
+            }
+            let middle = edited.summary.utf16 / 2
+            try viewport.requestScroll(toUTF16: middle); try await viewport.joinPresentation()
+            guard let displayed = viewport.visibleScrollWindow, displayed.snapshot.isSame(edited),
+              displayed.start.utf16 <= middle, middle <= displayed.start.utf16 + displayed.summary.utf16,
+              session.sealedGeneration == savedGeneration, executor.snapshot.foregroundRequests >= 2 else {
+              throw BoomError.invalid("Logical scroll or the real reserved save escaped the held writer condition.")
+            }
+            try viewport.requestScroll(toUTF16: 0); try await viewport.joinPresentation()
+            try viewport.selectVisibleUTF16(5); try await commands.joinPendingCommand()
+            let current = try currentMixedView(), beforeTyping = session.generation
+            current.insertText("Y", replacementRange: current.selectedRange())
+            guard session.generation == beforeTyping + 1, session.sealedGeneration == savedGeneration else {
+              throw BoomError.invalid("Later native typing remained coupled to the actual held writer.")
+            }
+            guard NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil),
+              try session.captureLogicalState().source.isSame(edited),
+              NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil),
+              try session.captureLogicalState().source.isSame(original),
+              try input.currentDocumentSelection() == beforeSelection else {
+              throw BoomError.invalid("Actual responder actions did not restore the original public source while saving.")
+            }
+            managedEditor = try currentMixedView()
+          }
+          group.addTask {
+            try await Task.sleep(for: .seconds(8))
+            release.signal(); entered.finish() // release so an entered/coupled read can actually join
+            throw BoomError.unavailable("Held-writer native/read control exceeded its fixed8s bound.")
+          }
+          try await group.next()
+        }
+      } catch { failure = error }
+      release.signal(); entered.finish()
+      do { try await writer.value } catch {
+        if let first = failure { failure = BoomError.unavailable(first.localizedDescription + "; actual writer join: " + error.localizedDescription) }
+        else { failure = error }
+      }
+      do { if let heldSave { try await heldSave.value } } catch {
+        if let first = failure { failure = BoomError.unavailable(first.localizedDescription + "; actual save join: " + error.localizedDescription) }
+        else { failure = error }
+      }
+      if let failure { throw failure }
+      try await model.flush(); managedEditor = model.pagedInput?.activeView
+      try await verifyOrdinaryExport(named: "held-save-export.txt")
+      try requireManagedSource(); heldWriterVerified = true; heldSave = nil
+    }
+
+    func writeNormalMemorySummary(maximumSampledCurrent: UInt64, kernelLifetimePeak: UInt64, samples: Int) throws {
+      guard normalMemory, maximumSampledCurrent > 0, kernelLifetimePeak >= maximumSampledCurrent,
+        (1...40_000).contains(samples), normalTimings.count <= Int(plan.operations) else { throw BoomError.invalid("Normal observations exceed their fixed recipe.") }
+      try JSONSerialization.data(withJSONObject: normalTimings, options: [.sortedKeys])
+        .write(to: root.appendingPathComponent("typing-observations.json"), options: .withoutOverwriting)
+      let value: [String: Any] = ["schema": 1, "normal_release": true, "model_free": true,
+        "sample_interval_ms": 20, "samples": samples,
+        "maximum_sampled_current_footprint_bytes": maximumSampledCurrent,
+        "kernel_lifetime_peak_footprint_bytes": kernelLifetimePeak,
+        "scope": "Normal App/file/native graph. Unsuspended scheduled paired input and synchronous layout; no bitmap, Mach stack capture, forced draw/compositor or GPU inference. Memory probe overhead is included; setup/exports are distinct phases."]
+      try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
+        .write(to: root.appendingPathComponent("memory-summary.json"), options: .withoutOverwriting)
     }
 
     // Fixed scalar provenance only, outside timed operations; no source bytes.
@@ -349,19 +504,32 @@ import SwiftUI
       for index in 0..<requested.operations {
         try Task.checkCancellation()
         guard clock.now < deadline else { throw BoomError.unavailable("Public editor observation exceeded its bound.") }
-        try await Task.sleep(until: clock.now.advanced(by: .milliseconds(100)), clock: clock)
+        let requested = clock.now.advanced(by: .milliseconds(100))
+        try await Task.sleep(until: requested, clock: clock)
         guard clock.now < deadline else { throw BoomError.unavailable("Public editor observation expired before its next cycle.") }
         let priorGeneration = view.session.generation
         do {
           let cycle = PerformanceTrace.begin("Editor.PublicTypingCycle", event: UInt64(index) + 1)
           defer { PerformanceTrace.end("Editor.PublicTypingCycle", cycle) }
+          let started = clock.now
           view.setSelectedRange(NSRange(location: 0, length: 0))
           view.insertText("x", replacementRange: view.selectedRange())
+          let inserted = clock.now
           view.insertText("", replacementRange: NSRange(location: 0, length: 1))
+          let deleted = clock.now
           let layout = PerformanceTrace.begin("Editor.HostLayout")
           host.layoutSubtreeIfNeeded()
           PerformanceTrace.end("Editor.HostLayout", layout)
-          try rasterize(view) // actual SDK cached-bitmap draw completes inside this cycle
+          let laidOut = clock.now
+          if !normalMemory { try rasterize(view) } // stack recipe retains actual cached-bitmap completion
+          if normalMemory {
+            normalTimings.append(["event": index + 1,
+              "scheduled_delay_seconds": max(0, requested.duration(to: started).timeInterval),
+              "insertion_seconds": started.duration(to: inserted).timeInterval,
+              "deletion_seconds": inserted.duration(to: deleted).timeInterval,
+              "layout_seconds": deleted.duration(to: laidOut).timeInterval,
+              "admitted_input_to_layout_seconds": started.duration(to: laidOut).timeInterval])
+          }
         }
         guard view.session.generation > priorGeneration, window.firstResponder === view else {
           throw BoomError.invalid("Ordinary native input did not advance its exact source/focus.")
@@ -404,8 +572,9 @@ import SwiftUI
         }
         let responder = window?.firstResponder.map { String(String(reflecting: type(of: $0)).prefix(96)) } ?? "nil"
         let slot = lastWarmSlot.map(String.init) ?? "none"
+        let application = window.map { String(describing: applicationState($0)) } ?? "no-window"
         throw BoomError.stale("Mixed observation lost its actual mounted key-window client [" +
-          missing.joined(separator: ",") + "]; warm-slot=" + slot + "; responder=" + responder + ".")
+          missing.joined(separator: ",") + "]; warm-slot=" + slot + "; responder=" + responder + "; application=" + application + ".")
       }
       managedEditor = view
       try requireManagedSource()
@@ -574,7 +743,7 @@ import SwiftUI
         let local = min(3, displayed.text.utf16.count)
         try mixedCPU(event, measured: measured) { try viewport.selectVisibleUTF16(local) }
         try await mixedReady(event, measured: measured) { try await commands.joinPendingCommand() }
-        guard try input.currentDocumentSelection().utf16Offset == displayed.utf16Start + UInt64(local) else {
+        guard try input.currentDocumentSelection().utf16Offset == displayed.start.utf16 + UInt64(local) else {
           throw BoomError.invalid("The displayed source click did not mount its exact native scalar.")
         }
       case 17:
@@ -760,10 +929,14 @@ import SwiftUI
           var consumed: UInt64 = 0, hash = SHA256()
           while consumed < extent {
             try Task.checkCancellation()
-            guard let block = try file.read(upToCount: Int(min(UInt64(64 << 10), extent - consumed))), !block.isEmpty else {
-              throw BoomError.invalid("Public export ended before its admitted extent.")
+            let count = try autoreleasepool {
+              guard let block = try file.read(upToCount: Int(min(UInt64(64 << 10), extent - consumed))), !block.isEmpty else {
+                throw BoomError.invalid("Public export ended before its admitted extent.")
+              }
+              hash.update(data: block)
+              return UInt64(block.count)
             }
-            hash.update(data: block); consumed += UInt64(block.count)
+            consumed += count
           }
           guard (try file.read(upToCount: 1))?.isEmpty != false else {
             throw BoomError.invalid("Public export exceeds its admitted extent.")
@@ -856,7 +1029,7 @@ import SwiftUI
     func writeReceipt(captureFinished: Bool, failures: [String]) throws {
       let extent = try diskExtent(reservingReceipt: true)
       let receipt: [String: Any] = [
-        "schema": 1, "status": failures.isEmpty && captureFinished && shutdownJoined && sourceVerified
+        "schema": 1, "status": failures.isEmpty && (normalMemory || captureFinished) && shutdownJoined && sourceVerified
           && completed == plan.operations ? "complete" : "incomplete",
         "requested_cycles": plan.operations, "completed_cycles": completed,
         "operation_program": plan.isMixed ? "mixed-v1" : "head-paired-v1",
@@ -878,7 +1051,8 @@ import SwiftUI
         "synchronous_cpu_stage": "Editor.PublicInputDispatch",
         "ready_wait_stage": "Editor.PublicReadyWait",
         "end_to_ready_stage": "Editor.PublicMixedOperation",
-        "offscreen_sdk_diagnostic": true,
+        "offscreen_sdk_diagnostic": true, "normal_release_memory_observation": normalMemory,
+        "bitmap_raster_exercised": !normalMemory, "actual_held_writer_control_passed": heldWriterVerified,
         "slow_dispatch_threshold_ns": 8_000_000,
         "fixture_kind": plan.kind, "storage_route": "files",
         "primitive_replacements_per_cycle": plan.isMixed ? (NSNull() as Any) : (2 as Any), "public_utf8_bytes": plan.utf8Bytes,
@@ -892,7 +1066,7 @@ import SwiftUI
         "process_footprint_before_bytes": footprintBefore, "process_footprint_after_bytes": footprintAfter,
         "process_peak_footprint_bytes": peakFootprint, "workspace_disk_bytes_before_receipt": extent,
         "workspace_disk_limit_bytes": plan.diskLimit, "target_lifetime_seconds": plan.lifetimeSeconds, "failures": failures,
-        "scope": plan.isMixed ? "Warmed actual ordinary graph with bounded head/middle/tail edits, NFD/ZWJ deletion, direct marked-text primitives, actual window-responder Undo/Redo, bounded and whole-source root edits, read-only scroll/click/recenter and interleaved contained input. Offscreen SDK raster; no hardware keyboard/input-method service/compositor, model or GPU-overlap acceptance. CPU dispatch spans contain no await; command/read/source joins have separate wait spans inside end-to-ready. All raw observations and failures retained." : "Warmed actual ordinary file WorkspaceModel/WorkspaceView/managed viewport; physical public ASCII imported/export-verified in <=64KiB chunks. Direct paired native edits, synchronous host layout and completed SDK cached-bitmap raster, closed-loop100ms pacing. No inference, IME, hardware input dispatch, deferred draw/compositor acceptance, or per-cycle whole-source copies/hash/files/Mach samples."
+        "scope": normalMemory ? "Actual normal Release ordinary graph, physical streamed file and exact imports/exports, fixed paired native edits and synchronous layout with existing20ms memory Probe. No bitmap/Mach suspension/model/GPU or presentation latency claim." : plan.isMixed ? "Warmed actual ordinary graph with bounded head/middle/tail edits, NFD/ZWJ deletion, direct marked-text primitives, actual window-responder Undo/Redo, bounded and whole-source root edits, read-only scroll/click/recenter and interleaved contained input. Offscreen SDK raster; no hardware keyboard/input-method service/compositor, model or GPU-overlap acceptance. CPU dispatch spans contain no await; command/read/source joins have separate wait spans inside end-to-ready. All raw observations and failures retained." : "Warmed actual ordinary file WorkspaceModel/WorkspaceView/managed viewport; physical public ASCII imported/export-verified in <=64KiB chunks. Direct paired native edits, synchronous host layout and completed SDK cached-bitmap raster, closed-loop100ms pacing. No inference, IME, hardware input dispatch, deferred draw/compositor acceptance, or per-cycle whole-source copies/hash/files/Mach samples."
       ]
       let bytes = try JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys])
       guard bytes.count <= 16_384 else { throw BoomError.budget("Public fixture receipt exceeds its bound.") }
@@ -901,4 +1075,3 @@ import SwiftUI
     }
   }
 }
-#endif

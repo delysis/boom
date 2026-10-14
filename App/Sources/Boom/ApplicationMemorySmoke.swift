@@ -22,7 +22,10 @@ import Synchronization
     private var peak: UInt64 = 0
     private var samples = 0
     private var finished = false
-    init(_ url: URL) throws {
+    private let observeModelAllocations: Bool
+    private var currentPeak: UInt64 = 0
+    init(_ url: URL, observeModelAllocations: Bool = true) throws {
+      self.observeModelAllocations = observeModelAllocations
       source = DispatchSource.makeTimerSource(queue: queue)
       guard FileManager.default.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
         throw BoomError.unavailable("Memory sample ledger could not be created.")
@@ -42,15 +45,46 @@ import Synchronization
       guard !finished else { return }
       let sampledPhase = currentPhase(), seconds = elapsedSeconds()
       let suspendingSeconds = suspendingStarted.duration(to: SuspendingClock().now).timeInterval
-      let accounting = ModelResidency.memoryAccounting(), footprint = accounting.current
-      peak = max(peak, footprint, accounting.peak); samples += 1
+      var record: [String: Any] = ["seconds": seconds, "suspending_seconds": suspendingSeconds, "phase": sampledPhase]
+      let footprint: UInt64, lifetimePeak: UInt64
+      if observeModelAllocations {
+        // Preserve the existing paired-model accounting and allocator path.
+        let accounting = ModelResidency.memoryAccounting()
+        footprint = accounting.current; lifetimePeak = accounting.peak
+        record["process_footprint_bytes"] = footprint
+        record["kernel_process_peak_footprint_bytes"] = lifetimePeak
+        record["mlx_active_bytes"] = Memory.activeMemory; record["mlx_cache_bytes"] = Memory.cacheMemory
+        record["mlx_peak_active_bytes"] = Memory.peakMemory
+      } else {
+        var vm = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let capacity = Int(count)
+        let status = withUnsafeMutablePointer(to: &vm) { pointer in
+          pointer.withMemoryRebound(to: integer_t.self, capacity: capacity) {
+            task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+          }
+        }
+        let available = status == KERN_SUCCESS && Int(count) == capacity
+        record["vm_available"] = available; record["vm_kernel_result"] = status
+        record["vm_returned_count"] = count
+        if available {
+          footprint = vm.phys_footprint; lifetimePeak = UInt64(max(0, vm.ledger_phys_footprint_peak))
+          record["process_footprint_bytes"] = footprint
+          record["kernel_process_peak_footprint_bytes"] = lifetimePeak
+          record["process_resident_bytes"] = vm.resident_size
+          record["internal_bytes"] = vm.internal; record["compressed_bytes"] = vm.compressed
+          record["graphics_footprint_bytes"] = vm.ledger_tag_graphics_footprint
+          record["purgeable_nonvolatile_bytes"] = vm.ledger_purgeable_nonvolatile
+        } else {
+          // Raw status is retained; absent counters are unknown, never zero proof.
+          footprint = 0; lifetimePeak = 0
+          if failure == nil { failure = "Normal memory TASK_VM_INFO unavailable: result=\(status), count=\(count)." }
+        }
+      }
+      peak = max(peak, footprint, lifetimePeak); currentPeak = max(currentPeak, footprint); samples += 1
       do {
-        var bytes = try JSONSerialization.data(withJSONObject: [
-          "seconds": seconds, "suspending_seconds": suspendingSeconds,
-          "phase": sampledPhase, "process_footprint_bytes": footprint,
-          "kernel_process_peak_footprint_bytes": accounting.peak,
-          "mlx_active_bytes": Memory.activeMemory, "mlx_cache_bytes": Memory.cacheMemory,
-          "mlx_peak_active_bytes": Memory.peakMemory], options: [.sortedKeys])
+        guard observeModelAllocations || samples <= 40_000 else { throw BoomError.budget("Normal memory observations exceeded their fixed sample bound.") }
+        var bytes = try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys])
         bytes.append(0x0a); try handle.write(contentsOf: bytes)
       } catch { failure = error.localizedDescription }
     }
@@ -63,6 +97,7 @@ import Synchronization
         return (peak, samples)
       }
     }
+    func maximumSampledCurrentFootprint() -> UInt64 { queue.sync { currentPeak } }
     deinit { source.cancel(); try? handle.close() }
   }
   private actor TrialTrace {

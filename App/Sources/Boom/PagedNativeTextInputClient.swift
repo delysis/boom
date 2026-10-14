@@ -5,7 +5,7 @@ import ObjectiveC
 /// One input context's permanent physical source. A retained old context owns
 /// this small client; the client never owns a view, session, text storage,
 /// command owner, source payload, continuation, or another context.
-@MainActor final class PagedNativeTextInputClient: NSObject, NSTextInputClient {
+@MainActor final class PagedNativeTextInputClient: NSObject, @MainActor NSTextInputClient {
   let identity: PagedNativeInputIdentity
   private enum State: Equatable { case unbound, bound, retired }
   private var state = State.unbound

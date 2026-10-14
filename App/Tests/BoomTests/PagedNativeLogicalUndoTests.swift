@@ -1,5 +1,6 @@
 import AppKit
 import BoomCore
+import Darwin
 import Foundation
 import XCTest
 @testable import Boom
@@ -197,7 +198,7 @@ private actor LogicalUndoDelivery: PagedNativeLogicalSessionStorage {
   private func fixture() async throws -> LogicalUndoFixture {
     guard Self.retained == nil else { throw BoomError.denied("A failed public logical fixture remains owned by this process.") }
     try PagedNativeFixtureApplication.bootstrap()
-    let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-logical-undo-" + UUID().uuidString)
+    let root = try PagedNativeFixtureApplication.scratchRoot(prefix: "Bloom-logical-undo-")
     let store = try await Task.detached { try WorkspaceStore(rootOverride: root) }.value
     let f = LogicalUndoFixture(root: root, store: store); Self.retained = f
     try await store.acquireExclusiveWorkspace()
@@ -373,6 +374,172 @@ private actor LogicalUndoDelivery: PagedNativeLogicalSessionStorage {
       XCTAssertNil(f.view.boundedStorage.mutationFailure)
       let finalResumeCalls = await route.resumeCalls
       XCTAssertEqual(finalResumeCalls, 2)
+    }
+  }
+  /// Genuine FileStore per-call O_RDWR permission refusal before any append.
+  /// No forwarding fault is armed; partial-write/fsync failure is not covered.
+  func testActualPagesWriteOpenEACCESKeepsNativeUndoLiveAndExactBeforeRetryPreservesLaterHead() async throws {
+    let failures = testRun?.failureCount ?? 0
+    try await run { f in
+      let session = f.session!, input = f.input!, commands = f.commands!, route = f.route!
+      let engine = f.engine!, publisher = f.publisher!, before = session.sealedRootRecord
+      // This is the actual FileStore path, not another store or source lane.
+      let pagesURL = f.root.appendingPathComponent("documents", isDirectory: true)
+        .appendingPathComponent(before.document.id.uuidString.lowercased(), isDirectory: true)
+        .appendingPathComponent("pages")
+      let descriptor = Darwin.open(pagesURL.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+      guard descriptor >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+      let file = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+      var originalStatus: stat?
+      var restricted = false
+      var pagesClosed = false
+      func admitPages() throws -> stat {
+        var actual = stat()
+        guard fstat(descriptor, &actual) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        guard let original = originalStatus, actual.st_mode & S_IFMT == S_IFREG,
+          actual.st_dev == original.st_dev, actual.st_ino == original.st_ino,
+          actual.st_uid == original.st_uid, actual.st_uid == geteuid() else {
+          throw BoomError.stale("The held public pages descriptor has another actual owner or inode.")
+        }
+        return actual
+      }
+      func restorePagesMode() throws {
+        guard restricted, let original = originalStatus else { return }
+        _ = try admitPages()
+        guard fchmod(descriptor, original.st_mode & 0o7777) == 0 else {
+          throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        let restored = try admitPages()
+        guard restored.st_mode & 0o7777 == original.st_mode & 0o7777 else {
+          throw BoomError.invalid("The actual public pages mode did not restore.")
+        }
+        restricted = false
+      }
+      do {
+        var opened = stat(), named = stat()
+        guard fstat(descriptor, &opened) == 0, lstat(pagesURL.path, &named) == 0 else {
+          throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        guard geteuid() != 0, opened.st_uid == geteuid(), opened.st_mode & S_IFMT == S_IFREG,
+          opened.st_mode & 0o7777 == 0o600, opened.st_size > 0,
+          named.st_mode & S_IFMT == S_IFREG, named.st_dev == opened.st_dev,
+          named.st_ino == opened.st_ino, named.st_uid == opened.st_uid,
+          named.st_mode == opened.st_mode else {
+          throw BoomError.denied("The genuine write-open control requires its own regular 0600 pages inode and unprivileged owner.")
+        }
+        originalStatus = opened
+        restricted = true // restore even if the attempted chmod itself fails
+        guard fchmod(descriptor, 0o400) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        XCTAssertEqual(try admitPages().st_mode & 0o7777, 0o400)
+        try input.setDocumentSelection(PagedNativeNavigationSelection(utf16Offset: 1, utf16Length: 0))
+        f.view.insertText("X", replacementRange: f.view.selectedRange())
+        let failedGeneration = session.generation
+        var failed: PagedTextCustodyFailure?
+        do {
+          _ = try await session.flushRecord(through: failedGeneration)
+          XCTFail("The actual FileStore O_RDWR must refuse the read-only pages inode.")
+        } catch {
+          guard let actual = error as? PagedTextCustodyFailure else { throw error }
+          let posix = actual.original as NSError
+          guard posix.domain == NSPOSIXErrorDomain, posix.code == Int(EACCES) else { throw error }
+          failed = actual
+        }
+        await session.joinPendingSave()
+        let originalFailure = try XCTUnwrap(failed), failedID = try XCTUnwrap(session.failedSaveIdentity)
+        let retainedFailure = try XCTUnwrap(session.persistenceFailure as? PagedTextCustodyFailure)
+        XCTAssertEqual(retainedFailure.lease, originalFailure.lease)
+        XCTAssertEqual((retainedFailure.original as NSError).domain, NSPOSIXErrorDomain)
+        XCTAssertEqual((retainedFailure.original as NSError).code, Int(EACCES))
+        let joined = try XCTUnwrap(engine.custodySnapshot.items.first { $0.id == originalFailure.lease.id })
+        XCTAssertEqual(joined.purpose, .nativeBatch(sessionID: session.sessionID, batchID: failedID,
+          first: 1, last: failedGeneration))
+        XCTAssertEqual(joined.phase, .unresolved); XCTAssertTrue(joined.producerJoined)
+        XCTAssertTrue(joined.writesAttempted); XCTAssertFalse(joined.publicationAttempted)
+        XCTAssertFalse(joined.bulkActive); XCTAssertEqual(engine.custodySnapshot.jobs, 0)
+        XCTAssertEqual(try admitPages().st_size, opened.st_size)
+        XCTAssertEqual(session.sealedRootRecord, before); XCTAssertEqual(session.sealedGeneration, 0)
+        let beforeRead = try await engine.currentDocumentRecordRetaining(publisher, documentID: before.document.id)
+        XCTAssertEqual(beforeRead.value, before, "Compare the actual complete disk head, not only Session's checkpoint")
+        do { try await engine.abandonJoinedRootOutput(beforeRead.lease) }
+        catch { throw PagedTextCustodyFailure(original: error, lease: beforeRead.lease) }
+        let returnedBeforeRetry = await route.publicationReturns
+        XCTAssertEqual(returnedBeforeRetry, 0, "The Backend threw the real write-open error before returning an ACK")
+
+        try input.setDocumentSelection(PagedNativeNavigationSelection(utf16Offset: 2, utf16Length: 0))
+        f.view.insertText("Y", replacementRange: f.view.selectedRange())
+        let typed = session.generation
+        XCTAssertEqual(f.view.string, "aXYbc")
+        XCTAssertTrue(NSApplication.shared.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+        XCTAssertEqual(session.generation, typed + 1); XCTAssertEqual(f.view.string, "aXbc")
+        XCTAssertTrue(NSApplication.shared.sendAction(NSSelectorFromString("redo:"), to: nil, from: nil))
+        XCTAssertEqual(session.generation, typed + 2); XCTAssertEqual(f.view.string, "aXYbc")
+        XCTAssertNil(commands.firstFailure); XCTAssertNil(input.firstRefusal)
+        XCTAssertNil(f.view.boundedStorage.mutationFailure)
+        let later = try session.captureLogicalState(), arena = session.arenaID
+        do {
+          _ = try await session.retryFailedSave(expectedIdentity: UUID())
+          XCTFail("An unrelated identity cannot retry the real BEFORE failure.")
+        } catch { guard case BoomError.stale = error else { throw error } }
+        let refusedRetryCalls = await route.resumeCalls
+        XCTAssertEqual(refusedRetryCalls, 0); XCTAssertEqual(session.failedSaveIdentity, failedID)
+        XCTAssertEqual((session.persistenceFailure as? PagedTextCustodyFailure)?.lease, originalFailure.lease)
+
+        try restorePagesMode() // same verified FD; no pathname replacement
+        let checkpoint = try await session.retryFailedSave(expectedIdentity: failedID)
+        XCTAssertEqual(session.arenaID, arena); XCTAssertEqual(session.generation, later.generation)
+        XCTAssertTrue(try session.captureLogicalState().source.isSame(later.source))
+        XCTAssertEqual(f.view.string, "aXYbc")
+        let checkpointDigest = try await engine.wholeTextSha256(checkpoint.document.revision)
+        XCTAssertEqual(checkpointDigest, Digest.sha256(Data("aXbc".utf8)))
+        let final = try await session.flushRecord(through: later.generation)
+        XCTAssertNil(session.failedSaveIdentity); XCTAssertNil(session.persistenceFailure)
+        XCTAssertNil(commands.firstFailure); XCTAssertNil(input.firstRefusal)
+        let expected = Data("aXYbc".utf8)
+        let exportURL = f.root.appendingPathComponent("actual-write-open-retry-export.txt")
+        try Data().write(to: exportURL, options: .withoutOverwriting)
+        let writer = try FileHandle(forWritingTo: exportURL)
+        do { try await engine.export(final.document.revision, to: writer); try writer.close() }
+        catch {
+          let original = error
+          do { try writer.close() } catch { throw LogicalUndoCleanupFailure(original: original, cleanup: error) }
+          throw original
+        }
+        XCTAssertEqual(try Data(contentsOf: exportURL), expected)
+        XCTAssertEqual(try admitPages().st_mode & 0o7777, 0o600)
+        try file.close(); pagesClosed = true
+        guard (testRun?.failureCount ?? 0) == failures else {
+          throw BoomError.invalid("The real write-open/receiving oracles failed; original owners and public source remain retained.")
+        }
+
+        // Close the actual first Engine before acquiring the singleton again.
+        // This is a fresh file/backend opening, not a cached-window oracle.
+        let detached = try await f.detach()
+        XCTAssertEqual(detached, final)
+        try await engine.close(); f.engine = nil; f.publisher = nil
+        try await f.store.releaseExclusiveWorkspace()
+        try await f.store.acquireExclusiveWorkspace()
+        let identity = try await f.store.storageIdentity()
+        let coldEngine = try await PagedTextEngineAdapter.create(root: f.root,
+          ownerID: identity.ownerID, storeID: identity.storeID)
+        f.engine = coldEngine
+        let coldPublisher = try await coldEngine.makeWorkspacePublisher(); f.publisher = coldPublisher
+        let coldRead = try await coldEngine.currentDocumentRecordRetaining(coldPublisher, documentID: final.document.id)
+        let cold = coldRead.value
+        do { try await coldEngine.abandonJoinedRootOutput(coldRead.lease) }
+        catch { throw PagedTextCustodyFailure(original: error, lease: coldRead.lease) }
+        XCTAssertEqual(cold, final)
+        try await f.install(cold)
+        XCTAssertEqual(f.view.string, "aXYbc"); XCTAssertEqual(f.session?.sealedRootRecord, final)
+        XCTAssertEqual(try f.commands!.captureLogicalHistory().undo.count, 2)
+      } catch {
+        let original = error
+        do {
+          try restorePagesMode()
+          if !pagesClosed { try file.close(); pagesClosed = true }
+        }
+        catch { throw LogicalUndoCleanupFailure(original: original, cleanup: error) }
+        throw original
+      }
     }
   }
   func testSelectionSupersedesColdUndoRetainsOriginalKeysAndLaterNativeTypingStaysLive() async throws {

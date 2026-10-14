@@ -40,6 +40,16 @@ import SwiftUI
       app.run(); return
     }
     #endif
+    if CommandLine.arguments.contains("--editor-memory-smoke") {
+      let app = NSApplication.shared
+      if app.activationPolicy() != .regular { _ = app.setActivationPolicy(.regular) }
+      guard app.activationPolicy() == .regular else { fputs("Public editor activation refused.\n", stderr); exit(1) }
+      Task {
+        do { try await DeveloperEditorFixture.runMemory(arguments: CommandLine.arguments); exit(0) }
+        catch { fputs("Public normal editor observation failed: \(error.localizedDescription)\n", stderr); exit(1) }
+      }
+      app.run(); return
+    }
     if CommandLine.arguments.contains("--video-storyboard-smoke") {
       let app = NSApplication.shared; app.setActivationPolicy(.prohibited)
       Task {

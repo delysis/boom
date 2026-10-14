@@ -635,12 +635,31 @@ private final class PagedNativeInputObservers {
     mounted: (PagedNativeTextView, PagedNativeTextView) throws -> Void) -> Error? {
     precondition(isAdopting && stagedClient != nil)
     let oldView = activeView!
-    let ownsSourceFocus = (try? physicalInputLease(for: oldView)) == stage.sourceSelection.inputLease
+    let source = stage.sourceSelection.inputLease
+    let ownsSourceFocus = (try? physicalInputLease(for: oldView)) == source
     oldView.inputBinding?.retire()
     oldView.retirePhysicalInputClient() // permanent old proxy is inert BEFORE framework reentrancy
     activeView = stage.client.view; activeContext = stage.client.context
     activeView.inputBinding?.activate(); stagedClient = nil
-    do { try mounted(oldView, activeView) }
+    do {
+      try mounted(oldView, activeView)
+      if ownsSourceFocus, source.isFirstResponder {
+        // Retirement may change AppKit's responder relationship. The exact
+        // staged source lease was validated before that synchronous boundary.
+        guard let window = stage.sourceWindow, activeView.window === window,
+          window.isKeyWindow == source.isKeyWindow else {
+          throw BoomError.stale("The managed mount changed its captured native window.")
+        }
+        if window.firstResponder !== activeView {
+          guard window.makeFirstResponder(activeView) else {
+            throw BoomError.unavailable("The managed mount could not restore its captured native focus.")
+          }
+        }
+        guard activeView.window === window, window.firstResponder === activeView else {
+          throw BoomError.unavailable("The managed mount did not retain its captured native focus.")
+        }
+      }
+    }
     catch {
       // The source and Foundation move already happened. Keep the actual
       // physical refusal on this binding and never grant raw-key replay.
@@ -648,7 +667,6 @@ private final class PagedNativeInputObservers {
       return error
     }
     if ownsSourceFocus, let target = try? physicalInputLease(for: activeView) {
-      let source = stage.sourceSelection.inputLease
       if source.keyboardEpoch == target.keyboardEpoch, source.keyboardID == target.keyboardID,
         source.windowID == target.windowID, source.isFirstResponder, target.isFirstResponder,
         source.isKeyWindow == target.isKeyWindow {

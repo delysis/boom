@@ -1998,7 +1998,7 @@ private struct BoundedConsultationContext: Sendable {
       let results = try await runner.runBatch(rawPrompt: recipe.prompt, media: orderedMedia, maxTokens: recipe.maxTokens,
           settings: recipe.settings, seeds: seeds, flag: flag, background: maxTokens == 64 && !showingCandidates,
           cacheOwner: cacheOwner, executionPolicy: executionPolicy, joinedRetention: joinedRetention,
-          beforeCachePublication: { [weak self] in
+          beforeCachePublication: { [weak self, recipe = capturedRecipe] in
             guard let self else { throw CancellationError() }
             if replay == nil { try await self.revalidateOnDisk(recipe.sources, attachments: []) }
             try await MainActor.run {
@@ -2010,7 +2010,7 @@ private struct BoundedConsultationContext: Sendable {
             }
           },
           pairedAdmission: pairedAdmission,
-          onCheckpoint: { [weak self] updates in
+          onCheckpoint: { [weak self, recipe = capturedRecipe] updates in
             for update in updates {
               try await checkpointStore.checkpoint(update.progress, identity: generations[update.lane],
                 stopReason: update.stopReason, stopTokenID: update.stopTokenID)
@@ -2312,7 +2312,8 @@ private struct BoundedConsultationContext: Sendable {
           throw BoomError.unavailable("The chosen folder cannot be read.")
         }
         var files: [(URL, String)] = [], entries = 0
-        for case let url as URL in iterator {
+        while let object = iterator.nextObject() {
+          guard let url = object as? URL else { continue }
           try flag.check(); entries += 1
           guard entries <= 4_096 else { throw BoomError.budget("Import at most 4,096 folder entries at a time.") }
           let values = try url.resourceValues(forKeys: Set(keys))
