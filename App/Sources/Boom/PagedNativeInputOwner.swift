@@ -218,6 +218,8 @@ private final class PagedNativeInputObservers {
   private var documentSelection: PagedNativeNavigationSelection?
   private var documentSelectionGeneration: UInt64?
   private var projectingDocumentSelection = false
+  private var mouseSelectionAnchor: (identity: PagedNativeInputIdentity, generation: UInt64,
+    absolute: UInt64, projected: UInt64)?
   private var nextInputGroupID: UUID?
   func continueNextInputGroup(_ id: UUID) { nextInputGroupID = id }
   func takeNextInputGroupID() -> UUID? {
@@ -333,7 +335,19 @@ private final class PagedNativeInputObservers {
       let affinity = try PagedSelectionAffinity(native: view.selectionAffinity)
       let end = next.utf16Offset + next.utf16Length
       let focusAtEnd: Bool
-      if next.utf16Length == 0 { focusAtEnd = false }
+      if let anchor = mouseSelectionAnchor, anchor.identity == activeIdentity,
+        anchor.generation == session.generation,
+        anchor.projected == next.utf16Offset || anchor.projected == end {
+        // Cocoa tracks the actual clipped anchor. Restore only that proven
+        // endpoint to the original global Shift anchor; affinity is separate.
+        let focus = anchor.projected == next.utf16Offset ? end : next.utf16Offset
+        documentSelection = PagedNativeNavigationSelection(utf16Offset: min(anchor.absolute, focus),
+          utf16Length: max(anchor.absolute, focus) - min(anchor.absolute, focus),
+          focusAtEnd: focus >= anchor.absolute, affinity: affinity)
+        documentSelectionGeneration = session.generation
+        if view.inputCommandIsClosed { typingGroup = nil; nextInputGroupID = nil }
+        return
+      } else if next.utf16Length == 0 { focusAtEnd = false }
       else if let previous, previous.anchorUTF16 == next.utf16Offset { focusAtEnd = true }
       else if let previous, previous.anchorUTF16 == end { focusAtEnd = false }
       else {
@@ -347,6 +361,32 @@ private final class PagedNativeInputObservers {
       documentSelectionGeneration = session.generation
     } catch { PerformanceTrace.event("Editor.ManagedAdmission") }
     if view.inputCommandIsClosed { typingGroup = nil; nextInputGroupID = nil }
+  }
+
+  /// A native Shift mouse gesture may have an anchor outside its bounded
+  /// projection. Seed Cocoa's real local caret and keep the original endpoint
+  /// only during this synchronous tracking call, never across a source rebind.
+  func withDocumentMouseSelection(anchorUTF16: UInt64, operation: () -> Void) throws {
+    guard mouseSelectionAnchor == nil, let view = activeView, let binding = view.inputBinding,
+      view.inputCommandIsClosed, !view.hasMarkedText() else {
+      throw BoomError.stale("The native mouse gesture has another selection or composition scope.")
+    }
+    try binding.admitsInput(in: session)
+    let coordinates = try session.documentCoordinates()
+    guard anchorUTF16 <= coordinates.projectedUTF16 else {
+      throw BoomError.stale("The mouse anchor exceeds its actual logical source.")
+    }
+    let end = coordinates.utf16Start + UInt64(coordinates.localUTF16)
+    let projected = min(end, max(coordinates.utf16Start, anchorUTF16))
+    let local = Int(projected - coordinates.utf16Start)
+    _ = try session.nativeSelection(NSRange(location: local, length: 0))
+    mouseSelectionAnchor = (binding.identity, session.generation, anchorUTF16, projected)
+    defer { mouseSelectionAnchor = nil }
+    projectingDocumentSelection = true
+    view.setSelectedRange(NSRange(location: local, length: 0),
+      affinity: view.selectionAffinity, stillSelecting: false)
+    projectingDocumentSelection = false
+    operation()
   }
 
   /// A document range is two scalar coordinates. Cocoa paints only the

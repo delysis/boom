@@ -323,7 +323,7 @@ import Foundation
       view.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
       container.widthTracksTextView = true; container.heightTracksTextView = false
       view.writingToolsBehavior = .none
-      view.clicked = { [weak self] point, extending in self?.selectScrollPoint(point, extending: extending) }
+      view.clicked = { [weak self] event in self?.selectScrollPoint(event) }
       let surface = PagedScrollSurface(frame: contentView.frame)
       surface.drawsBackground = false; surface.hasVerticalScroller = false; surface.hasHorizontalScroller = false
       surface.documentView = view
@@ -334,22 +334,54 @@ import Foundation
       scrollSurface = surface; scrollText = view
     }
     guard let surface = scrollSurface, let view = scrollText else { throw BoomError.unavailable("Bounded scroll surface could not be constructed.") }
-    view.string = window.text; view.sizeToFit()
+    view.completeMarkupContext = window.start.utf16 == 0 && window.summary.utf16 == window.snapshot.summary.utf16
+    view.string = window.text
+    view.setFrameSize(NSSize(width: max(1, contentSize.width), height: max(1, contentSize.height)))
+    // Share the editor's bounded paragraph metrics and wrapping. A partial
+    // source remains explicitly partial; it is never parsed as a full file.
+    MarkdownStyle.apply(to: view)
+    view.sizeToFit()
     surface.contentView.scroll(to: .zero); surface.isHidden = false; showingScroll = true
     try updateDocumentScroller()
   }
-  private func selectScrollPoint(_ point: NSPoint, extending: Bool) {
+  private func selectScrollPoint(_ event: NSEvent) {
     do {
-      guard let view = scrollText, view.layoutManager != nil, view.textContainer != nil else {
+      guard let display = scrollText, let surface = scrollSurface,
+        let input = managedInput, let native = input.activeView, let window = self.window,
+        event.type == .leftMouseDown, event.windowNumber == window.windowNumber,
+        display.window === window, native.window === window,
+        input.commandOwner?.hasPendingCommand == false,
+        display.layoutManager != nil, display.textContainer != nil else {
         throw BoomError.stale("The visible source window has no bounded native layout.")
       }
-      let local = view.characterIndexForInsertion(at: point)
-      try selectVisibleUTF16(local, extending: extending)
+      let extending = event.modifierFlags.contains(.shift)
+      let anchor: UInt64?
+      if extending { anchor = try input.currentDocumentSelection().anchorUTF16 }
+      else { anchor = nil }
+      let local = display.characterIndexForInsertion(at: display.convert(event.locationInWindow, from: nil))
+      let origin = surface.contentView.bounds.origin
+      try selectVisibleUTF16(local, extending: extending, installingDisplay: true)
+      // Mount exactly the window that supplied the hit, with its real clip
+      // origin. No synthetic event or source authority comes from pixel identity.
+      contentView.scroll(to: contentView.constrainBoundsRect(
+        NSRect(origin: origin, size: contentView.bounds.size)).origin)
+      reflectScrolledClipView(contentView)
+      guard input.activeView === native, textView === native,
+        native.characterIndexForInsertion(at: native.convert(event.locationInWindow, from: nil)) == local,
+        window.isKeyWindow, window.firstResponder === native else {
+        throw BoomError.stale("The native mouse handoff did not preserve its displayed source geometry.")
+      }
+      if let anchor {
+        try input.withDocumentMouseSelection(anchorUTF16: anchor) { native.mouseDown(with: event) }
+      } else { native.mouseDown(with: event) }
     } catch { failPresentation(error) }
   }
   /// The accessibility/mouse consumer names a real scalar in this currently
   /// displayed window. It cannot authorize an earlier root or a half surrogate.
   func selectVisibleUTF16(_ local: Int, extending: Bool = false) throws {
+    try selectVisibleUTF16(local, extending: extending, installingDisplay: false)
+  }
+  private func selectVisibleUTF16(_ local: Int, extending: Bool, installingDisplay: Bool) throws {
     guard let input = managedInput, showingScroll, let output = scrollProjection,
       let snapshot = scrollSnapshot, let owner = input.commandOwner else {
       throw BoomError.stale("The scroll projection has no current editable consumer.")
@@ -375,7 +407,7 @@ import Foundation
         focusAtEnd: absolute.partialValue >= fixed, affinity: original.affinity)
     } else { selection = PagedNativeNavigationSelection(utf16Offset: absolute.partialValue, utf16Length: 0) }
     let nativeEnd = current.utf16Start.addingReportingOverflow(UInt64(current.localUTF16))
-    if !nativeEnd.overflow, !owner.hasPendingCommand, input.session.isCurrent(snapshot),
+    if !installingDisplay, !nativeEnd.overflow, !owner.hasPendingCommand, input.session.isCurrent(snapshot),
       selection.focusUTF16 >= current.utf16Start, selection.focusUTF16 <= nativeEnd.partialValue,
       let focus = Int(exactly: selection.focusUTF16 - current.utf16Start) {
       // The copied display and this dirty native island name the SAME exact
@@ -634,11 +666,13 @@ import Foundation
 
 /// Physical read-only presentation never becomes the keyboard source. Its
 /// mouse point is interpreted only against its retained immutable window.
-@MainActor private final class PagedScrollTextView: NSTextView {
-  var clicked: ((NSPoint, Bool) -> Void)?
+@MainActor private final class PagedScrollTextView: MarkdownTextView {
+  var clicked: ((NSEvent) -> Void)?
+  var completeMarkupContext = false
+  override var hasCompleteMarkupContext: Bool { completeMarkupContext }
   override var acceptsFirstResponder: Bool { false }
   override func mouseDown(with event: NSEvent) {
-    clicked?(convert(event.locationInWindow, from: nil), event.modifierFlags.contains(.shift))
+    clicked?(event)
   }
 }
 @MainActor private final class PagedScrollSurface: NSScrollView {

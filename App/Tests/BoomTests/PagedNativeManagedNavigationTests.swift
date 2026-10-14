@@ -947,4 +947,92 @@ import XCTest
     }
   }
 
+  /// Actual NSWindow dispatch plus NSTextView's native tracking loop. The
+  /// posted SDK drag/up events are not a packaged physical-mouse acceptance.
+  func testActualScrollMouseDownTracksDragAtNonzeroClipOriginAndKeepsOutsideShiftAnchorWithUndo() async throws {
+    let line = "abcdefghijklmné🙂\n"
+    try await fixture(#function, text: String(repeating: line, count: 2_000)) { f in
+      let input = f.input!, source = f.session!, commands = f.commands!, window = f.window!, viewport = f.scroll!
+      try viewport.enableDocumentNavigation(engine: f.engine!, publisher: f.publisher!)
+      let view = f.view, manager = commands.manager, generation = source.generation
+      let saved = source.sealedRootRecord
+
+      @MainActor func drag(extending: Bool) async throws -> (UInt64, UInt64) {
+        try viewport.requestScroll(toUTF16: 20_000)
+        try await viewport.joinPresentation()
+        let projection = try XCTUnwrap(viewport.visibleScrollWindow)
+        let surface = try XCTUnwrap(viewport.subviews.compactMap { $0 as? NSScrollView }.first { !$0.isHidden })
+        let display = try XCTUnwrap(surface.documentView as? NSTextView)
+        surface.contentView.scroll(to: NSPoint(x: 0, y: 64))
+        surface.reflectScrolledClipView(surface.contentView)
+        XCTAssertGreaterThan(surface.contentView.bounds.minY, 0)
+        let clip = surface.contentView.bounds.origin
+        let layout = try XCTUnwrap(display.layoutManager), container = try XCTUnwrap(display.textContainer)
+        layout.ensureLayout(for: container)
+        let units = (line as NSString).length
+        @MainActor func point(_ location: Int) throws -> NSPoint {
+          let glyphs = layout.glyphRange(forCharacterRange: NSRange(location: location, length: 1), actualCharacterRange: nil)
+          let rect = layout.boundingRect(forGlyphRange: glyphs, in: container)
+          let local = NSPoint(x: rect.minX + display.textContainerOrigin.x + 0.1,
+            y: rect.midY + display.textContainerOrigin.y)
+          XCTAssertEqual(display.characterIndexForInsertion(at: local), location)
+          XCTAssertTrue(surface.contentView.bounds.contains(local), "The SDK pointer must start inside the actual displayed clip.")
+          return display.convert(local, to: nil)
+        }
+        let firstBreak = (projection.text as NSString).range(of: "\n", options: .literal).location
+        guard firstBreak != NSNotFound else { throw BoomError.invalid("The public drag projection has no complete line.") }
+        let downLocal = firstBreak + 1 + units * 5 + 2, endLocal = firstBreak + 1 + units * 8 + 8
+        let downPoint = try point(downLocal), endPoint = try point(endLocal)
+        let start = try projection.position(localUTF16: downLocal).utf16
+        let end = try projection.position(localUTF16: endLocal).utf16
+        let flags: NSEvent.ModifierFlags = extending ? [.shift] : []
+        @MainActor func event(_ type: NSEvent.EventType, _ point: NSPoint, _ number: Int) throws -> NSEvent {
+          try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: flags,
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+            context: nil, eventNumber: number, clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1))
+        }
+        let down = try event(.leftMouseDown, downPoint, 1)
+        let dragged = try event(.leftMouseDragged, endPoint, 2)
+        let up = try event(.leftMouseUp, endPoint, 3)
+        // Native mouseDown owns and consumes these actual SDK events. There
+        // is no direct global-selection substitution for the drag itself.
+        NSApplication.shared.postEvent(up, atStart: true)
+        NSApplication.shared.postEvent(dragged, atStart: true)
+        window.sendEvent(down)
+        XCTAssertNil(viewport.presentationFailure)
+        XCTAssertTrue(viewport.textView === view); XCTAssertTrue(input.activeView === view)
+        XCTAssertTrue(window.isKeyWindow); XCTAssertTrue(window.firstResponder === view)
+        XCTAssertEqual(viewport.contentView.bounds.origin, clip)
+        XCTAssertEqual(source.logicalWindow.start, projection.start)
+        XCTAssertEqual(source.generation, generation); XCTAssertEqual(source.sealedRootRecord, saved)
+        XCTAssertEqual(source.activeNavigationOperationCount, 0); XCTAssertFalse(commands.hasPendingCommand)
+        XCTAssertTrue(commands.manager === manager)
+        return (start, end)
+      }
+
+      let (start, end) = try await drag(extending: false)
+      let first = try input.currentDocumentSelection()
+      XCTAssertEqual(first.utf16Offset, start); XCTAssertEqual(first.utf16Length, end - start)
+      XCTAssertEqual(first.anchorUTF16, start); XCTAssertTrue(first.focusAtEnd)
+      // The exact outside endpoint is already owned before the real Shift
+      // event; the native range alone cannot manufacture this global anchor.
+      let outside: UInt64 = 100
+      try input.setDocumentSelection(PagedNativeNavigationSelection(utf16Offset: outside,
+        utf16Length: end - outside, focusAtEnd: true, affinity: .upstream))
+      let (_, shiftedEnd) = try await drag(extending: true)
+      let shifted = try input.currentDocumentSelection()
+      XCTAssertEqual(shifted.anchorUTF16, outside); XCTAssertEqual(shifted.focusUTF16, shiftedEnd)
+      XCTAssertEqual(shifted.utf16Offset, outside); XCTAssertEqual(shifted.utf16Length, shiftedEnd - outside)
+      let expected = NSMutableString(string: f.originalText)
+      expected.replaceCharacters(in: NSRange(location: Int(shifted.utf16Offset), length: Int(shifted.utf16Length)), with: "X")
+      view.insertText("X", replacementRange: view.selectedRange())
+      try await commands.joinPendingCommand(); try await f.assertSource(expected as String)
+      XCTAssertTrue(NSApplication.shared.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+      try await commands.joinPendingCommand(); try await f.assertSource(f.originalText)
+      XCTAssertEqual(try input.currentDocumentSelection(), shifted)
+      XCTAssertTrue(NSApplication.shared.sendAction(NSSelectorFromString("redo:"), to: nil, from: nil))
+      try await commands.joinPendingCommand(); try await f.assertSource(expected as String)
+      XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+    }
+  }
 }
