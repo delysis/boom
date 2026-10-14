@@ -19,6 +19,9 @@ final class PagedNativeTextStorage: NSTextStorage {
   fileprivate var performanceEvent: UInt64 = 0
   private(set) var mutationFailure: Error?
   var didRejectMutation: (@MainActor (Error) -> Void)?
+  // A successful return from the actual source primitive includes a valid
+  // no-op. This callback is not a fabricated generation or save receipt.
+  var didAcceptNativePrimitive: (@MainActor () -> Void)?
   var nativeSelection: (@MainActor () throws -> PagedWorkingSelection?)?
 
   @MainActor init(session: PagedNativeSession, attributes: [NSAttributedString.Key: Any] = [:],
@@ -108,6 +111,7 @@ final class PagedNativeTextStorage: NSTextStorage {
             beforeSelection: nativeSelection?())
         }
       }
+      MainActor.assumeIsolated { didAcceptNativePrimitive?() }
       guard accepted else { return }
       let insertedUnits = replacement.utf16.count
       do {
@@ -164,7 +168,23 @@ final class PagedNativeTextStorage: NSTextStorage {
   private(set) var performanceEvent: UInt64 = 0
   private var commandSelection: PagedWorkingSelection?
   private var pendingDocumentCommand: (selector: Selector, observation: PagedNativeSelectionObservation)?
-  private var pendingDocumentReplacement: (selection: PagedNativeNavigationSelection, bytes: Data)?
+  private struct DocumentReplacement {
+    let selection: PagedNativeNavigationSelection
+    let bytes: Data
+    let resolvingSelection: (@MainActor () throws -> PagedNativeNavigationSelection)?
+    let accepted: (@MainActor () -> Void)?
+  }
+  private var pendingDocumentReplacement: DocumentReplacement?
+  private var contextMutationAccepted: (@MainActor () -> Void)?
+  private var contextMutationSelection: (@MainActor () throws -> PagedNativeNavigationSelection)?
+  private struct DeferredDocumentMarkedText {
+    let pendingID: UUID
+    let text: Any
+    let selected: NSRange, replacement: NSRange
+    let chargedBytes: Int
+    weak var commands: PagedNativeUndoOwner?
+  }
+  private var pendingDocumentMarkedText: DeferredDocumentMarkedText?
   private var pendingDocumentClipboard: Bool?
   private var pendingDocumentTextPaste: PagedClipboardTextFile?
   private var pendingDocumentWrapping: (selection: PagedNativeNavigationSelection, prefix: String, suffix: String, toggles: Bool, name: String)?
@@ -253,7 +273,9 @@ final class PagedNativeTextStorage: NSTextStorage {
     }
     self.session = session
     self.inputBinding = inputBinding
-    managedInputClient = inputBinding.map { PagedNativeTextInputClient(identity: $0.identity) }
+    managedInputClient = inputBinding.map { PagedNativeTextInputClient(identity: PagedNativeDocumentInputIdentity(
+      ownerID: $0.identity.ownerID, sessionID: session.sessionID,
+      documentID: session.logicalWindow.snapshot.sourceRevision.documentID)) }
     let storageTrace = PerformanceTrace.begin("Editor.Update", event: 2)
     let storage = try PagedNativeTextStorage(session: session,
       attributes: [.font: MarkdownStyle.body],
@@ -324,21 +346,18 @@ final class PagedNativeTextStorage: NSTextStorage {
   /// Source/SDK admission and prepared projection allocation preceded consume.
   /// The physical view and TextKit graph stay; old storage/binding never retarget.
   func installPreparedProjection(storage: PagedNativeTextStorage,
-    binding: PagedNativeInputBinding, client: PagedNativeTextInputClient,
-    context: NSTextInputContext, manager: NSLayoutManager, container: NSTextContainer,
+    binding: PagedNativeInputBinding, manager: NSLayoutManager, container: NSTextContainer,
     selection: NSRange, affinity: NSSelectionAffinity) {
     precondition(inputBinding?.state == .retired && inputCommandIsClosed
-      && !boundedStorage.hasOpenCharacterTransaction && client.isAwaitingBind)
+      && !boundedStorage.hasOpenCharacterTransaction && managedInputClient?.isRetired == false)
     precondition(manager === layoutManager && container === textContainer
       && manager.textStorage === boundedStorage && container.textView === self)
     constructingView = true
     defer { constructingView = false }
     clearGhost(); endGhostBoundary()
     boundedStorage = storage; inputBinding = binding
-    managedInputClient = client; managedInputContext = context
     manager.replaceTextStorage(storage)
     precondition(manager.textStorage === storage && container.textView === self)
-    client.bindOnce(to: self)
     super.setSelectedRange(selection, affinity: affinity, stillSelecting: false)
     MarkdownStyle.apply(to: self)
     inlineMedia.layout.reconcileMediaPresence(in: storage)
@@ -347,7 +366,7 @@ final class PagedNativeTextStorage: NSTextStorage {
   /// Only the immutable binding's owner may retire a managed physical client.
   /// Deactivation controls input-source activation; it is not a callback join.
   /// The association is deliberately left intact for any retained context.
-  func retirePhysicalInputClient() {
+  func retireDocumentInputContext() {
     precondition(inputBinding?.state == .retired && inputCommandIsClosed)
     managedInputClient?.retire()
     let context = managedInputContext
@@ -404,12 +423,74 @@ final class PagedNativeTextStorage: NSTextStorage {
             throw BoomError.budget("This paste needs streamed file import.")
           }
           let selected = selectionSpansWindows ? global : try session.navigationSelection(local)
-          inputCommand { pendingDocumentReplacement = (selected, Data(text.utf8)) }
+          inputCommand { pendingDocumentReplacement = DocumentReplacement(selection: selected, bytes: Data(text.utf8),
+            resolvingSelection: contextMutationSelection, accepted: contextMutationAccepted) }
           return
         }
       } catch { didRejectInput?(error); return }
     }
     inputCommand { super.insertText(string, replacementRange: replacementRange) }
+  }
+
+  /// Keep the input method's pending anchor until a real source primitive or
+  /// the existing logical command's actual installation accepts its payload.
+  func withDocumentContextMutation(selecting: @escaping @MainActor () throws -> PagedNativeNavigationSelection,
+    accepted: @escaping @MainActor () -> Void, operation: () -> Void) {
+    let storage = boundedStorage, previous = boundedStorage.didAcceptNativePrimitive
+    let oldAccepted = contextMutationAccepted, oldSelection = contextMutationSelection
+    storage.didAcceptNativePrimitive = { previous?(); accepted() }
+    contextMutationAccepted = accepted; contextMutationSelection = selecting
+    defer {
+      storage.didAcceptNativePrimitive = previous
+      contextMutationAccepted = oldAccepted; contextMutationSelection = oldSelection
+    }
+    operation()
+  }
+
+  /// The document client supplies an exact global replacement; defer its
+  /// existing logical command until the enclosing native input scope closes.
+  func insertDocumentText(_ text: String, replacing selected: PagedNativeNavigationSelection) {
+    guard text.utf8.count <= PagedCapturedEditInput.maximumInputBytes,
+      pendingDocumentReplacement == nil, !hasMarkedText() else { return }
+    inputCommand { pendingDocumentReplacement = DocumentReplacement(selection: selected, bytes: Data(text.utf8),
+            resolvingSelection: contextMutationSelection, accepted: contextMutationAccepted) }
+  }
+
+  func deferDocumentMarkedText(_ original: Any, pendingID: UUID, selected: NSRange, replacement: NSRange) throws -> Bool {
+    guard inputCommandDepth > 0 else { return false }
+    guard let commands = inputBinding?.owner?.commandOwner,
+      let client = managedInputClient else { throw BoomError.stale("Deferred marked text lost its document owner.") }
+    // This escape is synchronous but outlives the producer callback. Snapshot
+    // supported values before the input method can mutate its original runs.
+    let payload = try PagedNativeContextPayload(original)
+    try commands.reserveDeferredContextPayload(identity: client.identity, chargedBytes: payload.chargedBytes)
+    do {
+      let copied = try payload.materialize()
+      let oldBytes = pendingDocumentMarkedText?.chargedBytes
+      guard pendingDocumentMarkedText == nil || pendingDocumentMarkedText?.commands === commands else {
+        throw BoomError.stale("A deferred native preview belongs to another actual input owner.")
+      }
+      pendingDocumentMarkedText = DeferredDocumentMarkedText(pendingID: pendingID, text: copied, selected: selected,
+        replacement: replacement, chargedBytes: payload.chargedBytes, commands: commands)
+      // The old preview is released by replacement before its charge returns.
+      if let oldBytes { commands.releaseDeferredContextPayload(chargedBytes: oldBytes) }
+    } catch {
+      commands.releaseDeferredContextPayload(chargedBytes: payload.chargedBytes)
+      throw error
+    }
+    return true
+  }
+
+  /// A final callback may supersede only its OWN unadopted intermediate
+  /// preview. Keep the original replacement anchor until final installation.
+  func supersedeDeferredDocumentMarkedText(pendingID: UUID) {
+    guard pendingDocumentMarkedText?.pendingID == pendingID else { return }
+    var discarded = pendingDocumentMarkedText
+    pendingDocumentMarkedText = nil
+    let commands = discarded?.commands, bytes = discarded!.chargedBytes
+    discarded = nil
+    precondition(commands != nil)
+    commands!.releaseDeferredContextPayload(chargedBytes: bytes)
   }
 
   override func compositionDidCommit() { MarkdownStyle.apply(to: self) }
@@ -606,12 +687,28 @@ final class PagedNativeTextStorage: NSTextStorage {
     let trace = beginInputTiming()
     defer { endInputTiming(trace) }
     guard admitsCommandDispatch() else { return }
+    if let owner = inputBinding?.owner, !owner.isDeliveringAcceptedInput {
+      guard window?.firstResponder === self, window?.isKeyWindow == true else {
+        PerformanceTrace.event("Editor.ManagedAdmission"); return
+      }
+    }
     if inputBinding?.owner?.commandOwner?.interceptRawKey(event, from: self) == true { return }
     if inputBinding?.owner?.interceptDocumentKey(event, from: self) == true { return }
     let previousIntent = typingIntent
     typingIntent = PagedNativeInputOwner.typingIntent(for: event)
     defer { typingIntent = previousIntent }
-    inputCommand { super.keyDown(with: event) }
+    if let managedInputClient {
+      managedInputClient.withNativeEvent {
+        inputCommand {
+          if inputBinding?.owner?.isDeliveringAcceptedInput == true, window?.firstResponder !== self,
+            let context = managedInputContext {
+            // Explicitly dispatch the admitted event to its retained document
+            // context. Never activate it or take focus from the newer control.
+            if !context.handleEvent(event) { super.keyDown(with: event) }
+          } else { super.keyDown(with: event) }
+        }
+      }
+    } else { inputCommand { super.keyDown(with: event) } }
   }
   override func doCommand(by selector: Selector) {
     let trace = beginInputTiming()
@@ -779,6 +876,19 @@ final class PagedNativeTextStorage: NSTextStorage {
         capturingSelectionFrom: inputCommandDepth == 0 && inputBinding != nil ? self : nil)
       if bindingOpened { inputBinding?.endCommand() }
       if inputCommandDepth == 0 {
+        if pendingDocumentMarkedText != nil {
+          var delivery = pendingDocumentMarkedText
+          pendingDocumentMarkedText = nil
+          let commands = delivery?.commands, bytes = delivery!.chargedBytes
+          if let marked = delivery {
+            managedInputClient?.setMarkedText(marked.text, selectedRange: marked.selected,
+              replacementRange: marked.replacement)
+          }
+          delivery = nil
+          // The actual drain returned and dropped its stored preview. The
+          // native view now owns any accepted live marked attributes.
+          commands?.releaseDeferredContextPayload(chargedBytes: bytes)
+        }
         if let wrapping = pendingDocumentWrapping {
           pendingDocumentWrapping = nil
           do { try requestWrapping(wrapping.selection, prefix: wrapping.prefix, suffix: wrapping.suffix,
@@ -801,7 +911,8 @@ final class PagedNativeTextStorage: NSTextStorage {
             guard let commands = inputBinding?.owner?.commandOwner else {
               throw BoomError.stale("Document replacement lost its actual command owner.")
             }
-            try commands.requestDocumentReplacement(pending.selection, replacement: pending.bytes, actionName: "Edit")
+            try commands.requestDocumentReplacement(pending.selection, replacement: pending.bytes, actionName: "Edit",
+              resolvingSelection: pending.resolvingSelection, onInstalled: pending.accepted)
           } catch { didRejectInput?(error) }
         }
         if let pending = pendingDocumentCommand {

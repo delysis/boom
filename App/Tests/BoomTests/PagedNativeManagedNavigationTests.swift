@@ -93,12 +93,16 @@ import XCTest
         self.refuseNextActualMount = false
         host.documentView = nil // force the actual viewport precondition to refuse after adoption
       }
+      let capturedResponder = window.firstResponder
+      let ownedFocus = capturedResponder === old
       do { try host.mountManagedView(from: old, to: new) }
       catch {
         self.preserve(error)
         throw error
       }
-      XCTAssertTrue(host.textView === new); XCTAssertTrue(window.firstResponder === new)
+      XCTAssertTrue(host.textView === new)
+      if ownedFocus { XCTAssertTrue(window.firstResponder === new) }
+      else { XCTAssertTrue(window.firstResponder === capturedResponder) }
       let maximumMounts = self.originalText.utf8.count > 72_204 ? 32 : 16
       guard self.mounts.count < maximumMounts, let identity = new.inputBinding?.identity else {
         throw BoomError.budget("Actual public mount exceeds its explicit fixture bound or lost its binding.")
@@ -211,6 +215,29 @@ import XCTest
 
 }
 
+/// Ordinary TextKit reference only: its actual automatic string Undo is
+/// independent of the product's sole canonical logical source/SDK manager.
+@MainActor private final class NativeContextReferenceTextView: NSTextView {
+  let referenceUndo = UndoManager()
+  private(set) var interpretedCommands: [Selector] = []
+  override var undoManager: UndoManager? { referenceUndo }
+  override func doCommand(by selector: Selector) {
+    precondition(interpretedCommands.count < 64)
+    interpretedCommands.append(selector); super.doCommand(by: selector)
+  }
+}
+
+/// Mutable test inputs only; production still uses the existing native owner.
+@MainActor private final class NativeContextCustodyProbe {
+  var entered = false
+  var chargedBytes = 0
+  let directions = NSMutableArray(array: [NSNumber(value: 0), NSNumber(value: 2)])
+  lazy var marked = NSMutableAttributedString(string: "候補", attributes: [
+    .markedClauseSegment: NSNumber(value: 3), .underlineStyle: NSNumber(value: NSUnderlineStyle.double.rawValue),
+    .writingDirection: directions,
+  ])
+}
+
 @MainActor final class PagedNativeManagedNavigationTests: XCTestCase {
   private static var retained: ManagedNavigationFixture?
   private static let entryKey = UndoManager.UserInfoKey(rawValue: "bloom.paged.native-entry.v1")
@@ -258,7 +285,7 @@ import XCTest
       throw error
     }
   }
-  func testManagedRecenterRetainsCanonicalOwnerAndAllowsTypingUndoRedoWithInertOldClients() async throws {
+  func testManagedRecenterKeepsDocumentContextAndAllowsTypingUndoRedoWithInertOldStorage() async throws {
     try await fixture(#function) { f in
       try f.replaceFirst("A"); try await f.seal()
       let input = f.input!, commands = f.commands!, source = f.session!, manager = commands.manager
@@ -281,33 +308,32 @@ import XCTest
       XCTAssertEqual(f.view.selectionAffinity, .upstream); XCTAssertEqual(oldBinding.state, .retired)
       XCTAssertTrue(f.view.layoutManager === oldManager); XCTAssertTrue(f.view.textContainer === oldContainer)
       XCTAssertFalse(f.view.boundedStorage === oldStorage); XCTAssertTrue(oldStorage.layoutManagers.isEmpty)
-      XCTAssertFalse(f.view.inputContext === context)
+      XCTAssertTrue(f.view.inputContext === context)
       XCTAssertTrue(oldManager.textStorage === f.view.boundedStorage)
       XCTAssertTrue(oldContainer.textView === f.view)
       XCTAssertTrue(oldManager.delegate === f.view.inlineMedia.layout)
       XCTAssertThrowsError(try oldBinding.admitsInput(in: source))
       XCTAssertEqual(try input.inputLease(for: old).identity, input.activeIdentity)
-      XCTAssertEqual(oldClient.identity, oldIdentity); XCTAssertTrue(oldClient.isRetired)
+      XCTAssertEqual(oldClient.identity.ownerID, oldIdentity.ownerID)
+      XCTAssertEqual(oldClient.identity.sessionID, oldIdentity.sessionID)
+      XCTAssertFalse(oldClient.isRetired)
       XCTAssertTrue((context.client as? PagedNativeTextInputClient) === oldClient)
-      XCTAssertEqual(oldClient.selectedRange(), NSRange(location: NSNotFound, length: 0))
+      XCTAssertEqual(oldClient.selectedRange(), NSRange(location: 8_000, length: 0))
       XCTAssertEqual(oldClient.markedRange(), NSRange(location: NSNotFound, length: 0))
       XCTAssertFalse(oldClient.hasMarkedText())
       var absent = NSRange(location: 0, length: 1)
       XCTAssertNil(oldClient.attributedSubstring(forProposedRange: NSRange(location: 0, length: 1), actualRange: &absent))
       XCTAssertEqual(absent, NSRange(location: NSNotFound, length: 0))
       let newClient = try XCTUnwrap(f.view.inputContext?.client as? PagedNativeTextInputClient)
-      XCTAssertFalse(newClient === oldClient); XCTAssertEqual(newClient.identity, input.activeIdentity)
+      XCTAssertTrue(newClient === oldClient)
       let currentBytes = Data(f.view.string.utf8), count = manager.undoCount
-      oldClient.insertText("OLD", replacementRange: NSRange(location: 0, length: 1))
-      oldClient.setMarkedText("旧", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: 0, length: 1))
-      oldClient.unmarkText(); oldClient.doCommand(by: NSSelectorFromString("undo:")); oldClient.doCommand(by: NSSelectorFromString("redo:"))
       oldStorage.replaceCharacters(in: NSRange(location: 0, length: 1), with: "OLD")
       oldStorage.setAttributes([.foregroundColor: NSColor.red], range: NSRange(location: 0, length: 1))
       XCTAssertEqual(oldStorage.string, oldText)
       XCTAssertEqual(Data(f.view.string.utf8), currentBytes); XCTAssertEqual(source.generation, sequence)
       XCTAssertEqual(manager.undoCount, count); XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
       // This retained reference IS the current physical view; ordinary input
-      // must still reach its new source, unlike retired proxy/storage handles.
+      // must still reach its new source, unlike retired storage/binding handles.
       old.insertText("X", replacementRange: NSRange(location: NSNotFound, length: 0))
       var after = f.originalText; after.replaceSubrange(after.startIndex..<after.index(after.startIndex, offsetBy: 1), with: "A")
       let position = after.utf16.index(after.utf16.startIndex, offsetBy: 8_000)
@@ -567,8 +593,9 @@ import XCTest
       XCTAssertNotNil(f.input!.firstRefusal); XCTAssertNotNil(f.commands!.firstFailure)
       XCTAssertNotEqual(f.session!.arenaID, oldArena); XCTAssertTrue(f.view === old)
       XCTAssertEqual(f.session!.sealedRevision, root); XCTAssertEqual(f.session!.generation, sequence)
-      XCTAssertEqual(oldBinding.state, .retired); XCTAssertTrue(client.isRetired)
-      XCTAssertEqual(client.identity, oldIdentity)
+      XCTAssertEqual(oldBinding.state, .retired); XCTAssertFalse(client.isRetired)
+      XCTAssertEqual(client.identity.ownerID, oldIdentity?.ownerID)
+      XCTAssertEqual(client.identity.sessionID, oldIdentity?.sessionID)
       XCTAssertEqual(f.commands!.queuedRawKeyCount, 0); XCTAssertEqual(f.commands!.unretainedRawKeyCount, 0)
       XCTAssertNil(f.input!.lastReplayTransition) // the failed physical mount supplies no replay grant
       let bytes = Data(f.view.string.utf8), errors = f.originalErrors.count
@@ -631,10 +658,8 @@ import XCTest
       let afterEnd = String(repeating: "q", count: middle) + String(reference.string.dropFirst(2))
       f.view.doCommand(by: NSSelectorFromString("deleteToEndOfParagraph:"))
       try await commands.joinPendingCommand(); try await f.assertSource(afterEnd)
-      XCTAssertEqual(manager.undoCount, 1); XCTAssertTrue(oldClient.isRetired)
+      XCTAssertEqual(manager.undoCount, 1); XCTAssertFalse(oldClient.isRetired)
       let changed = try await f.record(), changedLogical = try source.captureLogicalState().source
-      oldClient.insertText("OLD", replacementRange: NSRange(location: 0, length: 0))
-      oldClient.doCommand(by: NSSelectorFromString("deleteToBeginningOfParagraph:"))
       XCTAssertEqual(source.sealedRevision, changed.document.revision)
       XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
       manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource(text)
@@ -697,7 +722,7 @@ import XCTest
       let afterY = (formattedLine as NSString).replacingCharacters(in: formattedRange, with: "y")
       try await f.assertSource(afterY)
       XCTAssertEqual(manager.undoCount, 3); XCTAssertEqual(commands.queuedRawKeyCount, 0)
-      XCTAssertTrue(oldClient.isRetired); XCTAssertNil(commands.firstFailure); XCTAssertNil(input.firstRefusal)
+      XCTAssertFalse(oldClient.isRetired); XCTAssertNil(commands.firstFailure); XCTAssertNil(input.firstRefusal)
       manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource(formattedLine)
       XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, UInt64(formattedRange.location))
       XCTAssertEqual(try input.currentDocumentSelection().utf16Length, UInt64(formattedRange.length))
@@ -894,8 +919,8 @@ import XCTest
       XCTAssertLessThanOrEqual(source.logicalWindow.summary.bytes, UInt64(PagedWorkingWindow.hardBytes))
       XCTAssertEqual(commands.retainedRefusedInputCount, 0)
       let record = source.sealedRevision
-      oldClient.insertText("OLD", replacementRange: NSRange(location: 0, length: 0))
-      XCTAssertEqual(source.sealedRevision, record); XCTAssertTrue(oldClient.isRetired)
+      XCTAssertEqual(source.sealedRevision, record); XCTAssertFalse(oldClient.isRetired)
+      XCTAssertTrue(f.view.inputContext?.client === oldClient)
       let undoCount = commands.manager.undoCount
       XCTAssertGreaterThanOrEqual(undoCount, 1); XCTAssertLessThanOrEqual(undoCount, 100)
       for _ in 0..<undoCount { commands.manager.undo(); try await commands.joinPendingCommand() }
@@ -931,6 +956,8 @@ import XCTest
         context: nil, characters: "q", charactersIgnoringModifiers: "q", isARepeat: false, keyCode: 12))
       window.sendEvent(next)
       XCTAssertEqual(source.generation, generation + 2)
+      XCTAssertEqual(commands.queuedNativeContinuationCount, 0, "A same-selection preload must not escrow the actual immediate native callbacks.")
+      XCTAssertEqual(commands.retainedInputBytes, 0)
       XCTAssertEqual(commands.queuedRawKeyCount, 0); XCTAssertEqual(commands.unretainedRawKeyCount, 0)
       XCTAssertTrue(f.view === old); XCTAssertTrue(old.inputContext === context)
       XCTAssertEqual(input.activeIdentity, identity); XCTAssertEqual(source.arenaID, arena)
@@ -1331,4 +1358,574 @@ import XCTest
     }
   }
 
+
+  func testActualAdmittedTypingFinishesItsNavigationAfterFocusMoveWithoutRetargetingOrTakingFocus() async throws {
+    try await fixture(#function) { f in
+      let input = f.input!, commands = f.commands!, source = f.session!, window = f.window!, view = f.view
+      let context = try XCTUnwrap(view.inputContext)
+      let client = try XCTUnwrap(context.client as? PagedNativeTextInputClient)
+      let hold = try await f.route!.holdNext(.windowAfter)
+      let loading = try f.startNavigation(anchor: 48_000, caret: 50_000)
+      try await f.route!.awaitHeld(hold)
+      window.sendEvent(try f.key())
+      XCTAssertEqual(commands.queuedRawKeyCount, 1); XCTAssertEqual(source.generation, 0)
+      let other = NSTextView(frame: NSRect(x: 0, y: 240, width: 300, height: 70))
+      other.string = "Other"; window.contentView!.addSubview(other)
+      XCTAssertTrue(window.makeFirstResponder(other)); XCTAssertTrue(window.firstResponder === other)
+      let originalContextSelection = client.selectedRange()
+      view.keyDown(with: try f.key()) // foreign new ingress is not the already admitted event
+      XCTAssertEqual(source.generation, 0); XCTAssertEqual(client.selectedRange(), originalContextSelection)
+      XCTAssertEqual(commands.queuedRawKeyCount, 1); XCTAssertEqual(commands.retainedRefusedInputCount, 0)
+      window.sendEvent(try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero,
+        modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil,
+        characters: "q", charactersIgnoringModifiers: "q", isARepeat: false, keyCode: 12)))
+      let otherText = other.string
+      try await f.route!.release(hold); _ = try await loading.value
+      try await commands.joinPendingCommand()
+      XCTAssertTrue(view.inputContext === context); XCTAssertTrue(window.firstResponder === other)
+      XCTAssertEqual(other.string, otherText); XCTAssertTrue(otherText.contains("q"))
+      XCTAssertEqual(source.generation, 1); XCTAssertEqual(client.selectedRange(), NSRange(location: 50_001, length: 0))
+      var expected = f.originalText
+      expected.insert("z", at: expected.index(expected.startIndex, offsetBy: 50_000))
+      try await f.assertSource(expected)
+      XCTAssertEqual(commands.queuedRawKeyCount, 0); XCTAssertEqual(commands.retainedRefusedInputCount, 0)
+      XCTAssertEqual(commands.retainedInputBytes, 0); XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+      XCTAssertTrue(window.makeFirstResponder(view)); other.removeFromSuperview()
+      XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+      try await commands.joinPendingCommand(); try await f.assertSource(f.originalText)
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, 50_000)
+      XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("redo:"), to: nil, from: nil))
+      try await commands.joinPendingCommand(); try await f.assertSource(expected)
+    }
+  }
+
+  func testActualDocumentContextUsesGlobalBoundedRangesAndRetiresOnlyWithItsOwner() async throws {
+    try await fixture(#function) { f in
+      let view = f.view, input = f.input!, source = f.session!, commands = f.commands!
+      let context = try XCTUnwrap(view.inputContext), client = try XCTUnwrap(context.client as? PagedNativeTextInputClient)
+      let oldStorage = view.boundedStorage, oldBinding = try XCTUnwrap(view.inputBinding)
+      let window = try await f.startNavigation(anchor: 48_000, caret: 50_000).value
+      try await commands.joinPendingCommand()
+      XCTAssertTrue(view.inputContext === context); XCTAssertFalse(client.isRetired)
+      XCTAssertEqual(client.selectedRange(), NSRange(location: 50_000, length: 0))
+      XCTAssertEqual(oldBinding.state, .retired)
+      let oldText = oldStorage.string
+      oldStorage.replaceCharacters(in: NSRange(location: 0, length: 1), with: "OLD")
+      XCTAssertEqual(oldStorage.string, oldText); XCTAssertEqual(source.generation, 0)
+      var actual = NSRange(location: NSNotFound, length: 0)
+      let requested = NSRange(location: Int(window.start.utf16) - 10, length: 30)
+      let bounded = try XCTUnwrap(client.attributedSubstring(forProposedRange: requested, actualRange: &actual))
+      XCTAssertEqual(actual, NSRange(location: Int(window.start.utf16), length: 20))
+      XCTAssertEqual(bounded.string, String(window.text.prefix(20)))
+      XCTAssertNil(client.attributedSubstring(forProposedRange: NSRange(location: 0, length: 1), actualRange: &actual))
+      XCTAssertEqual(actual, NSRange(location: NSNotFound, length: 0))
+      client.setMarkedText("に", selectedRange: NSRange(location: 1, length: 0),
+        replacementRange: NSRange(location: 50_000, length: 0))
+      XCTAssertTrue(view.hasMarkedText()); XCTAssertTrue(source.isPinned)
+      XCTAssertEqual(client.markedRange(), NSRange(location: 50_000, length: 1))
+      client.insertText("日本", replacementRange: NSRange(location: NSNotFound, length: 0))
+      XCTAssertFalse(view.hasMarkedText()); XCTAssertFalse(source.isPinned)
+      XCTAssertEqual(client.selectedRange(), NSRange(location: 50_002, length: 0))
+      var expected = f.originalText
+      expected.insert(contentsOf: "日本", at: expected.index(expected.startIndex, offsetBy: 50_000))
+      try await commands.joinPendingCommand(); try await f.assertSource(expected)
+      XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+      try await commands.joinPendingCommand(); try await f.assertSource(f.originalText)
+      XCTAssertTrue(view.inputContext === context); XCTAssertFalse(client.isRetired)
+      // A global selection larger than this arena starts one real bounded
+      // composition, never an island-only replacement or a full source String.
+      view.selectAll(nil); try await commands.joinPendingCommand()
+      let global = try input.currentDocumentSelection()
+      XCTAssertEqual(client.selectedRange(), NSRange(location: 0, length: f.originalText.utf16.count))
+      client.setMarkedText("候補", selectedRange: NSRange(location: 2, length: 0),
+        replacementRange: NSRange(location: NSNotFound, length: 0))
+      XCTAssertTrue(view.hasMarkedText()); XCTAssertTrue(source.isPinned)
+      client.insertText("文", replacementRange: NSRange(location: NSNotFound, length: 0))
+      try await commands.joinPendingCommand(); try await f.assertSource("文")
+      XCTAssertTrue(view.inputContext === context)
+      XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+      try await commands.joinPendingCommand(); try await f.assertSource(f.originalText)
+      XCTAssertEqual(try input.currentDocumentSelection(), global)
+      XCTAssertFalse(view.hasMarkedText()); XCTAssertFalse(source.isPinned)
+      try commands.closeInput(); try commands.requireJoinedClose()
+      let generation = source.generation, bytes = Data(view.string.utf8)
+      XCTAssertTrue(client.isRetired); XCTAssertNil(view.inputContext)
+      client.insertText("LATE", replacementRange: NSRange(location: 0, length: 0))
+      client.setMarkedText("旧", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: 0, length: 0))
+      client.doCommand(by: NSSelectorFromString("undo:")); client.unmarkText()
+      XCTAssertEqual(client.selectedRange(), NSRange(location: NSNotFound, length: 0))
+      XCTAssertEqual(client.markedRange(), NSRange(location: NSNotFound, length: 0))
+      XCTAssertFalse(client.hasMarkedText()); XCTAssertEqual(source.generation, generation)
+      XCTAssertEqual(Data(view.string.utf8), bytes); XCTAssertNil(input.firstRefusal)
+    }
+  }
+
+  func testActualNativeDeadKeyUsesOneDocumentContextAcrossQueuedNavigationAndContinuation() async throws {
+    try await fixture(#function) { f in
+      let view = f.view, source = f.session!, commands = f.commands!, window = f.window!
+      let context = try XCTUnwrap(view.inputContext)
+      let priorSource = try XCTUnwrap(context.selectedKeyboardInputSource)
+      guard context.keyboardInputSources?.contains("com.apple.keylayout.US") == true else {
+        throw BoomError.unavailable("This actual dead-key control requires the native U.S. input source.")
+      }
+      // Fixture setup chooses an actual native layout; production never guesses
+      // admission from a source-name prefix or charactersIgnoringModifiers.
+      context.selectedKeyboardInputSource = "com.apple.keylayout.US"
+      defer { context.selectedKeyboardInputSource = priorSource }
+      XCTAssertEqual(context.selectedKeyboardInputSource, "com.apple.keylayout.US")
+      let reference = NSTextView(frame: NSRect(x: 0, y: 240, width: 300, height: 70))
+      window.contentView!.addSubview(reference)
+      defer { reference.removeFromSuperview() }
+      XCTAssertTrue(window.makeFirstResponder(reference))
+      reference.inputContext?.selectedKeyboardInputSource = "com.apple.keylayout.US"
+      let dead = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero,
+        modifierFlags: .option, timestamp: 0, windowNumber: window.windowNumber, context: nil,
+        characters: "", charactersIgnoringModifiers: "e", isARepeat: false, keyCode: 14))
+      let continuation = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero,
+        modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil,
+        characters: "e", charactersIgnoringModifiers: "e", isARepeat: false, keyCode: 14))
+      window.sendEvent(dead); window.sendEvent(continuation)
+      let nativeResult = reference.string
+      XCTAssertEqual(nativeResult, "é", "The real native reference must actually exercise a dead-key continuation.")
+      XCTAssertFalse(reference.hasMarkedText())
+      XCTAssertTrue(window.makeFirstResponder(view))
+      XCTAssertEqual(context.selectedKeyboardInputSource, "com.apple.keylayout.US")
+      let hold = try await f.route!.holdNext(.windowAfter)
+      let loading = try f.startNavigation(anchor: 48_000, caret: 50_000)
+      try await f.route!.awaitHeld(hold)
+      window.sendEvent(dead)
+      XCTAssertEqual(commands.queuedRawKeyCount, 1); XCTAssertEqual(source.generation, 0)
+      XCTAssertFalse(view.hasMarkedText()); XCTAssertTrue(view.inputContext === context)
+      try await f.route!.release(hold); _ = try await loading.value
+      XCTAssertEqual(commands.queuedRawKeyCount, 0); XCTAssertTrue(view.inputContext === context)
+      // The real context has now interpreted the dead key exactly once. If it
+      // emits no marked callback, a second arena rotation must preserve opaque
+      // state. If it marks text, the actual composition pin must forbid rotation.
+      if !view.hasMarkedText() {
+        let before = source.generation
+        _ = try await f.startNavigation(anchor: 49_000, caret: nil).value
+        XCTAssertEqual(source.generation, before); XCTAssertTrue(view.inputContext === context)
+      } else {
+        XCTAssertTrue(source.isPinned)
+        let pinnedNavigation = try f.startNavigation(anchor: 49_000, caret: nil)
+        do {
+          _ = try await pinnedNavigation.value
+          XCTFail("Actual marked text must keep its native arena pinned.")
+        } catch {
+          guard case BoomError.stale = error else { throw error }
+          f.preserve(error)
+        }
+        XCTAssertTrue(view.inputContext === context)
+      }
+      window.sendEvent(continuation)
+      try await commands.joinPendingCommand()
+      var expected = f.originalText
+      expected.insert(contentsOf: nativeResult, at: expected.index(expected.startIndex, offsetBy: 50_000))
+      try await f.assertSource(expected)
+      XCTAssertFalse(view.hasMarkedText()); XCTAssertFalse(source.isPinned)
+      XCTAssertEqual(commands.retainedRefusedInputCount, 0); XCTAssertNil(commands.firstFailure)
+      XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+      try await commands.joinPendingCommand(); try await f.assertSource(f.originalText)
+    }
+  }
+
+
+  // SDK protocol/range control over the genuine backend and native primitive;
+  // this is not a claim that a physical input method produced the late callback.
+  func testActualReportedContextAnchorMapsNativeSpliceBeforeUnfocusedContinuationWithoutUsingLatestCaret() async throws {
+    try await fixture(#function) { f in
+      let view = f.view, source = f.session!, input = f.input!, commands = f.commands!, window = f.window!
+      let context = try XCTUnwrap(view.inputContext), client = try XCTUnwrap(context.client as? PagedNativeTextInputClient)
+      view.setSelectedRange(NSRange(location: 8, length: 0))
+      client.withNativeEvent {
+        XCTAssertEqual(client.selectedRange(), NSRange(location: 8, length: 0))
+        // No insertion, marked text or command completed this reported range.
+      }
+      XCTAssertTrue(client.needsSpliceObservation)
+      view.setSelectedRange(NSRange(location: 2, length: 0))
+      view.insertText("🙂", replacementRange: NSRange(location: NSNotFound, length: 0))
+      XCTAssertEqual(source.generation, 1)
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, 4)
+      XCTAssertEqual(client.selectedRange(), NSRange(location: 10, length: 0))
+      let other = NSTextView(frame: NSRect(x: 0, y: 240, width: 300, height: 70))
+      other.string = "Unchanged"; window.contentView!.addSubview(other)
+      XCTAssertTrue(window.makeFirstResponder(other))
+      // The SAME document context, not a new foreign key, completes its
+      // earlier globally reported range after a genuine source generation.
+      client.insertText("é", replacementRange: NSRange(location: NSNotFound, length: 0))
+      try await commands.joinPendingCommand()
+      XCTAssertTrue(window.firstResponder === other); XCTAssertEqual(other.string, "Unchanged")
+      XCTAssertEqual(source.generation, 2); XCTAssertFalse(client.needsSpliceObservation)
+      let expected = (f.originalText as NSString).replacingCharacters(in: NSRange(location: 2, length: 0), with: "🙂") as NSString
+      try await f.assertSource(expected.replacingCharacters(in: NSRange(location: 10, length: 0), with: "é"))
+      XCTAssertEqual(commands.retainedRefusedInputCount, 0); XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+      XCTAssertTrue(window.makeFirstResponder(view)); other.removeFromSuperview()
+      XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+      try await commands.joinPendingCommand()
+      try await f.assertSource((f.originalText as NSString).replacingCharacters(in: NSRange(location: 2, length: 0), with: "🙂"))
+      XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+      try await commands.joinPendingCommand(); try await f.assertSource(f.originalText)
+    }
+  }
+
+  func testActualDeadKeyFocusMoveMatchesNativeContextWhileEarlierAdmittedContinuationKeepsDocumentTarget() async throws {
+    try await fixture(#function) { f in
+      let view = f.view, source = f.session!, input = f.input!, commands = f.commands!, window = f.window!
+      let context = try XCTUnwrap(view.inputContext), client = try XCTUnwrap(context.client as? PagedNativeTextInputClient)
+      let priorSource = try XCTUnwrap(context.selectedKeyboardInputSource)
+      guard context.keyboardInputSources?.contains("com.apple.keylayout.US") == true else {
+        throw BoomError.unavailable("This native focus/dead-key control requires the actual U.S. input source.")
+      }
+      context.selectedKeyboardInputSource = "com.apple.keylayout.US"
+      defer { context.selectedKeyboardInputSource = priorSource }
+      let reference = NSTextView(frame: NSRect(x: 0, y: 240, width: 140, height: 70))
+      let other = NSTextView(frame: NSRect(x: 160, y: 240, width: 140, height: 70))
+      other.string = "Other"; window.contentView!.addSubview(reference); window.contentView!.addSubview(other)
+      defer { reference.removeFromSuperview(); other.removeFromSuperview() }
+      XCTAssertTrue(window.makeFirstResponder(reference))
+      let referenceContext = try XCTUnwrap(reference.inputContext)
+      referenceContext.selectedKeyboardInputSource = "com.apple.keylayout.US"
+      let dead = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero,
+        modifierFlags: .option, timestamp: 0, windowNumber: window.windowNumber, context: nil,
+        characters: "", charactersIgnoringModifiers: "e", isARepeat: false, keyCode: 14))
+      let continuation = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero,
+        modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil,
+        characters: "e", charactersIgnoringModifiers: "e", isARepeat: false, keyCode: 14))
+      reference.keyDown(with: dead)
+      XCTAssertTrue(window.makeFirstResponder(other))
+      // The ordinary native reference decides whether losing focus commits,
+      // cancels or preserves conversion. No app-invented cancellation rule.
+      if !referenceContext.handleEvent(continuation) { reference.keyDown(with: continuation) }
+      let nativeResult = reference.string
+      XCTAssertFalse(nativeResult.isEmpty)
+      XCTAssertEqual(other.string, "Other"); XCTAssertTrue(window.firstResponder === other)
+      XCTAssertTrue(window.makeFirstResponder(view))
+      let hold = try await f.route!.holdNext(.windowAfter)
+      let loading = try f.startNavigation(anchor: 48_000, caret: 50_000)
+      try await f.route!.awaitHeld(hold)
+      window.sendEvent(dead); window.sendEvent(continuation)
+      XCTAssertEqual(commands.queuedRawKeyCount, 2); XCTAssertEqual(source.generation, 0)
+      var movedFocus = false
+      let previousEdit = input.onNativeEdit, previousSelection = input.onNativeSelection
+      let afterDead: @MainActor (PagedNativeStateObservation) -> Void = { _ in
+        guard !movedFocus, client.isInterpretingNativeEvent else { return }
+        movedFocus = true
+        XCTAssertTrue(window.makeFirstResponder(other))
+      }
+      input.onNativeEdit = { observation in previousEdit?(observation); afterDead(observation) }
+      input.onNativeSelection = { observation in previousSelection?(observation); afterDead(observation) }
+      defer { input.onNativeEdit = previousEdit; input.onNativeSelection = previousSelection }
+      try await f.route!.release(hold); _ = try await loading.value
+      try await commands.joinPendingCommand()
+      XCTAssertTrue(movedFocus); XCTAssertTrue(window.firstResponder === other)
+      XCTAssertEqual(other.string, "Other"); XCTAssertTrue(view.inputContext === context)
+      XCTAssertFalse(client.isRetired); XCTAssertEqual(commands.queuedRawKeyCount, 0)
+      XCTAssertEqual(commands.retainedRefusedInputCount, 0); XCTAssertFalse(view.hasMarkedText()); XCTAssertFalse(source.isPinned)
+      var expected = f.originalText
+      expected.insert(contentsOf: nativeResult, at: expected.index(expected.startIndex, offsetBy: 50_000))
+      try await f.assertSource(expected)
+      XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+      XCTAssertTrue(window.makeFirstResponder(view))
+      XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+      try await commands.joinPendingCommand(); try await f.assertSource(f.originalText)
+    }
+  }
+
+
+  func testActualDeferredMarkedPreviewSnapshotsMutableRunsBeforeOuterNativeScopeDeliversIt() async throws {
+    try await fixture(#function) { f in
+      let view = f.view, commands = f.commands!, source = f.session!
+      let client = try XCTUnwrap(view.inputContext?.client as? PagedNativeTextInputClient)
+      let probe = NativeContextCustodyProbe(), baseline = commands.retainedInputBytes
+      view.setSelectedRange(NSRange(location: 0, length: 0))
+      let observation = NotificationCenter.default.addObserver(forName: NSTextView.didChangeSelectionNotification,
+        object: view, queue: .main) { _ in
+        MainActor.assumeIsolated {
+          guard !probe.entered, !view.inputCommandIsClosed, source.generation == 1 else { return }
+          probe.entered = true
+          XCTAssertEqual(source.generation, 1, "The driver primitive is real, before its outer scope closes.")
+          let all = NSRange(location: 0, length: Int(source.logicalWindow.snapshot.summary.utf16))
+          client.setMarkedText(probe.marked, selectedRange: NSRange(location: 2, length: 0), replacementRange: all)
+          probe.chargedBytes = commands.retainedInputBytes - baseline
+          XCTAssertGreaterThan(probe.chargedBytes, probe.marked.string.utf8.count + 512)
+          XCTAssertFalse(view.hasMarkedText(), "The nonresident preview is deferred until this actual outer input scope closes.")
+          XCTAssertFalse(view.inputCommandIsClosed)
+          // Mutation AFTER callback return must not affect the stored preview.
+          probe.directions.add(NSNumber(value: 7))
+          probe.marked.replaceCharacters(in: NSRange(location: 0, length: 2), with: "改変")
+          probe.marked.setAttributes([.markedClauseSegment: NSNumber(value: 99)], range: NSRange(location: 0, length: 2))
+        }
+      }
+      defer { NotificationCenter.default.removeObserver(observation) }
+      view.insertText("z", replacementRange: NSRange(location: NSNotFound, length: 0))
+      XCTAssertTrue(probe.entered, "This control requires an actual synchronous native selection notification inside the outer input scope.")
+      XCTAssertTrue(view.hasMarkedText()); XCTAssertTrue(source.isPinned)
+      XCTAssertEqual(commands.retainedInputBytes, baseline, "The stored preview is drained, not left in refused/final custody.")
+      XCTAssertEqual(commands.queuedNativeContinuationCount, 0); XCTAssertEqual(commands.retainedRefusedInputCount, 0)
+      XCTAssertEqual(view.string, "候補", "The caller's later string/run mutation cannot retarget the captured preview.")
+      let actual = view.markedRange()
+      XCTAssertEqual(actual, NSRange(location: 0, length: 2))
+      let attributes = try XCTUnwrap(view.textStorage).attributes(at: actual.location, effectiveRange: nil)
+      XCTAssertEqual((attributes[.markedClauseSegment] as? NSNumber)?.intValue, 3)
+      XCTAssertEqual((attributes[.writingDirection] as? [NSNumber])?.map(\.intValue), [0, 2])
+      client.insertText("文", replacementRange: NSRange(location: NSNotFound, length: 0))
+      try await commands.joinPendingCommand(); try await f.assertSource("文")
+      XCTAssertFalse(view.hasMarkedText()); XCTAssertFalse(source.isPinned)
+      XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+      try await commands.joinPendingCommand(); try await f.assertSource("z" + f.originalText)
+      XCTAssertNil(f.input!.firstRefusal); XCTAssertNil(commands.firstFailure)
+    }
+  }
+
+  func testActualFinalCallbackSupersedesOnlyItsDeferredPreviewBeforeOuterNativeScopeCloses() async throws {
+    try await fixture(#function) { f in
+      let view = f.view, commands = f.commands!, source = f.session!
+      let client = try XCTUnwrap(view.inputContext?.client as? PagedNativeTextInputClient)
+      let probe = NativeContextCustodyProbe(), baseline = commands.retainedInputBytes
+      view.setSelectedRange(NSRange(location: 0, length: 0))
+      let observation = NotificationCenter.default.addObserver(forName: NSTextView.didChangeSelectionNotification,
+        object: view, queue: .main) { _ in
+        MainActor.assumeIsolated {
+          guard !probe.entered, !view.inputCommandIsClosed, source.generation == 1 else { return }
+          probe.entered = true
+          let all = NSRange(location: 0, length: Int(source.logicalWindow.snapshot.summary.utf16))
+          client.setMarkedText(probe.marked, selectedRange: NSRange(location: 2, length: 0), replacementRange: all)
+          XCTAssertGreaterThan(commands.retainedInputBytes, baseline)
+          client.insertText("文", replacementRange: NSRange(location: NSNotFound, length: 0))
+          XCTAssertFalse(view.hasMarkedText()); XCTAssertFalse(view.inputCommandIsClosed)
+          probe.marked.replaceCharacters(in: NSRange(location: 0, length: 2), with: "改変")
+        }
+      }
+      defer { NotificationCenter.default.removeObserver(observation) }
+      view.insertText("z", replacementRange: NSRange(location: NSNotFound, length: 0))
+      XCTAssertTrue(probe.entered)
+      try await commands.joinPendingCommand()
+      XCTAssertEqual(commands.retainedInputBytes, baseline); XCTAssertEqual(commands.queuedNativeContinuationCount, 0)
+      XCTAssertEqual(commands.retainedRefusedInputCount, 0)
+      XCTAssertFalse(view.hasMarkedText()); XCTAssertFalse(source.isPinned)
+      try await f.assertSource("文")
+      XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+      try await commands.joinPendingCommand(); try await f.assertSource("z" + f.originalText)
+      XCTAssertNil(f.input!.firstRefusal); XCTAssertNil(commands.firstFailure)
+    }
+  }
+
+  func testActualAdoptingFinalCallbacksKeepOriginalTargetMutableSnapshotAndJoinBeforeClose() async throws {
+    try await fixture(#function) { f in
+      let view = f.view, input = f.input!, source = f.session!, commands = f.commands!, window = f.window!
+      let context = try XCTUnwrap(view.inputContext), client = try XCTUnwrap(context.client as? PagedNativeTextInputClient)
+      let originalMount = try XCTUnwrap(commands.mountView)
+      let probe = NativeContextCustodyProbe(), baseline = commands.retainedInputBytes
+      let final = NSMutableAttributedString(string: "X", attributes: [.markedClauseSegment: NSNumber(value: 3)])
+      view.setSelectedRange(NSRange(location: 8, length: 0))
+      client.withNativeEvent { XCTAssertEqual(client.selectedRange(), NSRange(location: 8, length: 0)) }
+      commands.mountView = { old, new in
+        try originalMount(old, new)
+        guard !probe.entered else { return }
+        probe.entered = true
+        XCTAssertTrue(input.isAdopting); XCTAssertTrue(context === new.inputContext)
+        client.insertText(final, replacementRange: NSRange(location: NSNotFound, length: 0))
+        client.insertText("Y", replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertEqual(commands.queuedNativeContinuationCount, 2)
+        XCTAssertEqual(commands.retainedRefusedInputCount, 0)
+        XCTAssertGreaterThan(commands.retainedInputBytes, baseline)
+        final.replaceCharacters(in: NSRange(location: 0, length: 1), with: "WRONG")
+      }
+      let navigation = try f.startNavigation()
+      _ = try await navigation.value
+      XCTAssertTrue(probe.entered)
+      let other = NSTextField(frame: NSRect(x: 0, y: 280, width: 200, height: 24))
+      window.contentView!.addSubview(other)
+      XCTAssertTrue(window.makeFirstResponder(other))
+      let actualResponder = window.firstResponder
+      try await commands.joinPendingCommand()
+      XCTAssertTrue(window.firstResponder === actualResponder, "Completing admitted native text must not take focus back.")
+      XCTAssertEqual(commands.queuedNativeContinuationCount, 0)
+      XCTAssertEqual(commands.retainedInputBytes, baseline); XCTAssertEqual(commands.retainedRefusedInputCount, 0)
+      let expected = (f.originalText as NSString).replacingCharacters(in: NSRange(location: 8, length: 0), with: "XY")
+      try await f.assertSource(expected)
+      XCTAssertEqual(source.generation, 2)
+      try await PagedNativeFixtureApplication.focus(f.view, in: window)
+      XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+      try await commands.joinPendingCommand()
+      try await f.assertSource((f.originalText as NSString).replacingCharacters(in: NSRange(location: 8, length: 0), with: "X"))
+      XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+      try await commands.joinPendingCommand(); try await f.assertSource(f.originalText)
+      XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+      // The fixture's actual close joins this same queue/tasks, retires the
+      // document context, detaches Backend, closes Engine and releases flock.
+    }
+  }
+
+  func testNativeContextAttributePayloadRejectsOpaqueBackingAndSnapshotsSupportedMutableRuns() throws {
+    let opaque = NSMutableData(length: PagedNativeUndoOwner.maximumRawKeyBytes + 1)!
+    let invalid = NSAttributedString(string: "字", attributes: [.underlineColor: opaque])
+    XCTAssertThrowsError(try PagedNativeContextPayload(invalid)) { error in
+      guard case BoomError.invalid = error else { return XCTFail("Expected unsupported color-value refusal, got \(error)") }
+    }
+    let directions = NSMutableArray(array: [NSNumber(value: 0), NSNumber(value: 2)])
+    let input = NSMutableAttributedString(string: "候補", attributes: [
+      .markedClauseSegment: NSNumber(value: 3), .underlineStyle: NSNumber(value: NSUnderlineStyle.double.rawValue),
+      .underlineColor: NSColor.red, .writingDirection: directions,
+    ])
+    let snapshot = try PagedNativeContextPayload(input)
+    XCTAssertGreaterThan(snapshot.chargedBytes, snapshot.text.utf8.count + 512)
+    XCTAssertLessThanOrEqual(snapshot.chargedBytes, PagedNativeUndoOwner.maximumRawKeyBytes)
+    directions.add(NSNumber(value: 7))
+    input.setAttributes([.markedClauseSegment: NSNumber(value: 99)], range: NSRange(location: 0, length: 2))
+    let output = try XCTUnwrap(try snapshot.materialize() as? NSAttributedString)
+    XCTAssertEqual(output.string, "候補")
+    XCTAssertEqual((output.attribute(.markedClauseSegment, at: 0, effectiveRange: nil) as? NSNumber)?.intValue, 3)
+    XCTAssertEqual((output.attribute(.underlineStyle, at: 0, effectiveRange: nil) as? NSNumber)?.intValue,
+      NSUnderlineStyle.double.rawValue)
+    XCTAssertEqual((output.attribute(.writingDirection, at: 0, effectiveRange: nil) as? [NSNumber])?.map(\.intValue), [0, 2])
+    let excessiveRuns = NSMutableAttributedString(string: String(repeating: "a", count: 65))
+    for at in 0..<65 {
+      excessiveRuns.addAttribute(.markedClauseSegment, value: NSNumber(value: at), range: NSRange(location: at, length: 1))
+    }
+    XCTAssertThrowsError(try PagedNativeContextPayload(excessiveRuns))
+  }
+
+  func testActualRejectedContextCallbacksKeepOriginalAnchorForLaterValidInsertionAndResponderUndo() async throws {
+    try await fixture(#function) { f in
+      let view = f.view, input = f.input!, source = f.session!, commands = f.commands!
+      let client = try XCTUnwrap(view.inputContext?.client as? PagedNativeTextInputClient)
+      view.setSelectedRange(NSRange(location: 8, length: 0))
+      client.withNativeEvent { XCTAssertEqual(client.selectedRange(), NSRange(location: 8, length: 0)) }
+      view.setSelectedRange(NSRange(location: 2, length: 0))
+      view.insertText("🙂", replacementRange: NSRange(location: NSNotFound, length: 0))
+      XCTAssertEqual(source.generation, 1)
+      XCTAssertEqual(client.selectedRange(), NSRange(location: 10, length: 0))
+      let bytesBefore = commands.retainedInputBytes
+      // The pure custody control above covers opaque attributes. Ordinary
+      // resident callbacks retain the original native AppKit attribute path.
+      XCTAssertEqual(commands.retainedInputBytes, bytesBefore)
+      // Actual scalar refusal used to clear pendingSelection before validation.
+      let previous = view.didRejectInput
+      var rejected: Error?
+      view.didRejectInput = { error in rejected = error; previous?(error) }
+      defer { view.didRejectInput = previous }
+      client.setMarkedText("🙂", selectedRange: NSRange(location: 1, length: 0),
+        replacementRange: NSRange(location: NSNotFound, length: 0))
+      XCTAssertEqual(source.generation, 1); XCTAssertTrue(client.needsSpliceObservation)
+      XCTAssertEqual(client.selectedRange(), NSRange(location: 10, length: 0)); XCTAssertFalse(view.hasMarkedText())
+      guard case BoomError.invalid = try XCTUnwrap(rejected) else { return XCTFail("Expected the actual malformed marked-scalar refusal.") }
+      XCTAssertEqual(commands.retainedRefusedInputCount, 0, "Malformed protocol metadata never enters admitted final-input custody.")
+      XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+      client.insertText("é", replacementRange: NSRange(location: NSNotFound, length: 0))
+      try await commands.joinPendingCommand()
+      XCTAssertEqual(source.generation, 2); XCTAssertFalse(client.needsSpliceObservation)
+      let edited = (f.originalText as NSString).replacingCharacters(in: NSRange(location: 2, length: 0), with: "🙂")
+      try await f.assertSource((edited as NSString).replacingCharacters(in: NSRange(location: 10, length: 0), with: "é"))
+      XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+      try await commands.joinPendingCommand(); try await f.assertSource(edited)
+      XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+      try await commands.joinPendingCommand(); try await f.assertSource(f.originalText)
+      XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+    }
+  }
+
+  func testActualDeadKeyResponderUndoAndContinuationMatchOrdinaryNativeContextLifecycle() async throws {
+    try await fixture(#function, text: "abc") { f in
+      let view = f.view, window = f.window!, commands = f.commands!, source = f.session!
+      let context = try XCTUnwrap(view.inputContext), client = try XCTUnwrap(context.client as? PagedNativeTextInputClient)
+      let originalSource = try XCTUnwrap(context.selectedKeyboardInputSource)
+      guard context.keyboardInputSources?.contains("com.apple.keylayout.US") == true else {
+        throw BoomError.unavailable("The actual native Undo/dead-key reference requires the U.S. input source.")
+      }
+      context.selectedKeyboardInputSource = "com.apple.keylayout.US"
+      defer { context.selectedKeyboardInputSource = originalSource }
+      let reference = NativeContextReferenceTextView(frame: NSRect(x: 0, y: 240, width: 300, height: 70))
+      reference.isRichText = false; reference.allowsUndo = true; reference.string = "abc"
+      window.contentView!.addSubview(reference)
+      defer { reference.removeFromSuperview() }
+      XCTAssertTrue(window.makeFirstResponder(reference))
+      let referenceContext = try XCTUnwrap(reference.inputContext)
+      referenceContext.selectedKeyboardInputSource = "com.apple.keylayout.US"
+      reference.setSelectedRange(NSRange(location: 1, length: 0))
+      reference.referenceUndo.beginUndoGrouping()
+      reference.insertText("X", replacementRange: NSRange(location: NSNotFound, length: 0))
+      reference.breakUndoCoalescing(); reference.referenceUndo.endUndoGrouping()
+      XCTAssertEqual(reference.string, "aXbc"); XCTAssertTrue(reference.referenceUndo.canUndo)
+      let dead = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero,
+        modifierFlags: .option, timestamp: 0, windowNumber: window.windowNumber, context: nil,
+        characters: "", charactersIgnoringModifiers: "e", isARepeat: false, keyCode: 14))
+      let continuation = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero,
+        modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil,
+        characters: "e", charactersIgnoringModifiers: "e", isARepeat: false, keyCode: 14))
+      window.sendEvent(dead)
+      XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+      let nativeAfterUndo = reference.string, nativeMarkedAfterUndo = reference.hasMarkedText()
+      let nativeSelectionAfterUndo = reference.selectedRange()
+      window.sendEvent(continuation)
+      let nativeResult = reference.string, nativeFinalSelection = reference.selectedRange()
+      XCTAssertFalse(reference.hasMarkedText())
+      XCTAssertTrue(window.makeFirstResponder(view))
+      view.setSelectedRange(NSRange(location: 1, length: 0))
+      view.insertText("X", replacementRange: NSRange(location: NSNotFound, length: 0))
+      try await commands.joinPendingCommand(); try await f.assertSource("aXbc")
+      window.sendEvent(dead)
+      XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+      XCTAssertEqual(view.string, nativeAfterUndo); XCTAssertEqual(view.hasMarkedText(), nativeMarkedAfterUndo)
+      XCTAssertEqual(view.selectedRange(), nativeSelectionAfterUndo)
+      window.sendEvent(continuation)
+      try await commands.joinPendingCommand(); try await f.assertSource(nativeResult)
+      XCTAssertEqual(view.selectedRange(), nativeFinalSelection)
+      XCTAssertFalse(view.hasMarkedText()); XCTAssertFalse(source.isPinned)
+      XCTAssertTrue(view.inputContext === context); XCTAssertFalse(client.isRetired)
+      XCTAssertEqual(commands.retainedRefusedInputCount, 0)
+      XCTAssertNil(f.input?.firstRefusal); XCTAssertNil(commands.firstFailure)
+    }
+  }
+
+  func testActualFreshArrowHomeEndAndSelectAllThenTypingMatchOrdinaryNativeContextWithoutOldAnchor() async throws {
+    try await fixture(#function, text: "abcd\nsecond") { f in
+      let view = f.view, commands = f.commands!, window = f.window!
+      let client = try XCTUnwrap(view.inputContext?.client as? PagedNativeTextInputClient)
+      let reference = NativeContextReferenceTextView(frame: NSRect(x: 0, y: 230, width: 600, height: 80))
+      reference.isRichText = false; reference.font = view.font; reference.textContainerInset = view.textContainerInset
+      window.contentView!.addSubview(reference)
+      defer { reference.removeFromSuperview() }
+      let cases: [(String, UInt16, String, NSEvent.ModifierFlags)] = [
+        ("Left", 123, "\u{F702}", .function),
+        ("Right", 124, "\u{F703}", .function),
+        ("Home", 115, "\u{F729}", .function),
+        ("End", 119, "\u{F72B}", .function),
+        ("SelectAll", 0, "a", .command),
+      ]
+      for (label, code, characters, flags) in cases {
+        reference.string = f.originalText
+        reference.setSelectedRange(NSRange(location: 3, length: 0))
+        XCTAssertTrue(window.makeFirstResponder(reference))
+        let event = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero,
+          modifierFlags: flags, timestamp: 0, windowNumber: window.windowNumber, context: nil,
+          characters: characters, charactersIgnoringModifiers: characters, isARepeat: false, keyCode: code))
+        let typed = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero,
+          modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil,
+          characters: "x", charactersIgnoringModifiers: "x", isARepeat: false, keyCode: 7))
+        let commandCount = reference.interpretedCommands.count
+        reference.keyDown(with: event)
+        let nativeSelection = reference.selectedRange()
+        if label == "SelectAll" { XCTAssertEqual(nativeSelection, NSRange(location: 0, length: f.originalText.utf16.count)) }
+        else { XCTAssertGreaterThan(reference.interpretedCommands.count, commandCount, "The ordinary reference must actually interpret \(label).") }
+        if label == "Left" { XCTAssertEqual(nativeSelection.location, 2) }
+        if label == "Right" { XCTAssertEqual(nativeSelection.location, 4) }
+        reference.keyDown(with: typed)
+        let nativeResult = reference.string
+        XCTAssertTrue(window.makeFirstResponder(view))
+        view.setSelectedRange(NSRange(location: 3, length: 0))
+        XCTAssertFalse(client.needsSpliceObservation)
+        view.keyDown(with: event)
+        try await commands.joinPendingCommand()
+        XCTAssertEqual(view.selectedRange(), nativeSelection, label)
+        XCTAssertFalse(client.needsSpliceObservation, "A fresh completed selector must not retain its pre-command caret: \(label)")
+        view.keyDown(with: typed)
+        try await commands.joinPendingCommand(); try await f.assertSource(nativeResult)
+        XCTAssertEqual(commands.retainedRefusedInputCount, 0)
+        XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+        try await commands.joinPendingCommand(); try await f.assertSource(f.originalText)
+        XCTAssertNil(f.input?.firstRefusal); XCTAssertNil(commands.firstFailure)
+      }
+    }
+  }
 }

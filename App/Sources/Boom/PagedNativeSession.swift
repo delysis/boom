@@ -243,8 +243,8 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
     guard !adopting, characterDepth > 0 else { throw BoomError.invalid("Native source primitive has no character transaction.") }
     if working.requiresGroupClose(groupID) { emit(try working.closeNativeGroup(source: source)) }
     let cursor = try beforeSelection.map { try working.cursor(for: $0) } ?? working.currentCursor
-    // Capture coordinate provenance only while the actual input queue holds a
-    // pointer. Ordinary typing has no snapshot allocation or queue scan here.
+    // Capture provenance only for a queued pointer or pending context range.
+    // Ordinary synchronous typing adds no snapshot or queue scan here.
     let observesPointer = subscription?.observesPointerSplices?() == true
     let before = observesPointer ? logicalWindow : nil
     let changed = try working.replace(range, with: replacement, groupID: groupID, beforeCursor: cursor, source: source)
@@ -318,8 +318,8 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
     guard !hookTransition, !notifyingGroup else { throw BoomError.stale("Actual native history hook is being delivered.") }
     token.historyCapture = capture
   }
-  /// The SAME Foundation owner observes actual accepted primitives only when
-  /// its chronological queue contains a captured pointer. No parallel edit log.
+  /// The SAME Foundation/input owner observes actual accepted primitives only
+  /// for queued pointer or pending context endpoints. No parallel edit log.
   func setPointerSpliceObservation(_ token: PagedNativeGroupSubscription, ownerID: UUID,
     needed: @escaping () -> Bool,
     observe: @escaping (PagedNativeLogicalSnapshot, PagedNativeLogicalSnapshot, UInt64, UInt64, UInt64) -> Void) throws {

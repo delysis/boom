@@ -52,6 +52,7 @@ import Foundation
     let originalLease: PagedNativeReplayInputLease
     var replayLease: PagedNativeReplayInputLease
     let window: NSWindow
+    let context: NSTextInputContext
     let chargedBytes: Int
   }
   private struct HistoryRequest {
@@ -62,10 +63,12 @@ import Foundation
     case history(HistoryRequest)
     case rawKey(RawKey)
     case sourceCommand(SourceCommand)
+    case contextContinuation(PagedNativeContextContinuation)
   }
   private enum SourceAction {
     case documentCommand(Selector)
-    case replacement(Data, String, UUID)
+    case replacement(Data, String, UUID,
+      (@MainActor () throws -> PagedNativeNavigationSelection)?, (@MainActor () -> Void)?)
     case linePrefix(String)
     case wrapping(String, String, Bool, String)
     case pointerSelection(PointerSelection)
@@ -131,10 +134,17 @@ import Foundation
   private var relatedReadObservation: PagedNativeSelectionObservation?
   private var replayObservation: PagedNativeSelectionObservation?
   private var capturedEditObservation: PagedNativeSelectionObservation?
+  private var capturedContext: NSTextInputContext?
   private var queuedDirections = 0
   private var queuedPointerCount = 0
   private(set) var queuedRawKeyCount = 0
   private var rawKeyBytes = 0
+  private var deferredContextBytes = 0
+  private var queuedContextCount = 0
+  private var deliveringContext: PagedNativeContextContinuation?
+  private var contextDeliveryFailure: Error?
+  var queuedNativeContinuationCount: Int { queuedContextCount }
+  private var retainedInputEntryCount: Int { queue.count + refusedInput.count + (deferredContextBytes > 0 ? 1 : 0) }
   private var replayingRawKeys = false
   private var replayInsertionCount = 0
   private var currentRawKeyAwaitingSource = false
@@ -182,9 +192,14 @@ import Foundation
       return try self.captureLogicalHistory()
     }
     try input.session.setPointerSpliceObservation(subscription, ownerID: input.ownerID,
-      needed: { [weak self] in (self?.queuedPointerCount ?? 0) > 0 },
+      needed: { [weak self] in
+        guard let self else { return false }
+        return self.queuedPointerCount > 0 || self.queuedContextCount > 0 || self.input.needsContextSpliceObservation
+      },
       observe: { [weak self] before, after, start, removed, inserted in
+        self?.input.mapDocumentContext(before: before, after: after, start: start, removed: removed, inserted: inserted)
         self?.mapQueuedPointers(before: before, after: after, start: start, removed: removed, inserted: inserted)
+        self?.mapQueuedContext(before: before, after: after, start: start, removed: removed, inserted: inserted)
       })
   }
 
@@ -434,7 +449,7 @@ import Foundation
       lastCommandRefusal = error
       return
     }
-    guard queue.count + refusedInput.count < Self.maximumQueuedEntries,
+    guard retainedInputEntryCount < Self.maximumQueuedEntries,
       queuedDirections + refusedDirections < Self.maximumQueuedCommands else {
       if unretainedCommandCount < UInt64.max { unretainedCommandCount += 1 }
       reportRefusal(BoomError.budget("The bounded native history request queue is full."))
@@ -493,9 +508,15 @@ import Foundation
 
   private func pump() {
     guard phase == .idle, !registeringGroup, !replayingRawKeys,
-      firstFailure == nil,
-      let view = input.activeView, view.inputCommandIsClosed, !view.hasMarkedText() else { return }
+      firstFailure == nil, deliveringContext == nil, contextDeliveryFailure == nil,
+      let view = input.activeView, view.inputCommandIsClosed else { return }
     do {
+      if view.hasMarkedText(), !(queue.first.map { if case .contextContinuation = $0 { return true }; return false } ?? false) {
+        // Later accepted keys finish the SAME real input context's composition.
+        // Do not strand them merely because an earlier key began marked text.
+        if case .rawKey? = queue.first { try replayOriginalKeys(); resumeQueuedInput() }
+        return
+      }
       if queue.isEmpty { try finishOrderedInput(); return }
       // Native mouse tracking also defers queued keys until the button is up.
       // Keep this bounded display gesture responsive without changing the
@@ -506,22 +527,45 @@ import Foundation
         try replayOriginalKeys()
         if case .rawKey? = queue.first { resumeQueuedInput(); return }
       }
+      if case .contextContinuation(let continuation)? = queue.first {
+        guard commandTask == nil, capturedEditTask == nil, navigationTask == nil, !input.isAdopting else { return }
+        guard let context = input.documentContext,
+          let client = context.client as? PagedNativeTextInputClient, client.identity == continuation.identity else {
+          throw BoomError.stale("Queued native input lost its retained live document context.")
+        }
+        let beforeDelivery = try input.inputLease(for: view)
+        deliveringContext = continuation
+        replayingRawKeys = true
+        defer { replayingRawKeys = false }
+        let previous = view.didRejectInput
+        var refusal: Error?
+        view.didRejectInput = { error in if refusal == nil { refusal = error }; previous?(error) }
+        defer { view.didRejectInput = previous }
+        try client.deliver(continuation) { [weak self] in self?.completeContextHead(continuation) }
+        if deliveringContext != nil, capturedEditTask == nil, navigationTask == nil {
+          throw refusal ?? BoomError.unavailable("The admitted native callback did not complete its actual primitive or installation.")
+        }
+        if deliveringContext == nil {
+          try finishOrderedInput(after: beforeDelivery); resumeQueuedInput()
+        }
+        return
+      }
       if case .sourceCommand(let command)? = queue.first {
         // Preserve its original position until the actual preparation task
         // leaves its one slot; never dispose queued input as an unrelated
         // task-capacity refusal.
         guard commandTask == nil, capturedEditTask == nil, navigationTask == nil else { return }
-        guard command.window === view.window, command.window.firstResponder === view,
-          command.replayLease == (try input.inputLease(for: view)) else {
+        guard command.window === view.window,
+          command.replayLease.hasSameSourceAndKeyboard(as: try input.inputLease(for: view)) else {
           throw BoomError.stale("Ordered document input no longer owns its actual focus or source.")
         }
         replayingRawKeys = true; replayInsertionCount = 0
         defer { replayingRawKeys = false; replayInsertionCount = 0 }
         switch command.action {
         case .documentCommand(let selector): try input.performQueuedDocumentCommand(selector)
-        case .replacement(let bytes, let name, let groupID):
+        case .replacement(let bytes, let name, let groupID, let selecting, let onInstalled):
           try requestDocumentReplacement(input.currentDocumentSelection(), replacement: bytes,
-            actionName: name, groupID: groupID)
+            actionName: name, groupID: groupID, resolvingSelection: selecting, onInstalled: onInstalled)
         case .linePrefix(let prefix): try requestLinePrefix(prefix, from: view)
         case .wrapping(let prefix, let suffix, let toggles, let name):
           try requestDocumentWrapping(input.currentDocumentSelection(), prefix: prefix,
@@ -583,11 +627,11 @@ import Foundation
           prepared = ticket
           try Task.checkCancellation()
           try input.session.admitLogicalRead(read)
-          guard try top(direction) === entry, try input.observeSelection() == observed,
-            phase == .readingColdHistory else {
+          let receiver = try admittedReadReceiver(observed)
+          guard try top(direction) === entry, phase == .readingColdHistory else {
             throw BoomError.stale("Cold Undo no longer owns its original source, request or physical focus.")
           }
-          try advance(entry, ticket: ticket, observed: observed)
+          try advance(entry, ticket: ticket, observed: receiver)
           consumed = true
           consumeHistoryHead(request)
           relatedReadObservation = nil
@@ -638,7 +682,9 @@ import Foundation
       }
       if firstFailure == nil { reportRefusal(original) }
       else { didFail?(original) }
-      if case .rawKey? = queue.first, firstFailure == nil { preserveUnreplayableInput(original) }
+      if case .contextContinuation? = queue.first, firstFailure == nil {
+        deliveringContext = nil; contextDeliveryFailure = original
+      } else if case .rawKey? = queue.first, firstFailure == nil { preserveUnreplayableInput(original) }
       lastCommandRefusal = original
     }
   }
@@ -650,6 +696,11 @@ import Foundation
     inputSelectionDidChange()
     guard !replayingRawKeys,
       phase == .readingColdHistory || phase == .readingBoundary || !queue.isEmpty else { return false }
+    guard view === input.activeView, let window = view.window,
+      window.firstResponder === view, window.isKeyWindow else {
+      // A foreign callback cannot dispose already admitted human input.
+      PerformanceTrace.event("Editor.ManagedAdmission"); return true
+    }
     do { try retainRawKey(event, from: view) }
     catch {
       if unretainedRawKeyCount < UInt64.max { unretainedRawKeyCount += 1 }
@@ -678,7 +729,7 @@ import Foundation
       throw BoomError.budget("This original key exceeds its bounded cold-history custody.")
     }
     let charge = text.utf8.count + ignored.utf8.count + 512
-    guard queue.count + refusedInput.count < Self.maximumQueuedEntries,
+    guard retainedInputEntryCount < Self.maximumQueuedEntries,
       queuedRawKeyCount + refusedInput.filter({ if case .rawKey = $0 { return true }; return false }).count < Self.maximumQueuedRawKeys,
       charge <= Self.maximumRawKeyBytes - retainedInputBytes else {
       throw BoomError.budget("Cold-history input custody is full; the original event was not retained.")
@@ -686,8 +737,29 @@ import Foundation
     let lease = try input.inputLease(for: view)
     if replayObservation == nil { replayObservation = try input.observeSelection() }
     queue.append(.rawKey(RawKey(event: event, originalLease: lease, replayLease: lease,
-      window: window, chargedBytes: charge)))
+      window: window, context: try currentInputContext(for: view), chargedBytes: charge)))
     queuedRawKeyCount += 1; rawKeyBytes += charge
+  }
+
+  private func currentInputContext(for view: PagedNativeTextView) throws -> NSTextInputContext {
+    guard let context = view.inputContext, let client = context.client as? PagedNativeTextInputClient,
+      client.identity.ownerID == input.ownerID, client.identity.sessionID == input.session.sessionID,
+      !client.isRetired else { throw BoomError.stale("Admitted input has no live document context.") }
+    return context
+  }
+
+  /// Focus revokes future callback ingress. It cannot cancel an already
+  /// accepted event whose exact source/selection/keyboard is still unchanged.
+  private func admittedReadReceiver(_ observed: PagedNativeSelectionObservation)
+    throws -> PagedNativeSelectionObservation {
+    let current = try input.observeSelection()
+    if current == observed { return current }
+    let hasAdmittedContext = capturedContext != nil && capturedContext === input.documentContext
+    guard current.hasSameSourceSelectionAndKeyboard(as: observed),
+      hasAdmittedContext || queuedRawKeyCount > 0 && queue.contains(where: {
+        if case .rawKey(let key) = $0 { return key.context === input.documentContext }; return false
+      }) else { throw BoomError.stale("The entered read lost its admitted document input receiver.") }
+    return current
   }
 
   private func transferRawInputAfterMount() throws {
@@ -696,14 +768,14 @@ import Foundation
       throw BoomError.stale("Original cold-history keys have no actual focus-preserving mount.")
     }
     for item in queue {
-      if case .rawKey(let key) = item { _ = try transition.rebase(key.replayLease) }
-      else if case .sourceCommand(let command) = item { _ = try transition.rebase(command.replayLease) }
+      if case .rawKey(let key) = item { _ = try transition.rebaseAccepted(key.replayLease) }
+      else if case .sourceCommand(let command) = item { _ = try transition.rebaseAccepted(command.replayLease) }
     }
     for index in queue.indices {
       if case .rawKey(var key) = queue[index] {
-        key.replayLease = try transition.rebase(key.replayLease); queue[index] = .rawKey(key)
+        key.replayLease = try transition.rebaseAccepted(key.replayLease); queue[index] = .rawKey(key)
       } else if case .sourceCommand(var command) = queue[index] {
-        command.replayLease = try transition.rebase(command.replayLease); queue[index] = .sourceCommand(command)
+        command.replayLease = try transition.rebaseAccepted(command.replayLease); queue[index] = .sourceCommand(command)
       }
     }
     replayObservation = try input.observeSelection()
@@ -717,7 +789,8 @@ import Foundation
       if input.activeIdentity != delivered.identity {
         try transferRawInputAfterMount()
       } else {
-        guard let view = input.activeView, try input.inputLease(for: view) == delivered else {
+        guard let view = input.activeView,
+          try input.inputLease(for: view).hasSameSourceAndKeyboard(as: delivered) else {
           throw BoomError.stale("Delivered ordered input lost its original physical focus or keyboard.")
         }
       }
@@ -735,13 +808,27 @@ import Foundation
   /// advances. Cancellation retains the entered Task until its read joins.
   func inputSelectionDidChange() {
     guard !replayingRawKeys, phase == .idle || phase == .readingColdHistory || phase == .readingBoundary else { return }
-    if let capturedEditObservation, (try? input.observeSelection()) != capturedEditObservation {
-      // A later real edit/selection makes an unadopted agent/formatting target
-      // obsolete. Stop its actual reader instead of occupying that lane.
-      capturedEditTask?.cancel(); self.capturedEditObservation = nil
+    if let capturedEditObservation, let current = try? input.observeSelection(), current != capturedEditObservation {
+      let hasAdmittedContext = capturedContext != nil && capturedContext === input.documentContext
+      let retainedNativeDelivery = current.hasSameSourceSelectionAndKeyboard(as: capturedEditObservation)
+        && (hasAdmittedContext || queuedRawKeyCount > 0 && relatedReadObservation == capturedEditObservation)
+      if !retainedNativeDelivery {
+        // Independent agent preparation still loses its original receiver.
+        // A related human edit with accepted later keys retains exact source
+        // authority when only focus changed.
+        capturedEditTask?.cancel(); self.capturedEditObservation = nil
+      }
     }
     let expected = relatedReadObservation ?? (!queue.isEmpty ? replayObservation : nil)
     guard let expected, (try? input.observeSelection()) != expected else { return }
+    let hasAdmittedContext = capturedContext != nil && capturedContext === input.documentContext
+    if queuedRawKeyCount > 0 || hasAdmittedContext, let current = try? input.observeSelection(),
+      current.hasSameSourceSelectionAndKeyboard(as: expected) {
+      // An ordinary focus move left the captured document source untouched.
+      // Keep its real read and previously admitted keys; later old callbacks
+      // still require actual focus or the exclusive prior-delivery scope.
+      return
+    }
     let error = BoomError.stale("Selection or focus superseded its original bounded source read.")
     relatedReadObservation = nil
     commandTask?.cancel(); navigationTask?.cancel()
@@ -751,9 +838,79 @@ import Foundation
     reportRefusal(error)
   }
 
+  /// All escaping native payloads share the original key/command bound.
+  /// Admission does not borrow unrelated source or latest-caret authority.
+  func admitContextContinuation(identity: PagedNativeDocumentInputIdentity, chargedBytes: Int) throws {
+    guard identity.ownerID == input.ownerID, identity.sessionID == input.session.sessionID,
+      identity.documentID == input.session.sourceBaseRevision.documentID,
+      retainedInputEntryCount < Self.maximumQueuedEntries,
+      chargedBytes >= 512, chargedBytes <= Self.maximumRawKeyBytes - retainedInputBytes else {
+      throw BoomError.budget("The original native continuation exceeds the shared input custody bound.")
+    }
+  }
+  func reserveDeferredContextPayload(identity: PagedNativeDocumentInputIdentity, chargedBytes: Int) throws {
+    try admitContextContinuation(identity: identity, chargedBytes: chargedBytes)
+    rawKeyBytes += chargedBytes; deferredContextBytes += chargedBytes
+  }
+  func releaseDeferredContextPayload(chargedBytes: Int) {
+    precondition(chargedBytes >= 512 && chargedBytes <= deferredContextBytes && chargedBytes <= rawKeyBytes)
+    deferredContextBytes -= chargedBytes; rawKeyBytes -= chargedBytes
+  }
+
+  func retainRejectedContextContinuation(_ continuation: PagedNativeContextContinuation, refusal: Error) throws {
+    try admitContextContinuation(identity: continuation.identity, chargedBytes: continuation.chargedBytes)
+    refusedInput.append(.contextContinuation(continuation))
+    refusedInputBytes += continuation.chargedBytes
+    if refusedInputFailure == nil { refusedInputFailure = refusal }
+    reportRefusal(refusal)
+  }
+
+  var requiresOrderedContextDelivery: Bool {
+    !replayingRawKeys && (input.isAdopting || phase == .readingColdHistory || phase == .readingBoundary
+      || !queue.isEmpty)
+  }
+  func enqueueContextContinuation(_ continuation: PagedNativeContextContinuation) throws {
+    try admitContextContinuation(identity: continuation.identity, chargedBytes: continuation.chargedBytes)
+    // Only an undelivered intermediate preview of THIS conversion is replaced.
+    // Admit/copy its successor first; old bytes remain charged until released.
+    var superseded: PagedNativeContextContinuation?
+    if continuation.supersedesPreview, case .contextContinuation(let old)? = queue.last, old.isPreview,
+      let pendingID = old.pendingID, pendingID == continuation.pendingID,
+      old.identity == continuation.identity, old.rootID == continuation.rootID,
+      old.selection == continuation.selection, deliveringContext !== old {
+      superseded = old; queue.removeLast(); queuedContextCount -= 1
+    }
+    let oldBytes = superseded?.chargedBytes
+    superseded = nil
+    if let oldBytes { rawKeyBytes -= oldBytes }
+    let item = QueuedInput.contextContinuation(continuation)
+    if replayingRawKeys { queue.insert(item, at: 1 + replayInsertionCount); replayInsertionCount += 1 }
+    else { queue.append(item) }
+    queuedContextCount += 1; rawKeyBytes += continuation.chargedBytes
+    pump()
+  }
+  private func completeContextHead(_ continuation: PagedNativeContextContinuation) {
+    precondition(deliveringContext === continuation)
+    guard case .contextContinuation(let head)? = queue.first, head === continuation else {
+      preconditionFailure("The native callback lost its original chronological queue head.")
+    }
+    queue.removeFirst(); queuedContextCount -= 1; rawKeyBytes -= continuation.chargedBytes
+    deliveringContext = nil; contextDeliveryFailure = nil
+  }
+  private func mapQueuedContext(before: PagedNativeLogicalSnapshot, after: PagedNativeLogicalSnapshot,
+    start: UInt64, removed: UInt64, inserted: UInt64) {
+    guard queuedContextCount > 0 else { return }
+    for item in queue {
+      if case .contextContinuation(let continuation) = item, continuation !== deliveringContext {
+        continuation.map(before: before, after: after, start: start, removed: removed,
+          inserted: inserted, following: deliveringContext?.pendingID)
+      }
+    }
+  }
+
   private func preserveUnreplayableInput(_ error: Error) {
     guard !queue.isEmpty else { return }
-    precondition(queue.count + refusedInput.count <= Self.maximumQueuedEntries &&
+    precondition(retainedInputEntryCount <= Self.maximumQueuedEntries &&
       retainedInputBytes <= Self.maximumRawKeyBytes)
     if refusedInputFailure == nil { refusedInputFailure = error }
     if queuedPointerCount > 0 {
@@ -763,10 +920,17 @@ import Foundation
         }
       }
     }
-    refusedInput.append(contentsOf: queue)
-    refusedInputBytes += rawKeyBytes; refusedDirections += queuedDirections
-    queue.removeAll(keepingCapacity: true)
-    rawKeyBytes = 0; queuedRawKeyCount = 0; queuedDirections = 0; queuedPointerCount = 0
+    var accepted: [QueuedInput] = []
+    accepted.reserveCapacity(queuedContextCount)
+    var keptBytes = deferredContextBytes
+    for item in queue {
+      if case .contextContinuation(let continuation) = item {
+        accepted.append(item); keptBytes += continuation.chargedBytes
+      } else { refusedInput.append(item) }
+    }
+    refusedInputBytes += rawKeyBytes - keptBytes; refusedDirections += queuedDirections
+    queue = accepted
+    rawKeyBytes = keptBytes; queuedRawKeyCount = 0; queuedDirections = 0; queuedPointerCount = 0
     replayObservation = nil
     PerformanceTrace.event("Editor.ManagedAdmission")
   }
@@ -779,10 +943,12 @@ import Foundation
     while delivered < Self.maximumReplayBurst, case .rawKey(let key)? = queue.first {
       replayInsertionCount = 0; currentRawKeyAwaitingSource = false
       guard let view = input.activeView, key.window === view.window,
-        key.window.firstResponder === view, key.replayLease == (try input.inputLease(for: view)) else {
+        key.context === view.inputContext,
+        key.replayLease.hasSameSourceAndKeyboard(as: try input.inputLease(for: view)) else {
         throw BoomError.stale("Original cold-history input lost its actual focus or keyboard source.")
       }
-      if let replayObservation, try input.observeSelection() != replayObservation {
+      if let replayObservation,
+        !(try input.observeSelection()).hasSameSourceSelectionAndKeyboard(as: replayObservation) {
         throw BoomError.stale("Original cold-read input lost its exact selection epoch before replay.")
       }
       let generation = input.session.generation
@@ -790,7 +956,13 @@ import Foundation
       let previous = view.didRejectInput
       var refusal: Error?
       view.didRejectInput = { error in if refusal == nil { refusal = error }; previous?(error) }
-      view.keyDown(with: key.event)
+      defer { view.didRejectInput = previous }
+      try input.withAcceptedInputDelivery(key.originalLease, expected: key.replayLease) {
+        // Interpret exactly once. No-output/dead keys stay in this SAME actual
+        // context for their later native continuation; there is no fallback
+        // re-interpretation in a newly created arena context.
+        view.keyDown(with: key.event)
+      }
       view.didRejectInput = previous
       if let refusal, input.session.generation == generation,
         view.inputBinding?.selectionEpoch == epoch, replayInsertionCount == 0,
@@ -868,11 +1040,12 @@ import Foundation
     do {
       try Task.checkCancellation()
       try input.session.admitLogicalRead(captured)
+      let receiver = try admittedReadReceiver(observed)
       guard input.commandOwner === self, firstFailure == nil,
-        phase != .closed, try input.observeSelection() == observed, let mount = mountView else {
+        phase != .closed, let mount = mountView else {
         throw BoomError.stale("The prepared logical projection lost its original physical receiver.")
       }
-      try input.stageNavigation(ticket, observedSelection: observed)
+      try input.stageNavigation(ticket, observedSelection: receiver)
       return try input.withStagedNavigationInstallation(ticket, mounted: mount)
     } catch {
       let original = error
@@ -1073,7 +1246,7 @@ import Foundation
     chargedBytes: Int) throws {
     guard phase != .closed, let view, view === input.activeView,
       let window = view.window, window.firstResponder === view,
-      queue.count + refusedInput.count < Self.maximumQueuedEntries, chargedBytes >= 512,
+      retainedInputEntryCount < Self.maximumQueuedEntries, chargedBytes >= 512,
       chargedBytes <= Self.maximumRawKeyBytes - retainedInputBytes else {
       throw BoomError.budget("The bounded related-read queue cannot retain this document command.")
     }
@@ -1161,22 +1334,36 @@ import Foundation
   }
 
   func requestDocumentReplacement(_ selected: PagedNativeNavigationSelection,
-    replacement: Data, actionName: String, groupID requestedGroup: UUID? = nil) throws {
+    replacement: Data, actionName: String, groupID requestedGroup: UUID? = nil,
+    resolvingSelection: (@MainActor () throws -> PagedNativeNavigationSelection)? = nil,
+    onInstalled: (@MainActor () -> Void)? = nil) throws {
     guard replacement.count <= PagedCapturedEditInput.maximumInputBytes else {
       throw BoomError.budget("Document replacement needs its existing streamed input route.")
     }
     let groupID = requestedGroup ?? input.activeView?.typedCharacterCommandGroupID ?? UUID()
     if shouldQueueSourceCommand {
-      try enqueueSourceCommand(.replacement(replacement, actionName, groupID), from: input.activeView,
+      try enqueueSourceCommand(.replacement(replacement, actionName, groupID, resolvingSelection, onInstalled), from: input.activeView,
         chargedBytes: replacement.count + actionName.utf8.count + 512)
       return
     }
-    if try performResidentReplacement(selected, replacement: replacement,
-      actionName: actionName, groupID: groupID) != nil { return }
-    _ = try beginLogicalEdit(actionName: actionName, reportFailure: true, related: true) { [self] in
-      try await input.session.prepareLogicalReplacement(selection: selected,
+    let actualSelection = try resolvingSelection?() ?? selected
+    if try performResidentReplacement(actualSelection, replacement: replacement,
+      actionName: actionName, groupID: groupID) != nil { onInstalled?(); return }
+    _ = try beginLogicalEdit(actionName: actionName, reportFailure: true, related: true,
+      onInstalled: { onInstalled?() }) { [self] in
+      try await input.session.prepareLogicalReplacement(selection: actualSelection,
         replacement: replacement, owner: input, groupID: groupID)
     }
+  }
+
+  /// Preflight the bounded composition before replacing its nonresident
+  /// selection. The structural deletion and SDK marked bytes share one group.
+  func prepareResidentCompositionSelection(_ selected: PagedNativeNavigationSelection) throws -> Bool {
+    let groupID = UUID()
+    guard try performResidentReplacement(selected, replacement: Data(),
+      actionName: "Edit", groupID: groupID) != nil else { return false }
+    input.continueNextInputGroup(groupID)
+    return true
   }
 
   private func performResidentReplacement(_ selected: PagedNativeNavigationSelection,
@@ -1307,11 +1494,14 @@ import Foundation
     try input.session.admitLogicalRead(read)
     let observed = try requestedObservation ?? input.observeSelection()
     capturedEditObservation = observed
+    let context = input.isDocumentContextCallback ? input.documentContext : nil
+    capturedContext = context
     if related { phase = .readingBoundary; relatedReadObservation = observed }
     let task = Task<PagedNativeLogicalSnapshot, Error> { [self] in
       var ticket: PagedNativeNavigationInstallationTicket?
       defer {
         capturedEditTask = nil
+        if capturedContext === context { capturedContext = nil }
         if capturedEditObservation == observed { capturedEditObservation = nil }
         if relatedReadObservation == observed { relatedReadObservation = nil }
         if phase == .preparing || (related && phase == .readingBoundary) { phase = .idle }
@@ -1347,6 +1537,9 @@ import Foundation
         if related, relatedReadObservation == observed,
           (!input.session.isCurrent(read) || (try? input.observeSelection()) != observed) {
           preserveUnreplayableInput(original)
+        }
+        if deliveringContext != nil {
+          deliveringContext = nil; contextDeliveryFailure = original
         }
         if lastCommandRefusal == nil { lastCommandRefusal = original }
         if reportFailure, firstFailure == nil { reportRefusal(original) }
@@ -1553,8 +1746,8 @@ import Foundation
     let upper = min(windowEnd, max(lower, selectionEnd))
     let painted = NSRange(location: Int(lower - source.utf16Start), length: Int(upper - lower))
     let extendsBeyondWindow = original.utf16Offset < source.utf16Start || selectionEnd > windowEnd
-    guard observed.inputLease.isFirstResponder, observed.inputLease.isKeyWindow,
-      observed.range == painted,
+    guard (observed.inputLease.isFirstResponder && observed.inputLease.isKeyWindow
+        || input.isDeliveringAcceptedInput || input.isDocumentContextCallback), observed.range == painted,
       !extending || !extendsBeyondWindow || (original.focusUTF16 >= source.utf16Start && original.focusUTF16 <= windowEnd) else {
       throw BoomError.unavailable("Visual extension requires its actual focused source window.")
     }
@@ -1658,7 +1851,8 @@ import Foundation
   private func requireCommandQuiescence() throws {
     try requireLocalCommand()
     guard commandTask == nil, navigationTask == nil, capturedEditTask == nil,
-      queue.isEmpty, queuedDirections == 0, queuedRawKeyCount == 0, rawKeyBytes == 0,
+      queue.isEmpty, queuedDirections == 0, queuedRawKeyCount == 0, queuedContextCount == 0,
+      deliveringContext == nil, contextDeliveryFailure == nil, rawKeyBytes == 0,
       !replayingRawKeys, !isNavigating, !dispatchingRecenteredKey,
       historyAtCommandClose == nil, unregisteredGroup == nil, gatedManager.groupingLevel == 0,
       !gatedManager.isUndoing, !gatedManager.isRedoing else {
@@ -1671,12 +1865,14 @@ import Foundation
     pump()
     var original: Error?
     for _ in 0..<(Self.maximumQueuedEntries + 2) {
+      pump()
       if commandTask == nil, navigationTask == nil, capturedEditTask == nil { break }
       if let task = commandTask, case .failure(let error) = await task.result, original == nil { original = error }
       if let task = navigationTask, case .failure(let error) = await task.result, original == nil { original = error }
       if let task = capturedEditTask, case .failure(let error) = await task.result, original == nil { original = error }
     }
     if let firstFailure { throw firstFailure }
+    if let contextDeliveryFailure { throw contextDeliveryFailure }
     if commandTask != nil || navigationTask != nil || capturedEditTask != nil {
       let bound = BoomError.budget("New actual native commands kept this bounded join active.")
       if let original { throw PagedNativeNavigationOwnerFailure(original: original, cleanup: bound) }
@@ -1712,15 +1908,16 @@ import Foundation
     gatedManager.removeAllActions()
     undoEntries.removeAll(); redoEntries.removeAll(); activeGroup = nil
     lastCommandRefusal = nil; mountView = nil; didFail = nil
-    relatedReadObservation = nil; replayObservation = nil; capturedEditObservation = nil
+    relatedReadObservation = nil; replayObservation = nil; capturedEditObservation = nil; capturedContext = nil
     try requireJoinedClose()
   }
 
   func requireJoinedClose() throws {
     guard phase == .closed, groupSubscription == nil, gatedManager.requestHistory == nil,
-      commandTask == nil, navigationTask == nil, capturedEditTask == nil,
+      commandTask == nil, navigationTask == nil, capturedEditTask == nil, capturedContext == nil,
       !isNavigating, queue.isEmpty, queuedDirections == 0, queuedRawKeyCount == 0,
-      rawKeyBytes == 0, !replayingRawKeys, !registeringGroup, !dispatchingRecenteredKey,
+      queuedContextCount == 0, deliveringContext == nil, contextDeliveryFailure == nil,
+      rawKeyBytes == 0, deferredContextBytes == 0, !replayingRawKeys, !registeringGroup, !dispatchingRecenteredKey,
       expectedEntry == nil, inverseEntry == nil, adoptingSource == nil, hydrationExpected == nil,
       historyAtCommandClose == nil,
       undoEntries.isEmpty, redoEntries.isEmpty, firstFailure == nil, unregisteredGroup == nil else {

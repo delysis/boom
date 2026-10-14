@@ -42,8 +42,9 @@ struct PagedNativeStateObservation {
   let hasMarkedText: Bool
 }
 
-/// Original key events have no interpreted range. Their replay still requires
-/// the same physical focus and keyboard epoch, or this owner's exact mount.
+/// Original key events have no interpreted range. New ingress requires actual
+/// focus; accepted delivery retains exact document/source/keyboard authority
+/// through this owner's real mounts, independently of later focus moves.
 struct PagedNativeReplayInputLease: Equatable {
   let identity: PagedNativeInputIdentity
   let focusEpoch: UInt64
@@ -52,6 +53,20 @@ struct PagedNativeReplayInputLease: Equatable {
   let windowID: ObjectIdentifier?
   let isFirstResponder: Bool
   let isKeyWindow: Bool
+}
+
+extension PagedNativeReplayInputLease {
+  func hasSameSourceAndKeyboard(as other: Self) -> Bool {
+    identity == other.identity && keyboardEpoch == other.keyboardEpoch
+      && keyboardID == other.keyboardID && windowID == other.windowID
+  }
+}
+extension PagedNativeSelectionObservation {
+  func hasSameSourceSelectionAndKeyboard(as other: Self) -> Bool {
+    identity == other.identity && generation == other.generation && selectionEpoch == other.selectionEpoch
+      && range == other.range && affinity == other.affinity
+      && inputLease.hasSameSourceAndKeyboard(as: other.inputLease)
+  }
 }
 
 struct PagedNativeReplayInputTransition {
@@ -63,6 +78,14 @@ struct PagedNativeReplayInputTransition {
   func rebase(_ lease: PagedNativeReplayInputLease) throws -> PagedNativeReplayInputLease {
     guard lease == source else {
       throw BoomError.stale("Deferred native input has another physical source lease.")
+    }
+    return target
+  }
+  /// Only the queue's previously admitted event may use this source-only
+  /// mount edge. Focus changes revoke new ingress, never accepted writing.
+  func rebaseAccepted(_ lease: PagedNativeReplayInputLease) throws -> PagedNativeReplayInputLease {
+    guard lease.hasSameSourceAndKeyboard(as: source) else {
+      throw BoomError.stale("Admitted native input has another actual source mount.")
     }
     return target
   }
@@ -119,8 +142,8 @@ private final class PagedNativeInputObservers {
 }
 
 /// One binding belongs to one installed source arena and never retargets.
-/// A stable view rotates bindings; contexts retain their immutable proxy identity,
-/// and retired storage keeps its retired binding.
+/// A stable view rotates bindings while its document input context remains
+/// current. Retired storage keeps its retired binding; it never retargets.
 @MainActor final class PagedNativeInputBinding {
   enum State: Equatable { case staged, active, retired }
   let identity: PagedNativeInputIdentity
@@ -182,15 +205,14 @@ private final class PagedNativeInputObservers {
 }
 
 /// Physical clients for the file-backed editor. Keep one stable active view
-/// and at most one staged projection/context; old contexts own inert, weak-target
-/// clients. Normal reference lifetime handles their physical reclamation.
+/// and at most one staged projection. The same document input context survives
+/// projection rotation and becomes inert only when its owner actually retires.
 /// Actual source/history tasks remain owned by the session and backend.
 @MainActor final class PagedNativeInputOwner {
   private struct StagedClient {
     let ticket: PagedNativeNavigationInstallationTicket
     let binding: PagedNativeInputBinding
     let storage: PagedNativeTextStorage
-    let inputClient: PagedNativeTextInputClient
     let context: NSTextInputContext
     let sourceStorage: PagedNativeTextStorage
     let sourceManager: NSLayoutManager
@@ -205,6 +227,45 @@ private final class PagedNativeInputObservers {
   weak var commandOwner: PagedNativeUndoOwner?
   private(set) var activeView: PagedNativeTextView!
   private var activeContext: NSTextInputContext?
+  private var acceptedInputDeliveryDepth = 0
+  private var documentContextCallbackDepth = 0
+  var isDeliveringAcceptedInput: Bool { acceptedInputDeliveryDepth > 0 }
+  var isDocumentContextCallback: Bool { documentContextCallbackDepth > 0 }
+  var documentContext: NSTextInputContext? { activeContext }
+  var needsContextSpliceObservation: Bool {
+    (activeContext?.client as? PagedNativeTextInputClient)?.needsSpliceObservation == true
+  }
+  func mapDocumentContext(before: PagedNativeLogicalSnapshot, after: PagedNativeLogicalSnapshot,
+    start: UInt64, removed: UInt64, inserted: UInt64) {
+    (activeContext?.client as? PagedNativeTextInputClient)?.mapPendingSelection(
+      before: before, after: after, start: start, removed: removed, inserted: inserted)
+  }
+  func withDocumentContextCallback(_ operation: () -> Void) {
+    guard let view = activeView, view.inputBinding?.state == .active,
+      !isAdopting, firstRefusal == nil, view.boundedStorage.mutationFailure == nil,
+      documentContextCallbackDepth < 32 else { PerformanceTrace.event("Editor.ManagedAdmission"); return }
+    documentContextCallbackDepth += 1
+    defer { documentContextCallbackDepth -= 1 }
+    operation()
+  }
+
+  /// Exact source/keyboard admission still precedes this lexical delivery.
+  /// The original ingress proved a real focused key; no makeFirstResponder or
+  /// context activation is performed here after an ordinary focus move.
+  func withAcceptedInputDelivery(_ original: PagedNativeReplayInputLease,
+    expected: PagedNativeReplayInputLease, operation: () -> Void) throws {
+    guard original.identity.ownerID == ownerID, original.identity.sessionID == session.sessionID,
+      original.isFirstResponder, original.isKeyWindow, let view = activeView,
+      let binding = view.inputBinding, expected.identity == binding.identity,
+      try inputLease(for: view).hasSameSourceAndKeyboard(as: expected),
+      acceptedInputDeliveryDepth < 32 else {
+      throw BoomError.stale("Already admitted native input lost its document, source or keyboard.")
+    }
+    try binding.admitsInput(in: session)
+    acceptedInputDeliveryDepth += 1
+    defer { acceptedInputDeliveryDepth -= 1 }
+    operation()
+  }
   private var stagedClient: StagedClient?
   private let focusEpoch = PagedNativeInputEpoch()
   private let keyboardEpoch = PagedNativeInputEpoch()
@@ -669,11 +730,13 @@ private final class PagedNativeInputObservers {
       attributes: [.font: MarkdownStyle.body], inputBinding: binding, stagedNavigationTicket: ticket)
     view.prepareProjectionCallbacks(storage)
     binding.owner = self
-    let client = PagedNativeTextInputClient(identity: binding.identity)
-    let keyboardID = activeContext?.selectedKeyboardInputSource, sourceWindow = view.window
-    let context = client.makePreparedContext(markedAttributes: view.validAttributesForMarkedText())
+    guard let context = activeContext, context === view.inputContext,
+      let client = context.client as? PagedNativeTextInputClient,
+      client.identity.ownerID == ownerID, client.identity.sessionID == session.sessionID,
+      !client.isRetired else { throw BoomError.stale("The staged projection lost its document input context.") }
+    let keyboardID = context.selectedKeyboardInputSource, sourceWindow = view.window
     stagedClient = StagedClient(ticket: ticket, binding: binding, storage: storage,
-      inputClient: client, context: context, sourceStorage: view.boundedStorage,
+      context: context, sourceStorage: view.boundedStorage,
       sourceManager: manager, sourceContainer: container, sourceSelection: observedSelection,
       sourceKeyboardID: keyboardID, sourceWindow: sourceWindow)
   }
@@ -690,8 +753,10 @@ private final class PagedNativeInputObservers {
       stage.sourceStorage.layoutManagers.count == 1,
       stage.binding.state == .staged, stage.binding.owner === self,
       stage.binding.identity.arenaID == stage.ticket.provisionalArenaID,
-      stage.inputClient.identity == stage.binding.identity, stage.inputClient.isAwaitingBind,
-      (stage.context.client as? PagedNativeTextInputClient) === stage.inputClient else {
+      stage.context === activeContext, stage.context === activeView.inputContext,
+      (stage.context.client as? PagedNativeTextInputClient)?.identity.ownerID == ownerID,
+      (stage.context.client as? PagedNativeTextInputClient)?.identity.sessionID == session.sessionID,
+      (stage.context.client as? PagedNativeTextInputClient)?.isRetired == false else {
       throw BoomError.stale("The staged client no longer owns the exact source selection/focus/keyboard.")
     }
   }
@@ -704,12 +769,12 @@ private final class PagedNativeInputObservers {
     let source = stage.sourceSelection.inputLease
     let ownsSourceFocus = (try? physicalInputLease(for: oldView)) == source
     oldView.inputBinding?.retire()
-    oldView.retirePhysicalInputClient() // permanent old proxy is inert BEFORE framework reentrancy
+    // Retire only the arena projection. The document input context must not
+    // deactivate/discard opaque dead-key or IME state during this rotation.
     oldView.installPreparedProjection(storage: stage.storage, binding: stage.binding,
-      client: stage.inputClient, context: stage.context, manager: stage.sourceManager,
+      manager: stage.sourceManager,
       container: stage.sourceContainer, selection: stage.ticket.localSelection,
       affinity: stage.ticket.selectionAffinity)
-    activeContext = stage.context
     stage.binding.activate(); stagedClient = nil
     do {
       try mounted(oldView, activeView)
@@ -725,8 +790,8 @@ private final class PagedNativeInputObservers {
             throw BoomError.unavailable("The managed mount could not restore its captured native focus.")
           }
         }
-        if source.isKeyWindow { stage.context.activate() }
-        stage.context.invalidateCharacterCoordinates()
+        // The same document context remains active; no repeated activation
+        // or transient-coordinate notification occurs inside adoption.
         guard activeView.window === window, window.firstResponder === activeView else {
           throw BoomError.unavailable("The managed mount did not retain its captured native focus.")
         }
@@ -740,8 +805,8 @@ private final class PagedNativeInputObservers {
     }
     if ownsSourceFocus, let target = try? physicalInputLease(for: activeView) {
       if source.keyboardEpoch == target.keyboardEpoch, source.keyboardID == target.keyboardID,
-        source.windowID == target.windowID, source.isFirstResponder, target.isFirstResponder,
-        source.isKeyWindow == target.isKeyWindow {
+        source.windowID == target.windowID,
+        source.isFirstResponder == target.isFirstResponder, source.isKeyWindow == target.isKeyWindow {
         lastReplayTransition = PagedNativeReplayInputTransition(source: source, target: target)
       }
     }
@@ -764,6 +829,9 @@ private final class PagedNativeInputObservers {
         documentSelection = nil; documentSelectionGeneration = nil
       }
       if let activeView { notifyNativeState(from: activeView, edited: false) }
+      // Only the fully installed source/selection/geometry is visible to the
+      // input method. Never notify it of an intermediate staged projection.
+      if ticket.wasConsumed { activeContext?.invalidateCharacterCoordinates() }
     }
     var mountFailure: Error?
     // Session admits the complete source move before Foundation can pop its
@@ -782,8 +850,7 @@ private final class PagedNativeInputObservers {
   }
   private func retireConstructedStage() {
     guard let stage = stagedClient else { return }
-    stage.binding.retire(); stage.inputClient.retire()
-    stage.context.deactivate()
+    stage.binding.retire() // a cancelled projection never retires the document context
     stagedClient = nil
   }
   func cancelNavigationStage(_ ticket: PagedNativeNavigationInstallationTicket) throws {
@@ -838,6 +905,8 @@ private final class PagedNativeInputObservers {
   func prepareInputRetirement(commandOwner expectedOwner: PagedNativeUndoOwner?)
     throws -> PagedNativeInputRetirementTicket {
     guard !isAdopting, stagedClient == nil, firstRefusal == nil,
+      acceptedInputDeliveryDepth == 0, documentContextCallbackDepth == 0,
+      (activeContext?.client as? PagedNativeTextInputClient)?.isInterpretingNativeEvent != true,
       commandOwner === expectedOwner, let view = activeView,
       let binding = view.inputBinding, binding.state == .active,
       binding.identity == activeIdentity,
@@ -870,7 +939,7 @@ private final class PagedNativeInputObservers {
     view.inputBinding?.retire()
     documentKey = nil; documentCommand = nil
     commandOwner = nil
-    view.retirePhysicalInputClient()
+    view.retireDocumentInputContext()
     activeContext = nil; activeView = nil
     session.retireManagedArenaOwner(self)
     lastReplayTransition = nil
@@ -890,7 +959,8 @@ private final class PagedNativeInputObservers {
   /// receipt. The backend's joined controller/engine shutdown is separate.
   func requireJoinedClose() throws {
     guard activeView == nil, activeContext == nil, stagedClient == nil,
-      !isAdopting, commandOwner == nil, firstRefusal == nil else {
+      !isAdopting, acceptedInputDeliveryDepth == 0, documentContextCallbackDepth == 0,
+      commandOwner == nil, firstRefusal == nil else {
       throw BoomError.stale("Native physical input is still installed or retains an unresolved refusal.")
     }
   }
