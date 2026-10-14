@@ -210,6 +210,39 @@ final class NativeInputIdentityTests: XCTestCase {
     try await model.shutdown()
   }
 
+  @MainActor func testBusyInputCompletionDefersChangingChatDigestUntilIdleWithoutLosingNativeText() async throws {
+    let model = try await model()
+    let target = TextInputTarget(chatID: model.state.selectedChat, documentID: nil)
+    let input = ChatTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 120))
+    input.string = "Public draft."; input.setSelectedRange(NSRange(location: input.string.utf16.count, length: 0))
+    model.inputContextCache = nil; model.isBusy = true
+    let completion = TextInputCompletion(model: model, target: target)
+    completion.view = input; input.completionClient = completion; input.documentID = completion.id
+    completion.update(selection: input.selectedRange(), marked: false, target: target)
+    completion.refresh()
+    XCTAssertNil(model.inputContextCache, "Busy construction and native updates must not serialize the conversation for an ineligible completion.")
+    model.isBusy = false; completion.refresh()
+    let prior = try XCTUnwrap(model.inputContextCache)
+    completion.resumeGhost(" A lantern.", documentID: completion.id, caret: input.selectedRange().location, sources: [])
+    XCTAssertNotNil(completion.ghostStamp)
+    model.isBusy = true
+    let chat = try XCTUnwrap(model.state.chats.firstIndex { $0.id == target.chatID })
+    model.state.chats[chat].messages.append(ChatMessage(role: .assistant, text: "Streaming response."))
+    let changed = model.state.chats[chat].contentVersion
+    XCTAssertNotEqual(changed, prior.version)
+    completion.refresh()
+    XCTAssertNil(completion.ghostStamp, "Busy input must still cancel its previously displayed completion.")
+    input.string = "Public draft. Typed"; input.setSelectedRange(NSRange(location: input.string.utf16.count, length: 0))
+    completion.update(selection: input.selectedRange(), marked: false, target: target)
+    completion.refresh()
+    XCTAssertEqual(model.inputContextCache?.version, prior.version, "Streaming/native refreshes must leave the unused conversation digest alone.")
+    XCTAssertEqual(completion.completionDocument?.text, input.string)
+    model.isBusy = false; completion.refresh()
+    XCTAssertEqual(model.inputContextCache?.version, changed, "Idle refresh must reconcile the actual new conversation before completion becomes available.")
+    XCTAssertEqual(completion.completionDocument?.text, "Public draft. Typed")
+    try await model.shutdown()
+  }
+
   @MainActor func testCompletionInvalidatesTargetAndReboundStorageWithoutRehashingUnchangedSource() async throws {
     let model = try await model()
     let target = TextInputTarget(chatID: model.state.selectedChat, documentID: nil)

@@ -60,7 +60,7 @@ struct TextInputCapture: Codable, Sendable {
 
   init(model: WorkspaceModel, target: TextInputTarget) {
     self.model = model; self.target = target
-    contextDigest = try? model.inputContextDigest(target)
+    if !model.isBusy { contextDigest = try? model.inputContextDigest(target) }
     model.registerInputCompletion(self)
   }
   func update(selection: NSRange, marked: Bool, target: TextInputTarget) {
@@ -77,12 +77,18 @@ struct TextInputCapture: Codable, Sendable {
     if changed || marked || selection.length != 0 {
       invalidateGhost()
       if !view.movingGhostBoundary {
-        bundle = nil; contextDigest = try? model?.inputContextDigest(target); view.endGhostBoundary()
+        bundle = nil
+        if model?.isBusy == true { contextDigest = nil }
+        else { contextDigest = try? model?.inputContextDigest(target) }
+        view.endGhostBoundary()
       }
     }
     if !marked, selection.length == 0, !view.movingGhostBoundary { schedule() }
   }
   func refresh() {
+    // Streaming responses change the chat version on every publication. Input
+    // completion is unavailable while busy, so defer its full-context digest.
+    if model?.isBusy == true { invalidateGhost(); return }
     guard let model, let digest = try? model.inputContextDigest(target) else {
       invalidateGhost(); bundle = nil; contextDigest = nil; view?.endGhostBoundary(); return
     }
