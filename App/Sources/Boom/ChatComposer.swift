@@ -24,6 +24,8 @@ func nativeEditEvent(_ event: String) {
     reportContentHeight()
   }
   func reportContentHeight() {
+    let trace = PerformanceTrace.begin("Editor.ComposerHeight")
+    defer { PerformanceTrace.end("Editor.ComposerHeight", trace) }
     guard prepareTextLayout() else { return }
     guard let layoutManager, let textContainer else { return }
     layoutManager.ensureLayout(for: textContainer)
@@ -283,7 +285,8 @@ struct ChatComposer: NSViewRepresentable {
     let source = context.coordinator.text.wrappedValue
     let version = currentTextVersion?() ?? textVersion
     if !view.nativeEditInProgress, !view.hasMarkedText() {
-      if !context.coordinator.displays(source, version: version) {
+      let sourceChanged = !context.coordinator.displays(source, version: version)
+      if sourceChanged {
         view.endGhostBoundary(); context.coordinator.completion?.invalidateGhost()
         view.string = source
         MarkdownStyle.apply(to: view, bodyFont: NSFont.systemFont(ofSize: 14), lineSpacing: lineSpacing)
@@ -293,8 +296,10 @@ struct ChatComposer: NSViewRepresentable {
         MarkdownStyle.apply(to: view, bodyFont: NSFont.systemFont(ofSize: 14), lineSpacing: lineSpacing)
       }
       context.coordinator.acknowledge(source, version: version)
+      // Typing, native layout, media and ghost changes report their own size.
+      // Unrelated workspace updates must not force the draft's full layout.
+      if sourceChanged || styleChanged { view.reportContentHeight() }
     }
-    view.reportContentHeight()
     configureCompletion(view, coordinator: context.coordinator)
     context.coordinator.completion?.refresh()
     if isEnabled, focusRequest != context.coordinator.appliedFocusRequest {
