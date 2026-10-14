@@ -231,6 +231,32 @@ final class PagedTextColdReclamationTests: XCTestCase {
     XCTAssertEqual(read.value.text, "baaa"); try await engine.abandonJoinedRootOutput(read.lease)
     try await cleanup(f, engine: engine)
   }
+  func testInvalidLaterRangeRefusesBeforeAnyPunchAndRetainsPageBytes() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-public-range-preflight-" + UUID().uuidString)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let page = root.appendingPathComponent("pages"), ranges = root.appendingPathComponent("ranges")
+    let original = Data(repeating: 0x61, count: 16_384)
+    try original.write(to: page)
+    var live = Data()
+    for value in [UInt64(4096), 8192, 12_288, 20_000] {
+      for shift in stride(from: 0, through: 56, by: 8) { live.append(UInt8(truncatingIfNeeded: value >> shift)) }
+    }
+    try live.write(to: ranges)
+    let file = try FileHandle(forUpdating: page), reader = try FileHandle(forReadingFrom: ranges)
+    defer { try? reader.close(); try? file.close() }
+    var calls = 0
+    XCTAssertThrowsError(try PagedTextColdReclamation.punchGaps(file: file, ranges: reader, bytes: 16_384,
+      blockBytes: 4096, cancellation: PagedTextCancellation(), punch: { _, offset, length in
+        calls += 1
+        try file.seek(toOffset: offset)
+        try file.write(contentsOf: Data(repeating: 0, count: Int(length)))
+        return true
+      }))
+    XCTAssertEqual(calls, 0, "The later invalid extent must be admitted before any destructive call.")
+    XCTAssertEqual(try Data(contentsOf: page), original)
+  }
+
   func testUnsupportedPunchBoundarySkipsWithoutMutatingTheRealFile() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-public-unsupported-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)

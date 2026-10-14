@@ -422,6 +422,22 @@ final class PagedTextColdReclamation {
     guard blockBytes > 0 else { throw BoomError.invalid("Hole punching has no filesystem block size.") }
     let end = try ranges.seekToEnd()
     guard end % 16 == 0 else { throw BoomError.invalid("Sorted range stream is incomplete.") }
+    // Admit the entire bounded stream before the first destructive syscall.
+    // A malformed later range must not leave earlier gaps already punched.
+    try ranges.seek(toOffset: 0)
+    var unchecked = end, previousStart: UInt64 = 0
+    while unchecked > 0 {
+      if cancellation.isCancelled { throw CancellationError() }
+      let chunk = try readExactly(ranges, count: Int(min(unchecked, 65_536)))
+      for offset in stride(from: 0, to: chunk.count, by: 16) {
+        let extent = decode(chunk, offset)
+        guard extent.start >= previousStart, extent.end > extent.start, extent.end <= bytes else {
+          throw BoomError.invalid("Sorted live extent is invalid.")
+        }
+        previousStart = extent.start
+      }
+      unchecked -= UInt64(chunk.count)
+    }
     try ranges.seek(toOffset: 0)
     var cursor: UInt64 = 0, punched: UInt64 = 0, lastStart: UInt64 = 0
     func gap(_ a: UInt64, _ b: UInt64) throws -> Bool {
