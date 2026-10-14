@@ -1500,6 +1500,7 @@ import Foundation
     captured requested: PagedNativeLogicalReadSnapshot? = nil,
     observed requestedObservation: PagedNativeSelectionObservation? = nil,
     discardUnadopted: (@MainActor () async throws -> Void)? = nil,
+    onUnadoptedFailure: (@MainActor (Error) -> Void)? = nil,
     onInstalled: (@MainActor () throws -> Void)? = nil,
     preparing: @escaping @MainActor () async throws -> PagedNativeNavigationInstallationTicket)
     throws -> Task<PagedNativeLogicalSnapshot, Error> {
@@ -1551,6 +1552,7 @@ import Foundation
             failAcceptedSource(retained); throw retained
           }
         }
+        if ticket?.wasConsumed != true { onUnadoptedFailure?(original) }
         if related, relatedReadObservation == observed,
           (!input.session.isCurrent(read) || (try? input.observeSelection()) != observed) {
           preserveUnreplayableInput(original)
@@ -1585,20 +1587,32 @@ import Foundation
       return
     }
     let read = try input.session.captureLogicalRead()
-    let retainedHead = replayingRawKeys
-    if retainedHead { currentRawKeyAwaitingSource = true }
-    _ = try beginLogicalEdit(actionName: "Edit", reportFailure: true, related: true, captured: read,
-      observed: observed, onInstalled: { [self] in
-        if let activeGroup { input.continueNextInputGroup(activeGroup) }
-        if retainedHead { return } // the original queued head is still owned
-        guard let target = input.activeView, let transfer = input.lastReplayTransition else {
-          throw BoomError.stale("Prepared selected-source input lost its actual receiver.")
+    if replayingRawKeys { currentRawKeyAwaitingSource = true }
+    else {
+      // This first key reaches the boundary consumer before native context
+      // interpretation. Retain its real ingress just like later admitted keys;
+      // a subsequent focus move cannot cancel or retarget that original event.
+      try retainRawKey(event, from: view)
+    }
+    let refuseOriginal: @MainActor (Error) -> Void = { [self] error in
+      guard case .rawKey(let head)? = queue.first, head.event === event else { return }
+      // A failed preparation has no mount through which this key can replay.
+      // Preserve the original failure once instead of restarting the same read.
+      preserveUnreplayableInput(error)
+    }
+    do {
+      _ = try beginLogicalEdit(actionName: "Edit", reportFailure: true, related: true, captured: read,
+        observed: observed, onUnadoptedFailure: refuseOriginal, onInstalled: { [self] in
+          if let activeGroup { input.continueNextInputGroup(activeGroup) }
+          // The actual mount rebased the queued head. Its original event is
+          // interpreted once by the normal pump in its retained document context.
+        }) { [self] in
+          try await input.session.prepareLogicalReplacement(selection: selected, replacement: Data(), owner: input)
         }
-        _ = try transfer.rebase(observed.inputLease)
-        target.keyDown(with: event)
-      }) { [self] in
-        try await input.session.prepareLogicalReplacement(selection: selected, replacement: Data(), owner: input)
-      }
+    } catch {
+      refuseOriginal(error)
+      throw error
+    }
   }
 
   func requestDocumentCommand(_ selector: Selector, from view: PagedNativeTextView) throws {

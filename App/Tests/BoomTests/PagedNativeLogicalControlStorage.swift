@@ -55,7 +55,7 @@ import XCTest
 /// history action, root output or acknowledgement. All real tasks join.
 actor PagedNativeLogicalControlStorage: PagedNativeLogicalSessionStorage {
   nonisolated let engineIncarnation: UUID
-  enum Point: Hashable, Sendable { case windowAfter, commitBefore }
+  enum Point: Hashable, Sendable { case windowAfter, replacementAfter, commitBefore }
   struct Ticket: Sendable { let id: UUID }
   struct Snapshot: Sendable {
     let activeCalls: Int
@@ -186,7 +186,7 @@ actor PagedNativeLogicalControlStorage: PagedNativeLogicalSessionStorage {
   func logicalReplacement(_ snapshot: PagedNativeLogicalSnapshot, selection: PagedNativeNavigationSelection,
     replacement: Data, cancellation: CancellationFlag) async throws -> PagedNativeLogicalEdit {
     let backend = backend
-    return try await forward {
+    return try await forward(after: .replacementAfter) {
       try await backend.logicalReplacement(snapshot, selection: selection,
         replacement: replacement, cancellation: cancellation)
     }

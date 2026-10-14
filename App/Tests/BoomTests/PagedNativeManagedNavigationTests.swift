@@ -1883,6 +1883,67 @@ import XCTest
     }
   }
 
+  func testActualFirstKeyReplacingCrossWindowSelectionSurvivesFocusMoveAndUndoesAsOneNativeGroup() async throws {
+    try await fixture(#function) { f in
+      let input = f.input!, commands = f.commands!, source = f.session!, window = f.window!, view = f.view
+      let context = try XCTUnwrap(view.inputContext)
+      let client = try XCTUnwrap(context.client as? PagedNativeTextInputClient)
+      let selected = PagedNativeNavigationSelection(utf16Offset: 1_024, utf16Length: 48_976,
+        focusAtEnd: false, affinity: .upstream)
+      try input.setDocumentSelection(selected)
+      let before = try source.captureLogicalState(), history = try commands.captureLogicalHistory()
+      XCTAssertEqual(try input.currentDocumentSelection(), selected)
+      XCTAssertLessThan(selected.focusUTF16, source.logicalWindow.start.utf16 + source.logicalWindow.summary.utf16)
+      XCTAssertGreaterThan(selected.anchorUTF16, source.logicalWindow.start.utf16 + source.logicalWindow.summary.utf16)
+      XCTAssertLessThan(selected.anchorUTF16, before.source.summary.utf16, "This is a partial selection, not the whole-document resident fast path.")
+      XCTAssertGreaterThan(selected.utf16Length, UInt64(view.selectedRange().length))
+      let baseline = commands.retainedInputBytes, arena = source.arenaID
+      let originalKey = try f.key()
+      let hold = try await f.route!.holdNext(.replacementAfter)
+      window.sendEvent(originalKey)
+      try await f.route!.awaitHeld(hold)
+      XCTAssertTrue(try source.captureLogicalState().source.isSame(before.source))
+      XCTAssertEqual(source.generation, before.generation); XCTAssertEqual(source.arenaID, arena)
+      XCTAssertEqual(commands.queuedRawKeyCount, 1)
+      XCTAssertEqual(commands.retainedInputBytes, baseline + 514)
+      XCTAssertEqual(commands.retainedRefusedInputCount, 0)
+      let other = NSTextView(frame: NSRect(x: 0, y: 240, width: 300, height: 70))
+      other.string = "Other"; window.contentView!.addSubview(other)
+      XCTAssertTrue(window.makeFirstResponder(other)); XCTAssertTrue(window.firstResponder === other)
+      view.keyDown(with: try f.key()) // new unfocused ingress is not the admitted original key
+      XCTAssertEqual(commands.queuedRawKeyCount, 1); XCTAssertEqual(source.generation, before.generation)
+      try await f.route!.release(hold)
+      try await commands.joinPendingCommand()
+      XCTAssertTrue(window.firstResponder === other, "Finishing the original key must not take focus back.")
+      XCTAssertEqual(other.string, "Other"); XCTAssertTrue(view.inputContext === context); XCTAssertFalse(client.isRetired)
+      let expected = (f.originalText as NSString).replacingCharacters(
+        in: NSRange(location: Int(selected.utf16Offset), length: Int(selected.utf16Length)), with: "z")
+      try await f.assertSource(expected)
+      XCTAssertEqual(source.generation, before.generation + 2)
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, selected.utf16Offset + 1)
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Length, 0)
+      XCTAssertEqual(commands.queuedRawKeyCount, 0); XCTAssertEqual(commands.retainedInputBytes, baseline)
+      XCTAssertEqual(commands.retainedRefusedInputCount, 0); XCTAssertEqual(commands.unretainedRawKeyCount, 0)
+      XCTAssertEqual(try commands.captureLogicalHistory().undo.count, history.undo.count + 1)
+      let after = try source.captureLogicalState()
+      // Only after proving no focus steal, explicitly return for real responder
+      // Undo/Redo. The deletion and original character share their actual group.
+      try await PagedNativeFixtureApplication.focus(view, in: window)
+      XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+      try await commands.joinPendingCommand(); try await f.assertSource(f.originalText)
+      XCTAssertTrue(try source.captureLogicalState().source.isSame(before.source))
+      XCTAssertEqual(try input.currentDocumentSelection(), selected)
+      XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("redo:"), to: nil, from: nil))
+      try await commands.joinPendingCommand(); try await f.assertSource(expected)
+      XCTAssertTrue(try source.captureLogicalState().source.isSame(after.source))
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, selected.utf16Offset + 1)
+      XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure); XCTAssertNil(view.boundedStorage.mutationFailure)
+      let joined = await f.route!.snapshot
+      XCTAssertEqual(joined.activeCalls, 0); XCTAssertEqual(joined.startedCalls, joined.finishedCalls)
+      other.removeFromSuperview()
+    }
+  }
+
   func testActualDocumentContextUsesGlobalBoundedRangesAndRetiresOnlyWithItsOwner() async throws {
     try await fixture(#function) { f in
       let view = f.view, input = f.input!, source = f.session!, commands = f.commands!
