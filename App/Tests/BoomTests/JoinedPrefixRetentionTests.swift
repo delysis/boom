@@ -288,7 +288,7 @@ final class JoinedPrefixRetentionTests: XCTestCase {
         let scope = owner(), b = binding(scope), session = try request(store, Array(0..<66), scope, binding: b)
         // Actual all-owning-layer execution, parent submission/evaluation and
         // completed immutable disk write precede any later future descriptor.
-        await append(session, Array(0..<64))
+        await append(session, (0..<64).map(Float.init))
         session.prefill.progress?(64, 66)
         XCTAssertEqual(session.submittedTokenCount, 64)
         XCTAssertEqual(session.retentionObservation?.lastCompleteTokenCount, 64)

@@ -121,12 +121,12 @@ final class PrefixKVStorageTests: XCTestCase {
     try Device.withDefaultDevice(.cpu) {
       let keys = tensor(0..<4), values = tensor(0..<4, values: true)
       let original = try PrefixKVSpan(offset: 0, layer: 0, keys: keys, values: values)
-      let view = try PrefixKVSpan(id: original.id, offset: 1, layer: 0,
-        keys: original.keys[0..., 0..., 1..<3, 0...], values: original.values[0..., 0..., 1..<3, 0...],
-        backingBytesUpperBound: original.backingBytesUpperBound)
+      let view = try original.sliced(positions: 1..<3)
       keys[.ellipsis] = tensor(10..<14); values[.ellipsis] = tensor(10..<14, values: true)
-      XCTAssertEqual(original.keys.asArray(Float.self), [0, 10, 20, 30])
-      XCTAssertEqual(view.keys.asArray(Float.self), [10, 20])
+      let originalArrays = try original.materialize(row: 0, positions: 0..<4)
+      let viewArrays = try view.materialize(row: 0, positions: 0..<2)
+      XCTAssertEqual(originalArrays.0.asArray(Float.self), [0, 10, 20, 30])
+      XCTAssertEqual(viewArrays.0.asArray(Float.self), [10, 20])
       XCTAssertEqual(view.id, original.id); XCTAssertEqual(view.backingBytesUpperBound, original.backingBytesUpperBound)
     }
   }
@@ -143,7 +143,8 @@ final class PrefixKVStorageTests: XCTestCase {
       XCTAssertEqual(restored.state[1].asArray(Float.self), tensor(0..<7, values: true).asArray(Float.self))
       let updated = append(restored, 7..<9)
       XCTAssertEqual(updated.0.asArray(Float.self), tensor(0..<9).asArray(Float.self))
-      XCTAssertEqual(pages[1].keys.asArray(Float.self), tensor(4..<9).asArray(Float.self))
+      XCTAssertEqual(try pages[1].materialize(row: 0, positions: 0..<5).0.asArray(Float.self),
+        tensor(4..<9).asArray(Float.self))
       let empty = try PrefixKVStorage.hydrate(layout: layout, spans: [], prefix: 0, row: 0)
       XCTAssertEqual(empty.offset, 0); XCTAssertTrue(empty.state.isEmpty)
     }
@@ -207,9 +208,8 @@ final class PrefixKVStorageTests: XCTestCase {
       let layout = try XCTUnwrap(PrefixKVStorage.layout(of: live))
       XCTAssertThrowsError(try PrefixKVStorage.hydrate(layout: layout, spans: newer, prefix: 13, row: 0))
       let first = try XCTUnwrap(older.first)
-      let disjointOld = try PrefixKVSpan(id: first.id, offset: 8, layer: 0,
-        keys: first.keys[0..., 0..., 0..<3, 0...], values: first.values[0..., 0..., 0..<3, 0...],
-        backingBytesUpperBound: first.backingBytesUpperBound)
+      XCTAssertEqual(first.start, 8)
+      let disjointOld = try first.sliced(positions: 0..<3)
       let restored = try PrefixKVStorage.hydrate(layout: layout, spans: [disjointOld] + newer, prefix: 13, row: 0)
       XCTAssertEqual(restored.offset, 13); XCTAssertEqual(restored.state[0].asArray(Float.self), [90, 100, 110, 120])
       XCTAssertLessThanOrEqual(older.reduce(0) { $0 + $1.end - $1.start }, 4)
@@ -226,7 +226,8 @@ final class PrefixKVStorageTests: XCTestCase {
       let views = try PrefixKVStorage.residentWindowSpans(of: live, layer: 0)
       XCTAssertEqual(views.map(\.start), [7]); XCTAssertEqual(views.map(\.end), [11])
       XCTAssertEqual(views[0].backingBytesUpperBound, capacityBytes)
-      XCTAssertGreaterThan(capacityBytes, UInt64(views[0].keys.nbytes + views[0].values.nbytes))
+      let viewArrays = try views[0].materialize(row: 0, positions: 0..<4)
+      XCTAssertGreaterThan(capacityBytes, UInt64(viewArrays.0.nbytes + viewArrays.1.nbytes))
       let restored = try PrefixKVStorage.hydrate(layout: try XCTUnwrap(PrefixKVStorage.layout(of: live)),
         spans: views, prefix: 11, row: 0)
       XCTAssertEqual(restored.state[0].asArray(Float.self), [70, 80, 90, 100])
