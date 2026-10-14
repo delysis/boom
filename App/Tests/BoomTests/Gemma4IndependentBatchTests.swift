@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 
 import Foundation
+import BoomCore
+@testable import Boom
 import MLX
 import MLXLMCommon
 import Testing
@@ -10,7 +12,7 @@ import MLXVLM
 /// Real CPU forwards with tiny local weights. No model download or Metal work.
 @Suite(.serialized)
 struct Gemma4IndependentBatchTests {
-    private static func model() throws -> Gemma4Unified {
+    private static func model(perLayerInput: Int = 0, kEqualsV: Bool = true) throws -> Gemma4Unified {
         let json = """
             {
               "model_type": "gemma4_unified", "vocab_size": 32,
@@ -20,9 +22,9 @@ struct Gemma4IndependentBatchTests {
                 "num_attention_heads": 2, "num_key_value_heads": 1,
                 "num_global_key_value_heads": 1, "head_dim": 8, "global_head_dim": 8,
                 "vocab_size": 32, "vocab_size_per_layer_input": 32,
-                "num_kv_shared_layers": 2, "hidden_size_per_layer_input": 0,
+                "num_kv_shared_layers": 2, "hidden_size_per_layer_input": \(perLayerInput),
                 "sliding_window": 512, "max_position_embeddings": 4096,
-                "attention_k_eq_v": true, "use_double_wide_mlp": false,
+                "attention_k_eq_v": \(kEqualsV), "use_double_wide_mlp": false,
                 "layer_types": ["sliding_attention", "full_attention", "sliding_attention", "full_attention"],
                 "tie_word_embeddings": true
               },
@@ -218,6 +220,160 @@ struct Gemma4IndependentBatchTests {
                 _ = try model.prepare(emptyRow, cache: batch, state: nil, prefill: .init())
             }
             #expect(batch.allSatisfy { $0.offset == 0 })
+        }
+    }
+
+    @Test("Per-layer inputs, distinct K/V and shared tails preserve cold/warm ragged 512-boundary forwards")
+    func perLayerInputsAndDistinctKVStayIndependent() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = try Self.model(perLayerInput: 4, kEqualsV: false)
+            let prefixes = [511, 512, 513].enumerated().map { Self.tokens($0.element, row: $0.offset) }
+            let scalar = try prefixes.map { _ in try model.newCache(parameters: nil) }
+            let cold = try Self.merge(prefixes.map { _ in try model.newCache(parameters: nil) })
+            let logits = try Self.prepare(model, rows: prefixes, cache: cold, step: 512)
+            for row in prefixes.indices {
+                Self.expectMatch(logits[row], try Self.prepare(model, rows: [prefixes[row]], cache: scalar[row], step: 512)[0])
+            }
+            let merged = try Self.merge(scalar)
+            let suffixes: [[Int32]] = [[5], [11, 12, 13, 14], [21, 22]]
+            let warm = try Self.prepare(model, rows: suffixes, cache: merged, step: 512)
+            for row in prefixes.indices {
+                Self.expectMatch(warm[row], try Self.prepare(model, rows: [suffixes[row]], cache: scalar[row], step: 512)[0])
+                let extracted = try merged.map { try ($0 as! any BatchKVCacheProtocol).extract(row: row) }
+                let next = model(LMInput.Text(tokens: MLXArray([Int32(7)]).reshaped([1, 1])), cache: extracted, state: nil).logits
+                let expected = model(LMInput.Text(tokens: MLXArray([Int32(7)]).reshaped([1, 1])), cache: scalar[row], state: nil).logits
+                eval(next, expected); Self.expectMatch(next, expected)
+            }
+        }
+    }
+
+    private struct IDTokenizer: MLXLMCommon.Tokenizer {
+        var bosToken: String? { nil }; var eosToken: String? { "31" }; var unknownToken: String? { nil }
+        func encode(text: String, addSpecialTokens: Bool) -> [Int] { text.split(separator: " ").compactMap { Int($0) } }
+        func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { tokenIds.map(String.init).joined(separator: " ") }
+        func convertTokenToId(_ token: String) -> Int? { Int(token) }
+        func convertIdToToken(_ id: Int) -> String? { String(id) }
+        func applyChatTemplate(messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+            additionalContext: [String: any Sendable]?) throws -> [Int] { throw TestFailure.notLogits }
+    }
+    private actor Journals {
+        var values: [UUID: GenerationCheckpoint] = [:]
+        func accept(_ progress: GenerationProgress, identity: GenerationIdentity,
+            stop: String?, token: Int?) throws {
+            let next = GenerationCheckpoint(schema: 1, identity: identity, progress: progress,
+                stopReason: stop, stopTokenID: token)
+            values[identity.attemptID] = try ProductCore.generationCheckpoint(next, expected: identity,
+                previous: values[identity.attemptID])
+        }
+        func value(_ id: UUID) -> GenerationCheckpoint? { values[id] }
+    }
+    private enum RowFailure: Error { case checkpoint }
+
+    @Test("Real independent forwards isolate cancelled and failed-checkpoint rows and preserve peer seeds/journals")
+    func independentDecodeKeepsPeerAfterRowCancellationAndCheckpointFailure() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let model = try Self.model(perLayerInput: 4, kEqualsV: false)
+            let prompts = [511, 512, 513].enumerated().map { Self.tokens($0.element, row: $0.offset).map(Int.init) }
+            let policy = ModelGenerationPolicy(schema: 1, vocabularySize: 32, eosTokenIDs: [31],
+                suppressedTokenIDs: [], controlTokenIDs: [31], textDecoding: "checkpoint-no-cleanup-v1",
+                prefill: .init(chunking: "fixed_v1", tokenCeiling: 512))
+            let seeds: [UInt64] = [7, 41, 151], journals = Journals()
+            func run(faults: Bool) async throws -> (MLXGemmaRunner.IndependentTextDecoded,
+                [MLXGemmaRunner.IndependentTextRequest], [GenerationExecutionOrigin]) {
+                let parent = ProcessInfo.processInfo.environment["TMPDIR"].flatMap {
+                    $0.hasPrefix("/") ? URL(fileURLWithPath: $0, isDirectory: true) : nil
+                }
+                let manager = PromptPrefixCache(temporaryParent: parent)
+                let flags = prompts.map { _ in CancellationFlag() }
+                let requests = prompts.indices.map { row in
+                    let identity = GenerationIdentity(kind: .consultation, operationID: flags[row].operationID,
+                        recordID: UUID(), attemptID: UUID(), model: "tiny-local-gemma4", seed: seeds[row],
+                        requestDigest: Digest.sha256("independent-question-\(row)"), maxTokens: 4, generationPolicy: policy)
+                    let owner = PromptCacheOwner(namespace: UUID(), entity: identity.recordID, route: .consultation)
+                    return MLXGemmaRunner.IndependentTextRequest(identity: identity, owner: owner,
+                        input: .raw("independent-question-\(row)"),
+                        settings: .init(temperature: 0.7, topP: 1, topK: 4, minP: 0), flag: flags[row], policy: policy,
+                        onPrefill: { progress in
+                            if faults && row == 0 && progress.processedPositions > 0 { flags[row].cancel() }
+                        }, onCheckpoint: { progress, stop, token in
+                            if faults && row == 1 { throw RowFailure.checkpoint }
+                            try await journals.accept(progress, identity: identity, stop: stop, token: token)
+                        }, onText: { _ in })
+                }
+                let cohort = try manager.makeTextCohort(requests.indices.map {
+                    .init(owner: requests[$0].owner, tokens: prompts[$0], joinedBinding: nil)
+                }, prefill: .init(stepSize: 512), allowSnapshot: nil, admit: { _ in },
+                    outputLimits: requests.map { $0.identity.maxTokens }, makeCache: { try model.newCache(parameters: nil) })
+                defer { cohort.discard() }
+                let origins = try MLXGemmaRunner.independentOrigins(requests: requests, preparedIDs: prompts,
+                    cohort: cohort, policy: policy)
+                do {
+                    let decoded = try await MLXGemmaRunner.decodeIndependentText(requests: requests, model: model,
+                        tokenizer: IDTokenizer(), cohort: cohort, origins: origins, policy: policy, flag: CancellationFlag())
+                    // The exact local CPU producer has returned. Join submitted
+                    // arrays and real spill work before destroying their owner.
+                    Stream.defaultStream.synchronize()
+                    await manager.joinTextCohortSpill(cohort, cancelled: false)
+                    let dispositions: [PromptPrefixCache.TextCohortRetention?] = requests.indices.map { row in
+                        if case .failure = decoded.outputs[row] { return nil }
+                        return .init(completion: decoded.completions[row], acknowledged: decoded.acknowledged[row],
+                            proof: nil, authorization: nil)
+                    }
+                    #expect(manager.publishTextCohort(cohort, retention: dispositions))
+                    let retained = manager.retainedSnapshotObservations
+                    #expect(!retained.isEmpty)
+                    #expect(retained.allSatisfy { value in
+                        value.row.map { row in requests.indices.contains(row) && dispositions[row] != nil
+                            && value.namespace == requests[row].owner.namespace
+                            && value.nativePhysicalWidth == requests.count } == true
+                    })
+                    if faults {
+                        #expect(retained.contains { $0.row == 2 && $0.namespace == requests[2].owner.namespace })
+                        #expect(!retained.contains { $0.row == 0 || $0.row == 1 })
+                    }
+                    cohort.discard()
+                    manager.clear(reason: "public_cpu_control_joined")
+                    await manager.joinTextCohortSpill(cohort, cancelled: true)
+                    return (decoded, requests, origins)
+                } catch {
+                    Stream.defaultStream.synchronize()
+                    await manager.joinTextCohortSpill(cohort, cancelled: true)
+                    throw error
+                }
+            }
+            let (baseline, _, _) = try await run(faults: false)
+            let (faulted, requests, origins) = try await run(faults: true)
+            #expect(try baseline.outputs[2].get().outputTokens > 0)
+            #expect(faulted.cancelled == [true, false, false])
+            #expect(faulted.checkpointUncertain == [false, true, false])
+            if case .failure(let error) = faulted.outputs[0] { #expect(error is CancellationError) }
+            else { Issue.record("Cancelled actual row returned success") }
+            if case .failure(let error) = faulted.outputs[1] { #expect(error is RowFailure) }
+            else { Issue.record("Refused actual row checkpoint returned success") }
+            let peer = try faulted.outputs[2].get(), expected = try baseline.outputs[2].get()
+            #expect(peer.tokenIDs == expected.tokenIDs && peer.stopReason == expected.stopReason)
+            let journal = try #require(await journals.value(requests[2].identity.attemptID))
+            #expect(journal.identity == requests[2].identity)
+            #expect(journal.progress.tokenIDs == peer.tokenIDs)
+            let document = DocumentSnapshot(title: "Fixture", text: "1 ")
+            let recipe = CompletionRecipe(document: document, caretUTF16: 2, sources: [],
+                prompt: "independent-question-2", promptDigest: requests[2].identity.requestDigest,
+                omittedPrefixCharacters: 0, model: requests[2].identity.model, profile: .standard,
+                settings: requests[2].settings, maxTokens: 4, generationPolicy: policy)
+            let candidate = WritingCandidate(id: requests[2].identity.attemptID, seed: seeds[2],
+                text: peer.text, state: .complete, promptTokens: peer.promptTokens,
+                outputTokens: peer.outputTokens, tokenIDs: peer.tokenIDs, stopReason: peer.stopReason,
+                executionOrigin: peer.executionOrigin)
+            #expect(throws: BoomError.self) {
+                try candidate.coldReplayPolicy(recipe: recipe, loadedModel: recipe.model, loadedPolicy: policy)
+            }
+            #expect(await journals.value(requests[1].identity.attemptID) == nil)
+            for row in requests.indices {
+                let origin = try #require(origins[row].independentCohort)
+                #expect(origin.row == row && origin.rows[row].namespace == requests[row].owner.namespace)
+                #expect(origin.rows[row].seed == seeds[row] && origin.rows[row].attemptID == requests[row].identity.attemptID)
+                #expect(!origins[row].isConfirmedCold(promptTokens: prompts[row].count))
+            }
         }
     }
 }

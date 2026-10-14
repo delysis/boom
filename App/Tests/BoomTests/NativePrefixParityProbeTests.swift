@@ -21,7 +21,7 @@ final class NativePrefixParityProbeTests: XCTestCase {
   private func caches(_ store: PromptPrefixCache, ids: [Int], scope: PromptCacheOwner,
     create: () throws -> [any KVCache]) throws -> PromptPrefixCache.Session {
     try store.makeSession(owner: scope, input: LMInput(tokens: MLXArray(ids.map(Int32.init))),
-      promptTokenIDs: ids, prefill: PrefillParameters(stepSize: 4, chunking: .remainder), makeCache: create)
+      promptTokenIDs: ids, prefill: PrefillParameters(stepSize: 4, chunking: .remainder), useActiveNative: true, makeCache: create)
   }
 
   func testOverfullPrefillInteriorCropUsesKnownNativeChronology() throws {
@@ -67,13 +67,18 @@ final class NativePrefixParityProbeTests: XCTestCase {
     }
   }
 
-  func testIndependentNativeBaselineMatchesActualNormalManagerHydration() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testIndependentNativeBaselineMatchesActualNormalManagerHydration() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let manager = PromptPrefixCache(byteLimit: 16_384), scope = owner(), ids = Array(10..<18)
       let full = KVCacheSimple(); full.step = 2
       let local = RotatingKVCache(maxSize: 4, step: 2)
       let session = try caches(manager, ids: ids, scope: scope) { [full, local] }
-      for range in [0..<4, 4..<8] { session.cache.forEach { append($0, range) } }
+      for range in [0..<4, 4..<8] {
+        session.cache.forEach { append($0, range) }
+        asyncEval(session.cache.flatMap { $0.innerState() }); eval(session.cache)
+        session.markCacheSubmitted(); session.observeReadySpill()
+        await session.joinPendingSpill(cancelled: false)
+      }
       session.prefill.progress?(8, 8)
       let native = try NativePrefixParityProbe.captureNative([full, local], evaluatedPrefix: 8, selectedRow: 0)
       XCTAssertTrue(manager.publish(session))

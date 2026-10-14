@@ -416,12 +416,18 @@ struct ChatPane: View {
         Button { model.cancel() } label: {
           Image(systemName: "stop.fill").frame(width: 24, height: 24)
         }.buttonStyle(.plain).accessibilityLabel("Stop local operation")
-      } else {
+      }
+      if !model.isBusy || model.canQueueConsultation {
         Button { model.send() } label: {
           Image(systemName: "arrow.up.circle.fill").font(.system(size: 24))
         }.buttonStyle(.plain).disabled(
           model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && model.pendingAttachments.isEmpty
-        ).keyboardShortcut(.return, modifiers: .command).accessibilityLabel(model.authoredChatRole == nil ? "Send message" : "Add message")
+        ).overlay(alignment: .topTrailing) {
+          if model.pendingConsultationCount > 0 {
+            Text("\(model.pendingConsultationCount)").font(.caption2).monospacedDigit()
+          }
+        }.help(model.isBusy ? "Queue independent answer" : "Send message")
+        .keyboardShortcut(.return, modifiers: .command).accessibilityLabel(model.authoredChatRole == nil ? "Send message" : "Add message")
       }
     }
   }

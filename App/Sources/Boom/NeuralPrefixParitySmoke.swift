@@ -203,31 +203,32 @@ enum NeuralPrefixParitySmoke {
   // Mirrors pinned Gemma text-only prepare, in this explicit diagnostic only.
   // Capture may occur before a later prefill chunk, not only at its final extent.
   private static func prepare(model: any LanguageModel, session: PromptPrefixCache.Session,
-    captureAt: Int?, label: String, flag: CancellationFlag, evidence: URL) throws -> Prepared {
+    captureAt: Int?, label: String, flag: CancellationFlag, evidence: URL) async throws -> Prepared {
     let ids = session.input.text.tokens.asArray(Int.self)
     let y = MLXArray(ids.map(Int32.init)).expandedDimensions(axis: 0)
     var snapshot: NativePrefixParityProbe.Snapshot?, ranges: [NativePrefixParityProbe.TokenRange] = []
-    var failure: Error?
-    let done = try session.prefill.forEachChunk(total: ids.count) { range in
-      guard failure == nil else { return }
-      do {
-        try flag.check(); try ModelResidency.check()
-        let result = model(LMInput.Text(tokens: y[0..., range]), cache: session.cache, state: nil)
-        guard result.state == nil else { throw BoomError.invalid("Unsupported public model state.") }
-        asyncEval(session.cache)
-        let absolute = session.cachedTokenCount + range.upperBound
-        ranges.append(NativePrefixParityProbe.TokenRange(
-          session.cachedTokenCount + range.lowerBound ..< absolute))
-        if captureAt == absolute {
-          let captured = try NativePrefixParityProbe.captureNative(nativeBases(session.cache),
-            evaluatedPrefix: absolute, selectedRow: 0)
-          snapshot = captured
-          try write(captured.source, label + "-native-source.json", evidence)
-        }
-        try write(ranges, label + "-prefill-ranges.json", evidence)
-      } catch { failure = error }
+    var partition = session.prefill; partition.progress = nil
+    var chunks: [Range<Int>] = []
+    let done = try partition.forEachChunk(total: ids.count) { chunks.append($0) }
+    for range in chunks {
+      try flag.check(); try ModelResidency.check()
+      let result = model(LMInput.Text(tokens: y[0..., range]), cache: session.cache, state: nil)
+      guard result.state == nil else { throw BoomError.invalid("Unsupported public model state.") }
+      asyncEval([result.logits] + session.cache.flatMap { $0.innerState() })
+      eval(result.logits); session.markCacheSubmitted()
+      session.prefill.progress?(range.upperBound, ids.count)
+      session.observeReadySpill(); await session.joinPendingSpill(cancelled: false)
+      let absolute = session.cachedTokenCount + range.upperBound
+      ranges.append(NativePrefixParityProbe.TokenRange(
+        session.cachedTokenCount + range.lowerBound ..< absolute))
+      if captureAt == absolute {
+        let captured = try NativePrefixParityProbe.captureNative(nativeBases(session.cache),
+          evaluatedPrefix: absolute, selectedRow: 0)
+        snapshot = captured
+        try write(captured.source, label + "-native-source.json", evidence)
+      }
+      try write(ranges, label + "-prefill-ranges.json", evidence)
     }
-    if let failure { throw failure }
     if done > 0 { eval(session.cache) }
     try flag.check(); try ModelResidency.check()
     let final = model(LMInput.Text(tokens: y[0..., done...]), cache: session.cache, state: nil)
@@ -236,7 +237,9 @@ enum NeuralPrefixParitySmoke {
     }
     ranges.append(NativePrefixParityProbe.TokenRange(session.cachedTokenCount + done ..< session.fullPromptTokenCount))
     session.prefill.progress?(ids.count, ids.count)
-    eval([final.logits] + session.cache.flatMap { $0.innerState() })
+    asyncEval([final.logits] + session.cache.flatMap { $0.innerState() })
+    eval(final.logits); session.markCacheSubmitted()
+    session.observeReadySpill(); await session.joinPendingSpill(cancelled: false)
     try flag.check(); try ModelResidency.check()
     try write(ranges, label + "-prefill-ranges.json", evidence)
     if captureAt != nil, snapshot == nil {
@@ -249,19 +252,19 @@ enum NeuralPrefixParitySmoke {
     manager: PromptPrefixCache, owner: PromptCacheOwner, prefill: PrefillParameters,
     policy: ModelGenerationPolicy, expectedCached: Int, width: Int, processed: Int, delivered: Int,
     captureAt: Int?, label: String, flag: CancellationFlag,
-    allowSnapshot: @escaping @Sendable (UInt64) -> Bool, fence: () -> Void, evidence: URL) throws -> Prepared {
+    allowSnapshot: @escaping @Sendable (UInt64) -> Bool, fence: () -> Void, evidence: URL) async throws -> Prepared {
     let parameters = GenerateParameters(maxTokens: 16, temperature: input.settings.temperature,
       topP: input.settings.topP, topK: input.settings.topK, minP: input.settings.minP,
       repetitionPenalty: nil, prefill: prefill, seed: 42)
     let session = try manager.makeSession(owner: owner,
       input: LMInput(tokens: MLXArray(input.prepared_token_ids.map(Int32.init))),
       promptTokenIDs: input.prepared_token_ids, prefill: prefill, allowSnapshot: allowSnapshot,
-      makeCache: { try model.newCache(parameters: parameters) })
+      useActiveNative: true, outputTokens: 16, batchWidth: width, makeCache: { try model.newCache(parameters: parameters) })
     try write(session.observation, label + "-lookup.json", evidence)
     guard session.cachedTokenCount == expectedCached else {
       throw BoomError.invalid("The declared source's actual manager selection changed.")
     }
-    let prepared = try prepare(model: model, session: session, captureAt: captureAt,
+    let prepared = try await prepare(model: model, session: session, captureAt: captureAt,
       label: label, flag: flag, evidence: evidence)
     let ledgers = input.outputs.map { Array($0.token_ids.prefix(delivered)) }
     guard ledgers.count == width, processed <= delivered, width == 1 || processed < delivered,
@@ -295,7 +298,9 @@ enum NeuralPrefixParitySmoke {
       let output = model(LMInput.Text(tokens: MLXArray(column.map(Int32.init)).reshaped([width, 1])),
         cache: session.cache, state: nil)
       guard output.state == nil else { throw BoomError.invalid("Unexpected teacher-forced model state.") }
-      eval([output.logits] + session.cache.flatMap { $0.innerState() })
+      asyncEval([output.logits] + session.cache.flatMap { $0.innerState() })
+      eval(output.logits); session.markCacheSubmitted()
+      session.observeReadySpill(); await session.joinPendingSpill(cancelled: false)
       processedMatrices.append(column)
     }
     if width > 1 {
@@ -306,6 +311,7 @@ enum NeuralPrefixParitySmoke {
       }
     }
     fence(); try flag.check(); try ModelResidency.check()
+    await session.joinPendingSpill(cancelled: false)
     let published = manager.publish(session, completions: ledgers.indices.map {
       PromptPrefixCache.Completion(row: $0, emittedTokenIDs: ledgers[$0])
     })
@@ -405,16 +411,17 @@ enum NeuralPrefixParitySmoke {
     return summary
   }
 
-  // Runs synchronously only on the owned inference executor. Default inference
-  // gains no eval, snapshot, matrix, reduction or diagnostic callback.
+  // Remains on the owned inference executor; only this deliberate diagnostic
+  // joins disposable spill work between its actual forwards. Default inference
+  // gains no snapshot, matrix, reduction or diagnostic callback.
   static func execute(_ request: Request, model: any LanguageModel, manager: PromptPrefixCache,
     prefill: PrefillParameters, policy: ModelGenerationPolicy, layerWindows: [Int?],
     flag: CancellationFlag, allowSnapshot: @escaping @Sendable (UInt64) -> Bool, fence: () -> Void,
-    evidence: URL) throws -> CaseSummary {
+    evidence: URL) async throws -> CaseSummary {
     let d = request.declaration
     let owner = PromptCacheOwner(namespace: d.namespace, entity: d.namespace,
       route: d.kind == .consultationInterior ? .consultation : .writing)
-    let shared = try produce(request.shared, model: model, manager: manager, owner: owner,
+    let shared = try await produce(request.shared, model: model, manager: manager, owner: owner,
       prefill: prefill, policy: policy, expectedCached: 0, width: d.sharedWidth,
       processed: d.sharedProcessedDecodeTokens, delivered: d.sharedDeliveredLedgerTokens,
       captureAt: d.kind == .consultationInterior ? d.sourceNativeBoundary : nil,
@@ -422,7 +429,7 @@ enum NeuralPrefixParitySmoke {
     let anchor: Prepared?
     if let input = request.anchor {
       guard let cached = d.anchorCachedPrefix else { throw BoomError.invalid("Missing declared anchor admission.") }
-      anchor = try produce(input, model: model, manager: manager, owner: owner, prefill: prefill,
+      anchor = try await produce(input, model: model, manager: manager, owner: owner, prefill: prefill,
         policy: policy, expectedCached: cached, width: 1, processed: 16, delivered: 16,
         captureAt: d.sourceNativeBoundary, label: "late-anchor", flag: flag,
         allowSnapshot: allowSnapshot, fence: fence, evidence: evidence)
@@ -439,7 +446,7 @@ enum NeuralPrefixParitySmoke {
       input: LMInput(tokens: MLXArray(request.query.prepared_token_ids.map(Int32.init))),
       promptTokenIDs: request.query.prepared_token_ids, prefill: prefill,
       makeCache: { try model.newCache(parameters: parameters) })
-    let coldPrepared = try prepare(model: model, session: cold, captureAt: d.coldNativeBoundary,
+    let coldPrepared = try await prepare(model: model, session: cold, captureAt: d.coldNativeBoundary,
       label: "natural-full-query-cold", flag: flag, evidence: evidence)
     guard let coldSnapshot = coldPrepared.snapshot else { throw BoomError.invalid("Full-query cold native boundary was not captured.") }
     let coldSamples = try naturalSamples(model: model, cache: cold.cache, logits: coldPrepared.logits,
@@ -455,7 +462,7 @@ enum NeuralPrefixParitySmoke {
     let warm = try manager.makeSession(owner: owner,
       input: LMInput(tokens: MLXArray(request.query.prepared_token_ids.map(Int32.init))),
       promptTokenIDs: request.query.prepared_token_ids, prefill: prefill, allowSnapshot: allowSnapshot,
-      makeCache: { try model.newCache(parameters: parameters) })
+      useActiveNative: true, outputTokens: 16, batchWidth: 1, makeCache: { try model.newCache(parameters: parameters) })
     defer { withExtendedLifetime((warm, coldPrepared)) {} }
     try write(warm.observation, "actual-warm-lookup.json", evidence)
     guard warm.cachedTokenCount == d.cachedPrefix,

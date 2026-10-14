@@ -21,7 +21,7 @@ struct StoredProposal: Codable, Identifiable, Sendable {
 
 enum DocumentMergeConflict: Error { case changed }
 
-struct ConsultationReplay {
+struct ConsultationReplay: Sendable {
   let request: String
   let voice: Voice?
   let attachmentIDs: [UUID]
@@ -107,6 +107,22 @@ private struct BoundedConsultationContext: Sendable {
   @Published var mode: InteractionMode = .ask
   @Published var pendingAttachments: [UUID] = [] { didSet { if pendingAttachments != oldValue { retainComposerDraft() } } }
   @Published var isBusy = false
+  @Published private(set) var pendingConsultationCount = 0
+  private struct PendingConsultation: Sendable {
+    let chat: ChatRecord
+    let request: String
+    let interaction: InteractionMode
+    let promptContract: ConsultationPromptContract
+    let selectedIDs: [UUID]
+    let style: ConsultationStyle
+    let replay: ConsultationReplay?
+    let userMessageID: UUID?
+  }
+  private var pendingConsultations: [PendingConsultation] = []
+  var canQueueConsultation: Bool {
+    canInfer && mode == .ask && consultationStyle == .separate && authoredChatRole == nil
+      && selectedChat != nil && !pagedShutdownRequested
+  }
   @Published var status = "Install a consultation model to begin"
   @Published var errorMessage: String?
   @Published var composerIssue: String?
@@ -1051,6 +1067,7 @@ private struct BoundedConsultationContext: Sendable {
           self.streamingChat = nil
           self.scheduleCompletion()
           if completed { after?() }
+          self.startPendingConsultations()
         }
       }
       do {
@@ -1069,6 +1086,10 @@ private struct BoundedConsultationContext: Sendable {
   }
   func cancel() {
     PerformanceTrace.event("Request.CancelRequested")
+    let hadPending = !pendingConsultations.isEmpty
+    for captured in pendingConsultations { finishPendingConsultation(captured, error: nil) }
+    pendingConsultations.removeAll(); pendingConsultationCount = 0
+    if hadPending { scheduleSave() }
     cancelInputCompletions()
     activeFlag?.cancel()
     foreground?.cancel()
@@ -1076,6 +1097,8 @@ private struct BoundedConsultationContext: Sendable {
   }
   func shutdown() async throws {
     pagedShutdownRequested = true
+    for captured in pendingConsultations { finishPendingConsultation(captured, error: nil) }
+    pendingConsultations.removeAll(); pendingConsultationCount = 0
     for operation in Array(exportTasks.values) {
       operation.pagedResult?.cancel(); operation.clipboardResult?.cancel()
     }
@@ -1136,376 +1159,564 @@ private struct BoundedConsultationContext: Sendable {
     defer { PerformanceTrace.end("Request.ConsultationCapture", captureTrace) }
     if replay == nil { ensureChatForSend() }
     if replay == nil && authoredChatRole != nil { appendAuthoredChatMessage(); return }
-    guard !isBusy, let chat = selectedChat, canInfer,
+    guard (!isBusy || canQueueConsultation), let chat = selectedChat, canInfer,
       replay != nil || !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !pendingAttachments.isEmpty
     else { if !canInfer && !isBusy { prepareModels() }; return }
     let request = replay?.request ?? draft, interaction: InteractionMode = replay == nil ? mode : .propose
     let promptContract = replay?.promptContract ?? .referenceBindingsV3
     let selectedIDs = replay?.attachmentIDs ?? pendingAttachments, style = consultationStyle
+    let captured = PendingConsultation(chat: chat, request: request, interaction: interaction,
+      promptContract: promptContract, selectedIDs: selectedIDs, style: style, replay: replay, userMessageID: nil)
+    if isBusy {
+      // Requests are accepted visibly; generation is still owned by the same
+      // foreground lifetime. Captured history never acquires later answers.
+      guard replay == nil, canQueueConsultation else { return }
+      do { try enqueueIndependentQuestion(request, in: chat, attachments: selectedIDs) }
+      catch { composerIssue = error.localizedDescription }
+      return
+    }
     work("Checking consultation context…") { [weak self] flag in
-      guard let self else { return }
-      finishComposition()
-      let graph = try await captureChatContext(request: request, attachedDocumentID: chat.attachedDocumentID,
-        editingDocumentID: interaction == .ask ? nil : state.selectedDocument, flag: flag)
-      let document = interaction == .ask ? nil : graph.captures.first { $0.documentID == self.state.selectedDocument }?.modelSnapshot
-      consultationCaptures = Dictionary(uniqueKeysWithValues: graph.captures.map { ($0.documentID, $0) })
-      let slugs = try ReferenceParser.voices(request)
-      guard slugs.count <= 3 else { throw BoomError.budget("Consult at most three voices per turn.") }
-      guard interaction != .edit || slugs.count <= 1 else {
-        throw BoomError.denied("Edit grants one voice at a time. Use Propose to compare voices.")
+      try await self?.performConsultation(captured, flag: flag)
+    }
+  }
+
+  func enqueueIndependentQuestion(_ request: String, in chat: ChatRecord, attachments selectedIDs: [UUID]) throws {
+    guard isBusy, activeFlag != nil, mode == .ask, consultationStyle == .separate,
+      !pagedShutdownRequested, state.chats.contains(where: { $0.id == chat.id }) else {
+      throw BoomError.stale("This question lost its actual foreground or chat owner.")
+    }
+    guard pendingConsultations.count < 16,
+      pendingConsultations.reduce(request.utf8.count, { $0 + $1.request.utf8.count }) <= 524_288 else {
+      throw BoomError.budget("The pending request budget is full.") // preserve unsent draft
+    }
+    let routing = try ReferenceParser.voices(request), id = UUID()
+    if let c = state.chats.firstIndex(where: { $0.id == chat.id }) {
+      state.chats[c].messages.append(ChatMessage(id: id, role: .user, text: request, state: .pending,
+        speaker: Speaker(name: "Human"), directAttachments: selectedIDs,
+        consultationRouting: routing, consultationPromptContract: .referenceBindingsV3))
+    }
+    var history = chat
+    history.messages = history.messages.filter { $0.state == .complete }
+    pendingConsultations.append(.init(chat: history, request: request, interaction: .ask,
+      promptContract: .referenceBindingsV3, selectedIDs: selectedIDs, style: .separate,
+      replay: nil, userMessageID: id))
+    pendingConsultationCount = pendingConsultations.count
+    if draft == request { draft = "" }
+    if pendingAttachments == selectedIDs { pendingAttachments = [] }
+    scheduleSave()
+  }
+
+  private func performConsultation(_ captured: PendingConsultation, flag: CancellationFlag,
+    ownedBy scopeOwner: CancellationFlag? = nil) async throws {
+    let ownerFlag = scopeOwner ?? flag
+    let chat = captured.chat, request = captured.request, interaction = captured.interaction
+    let promptContract = captured.promptContract, selectedIDs = captured.selectedIDs
+    let style = captured.style, replay = captured.replay
+    finishComposition()
+    let graph = try await captureChatContext(request: request, attachedDocumentID: chat.attachedDocumentID,
+      editingDocumentID: interaction == .ask ? nil : state.selectedDocument, flag: flag)
+    let document = interaction == .ask ? nil : graph.captures.first { $0.documentID == self.state.selectedDocument }?.modelSnapshot
+    for capture in graph.captures { consultationCaptures[capture.documentID] = capture }
+    let slugs = try ReferenceParser.voices(request)
+    guard slugs.count <= 3 else { throw BoomError.budget("Consult at most three voices per turn.") }
+    guard interaction != .edit || slugs.count <= 1 else {
+      throw BoomError.denied("Edit grants one voice at a time. Use Propose to compare voices.")
+    }
+    let voices: [Voice]
+    if let replay { voices = replay.voice.map { [$0] } ?? [] }
+    else { voices = try slugs.map { slug -> Voice in
+      guard let voice = self.state.voices.first(where: { $0.slug == slug }) else { throw BoomError.invalid("Unknown voice @\(slug).") }
+      return voice
+    } }
+    guard interaction == .ask || document != nil else { throw BoomError.denied("Choose a document before requesting edits.") }
+    let inherited = graph.documents.flatMap { AttachmentLink.ids(in: $0.text) }
+    let attachmentIDs = (selectedIDs + inherited).reduce(into: [UUID]()) { if !$0.contains($1) { $0.append($1) } }
+    guard attachmentIDs.count <= 8 else { throw BoomError.budget("At most eight attachments per turn.") }
+    var attachments = try attachmentIDs.map { id -> AttachmentRecord in
+      guard let record = self.state.attachments.first(where: { $0.id == id }) else { throw BoomError.stale("An attachment was removed.") }
+      return record
+    }
+    if attachments.contains(where: { $0.kind == .unavailable }) {
+      let issue = "An attachment can't be read locally. Its original has been kept."
+      composerIssue = issue
+      if captured.userMessageID != nil { throw BoomError.unavailable(issue) }
+      return
+    }
+    for index in attachments.indices where attachments[index].needsPreparation {
+      let captured = attachments[index]
+      let data = try await store.attachment(captured.id)
+      let prepared = try await preparedRecord(captured, data: data, automaticAudio: true, flag: flag)
+      guard let current = state.attachments.firstIndex(where: { $0.id == captured.id }),
+        state.attachments[current].digest == captured.digest else { throw BoomError.stale("The attachment changed.") }
+      state.attachments[current] = prepared; attachments[index] = prepared
+    }
+    let attachmentSources = attachments.map(\.reference), sources = graph.sources + attachmentSources
+    let attachmentText = promptContract == .referenceBindingsV3 ? "" : attachments.filter { !$0.text.isEmpty }.map {
+      "ATTACHMENT \($0.name)\nID \($0.id)\nDIGEST \($0.digest)\nCOVERAGE \($0.coverage)\n\($0.text)"
+    }.joined(separator: "\n\n")
+    let authority = CapturedDocumentAuthority(mode: interaction, target: document,
+      capture: interaction == .ask ? nil : graph.captures.first { $0.documentID == document?.id })
+    let context: String, renderedContext: RenderedReferenceContext?, capturedContextSources: [SourceReference]
+    let capturedAttachments = attachments
+    if promptContract == .referenceBindingsV3 {
+      let rendered = try await detachedWork {
+        try DocumentTools.renderedContext(graph.documents, attachments: capturedAttachments, authority: authority)
       }
-      let voices: [Voice]
-      if let replay { voices = replay.voice.map { [$0] } ?? [] }
-      else { voices = try slugs.map { slug -> Voice in
-        guard let voice = self.state.voices.first(where: { $0.slug == slug }) else { throw BoomError.invalid("Unknown voice @\(slug).") }
-        return voice
-      } }
-      guard interaction == .ask || document != nil else { throw BoomError.denied("Choose a document before requesting edits.") }
-      let inherited = graph.documents.flatMap { AttachmentLink.ids(in: $0.text) }
-      let attachmentIDs = (selectedIDs + inherited).reduce(into: [UUID]()) { if !$0.contains($1) { $0.append($1) } }
-      guard attachmentIDs.count <= 8 else { throw BoomError.budget("At most eight attachments per turn.") }
-      var attachments = try attachmentIDs.map { id -> AttachmentRecord in
-        guard let record = self.state.attachments.first(where: { $0.id == id }) else { throw BoomError.stale("An attachment was removed.") }
-        return record
+      renderedContext = rendered; context = rendered.prompt
+      capturedContextSources = graph.promptSources + attachments.filter { !$0.text.isEmpty }.map(\.reference)
+    } else {
+      let documentContext = try await detachedWork { try DocumentTools.context(graph.documents, authority: authority) }
+      context = [documentContext, attachmentText].filter { !$0.isEmpty }.joined(separator: "\n\n")
+      renderedContext = nil; capturedContextSources = []
+    }
+    guard context.utf8.count <= 524_288 else { throw BoomError.budget("Combined reference context exceeds 512 KiB.") }
+    let instructions = chat.instructions ?? ""
+    let targets: [Voice?] = voices.isEmpty ? [nil] : voices.map(Optional.some)
+    let outputLimit = interaction == .ask ? 512 : 4096
+      let runner = try await self.runnerForGeneration(.consultation, flag: flag)
+      let executionPolicy = try ProductCore.resolvedGenerationPolicy(
+        replay?.generationPolicy ?? runner.generationPolicy, loaded: runner.generationPolicy)
+      // Exact replay starts cold; live turns may reuse only this chat's prefix.
+      let cacheOwner: PromptCacheOwner? = replay == nil
+        ? PromptCacheOwner(namespace: self.inferenceCacheNamespace, entity: chat.id, route: .consultation)
+        : nil
+      let provider = runner.identity
+      try await self.flush()
+      try await self.revalidateResponseSources(graph.sources, attachments: attachmentSources, targetID: authority.target?.id)
+      let media = try await self.consultationMedia(attachments, rawAudio: runner.supportsRawAudio, flag: flag)
+      let images = media.images
+      let reserves = targets.indices.map { index in
+        style == .discuss ? outputLimit * (index + 1) + 256 * index : outputLimit
       }
-      if attachments.contains(where: { $0.kind == .unavailable }) {
-        composerIssue = "An attachment can't be read locally. Its original has been kept."
-        return
+      let fitPairedAdmission = self.makePairedContextAdmission(runner: runner, purpose: .consultation,
+        owner: cacheOwner, flag: flag) { [weak self] in
+        guard let workspace = self else { throw CancellationError() }
+        try await workspace.validateConsultationAdmissionSource(chat: chat, sources: graph.sources,
+          attachments: attachmentSources, targetID: authority.target?.id,
+          requiredDocumentID: interaction == .ask ? nil : document?.id, flag: flag,
+          independentHistory: interaction == .ask && style == .separate, ownedBy: ownerFlag)
       }
-      for index in attachments.indices where attachments[index].needsPreparation {
-        let captured = attachments[index]
-        let data = try await store.attachment(captured.id)
-        let prepared = try await preparedRecord(captured, data: data, automaticAudio: true, flag: flag)
-        guard let current = state.attachments.firstIndex(where: { $0.id == captured.id }),
-          state.attachments[current].digest == captured.digest else { throw BoomError.stale("The attachment changed.") }
-        state.attachments[current] = prepared; attachments[index] = prepared
+      let fitted = try await runner.fittedRound(voices: targets, history: chat.messages,
+        instructions: instructions, context: context, request: request, routing: slugs,
+        images: images, media: media.media, reserves: reserves, flag: flag, authority: authority, cacheOwner: cacheOwner,
+        pairedAdmission: fitPairedAdmission, promptContract: promptContract,
+        renderedContext: renderedContext, capturedSources: capturedContextSources)
+      let plans = fitted.plans
+      try flag.check()
+      try await self.revalidateResponseSources(graph.sources, attachments: attachmentSources, targetID: authority.target?.id)
+      guard let index = self.state.chats.firstIndex(where: { $0.id == chat.id }) else { throw BoomError.stale("Chat was removed.") }
+      let replyIDs = targets.map { _ in UUID() }
+      if replay == nil && captured.userMessageID == nil {
+        self.state.chats[index].messages.append(ChatMessage(role: .user, text: request,
+          context: context, sources: sources, speaker: Speaker(name: "Human"), directAttachments: selectedIDs,
+          consultationRouting: slugs, consultationPromptContract: promptContract))
       }
-      let attachmentSources = attachments.map(\.reference), sources = graph.sources + attachmentSources
-      let attachmentText = promptContract == .referenceBindingsV3 ? "" : attachments.filter { !$0.text.isEmpty }.map {
-        "ATTACHMENT \($0.name)\nID \($0.id)\nDIGEST \($0.digest)\nCOVERAGE \($0.coverage)\n\($0.text)"
-      }.joined(separator: "\n\n")
-      let authority = CapturedDocumentAuthority(mode: interaction, target: document,
-        capture: interaction == .ask ? nil : graph.captures.first { $0.documentID == document?.id })
-      let context: String, renderedContext: RenderedReferenceContext?, capturedContextSources: [SourceReference]
-      let capturedAttachments = attachments
-      if promptContract == .referenceBindingsV3 {
-        let rendered = try await detachedWork {
-          try DocumentTools.renderedContext(graph.documents, attachments: capturedAttachments, authority: authority)
-        }
-        renderedContext = rendered; context = rendered.prompt
-        capturedContextSources = graph.promptSources + attachments.filter { !$0.text.isEmpty }.map(\.reference)
-      } else {
-        let documentContext = try await detachedWork { try DocumentTools.context(graph.documents, authority: authority) }
-        context = [documentContext, attachmentText].filter { !$0.isEmpty }.joined(separator: "\n\n")
-        renderedContext = nil; capturedContextSources = []
+      if let userID = captured.userMessageID,
+        let user = self.state.chats[index].messages.firstIndex(where: { $0.id == userID }) {
+        self.state.chats[index].messages[user].context = context
+        self.state.chats[index].messages[user].sources = sources
+        self.state.chats[index].messages[user].state = .complete
       }
-      guard context.utf8.count <= 524_288 else { throw BoomError.budget("Combined reference context exceeds 512 KiB.") }
-      let instructions = chat.instructions ?? ""
-      let targets: [Voice?] = voices.isEmpty ? [nil] : voices.map(Optional.some)
-      let outputLimit = interaction == .ask ? 512 : 4096
-        let runner = try await self.runnerForGeneration(.consultation, flag: flag)
-        let executionPolicy = try ProductCore.resolvedGenerationPolicy(
-          replay?.generationPolicy ?? runner.generationPolicy, loaded: runner.generationPolicy)
-        // Exact replay starts cold; live turns may reuse only this chat's prefix.
-        let cacheOwner: PromptCacheOwner? = replay == nil
-          ? PromptCacheOwner(namespace: self.inferenceCacheNamespace, entity: chat.id, route: .consultation)
-          : nil
-        let provider = runner.identity
+      for (offset, voice) in targets.enumerated() {
+        self.state.chats[index].messages.append(ChatMessage(id: replyIDs[offset], role: .assistant,
+          text: "", sources: sources, state: .pending, provider: provider,
+          speaker: voice?.speaker ?? Speaker(name: "Bloom")))
+      }
+      if self.state.chats[index].title == "New chat" { self.state.chats[index].title = try ProductCore.chatTitle(request, routing: slugs) }
+      if replay == nil && self.draft == request { self.draft = "" }
+      if replay == nil && self.pendingAttachments == selectedIDs {
+        self.pendingAttachments = []
+        self.state.recordingDrafts?[chat.id] = (self.state.recordingDrafts?[chat.id] ?? []).filter { !selectedIDs.contains($0) }
+      }
+      self.streamingChat = chat.id
+      var round: [ChatMessage] = []
+      do {
         try await self.flush()
-        try await self.revalidateResponseSources(graph.sources, attachments: attachmentSources, targetID: authority.target?.id)
-        let media = try await self.consultationMedia(attachments, rawAudio: runner.supportsRawAudio, flag: flag)
-        let images = media.images
-        let reserves = targets.indices.map { index in
-          style == .discuss ? outputLimit * (index + 1) + 256 * index : outputLimit
-        }
-        let fitPairedAdmission = self.makePairedContextAdmission(runner: runner, purpose: .consultation,
-          owner: cacheOwner, flag: flag) { [weak self] in
-          guard let workspace = self else { throw CancellationError() }
-          try await workspace.validateConsultationAdmissionSource(chat: chat, sources: graph.sources,
-            attachments: attachmentSources, targetID: authority.target?.id,
-            requiredDocumentID: interaction == .ask ? nil : document?.id, flag: flag)
-        }
-        let fitted = try await runner.fittedRound(voices: targets, history: chat.messages,
-          instructions: instructions, context: context, request: request, routing: slugs,
-          images: images, media: media.media, reserves: reserves, flag: flag, authority: authority, cacheOwner: cacheOwner,
-          pairedAdmission: fitPairedAdmission, promptContract: promptContract,
-          renderedContext: renderedContext, capturedSources: capturedContextSources)
-        let plans = fitted.plans
-        try flag.check()
-        try await self.revalidateResponseSources(graph.sources, attachments: attachmentSources, targetID: authority.target?.id)
-        guard let index = self.state.chats.firstIndex(where: { $0.id == chat.id }) else { throw BoomError.stale("Chat was removed.") }
-        let replyIDs = targets.map { _ in UUID() }
-        if replay == nil {
-          self.state.chats[index].messages.append(ChatMessage(role: .user, text: request,
-            context: context, sources: sources, speaker: Speaker(name: "Human"), directAttachments: selectedIDs,
-            consultationRouting: slugs, consultationPromptContract: promptContract))
-        }
-        for (offset, voice) in targets.enumerated() {
-          self.state.chats[index].messages.append(ChatMessage(id: replyIDs[offset], role: .assistant,
-            text: "", sources: sources, state: .pending, provider: provider,
-            speaker: voice?.speaker ?? Speaker(name: "Bloom")))
-        }
-        if self.state.chats[index].title == "New chat" { self.state.chats[index].title = try ProductCore.chatTitle(request, routing: slugs) }
-        if replay == nil && self.draft == request { self.draft = "" }
-        if replay == nil && self.pendingAttachments == selectedIDs {
-          self.pendingAttachments = []
-          self.state.recordingDrafts?[chat.id] = (self.state.recordingDrafts?[chat.id] ?? []).filter { !selectedIDs.contains($0) }
-        }
-        self.streamingChat = chat.id
-        var round: [ChatMessage] = []
-        do {
-          try await self.flush()
-          for (offset, voice) in targets.enumerated() {
-            try flag.check()
-            self.status = voice.map { "Consulting @\($0.slug)…" } ?? "Generating locally…"
-            self.streamingText = ""
-            var plan: ConsultationPlan
-            if style == .discuss, !round.isEmpty {
-              plan = try ProductCore.prompt(voice: voice, history: fitted.history + round,
-                instructions: instructions, context: context, request: request, routing: slugs,
-                authority: authority, promptContract: promptContract,
-                renderedContext: renderedContext, capturedSources: capturedContextSources)
-            } else { plan = plans[offset] }
-            var responseAuthority = authority
-            var sourceDocuments = graph.documents
-            var previousAttemptID = replay?.previousAttemptID
-            while true {
-              try flag.check()
-              try await self.revalidateResponseSources(try self.sourceReferences(for: sourceDocuments), attachments: attachmentSources, targetID: responseAuthority.target?.id)
-              guard interaction == .ask || self.state.selectedDocument == document?.id else { throw BoomError.stale("Active document changed.") }
-              let attemptSources = try self.sourceReferences(for: sourceDocuments) + attachmentSources
-              let seed = UInt64.random(in: .min ... .max), vault = self.store.vault
-              let attemptID = UUID()
-              var receipt = ConsultationReceipt(operationID: flag.operationID, seed: seed, state: .pending,
-                failure: nil, model: provider, voice: voice, plan: plan, sources: attemptSources,
-                promptDigest: Digest.sha256(plan.rawPrompt), tokenIDs: [], stopReason: "pending",
-                firstTokenSeconds: nil, elapsedSeconds: 0, generationPolicy: executionPolicy)
-              let replyID = replyIDs[offset]
-              receipt.media = media.media.isEmpty ? nil : media.media.map(\.reference)
-              receipt.attemptID = attemptID; receipt.previousAttemptID = previousAttemptID; receipt.responseID = replyID
-              let pendingReceipt = receipt
-              try await detachedWork {
-                try vault.encode(pendingReceipt, kind: .receipt, id: attemptID)
-                try vault.encode(pendingReceipt, kind: .receipt, id: replyID)
-              }
-              let checkpointStore = self.store
-              let generation = GenerationIdentity(kind: interaction == .ask ? .consultation : .documentResponse,
-                operationID: flag.operationID, recordID: replyID, attemptID: attemptID,
-                model: provider, seed: seed, requestDigest: Digest.sha256(plan.rawPrompt), maxTokens: outputLimit,
-                generationPolicy: executionPolicy)
-              let deliveryTrace = PerformanceTrace.firstDelivery()
-              let cacheSources = try self.sourceReferences(for: sourceDocuments)
-              let cacheTargetID = responseAuthority.target?.id
-              guard let admissionChat = self.state.chats.first(where: { $0.id == chat.id }) else {
-                throw BoomError.stale("The captured chat was removed.")
-              }
-              let generationPairedAdmission = self.makePairedContextAdmission(runner: runner, purpose: .consultation,
-                owner: cacheOwner, flag: flag, sharingAttempt: fitPairedAdmission) { [weak self] in
-                guard let workspace = self else { throw CancellationError() }
-                try await workspace.validateConsultationAdmissionSource(chat: admissionChat, sources: cacheSources,
-                  attachments: attachmentSources, targetID: cacheTargetID,
-                  requiredDocumentID: interaction == .ask ? nil : document?.id, flag: flag)
-              }
-              let joinedRetention = try self.makeJoinedRetentionRequest(owner: cacheOwner,
-                runner: runner, policy: executionPolicy, operationID: flag.operationID)
-              defer { self.finishJoinedRetentionRequest(joinedRetention) }
-              let result = try await runner.run(plan: plan, images: images, media: media.media, maxTokens: outputLimit,
-                seed: seed, flag: flag, cacheOwner: cacheOwner, executionPolicy: executionPolicy,
-                joinedRetention: joinedRetention,
-                beforeCachePublication: { [weak self] in
-                  guard let self else { throw CancellationError() }
-                  try await self.revalidateResponseSources(cacheSources,
-                    attachments: attachmentSources, targetID: cacheTargetID)
-                  try await MainActor.run {
-                    try flag.check()
-                    guard self.activeFlag === flag,
-                      self.state.chats.contains(where: { $0.id == chat.id }),
-                      interaction == .ask || self.state.selectedDocument == document?.id else {
-                      throw BoomError.stale("The request owner changed before prompt-cache publication.")
-                    }
-                  }
-                },
-                pairedAdmission: generationPairedAdmission,
-                onCheckpoint: { progress, stop, token in
-                  try await checkpointStore.checkpoint(progress, identity: generation, stopReason: stop, stopTokenID: token)
-                }) { [weak self] text in
-                  Task { @MainActor in
-                    guard let self, self.activeFlag === flag, !flag.isCancelled else { return }
-                    if interaction == .ask {
-                      self.streamingText = text
-                      if let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
-                        let m = self.state.chats[c].messages.firstIndex(where: { $0.id == replyIDs[offset] }),
-                        self.state.chats[c].messages[m].state == .pending {
-                        self.state.chats[c].messages[m].text = text
-                      }
-                      deliveryTrace?.published()
-                    }
-                  }
-                }
-              receipt.promptDigest = result.promptDigest; receipt.tokenIDs = result.tokenIDs
-              receipt.stopReason = result.stopReason; receipt.firstTokenSeconds = result.firstTokenSeconds
-              receipt.stopTokenID = result.stopTokenID
-              receipt.elapsedSeconds = result.elapsedSeconds
-              receipt.executionOrigin = result.executionOrigin
-              if result.stopReason == "cancelled" { receipt.state = .cancelled }
-              let emittedReceipt = receipt
-              try await detachedWork {
-                try vault.encode(emittedReceipt, kind: .receipt, id: attemptID)
-                try vault.encode(emittedReceipt, kind: .receipt, id: replyID)
-              }
-              if interaction == .ask,
-                let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
-                let m = self.state.chats[c].messages.firstIndex(where: { $0.id == replyID }) {
-                self.state.chats[c].messages[m].text = result.text
-              }
-              try flag.check()
-              try await self.revalidateResponseSources(try self.sourceReferences(for: sourceDocuments), attachments: attachmentSources, targetID: responseAuthority.target?.id)
-              guard interaction == .ask || self.state.selectedDocument == document?.id else { throw BoomError.stale("Active document changed.") }
-              var issue: String?
-              var refreshContext = false
-              if interaction != .ask {
-                let capturedAuthority = responseAuthority
-                let parsed = try await detachedWork { try DocumentTools.response(result.text, authority: capturedAuthority) }
-                issue = parsed.issue
-                if issue == nil, let patch = parsed.edits.first, let base = responseAuthority.target,
-                  let current = responseAuthority.capture?.modelSnapshot {
-                  do { _ = try await detachedWork { try DocumentTools.validate(patch,
-                    grant: DocumentGrant(mode: interaction, snapshot: base), current: current) } }
-                  catch { issue = error.localizedDescription; refreshContext = current.revision != base.revision }
-                }
-              }
-              var message: ChatMessage?
-              if issue == nil {
-                guard !result.text.isEmpty else { throw BoomError.unavailable("The model ended before producing an answer.") }
-                let pending = ChatMessage(id: replyID, role: .assistant, text: "", sources: attemptSources,
-                  state: .pending, provider: provider, speaker: voice?.speaker ?? Speaker(name: "Bloom"))
-                do {
-                  let completed = try await self.finishConsultationResponse(result.text, pending: pending,
-                    chatID: chat.id, authority: responseAuthority,
-                    documentSources: try self.sourceReferences(for: sourceDocuments),
-                    attachments: attachmentSources, recovering: true)
-                  if completed.state == .failed {
-                    issue = completed.failure
-                    refreshContext = self.pagedSession?.generation != responseAuthority.capture?.generation
-                  } else { message = completed }
-                } catch is DocumentMergeConflict {
-                  issue = "Intervening manuscript changes conflict with this attempt."
-                  refreshContext = true
-                }
-              }
-              if let issue {
-                // Fail the joined producer privately. Never add malformed output
-                // to history, or let a retry overwrite an earlier attempt journal.
-                receipt.state = .failed; receipt.failure = issue
-                let failedReceipt = receipt
-                try await detachedWork {
-                  try vault.encode(failedReceipt, kind: .receipt, id: attemptID)
-                  try vault.encode(failedReceipt, kind: .receipt, id: replyID)
-                }
-                previousAttemptID = attemptID
-                self.status = "Preparing document changes…"
-                if refreshContext {
-                  guard let targetID = authority.target?.id, self.state.selectedDocument == targetID else {
-                    throw BoomError.stale("Choose the original document before requesting a fresh proposal.")
-                  }
-                  let refreshedGraph = try await self.captureChatContext(request: request,
-                    attachedDocumentID: chat.attachedDocumentID, editingDocumentID: targetID, flag: flag)
-                  self.consultationCaptures = Dictionary(uniqueKeysWithValues: refreshedGraph.captures.map { ($0.documentID, $0) })
-                  guard let freshTarget = refreshedGraph.captures.first(where: { $0.documentID == targetID }) else { throw BoomError.stale("The refreshed target was removed.") }
-                  responseAuthority = CapturedDocumentAuthority(mode: interaction, target: freshTarget.modelSnapshot, capture: freshTarget)
-                  sourceDocuments = refreshedGraph.documents
-                  let fullContext: String, refreshedContext: RenderedReferenceContext?, refreshedSources: [SourceReference]
-                  let refreshedDocuments = sourceDocuments, refreshedAuthority = responseAuthority
-                  if promptContract == .referenceBindingsV3 {
-                    let rendered = try await detachedWork {
-                      try DocumentTools.renderedContext(refreshedDocuments, attachments: capturedAttachments, authority: refreshedAuthority)
-                    }
-                    refreshedContext = rendered; fullContext = rendered.prompt
-                    refreshedSources = refreshedGraph.promptSources
-                      + attachments.filter { !$0.text.isEmpty }.map(\.reference)
-                  } else {
-                    let recapturedContext = try await detachedWork { try DocumentTools.context(refreshedDocuments, authority: refreshedAuthority) }
-                    fullContext = [recapturedContext, attachmentText].filter { !$0.isEmpty }.joined(separator: "\n\n")
-                    refreshedContext = nil; refreshedSources = []
-                  }
-                  guard let refitChat = self.state.chats.first(where: { $0.id == chat.id }) else {
-                    throw BoomError.stale("The captured chat was removed.")
-                  }
-                  let refitSources = try self.sourceReferences(for: sourceDocuments)
-                  let refitTargetID = responseAuthority.target?.id
-                  let refitPairedAdmission = self.makePairedContextAdmission(runner: runner, purpose: .consultation,
-                    owner: cacheOwner, flag: flag, sharingAttempt: fitPairedAdmission) { [weak self] in
-                    guard let workspace = self else { throw CancellationError() }
-                    try await workspace.validateConsultationAdmissionSource(chat: refitChat, sources: refitSources,
-                      attachments: attachmentSources, targetID: refitTargetID,
-                      requiredDocumentID: document?.id, flag: flag)
-                  }
-                  let refreshed = try await runner.fittedRound(voices: [voice], history: fitted.history + round,
-                    instructions: instructions, context: fullContext, request: request, routing: slugs,
-                    images: images, media: media.media, reserves: [outputLimit], flag: flag,
-                    authority: responseAuthority, cacheOwner: cacheOwner,
-                    pairedAdmission: refitPairedAdmission, promptContract: promptContract,
-                    renderedContext: refreshedContext, capturedSources: refreshedSources)
-                  guard let refreshedPlan = refreshed.plans.first else { throw BoomError.invalid("Missing captured response plan.") }
-                  plan = refreshedPlan
-                }
-                continue
-              }
-              guard let message else { throw BoomError.invalid("Missing completed answer.") }
-              round.append(message)
-              receipt.state = message.state
-              receipt.failure = message.failure
-              let completedReceipt = receipt
-              try await detachedWork {
-                try vault.encode(completedReceipt, kind: .receipt, id: attemptID)
-                try vault.encode(completedReceipt, kind: .receipt, id: replyID)
-              }
-              self.streamingText = ""
-              if interaction == .ask { self.status = "Local answer · \(result.promptTokens) prompt tokens" }
-              try await self.flush()
-              break
+        // Separate voices answer the same captured history independently.
+        // Discussion rounds, document mutations, replay and media stay ordered.
+        var independent: [(ConsultationReceipt, Result<MLXGemmaRunner.Output, Error>)]?
+        if interaction == .ask, style == .separate, replay == nil,
+          images.isEmpty, media.media.isEmpty, targets.count > 1, let cacheOwner {
+          let vault = self.store.vault, checkpointStore = self.store
+          let rowFlags = targets.map { _ in CancellationFlag() }
+          let cancellation = flag.onCancel { for row in rowFlags { row.cancel() } }
+          defer { flag.removeCancellationHandler(cancellation) }
+          var receipts: [ConsultationReceipt] = []
+          var requests: [MLXGemmaRunner.IndependentTextRequest] = []
+          var grants: [JoinedKVRetentionRequest?] = []
+          defer { for grant in grants { self.finishJoinedRetentionRequest(grant) } }
+          for (row, voice) in targets.enumerated() {
+            let rowFlag = rowFlags[row], seed = UInt64.random(in: .min ... .max), attemptID = UUID()
+            let plan = plans[row], replyID = replyIDs[row]
+            var receipt = ConsultationReceipt(operationID: rowFlag.operationID, seed: seed, state: .pending,
+              failure: nil, model: provider, voice: voice, plan: plan, sources: sources,
+              promptDigest: Digest.sha256(plan.rawPrompt), tokenIDs: [], stopReason: "pending",
+              firstTokenSeconds: nil, elapsedSeconds: 0, generationPolicy: executionPolicy)
+            receipt.attemptID = attemptID; receipt.responseID = replyID
+            receipts.append(receipt)
+            let pending = receipt
+            try await detachedWork {
+              try vault.encode(pending, kind: .receipt, id: attemptID)
+              try vault.encode(pending, kind: .receipt, id: replyID)
             }
+            let generation = GenerationIdentity(kind: .consultation, operationID: rowFlag.operationID,
+              recordID: replyID, attemptID: attemptID, model: provider, seed: seed,
+              requestDigest: Digest.sha256(plan.rawPrompt), maxTokens: outputLimit,
+              generationPolicy: executionPolicy)
+            let grant = try self.makeJoinedRetentionRequest(owner: cacheOwner, runner: runner,
+              policy: executionPolicy, operationID: rowFlag.operationID)
+            grants.append(grant)
+            let rowAdmission = self.makePairedContextAdmission(runner: runner, purpose: .consultation,
+              owner: cacheOwner, flag: rowFlag, sharingAttempt: fitPairedAdmission) { [weak self] in
+              guard let self else { throw CancellationError() }
+              try await self.validateConsultationAdmissionSource(chat: chat, sources: graph.sources,
+                attachments: attachmentSources, targetID: authority.target?.id,
+                requiredDocumentID: nil, flag: rowFlag, independentHistory: true, ownedBy: ownerFlag)
+            }
+            let deliveryTrace = PerformanceTrace.firstDelivery()
+            requests.append(.init(identity: generation, owner: cacheOwner, input: .consultation(plan),
+              settings: try ProductCore.sampling(.standard), flag: rowFlag, policy: executionPolicy,
+              joinedRetention: grant, pairedAdmission: rowAdmission, beforeCachePublication: { [weak self] in
+                guard let self else { throw CancellationError() }
+                try await self.revalidateResponseSources(graph.sources,
+                  attachments: attachmentSources, targetID: authority.target?.id)
+                try await MainActor.run {
+                  try flag.check(); try rowFlag.check()
+                  guard self.activeFlag === ownerFlag, self.state.chats.contains(where: { $0.id == chat.id }) else {
+                    throw BoomError.stale("The independent answer owner changed before cache publication.")
+                  }
+                }
+              }, onCheckpoint: { progress, stop, token in
+                try await checkpointStore.checkpoint(progress, identity: generation, stopReason: stop, stopTokenID: token)
+              }, onText: { [weak self] text in
+                Task { @MainActor in
+                  guard let self, self.activeFlag === ownerFlag, !rowFlag.isCancelled,
+                    let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
+                    let m = self.state.chats[c].messages.firstIndex(where: { $0.id == replyID }),
+                    self.state.chats[c].messages[m].state == .pending else { return }
+                  self.state.chats[c].messages[m].text = text; deliveryTrace?.published()
+                }
+              }))
           }
-        } catch {
-          if let chatIndex = self.state.chats.firstIndex(where: { $0.id == chat.id }) {
-            for message in self.state.chats[chatIndex].messages.indices where replyIDs.contains(self.state.chats[chatIndex].messages[message].id)
-              && self.state.chats[chatIndex].messages[message].state == .pending {
-              self.state.chats[chatIndex].messages[message].state = flag.isCancelled ? .cancelled : .failed
-              self.state.chats[chatIndex].messages[message].failure = flag.isCancelled ? nil : "Bloom couldn't finish this answer. You can try again."
+          let outputs = await runner.runIndependentText(requests)
+          independent = Array(zip(receipts, outputs))
+        }
+        responses: for (offset, voice) in targets.enumerated() {
+          try flag.check()
+          self.status = voice.map { "Consulting @\($0.slug)…" } ?? "Generating locally…"
+          self.streamingText = ""
+          var plan: ConsultationPlan
+          if style == .discuss, !round.isEmpty {
+            plan = try ProductCore.prompt(voice: voice, history: fitted.history + round,
+              instructions: instructions, context: context, request: request, routing: slugs,
+              authority: authority, promptContract: promptContract,
+              renderedContext: renderedContext, capturedSources: capturedContextSources)
+          } else { plan = plans[offset] }
+          if let entry = independent?[offset], case .failure(let error) = entry.1 {
+            var receipt = entry.0
+            if let journal = try await self.store.consultationCheckpoint(id: replyIDs[offset], receipt: receipt) {
+              receipt.retain(journal)
             }
-          }
-          let vault = self.store.vault, failedIDs = replyIDs, reason = error.localizedDescription
-          let checkpointStore = self.store
-          let ending: MessageState = flag.isCancelled ? .cancelled : .failed
-          do {
-            let restored: [(UUID, GenerationCheckpoint)] = try await detachedWork {
-              var restored: [(UUID, GenerationCheckpoint)] = []
-              for id in failedIDs where vault.exists(.receipt, id) {
-                var receipt = try vault.decode(ConsultationReceipt.self, kind: .receipt, id: id)
-                if receipt.state == .pending {
-                  if let journal = try await checkpointStore.consultationCheckpoint(id: id, receipt: receipt) {
-                    receipt.retain(journal); restored.append((id, journal))
-                  }
-                  receipt.state = ending; receipt.failure = reason; receipt.stopReason = ending.rawValue
-                  if let attemptID = receipt.attemptID { try vault.encode(receipt, kind: .receipt, id: attemptID) }
-                  try vault.encode(receipt, kind: .receipt, id: id)
-                }
-              }
-              return restored
+            receipt.state = error is CancellationError ? .cancelled : .failed
+            receipt.failure = error.localizedDescription; receipt.stopReason = receipt.state.rawValue
+            let failed = receipt, vault = self.store.vault
+            try await detachedWork {
+              if let attempt = failed.attemptID { try vault.encode(failed, kind: .receipt, id: attempt) }
+              try vault.encode(failed, kind: .receipt, id: replyIDs[offset])
             }
-            for (id, journal) in restored where journal.identity.kind == .consultation {
-              if let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
-                let m = self.state.chats[c].messages.firstIndex(where: { $0.id == id }),
-                self.state.chats[c].messages[m].state == ending {
+            if let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
+              let m = self.state.chats[c].messages.firstIndex(where: { $0.id == replyIDs[offset] }) {
+              self.state.chats[c].messages[m].state = receipt.state
+              self.state.chats[c].messages[m].failure = receipt.failure
+              if let journal = try await self.store.consultationCheckpoint(id: replyIDs[offset], receipt: receipt) {
                 self.state.chats[c].messages[m].text = journal.progress.text
               }
             }
-          } catch { self.report(error) }
-          self.scheduleSave()
-          self.composerIssue = flag.isCancelled ? nil : "Bloom couldn't finish this answer. You can try again."
-          self.status = flag.isCancelled ? "Cancelled" : "Answer interrupted"
+            continue responses
+          }
+          var responseAuthority = authority
+          var sourceDocuments = graph.documents
+          var previousAttemptID = replay?.previousAttemptID
+          while true {
+            try flag.check()
+            try await self.revalidateResponseSources(try self.sourceReferences(for: sourceDocuments), attachments: attachmentSources, targetID: responseAuthority.target?.id)
+            guard interaction == .ask || self.state.selectedDocument == document?.id else { throw BoomError.stale("Active document changed.") }
+            let attemptSources = try self.sourceReferences(for: sourceDocuments) + attachmentSources
+            let seed = independent?[offset].0.seed ?? UInt64.random(in: .min ... .max), vault = self.store.vault
+            let attemptID = independent?[offset].0.attemptID ?? UUID()
+            var receipt = ConsultationReceipt(operationID: flag.operationID, seed: seed, state: .pending,
+              failure: nil, model: provider, voice: voice, plan: plan, sources: attemptSources,
+              promptDigest: Digest.sha256(plan.rawPrompt), tokenIDs: [], stopReason: "pending",
+              firstTokenSeconds: nil, elapsedSeconds: 0, generationPolicy: executionPolicy)
+            let replyID = replyIDs[offset]
+            if let prepared = independent?[offset].0 { receipt = prepared }
+            receipt.media = media.media.isEmpty ? nil : media.media.map(\.reference)
+            receipt.attemptID = attemptID; receipt.previousAttemptID = previousAttemptID; receipt.responseID = replyID
+            let pendingReceipt = receipt
+            try await detachedWork {
+              try vault.encode(pendingReceipt, kind: .receipt, id: attemptID)
+              try vault.encode(pendingReceipt, kind: .receipt, id: replyID)
+            }
+            let checkpointStore = self.store
+            let generation = GenerationIdentity(kind: interaction == .ask ? .consultation : .documentResponse,
+              operationID: flag.operationID, recordID: replyID, attemptID: attemptID,
+              model: provider, seed: seed, requestDigest: Digest.sha256(plan.rawPrompt), maxTokens: outputLimit,
+              generationPolicy: executionPolicy)
+            let deliveryTrace = PerformanceTrace.firstDelivery()
+            let cacheSources = try self.sourceReferences(for: sourceDocuments)
+            let cacheTargetID = responseAuthority.target?.id
+            guard let admissionChat = self.state.chats.first(where: { $0.id == chat.id }) else {
+              throw BoomError.stale("The captured chat was removed.")
+            }
+            let generationPairedAdmission = self.makePairedContextAdmission(runner: runner, purpose: .consultation,
+              owner: cacheOwner, flag: flag, sharingAttempt: fitPairedAdmission) { [weak self] in
+              guard let workspace = self else { throw CancellationError() }
+              try await workspace.validateConsultationAdmissionSource(chat: admissionChat, sources: cacheSources,
+                attachments: attachmentSources, targetID: cacheTargetID,
+                requiredDocumentID: interaction == .ask ? nil : document?.id, flag: flag,
+                independentHistory: interaction == .ask && style == .separate, ownedBy: ownerFlag)
+            }
+            let joinedRetention = try self.makeJoinedRetentionRequest(owner: cacheOwner,
+              runner: runner, policy: executionPolicy, operationID: flag.operationID)
+            defer { self.finishJoinedRetentionRequest(joinedRetention) }
+            let result: MLXGemmaRunner.Output
+            if let prepared = independent?[offset] { result = try prepared.1.get() }
+            else { result = try await runner.run(plan: plan, images: images, media: media.media, maxTokens: outputLimit,
+              seed: seed, flag: flag, independentIdentity: generation, cacheOwner: cacheOwner, executionPolicy: executionPolicy,
+              joinedRetention: joinedRetention,
+              beforeCachePublication: { [weak self] in
+                guard let self else { throw CancellationError() }
+                try await self.revalidateResponseSources(cacheSources,
+                  attachments: attachmentSources, targetID: cacheTargetID)
+                try await MainActor.run {
+                  try flag.check()
+                  guard self.activeFlag === ownerFlag,
+                    self.state.chats.contains(where: { $0.id == chat.id }),
+                    interaction == .ask || self.state.selectedDocument == document?.id else {
+                    throw BoomError.stale("The request owner changed before prompt-cache publication.")
+                  }
+                }
+              },
+              pairedAdmission: generationPairedAdmission,
+              onCheckpoint: { progress, stop, token in
+                try await checkpointStore.checkpoint(progress, identity: generation, stopReason: stop, stopTokenID: token)
+              }) { [weak self] text in
+                Task { @MainActor in
+                  guard let self, self.activeFlag === ownerFlag, !flag.isCancelled else { return }
+                  if interaction == .ask {
+                    self.streamingText = text
+                    if let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
+                      let m = self.state.chats[c].messages.firstIndex(where: { $0.id == replyIDs[offset] }),
+                      self.state.chats[c].messages[m].state == .pending {
+                      self.state.chats[c].messages[m].text = text
+                    }
+                    deliveryTrace?.published()
+                  }
+                }
+              }
+            }
+            receipt.promptDigest = result.promptDigest; receipt.tokenIDs = result.tokenIDs
+            receipt.stopReason = result.stopReason; receipt.firstTokenSeconds = result.firstTokenSeconds
+            receipt.stopTokenID = result.stopTokenID
+            receipt.elapsedSeconds = result.elapsedSeconds
+            receipt.executionOrigin = result.executionOrigin
+            if result.stopReason == "cancelled" { receipt.state = .cancelled }
+            let emittedReceipt = receipt
+            try await detachedWork {
+              try vault.encode(emittedReceipt, kind: .receipt, id: attemptID)
+              try vault.encode(emittedReceipt, kind: .receipt, id: replyID)
+            }
+            if interaction == .ask,
+              let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
+              let m = self.state.chats[c].messages.firstIndex(where: { $0.id == replyID }) {
+              self.state.chats[c].messages[m].text = result.text
+            }
+            try flag.check()
+            try await self.revalidateResponseSources(try self.sourceReferences(for: sourceDocuments), attachments: attachmentSources, targetID: responseAuthority.target?.id)
+            guard interaction == .ask || self.state.selectedDocument == document?.id else { throw BoomError.stale("Active document changed.") }
+            var issue: String?
+            var refreshContext = false
+            if interaction != .ask {
+              let capturedAuthority = responseAuthority
+              let parsed = try await detachedWork { try DocumentTools.response(result.text, authority: capturedAuthority) }
+              issue = parsed.issue
+              if issue == nil, let patch = parsed.edits.first, let base = responseAuthority.target,
+                let current = responseAuthority.capture?.modelSnapshot {
+                do { _ = try await detachedWork { try DocumentTools.validate(patch,
+                  grant: DocumentGrant(mode: interaction, snapshot: base), current: current) } }
+                catch { issue = error.localizedDescription; refreshContext = current.revision != base.revision }
+              }
+            }
+            var message: ChatMessage?
+            if issue == nil {
+              guard !result.text.isEmpty else { throw BoomError.unavailable("The model ended before producing an answer.") }
+              let pending = ChatMessage(id: replyID, role: .assistant, text: "", sources: attemptSources,
+                state: .pending, provider: provider, speaker: voice?.speaker ?? Speaker(name: "Bloom"))
+              do {
+                let completed = try await self.finishConsultationResponse(result.text, pending: pending,
+                  chatID: chat.id, authority: responseAuthority,
+                  documentSources: try self.sourceReferences(for: sourceDocuments),
+                  attachments: attachmentSources, recovering: true)
+                if completed.state == .failed {
+                  issue = completed.failure
+                  refreshContext = self.pagedSession?.generation != responseAuthority.capture?.generation
+                } else { message = completed }
+              } catch is DocumentMergeConflict {
+                issue = "Intervening manuscript changes conflict with this attempt."
+                refreshContext = true
+              }
+            }
+            if let issue {
+              // Fail the joined producer privately. Never add malformed output
+              // to history, or let a retry overwrite an earlier attempt journal.
+              receipt.state = .failed; receipt.failure = issue
+              let failedReceipt = receipt
+              try await detachedWork {
+                try vault.encode(failedReceipt, kind: .receipt, id: attemptID)
+                try vault.encode(failedReceipt, kind: .receipt, id: replyID)
+              }
+              previousAttemptID = attemptID
+              self.status = "Preparing document changes…"
+              if refreshContext {
+                guard let targetID = authority.target?.id, self.state.selectedDocument == targetID else {
+                  throw BoomError.stale("Choose the original document before requesting a fresh proposal.")
+                }
+                let refreshedGraph = try await self.captureChatContext(request: request,
+                  attachedDocumentID: chat.attachedDocumentID, editingDocumentID: targetID, flag: flag)
+                self.consultationCaptures = Dictionary(uniqueKeysWithValues: refreshedGraph.captures.map { ($0.documentID, $0) })
+                guard let freshTarget = refreshedGraph.captures.first(where: { $0.documentID == targetID }) else { throw BoomError.stale("The refreshed target was removed.") }
+                responseAuthority = CapturedDocumentAuthority(mode: interaction, target: freshTarget.modelSnapshot, capture: freshTarget)
+                sourceDocuments = refreshedGraph.documents
+                let fullContext: String, refreshedContext: RenderedReferenceContext?, refreshedSources: [SourceReference]
+                let refreshedDocuments = sourceDocuments, refreshedAuthority = responseAuthority
+                if promptContract == .referenceBindingsV3 {
+                  let rendered = try await detachedWork {
+                    try DocumentTools.renderedContext(refreshedDocuments, attachments: capturedAttachments, authority: refreshedAuthority)
+                  }
+                  refreshedContext = rendered; fullContext = rendered.prompt
+                  refreshedSources = refreshedGraph.promptSources
+                    + attachments.filter { !$0.text.isEmpty }.map(\.reference)
+                } else {
+                  let recapturedContext = try await detachedWork { try DocumentTools.context(refreshedDocuments, authority: refreshedAuthority) }
+                  fullContext = [recapturedContext, attachmentText].filter { !$0.isEmpty }.joined(separator: "\n\n")
+                  refreshedContext = nil; refreshedSources = []
+                }
+                guard let refitChat = self.state.chats.first(where: { $0.id == chat.id }) else {
+                  throw BoomError.stale("The captured chat was removed.")
+                }
+                let refitSources = try self.sourceReferences(for: sourceDocuments)
+                let refitTargetID = responseAuthority.target?.id
+                let refitPairedAdmission = self.makePairedContextAdmission(runner: runner, purpose: .consultation,
+                  owner: cacheOwner, flag: flag, sharingAttempt: fitPairedAdmission) { [weak self] in
+                  guard let workspace = self else { throw CancellationError() }
+                  try await workspace.validateConsultationAdmissionSource(chat: refitChat, sources: refitSources,
+                    attachments: attachmentSources, targetID: refitTargetID,
+                    requiredDocumentID: document?.id, flag: flag)
+                }
+                let refreshed = try await runner.fittedRound(voices: [voice], history: fitted.history + round,
+                  instructions: instructions, context: fullContext, request: request, routing: slugs,
+                  images: images, media: media.media, reserves: [outputLimit], flag: flag,
+                  authority: responseAuthority, cacheOwner: cacheOwner,
+                  pairedAdmission: refitPairedAdmission, promptContract: promptContract,
+                  renderedContext: refreshedContext, capturedSources: refreshedSources)
+                guard let refreshedPlan = refreshed.plans.first else { throw BoomError.invalid("Missing captured response plan.") }
+                plan = refreshedPlan
+              }
+              continue
+            }
+            guard let message else { throw BoomError.invalid("Missing completed answer.") }
+            round.append(message)
+            receipt.state = message.state
+            receipt.failure = message.failure
+            let completedReceipt = receipt
+            try await detachedWork {
+              try vault.encode(completedReceipt, kind: .receipt, id: attemptID)
+              try vault.encode(completedReceipt, kind: .receipt, id: replyID)
+            }
+            self.streamingText = ""
+            if interaction == .ask { self.status = "Local answer · \(result.promptTokens) prompt tokens" }
+            try await self.flush()
+            break
+          }
         }
+      } catch {
+        if let chatIndex = self.state.chats.firstIndex(where: { $0.id == chat.id }) {
+          for message in self.state.chats[chatIndex].messages.indices where replyIDs.contains(self.state.chats[chatIndex].messages[message].id)
+            && self.state.chats[chatIndex].messages[message].state == .pending {
+            self.state.chats[chatIndex].messages[message].state = flag.isCancelled ? .cancelled : .failed
+            self.state.chats[chatIndex].messages[message].failure = flag.isCancelled ? nil : "Bloom couldn't finish this answer. You can try again."
+          }
+        }
+        let vault = self.store.vault, failedIDs = replyIDs, reason = error.localizedDescription
+        let checkpointStore = self.store
+        let ending: MessageState = flag.isCancelled ? .cancelled : .failed
+        do {
+          let restored: [(UUID, GenerationCheckpoint)] = try await detachedWork {
+            var restored: [(UUID, GenerationCheckpoint)] = []
+            for id in failedIDs where vault.exists(.receipt, id) {
+              var receipt = try vault.decode(ConsultationReceipt.self, kind: .receipt, id: id)
+              if receipt.state == .pending {
+                if let journal = try await checkpointStore.consultationCheckpoint(id: id, receipt: receipt) {
+                  receipt.retain(journal); restored.append((id, journal))
+                }
+                receipt.state = ending; receipt.failure = reason; receipt.stopReason = ending.rawValue
+                if let attemptID = receipt.attemptID { try vault.encode(receipt, kind: .receipt, id: attemptID) }
+                try vault.encode(receipt, kind: .receipt, id: id)
+              }
+            }
+            return restored
+          }
+          for (id, journal) in restored where journal.identity.kind == .consultation {
+            if let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
+              let m = self.state.chats[c].messages.firstIndex(where: { $0.id == id }),
+              self.state.chats[c].messages[m].state == ending {
+              self.state.chats[c].messages[m].text = journal.progress.text
+            }
+          }
+        } catch { self.report(error) }
+        self.scheduleSave()
+        self.composerIssue = flag.isCancelled ? nil : "Bloom couldn't finish this answer. You can try again."
+        self.status = flag.isCancelled ? "Cancelled" : "Answer interrupted"
+      }
+  }
+  private func startPendingConsultations() {
+    guard !isBusy, !pagedShutdownRequested, !pendingConsultations.isEmpty else { return }
+    let ready = Array(pendingConsultations.prefix(4))
+    work("Consulting…") { [weak self] flag in
+      guard let self else { return }
+      // Leave accepted questions in the existing queue until this real body
+      // enters. Stop before its first turn can still disposition every message.
+      self.pendingConsultations.removeAll { queued in
+        ready.contains { $0.userMessageID == queued.userMessageID }
+      }
+      self.pendingConsultationCount = self.pendingConsultations.count
+      // The same foreground Task joins every prepared request. Their actual
+      // runner submits ready compatible rows into its existing GPU wait queue.
+      let requests = ready.map { _ in CancellationFlag() }
+      let cancellation = flag.onCancel { for request in requests { request.cancel() } }
+      defer { flag.removeCancellationHandler(cancellation) }
+      await withTaskGroup(of: Void.self) { group in
+        for (captured, request) in zip(ready, requests) {
+          group.addTask { @MainActor in
+            do {
+              try await self.performConsultation(captured, flag: request, ownedBy: flag)
+              self.finishPendingConsultation(captured,
+                error: BoomError.unavailable("The captured question did not enter generation."))
+            }
+            catch is CancellationError { self.finishPendingConsultation(captured, error: nil) }
+            catch { self.finishPendingConsultation(captured, error: error); self.report(error) }
+          }
+        }
+      }
     }
+  }
+  private func finishPendingConsultation(_ captured: PendingConsultation, error: Error?) {
+    guard let id = captured.userMessageID,
+      let chat = state.chats.firstIndex(where: { $0.id == captured.chat.id }),
+      let message = state.chats[chat].messages.firstIndex(where: { $0.id == id }),
+      state.chats[chat].messages[message].state == .pending else { return }
+    state.chats[chat].messages[message].state = error == nil ? .cancelled : .failed
+    state.chats[chat].messages[message].failure = error?.localizedDescription
   }
   func finishConsultationResponse(_ text: String, pending: ChatMessage, chatID: UUID,
     authority: CapturedDocumentAuthority, documentSources: [SourceReference], attachments: [SourceReference], recovering: Bool = false
@@ -3033,11 +3244,17 @@ private struct BoundedConsultationContext: Sendable {
     return released
   }
   private func validateConsultationAdmissionSource(chat: ChatRecord, sources: [SourceReference],
-    attachments: [SourceReference], targetID: UUID?, requiredDocumentID: UUID?, flag: CancellationFlag) async throws {
+    attachments: [SourceReference], targetID: UUID?, requiredDocumentID: UUID?, flag: CancellationFlag,
+    independentHistory: Bool = false, ownedBy scopeOwner: CancellationFlag? = nil) async throws {
     func check() throws {
       try flag.check()
-      guard activeFlag === flag, state.selectedChat == chat.id,
-        state.chats.first(where: { $0.id == chat.id })?.contentVersion == chat.contentVersion,
+      guard let current = state.chats.first(where: { $0.id == chat.id }), activeFlag === (scopeOwner ?? flag),
+        (independentHistory || state.selectedChat == chat.id),
+        (independentHistory ? current.instructions == chat.instructions
+          && current.attachedDocumentID == chat.attachedDocumentID
+          && chat.messages.filter({ $0.state == .complete }).allSatisfy({ message in
+            current.messages.first(where: { $0.id == message.id }) == message
+          }) : current.contentVersion == chat.contentVersion),
         requiredDocumentID == nil || state.selectedDocument == requiredDocumentID else {
         throw BoomError.stale("The captured consultation changed before paired-model reclamation.")
       }
@@ -3352,6 +3569,7 @@ private struct BoundedConsultationContext: Sendable {
   private func finishWorkspaceBackupCapture(_ id: UUID) {
     guard activeID == id else { return }
     isBusy = false; activeID = nil; activeFlag = nil
+    startPendingConsultations()
     scheduleSave(); refreshVisibleSearch(); scheduleCompletion()
   }
   func importModel() {

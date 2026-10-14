@@ -13,22 +13,30 @@ final class ResidentPrefixAdversarialTests: XCTestCase {
     caches: () throws -> [KVCache]) throws -> PromptPrefixCache.Session {
     try store.makeSession(owner: owner, input: LMInput(tokens: MLXArray(ids, [1, ids.count])),
       promptTokenIDs: ids, prefill: PrefillParameters(stepSize: 4, chunking: .remainder),
-      makeCache: caches)
+      useActiveNative: true, makeCache: caches)
   }
 
-  private func append(_ request: PromptPrefixCache.Session, ids: [Int], width: Int = 1) {
+  private func append(_ request: PromptPrefixCache.Session, ids: [Int], width: Int = 1, submitted: Bool = true) async {
     let keys = MLXArray(ids.map(Float.init), [width, 1, ids.count / width, 1])
     let values = MLXArray(ids.map { -Float($0) - 1 }, [width, 1, ids.count / width, 1])
     for cache in request.cache { _ = cache.update(keys: keys, values: values) }
+      if submitted {
+      asyncEval(request.cache.flatMap { $0.innerState() })
+      eval(request.cache); request.markCacheSubmitted()
+      request.observeReadySpill(); await request.joinPendingSpill(cancelled: false)
+    }
   }
 
-  private func prefill(_ request: PromptPrefixCache.Session) throws {
+  private func prefill(_ request: PromptPrefixCache.Session) async throws {
     let ids = request.input.text.tokens.asArray(Int.self)
-    let done = try request.prefill.forEachChunk(total: ids.count) { range in
-      append(request, ids: Array(ids[range]))
+    var partition = request.prefill; partition.progress = nil
+    var ranges: [Range<Int>] = []
+    let done = try partition.forEachChunk(total: ids.count) { ranges.append($0) }
+    if done < ids.count { ranges.append(done..<ids.count) }
+    for range in ranges {
+      await append(request, ids: Array(ids[range]))
+      request.prefill.progress?(range.upperBound, ids.count)
     }
-    append(request, ids: Array(ids[done...]))
-    request.prefill.progress?(ids.count, ids.count)
   }
 
   private func expand(_ request: PromptPrefixCache.Session, width: Int) {
@@ -43,11 +51,11 @@ final class ResidentPrefixAdversarialTests: XCTestCase {
     XCTAssertEqual(cache.state[1].asArray(Float.self), ids.map { -Float($0) - 1 }, file: file, line: line)
   }
 
-  func testActualHeterogeneousLayerBytesRejectTheWholeCohortAndPermitASmallControl() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testActualHeterogeneousLayerBytesRejectTheWholeCohortAndPermitASmallControl() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let ids = Array(0..<4), scope = owner(), limit: UInt64 = 64
       let store = PromptPrefixCache(byteLimit: limit)
-      let rejected = try session(store, ids: ids, owner: scope) { [KVCacheSimple(), KVCacheSimple()] }
+      let rejected = try session(store, ids: ids, owner: scope) { [0, 1].map { _ in let cache = KVCacheSimple(); cache.step = 4; return cache } }
       let smallKeys = MLXArray(ids.map(Float.init), [1, 1, ids.count, 1]).asType(.float16)
       let smallValues = MLXArray(ids.map { -Float($0) - 1 }, [1, 1, ids.count, 1]).asType(.float16)
       let largeKeys = MLXArray(Array(repeating: Float(123), count: 2 * ids.count * 4),
@@ -60,17 +68,20 @@ final class ResidentPrefixAdversarialTests: XCTestCase {
       XCTAssertGreaterThan(actualBytes, limit, "The actual heterogeneous cohort must exceed the bound.")
 
       _ = rejected.cache[0].update(keys: smallKeys, values: smallValues)
-      XCTAssertEqual(rejected.stagedBytesUpperBound, firstLayerBytes)
+      XCTAssertEqual(rejected.stagedBytesUpperBound, 0, "No incoming RAM page is archived before the completed raw handoff.")
       _ = rejected.cache[1].update(keys: largeKeys, values: largeValues)
       rejected.prefill.progress?(ids.count, ids.count)
       XCTAssertEqual(rejected.cache.map(\.offset), [ids.count, ids.count], "Capture refusal must not alter native execution.")
       XCTAssertEqual(rejected.stagedBytesUpperBound, 0, "A rejected cohort must release its already tapped layer.")
-      XCTAssertTrue(rejected.stagedAnchorTokenCounts.isEmpty)
-      XCTAssertFalse(store.publish(rejected))
-      XCTAssertFalse(store.hasAnchors)
+      asyncEval(rejected.cache.flatMap { $0.innerState() }); eval(rejected.cache)
+      rejected.markCacheSubmitted(); await rejected.joinPendingSpill(cancelled: false)
+      XCTAssertTrue(store.publish(rejected), "The actual complete native cache remains usable even when a large parent cannot spill.")
+      XCTAssertEqual(rejected.retentionObservation?.refusalReason, "pool_limit")
+      store.clear() // next factory has a different actual head/dtype layout
+
       XCTAssertEqual(store.retainedBytesUpperBound, 0)
 
-      let accepted = try session(store, ids: ids, owner: scope) { [KVCacheSimple(), KVCacheSimple()] }
+      let accepted = try session(store, ids: ids, owner: scope) { [0, 1].map { _ in let cache = KVCacheSimple(); cache.step = 4; return cache } }
       let controlKeys = smallKeys.asType(.float32), controlValues = smallValues.asType(.float32)
       let controlBytes = firstLayerBytes + UInt64(controlKeys.nbytes + controlValues.nbytes)
       XCTAssertGreaterThan(controlBytes, 2 * firstLayerBytes, "The fitting control must also correct the initial estimate.")
@@ -78,9 +89,12 @@ final class ResidentPrefixAdversarialTests: XCTestCase {
       _ = accepted.cache[0].update(keys: smallKeys, values: smallValues)
       _ = accepted.cache[1].update(keys: controlKeys, values: controlValues)
       accepted.prefill.progress?(ids.count, ids.count)
+      asyncEval(accepted.cache.flatMap { $0.innerState() }); eval(accepted.cache)
+      accepted.markCacheSubmitted(); await accepted.joinPendingSpill(cancelled: false)
       XCTAssertTrue(store.publish(accepted))
-      XCTAssertEqual(store.retainedBytesUpperBound, controlBytes)
-      let reuse = try session(store, ids: ids + [99], owner: scope) { [KVCacheSimple(), KVCacheSimple()] }
+      XCTAssertEqual(store.retainedBytesUpperBound, 0)
+      XCTAssertEqual(accepted.retentionObservation?.diskBytes, controlBytes)
+      let reuse = try session(store, ids: ids + [99], owner: scope) { [0, 1].map { _ in let cache = KVCacheSimple(); cache.step = 4; return cache } }
       XCTAssertEqual(reuse.cachedTokenCount, ids.count)
       XCTAssertEqual(reuse.cache[0].state[0].dtype, .float16)
       XCTAssertEqual(reuse.cache[1].state[0].dtype, .float32)
@@ -88,18 +102,18 @@ final class ResidentPrefixAdversarialTests: XCTestCase {
     }
   }
 
-  func testFinishedBatchRowSurvivesPeersAdvancingBeyondTwoWindowsWithoutInertTokens() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testFinishedBatchRowSurvivesPeersAdvancingBeyondTwoWindowsWithoutInertTokens() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let store = PromptPrefixCache(byteLimit: 4_096), scope = owner(), ids = Array(0..<9)
       let request = try session(store, ids: ids, owner: scope) {
         [KVCacheSimple(), RotatingKVCache(maxSize: 4, step: 2)]
       }
-      try prefill(request); expand(request, width: 3)
+      try await prefill(request); expand(request, width: 3)
       for row in 0..<3 {
         XCTAssertTrue(request.captureDecodeLane(row: row, width: 3,
           emittedTokenIDs: [901 + row * 100], finished: false))
       }
-      append(request, ids: [901, 1001, 1101], width: 3)
+      await append(request, ids: [901, 1001, 1101], width: 3)
       XCTAssertTrue(request.captureFinishedLane(row: 0, width: 3, emittedTokenIDs: [901, 902]))
       for row in 1..<3 {
         XCTAssertTrue(request.captureDecodeLane(row: row, width: 3,
@@ -108,7 +122,7 @@ final class ResidentPrefixAdversarialTests: XCTestCase {
       let additionalForwards = 12
       XCTAssertGreaterThan(additionalForwards, 2 * 4)
       for step in 1...additionalForwards {
-        append(request, ids: [-1, 1001 + step, 1101 + step], width: 3)
+        await append(request, ids: [-1, 1001 + step, 1101 + step], width: 3)
         for row in 1..<3 {
           let first = 901 + row * 100
           XCTAssertTrue(request.captureDecodeLane(row: row, width: 3,
@@ -135,7 +149,9 @@ final class ResidentPrefixAdversarialTests: XCTestCase {
       let globalBytes = UInt64(ids.count + 3 * (1 + additionalForwards)) * pairBytesPerPosition
       let frozenRowZeroBytes = UInt64(ids.count + 3) * pairBytesPerPosition
       let currentLocalBytes = UInt64(2 * 4 * 3) * pairBytesPerPosition
-      XCTAssertEqual(store.retainedBytesUpperBound, globalBytes + frozenRowZeroBytes + currentLocalBytes)
+      XCTAssertEqual(store.retainedBytesUpperBound, 0)
+      XCTAssertGreaterThanOrEqual(store.retainedNativeBytesUpperBound, globalBytes)
+      _ = (frozenRowZeroBytes, currentLocalBytes) // predecessor RAM archive geometry is preserved in the preimage
       XCTAssertLessThanOrEqual(store.retainedBytesUpperBound, 4_096)
 
       for row in 0..<3 {
@@ -154,13 +170,13 @@ final class ResidentPrefixAdversarialTests: XCTestCase {
     }
   }
 
-  func testImmediateEOSFreezesEnoughResidentCoverageForTheLastPromptTokenToBeRecomputed() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testImmediateEOSFreezesEnoughResidentCoverageForTheLastPromptTokenToBeRecomputed() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let store = PromptPrefixCache(byteLimit: 4_096), scope = owner(), ids = Array(0..<9)
       let request = try session(store, ids: ids, owner: scope) {
         [KVCacheSimple(), RotatingKVCache(maxSize: 4, step: 2)]
       }
-      try prefill(request); expand(request, width: 3)
+      try await prefill(request); expand(request, width: 3)
       XCTAssertTrue(request.captureDecodeLane(row: 0, width: 3, emittedTokenIDs: [],
         stopTokenID: 99, finished: true))
       XCTAssertTrue(request.captureDecodeLane(row: 1, width: 3, emittedTokenIDs: [1000], finished: false))
@@ -168,7 +184,7 @@ final class ResidentPrefixAdversarialTests: XCTestCase {
       let peerForwards = 12
       XCTAssertGreaterThan(peerForwards, 2 * 4)
       for step in 1...peerForwards {
-        append(request, ids: [99, 999 + step, 1999 + step], width: 3)
+        await append(request, ids: [99, 999 + step, 1999 + step], width: 3)
         XCTAssertTrue(request.captureDecodeLane(row: 1, width: 3,
           emittedTokenIDs: Array(1000...(1000 + step)), finished: step == peerForwards))
         XCTAssertTrue(request.captureDecodeLane(row: 2, width: 3,
@@ -189,7 +205,9 @@ final class ResidentPrefixAdversarialTests: XCTestCase {
       let globalBytes = UInt64(ids.count + 3 * peerForwards) * pairBytesPerPosition
       let frozenPromptLocalBytes = UInt64(ids.count) * pairBytesPerPosition
       let currentPeerLocalBytes = UInt64(2 * 4 * 3) * pairBytesPerPosition
-      XCTAssertEqual(store.retainedBytesUpperBound, globalBytes + frozenPromptLocalBytes + currentPeerLocalBytes)
+      XCTAssertEqual(store.retainedBytesUpperBound, 0)
+      XCTAssertGreaterThanOrEqual(store.retainedNativeBytesUpperBound, globalBytes)
+      _ = (frozenPromptLocalBytes, currentPeerLocalBytes)
       XCTAssertLessThanOrEqual(store.retainedBytesUpperBound, 4_096)
 
       let repeatRequest = try session(store, ids: ids, owner: scope) {
@@ -220,19 +238,19 @@ final class ResidentPrefixAdversarialTests: XCTestCase {
     }
   }
 
-  func testLongDecodeKeepsOnlyBoundedResidentWindowsAndHydratesARecentInteriorPrefix() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testLongDecodeKeepsOnlyBoundedResidentWindowsAndHydratesARecentInteriorPrefix() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let window = 4, forwards = 1_024, ids = Array(0..<9), scope = owner()
       let store = PromptPrefixCache(byteLimit: 192)
       let request = try session(store, ids: ids, owner: scope) { [RotatingKVCache(maxSize: window, step: 2)] }
-      try prefill(request)
+      try await prefill(request)
       let ledger = Array(2_000..<(2_000 + forwards))
       let initialRange = 4..<8
       let pairBytesPerPosition = UInt64(2 * MemoryLayout<Float>.size)
       let retainedBound = UInt64(initialRange.count + 2 * window) * pairBytesPerPosition
       for (position, token) in ledger.enumerated() {
         request.didSample?(MLXArray([token]))
-        append(request, ids: [token])
+        await append(request, ids: [token])
         if position >= 2 * window {
           XCTAssertLessThanOrEqual(request.stagedBytesUpperBound, retainedBound,
             "Only the initial reusable window and rolling tail may retain backing charges.")
@@ -240,16 +258,16 @@ final class ResidentPrefixAdversarialTests: XCTestCase {
         if position % 32 == 0 { _ = request.cache[0].state[0].asArray(Float.self) }
       }
       XCTAssertTrue(store.publish(request, completions: [.init(emittedTokenIDs: ledger)]))
-      XCTAssertEqual(store.retainedBytesUpperBound, retainedBound)
+      XCTAssertEqual(store.retainedBytesUpperBound, 0)
       XCTAssertLessThanOrEqual(store.retainedBytesUpperBound, 192)
       let snapshot = try XCTUnwrap(store.retainedSnapshotObservations.first)
       XCTAssertEqual(store.retainedSnapshotObservations.count, 1)
       XCTAssertEqual(snapshot.tokenIDs, ids + ledger)
       XCTAssertEqual(snapshot.origin, .singleDecode)
-      XCTAssertEqual(snapshot.residentLocalStarts, [initialRange.lowerBound])
+      XCTAssertEqual(snapshot.residentLocalStarts, [0])
       XCTAssertEqual(snapshot.residentLocalCoverage, [.init(layer: 0, window: window, keep: 0,
-        intervals: [.init(lowerBound: initialRange.lowerBound, upperBound: initialRange.upperBound),
-          .init(lowerBound: ids.count + forwards - 2 * window, upperBound: ids.count + forwards)])])
+        intervals: [.init(lowerBound: 0, upperBound: ids.count + forwards)])],
+        "Ample disk quota preserves admitted middle intervals without a resident archive.")
       XCTAssertEqual(snapshot.forwardHistory.last?.endTokenCount, ids.count + forwards)
 
       let repeatPrompt = try session(store, ids: ids, owner: scope) {
@@ -262,9 +280,9 @@ final class ResidentPrefixAdversarialTests: XCTestCase {
       let gap = try session(store, ids: gapIDs, owner: scope) {
         [RotatingKVCache(maxSize: window, step: 2)]
       }
-      XCTAssertEqual(gap.cachedTokenCount, initialRange.upperBound)
-      XCTAssertEqual(gap.input.text.tokens.asArray(Int.self), Array(gapIDs.dropFirst(initialRange.upperBound)))
-      assertKV(gap.cache[0], ids: Array(initialRange))
+      XCTAssertEqual(gap.cachedTokenCount, gapIDs.count - 1)
+      XCTAssertEqual(gap.input.text.tokens.asArray(Int.self), [93_000])
+      assertKV(gap.cache[0], ids: Array(gapIDs.dropLast().suffix(window)))
       let exact = try session(store, ids: ids + ledger + [90_000], owner: scope) {
         [RotatingKVCache(maxSize: window, step: 2)]
       }
@@ -279,8 +297,8 @@ final class ResidentPrefixAdversarialTests: XCTestCase {
       let evicted = try session(store, ids: [0, 1, 92_000], owner: scope) {
         [RotatingKVCache(maxSize: window, step: 2)]
       }
-      XCTAssertEqual(evicted.cachedTokenCount, 0)
-      XCTAssertEqual(evicted.observation.missReason, "local_coverage_missing")
+      XCTAssertEqual(evicted.cachedTokenCount, 2)
+      assertKV(evicted.cache[0], ids: [0, 1])
     }
   }
 }

@@ -21,22 +21,88 @@ struct GenerationExecutionOrigin: Codable, Equatable, Sendable {
   let cacheAlgorithm: String
   let cachedPromptTokens: Int
   let cacheMissReason: String?
+  var independentCohort: IndependentTextCohortOrigin? = nil
 
   func isValid(promptTokens: Int) -> Bool {
     guard schema == 1, promptTokens > 0, promptTokens <= 16_384,
       cachedPromptTokens >= 0, cachedPromptTokens < promptTokens,
-      Self.identifier(cacheAlgorithm) else { return false }
+      Self.identifier(cacheAlgorithm),
+      independentCohort.map({ $0.isValid(promptTokens: promptTokens, cachedTokens: cachedPromptTokens) }) ?? true else { return false }
     if cachedPromptTokens > 0 { return cacheMissReason == nil }
     return cacheMissReason.map(Self.identifier) == true
   }
   func isConfirmedCold(promptTokens: Int) -> Bool {
-    isValid(promptTokens: promptTokens) && cachedPromptTokens == 0
+    isValid(promptTokens: promptTokens) && cachedPromptTokens == 0 && independentCohort == nil
   }
   private static func identifier(_ value: String) -> Bool {
     !value.isEmpty && value.utf8.count <= 128 && value.utf8.allSatisfy {
       (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0)
         || $0 == 45 || $0 == 46 || $0 == 95
     }
+  }
+}
+
+
+/// The actual fixed-cohort geometry binds heterogeneous execution. Digests bind
+/// other rows without copying their private prompts into this row's journal.
+/// These observations deliberately do not authorize a width-one seeded replay.
+struct IndependentTextCohortOrigin: Codable, Equatable, Sendable {
+  struct Row: Codable, Equatable, Sendable {
+    let operationID: UUID
+    let attemptID: UUID
+    let namespace: UUID
+    let recordID: UUID
+    let requestDigest: String
+    let preparedTokenDigest: String
+    let promptTokens: Int
+    let cachedTokens: Int
+    let seed: UInt64
+    let outputLimit: Int
+    let samplingDigest: String
+    let cacheParentID: UUID?
+    let cacheHistoryDigest: String
+    let cacheLengths: [Int]
+    let cachePadding: [Int]
+  }
+  let schema: Int
+  let cohortID: UUID
+  let row: Int
+  let rows: [Row]
+  let policyDigest: String
+  let promptWidth: Int
+  let maskDigest: String
+  let cacheWidths: [Int]
+  let prefill: PromptCacheGeometry
+
+  func isValid(promptTokens: Int, cachedTokens: Int) -> Bool {
+    func hash(_ value: String) -> Bool {
+      value.utf8.count == 64 && value.utf8.allSatisfy {
+        (48...57).contains($0) || (97...102).contains($0)
+      }
+    }
+    let nilID = UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+    guard schema == 1, cohortID != nilID, (2...4).contains(rows.count),
+      rows.indices.contains(row), hash(policyDigest), hash(maskDigest),
+      (1...16_384).contains(promptWidth), (1...128).contains(cacheWidths.count),
+      cacheWidths.allSatisfy({ (0...16_384).contains($0) }),
+      rows[row].promptTokens == promptTokens, rows[row].cachedTokens == cachedTokens,
+      Set(rows.map(\.attemptID)).count == rows.count,
+      (1...16_384).contains(prefill.tokenCeiling),
+      prefill.chunkStride.map({ (1...16_384).contains($0) }) ?? true else { return false }
+    let validRows = rows.allSatisfy { value in
+      value.operationID != nilID && value.attemptID != nilID && value.namespace != nilID
+        && value.recordID != nilID && hash(value.requestDigest) && hash(value.preparedTokenDigest)
+        && hash(value.samplingDigest) && hash(value.cacheHistoryDigest)
+        && (1...16_384).contains(value.promptTokens)
+        && (0..<value.promptTokens).contains(value.cachedTokens)
+        && (1...4096).contains(value.outputLimit)
+        && value.cacheLengths.count == cacheWidths.count && value.cachePadding.count == cacheWidths.count
+        && zip(cacheWidths.indices, cacheWidths).allSatisfy { index, width in
+          (0...width).contains(value.cacheLengths[index])
+            && value.cachePadding[index] == width - value.cacheLengths[index]
+        }
+    }
+    return validRows && promptWidth == rows.map({ $0.promptTokens - $0.cachedTokens }).max()
   }
 }
 

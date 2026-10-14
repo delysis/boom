@@ -385,6 +385,12 @@ enum ProductCore {
     try call(["op": "incremental_kv_readmission", "applicationBytes": application,
       "usedBytes": used, "workingReserveBytes": reserve, "allocationBytesUpperBound": allocation])
   }
+  static func independentKVAllocation(configuration: Data, prompts: [Int], cached: [Int],
+    outputs: [Int], prefill: PrefillGeometry, initial: Bool, valueBytes: Int) throws -> UInt64 {
+    try call(["op": "independent_kv_allocation", "configuration": JSONSerialization.jsonObject(with: configuration),
+      "prompts": prompts, "cached": cached, "outputs": outputs, "prefill": try object(prefill),
+      "initial": initial, "valueBytes": valueBytes])
+  }
   static func contextCapacity(configuration: Data, available: UInt64, width: Int,
     prefill: PrefillGeometry? = nil) throws -> Int {
     try call(["op": "context_capacity", "configuration": JSONSerialization.jsonObject(with: configuration),
@@ -486,7 +492,7 @@ private struct PinnableTurn: Codable {
   let state: String
   let speaker: Speaker?
 }
-enum ConsultationStyle: String, Codable, CaseIterable {
+enum ConsultationStyle: String, Codable, CaseIterable, Sendable {
   case separate = "Separate answers"
   case discuss = "Discuss together"
 }

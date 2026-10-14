@@ -1,11 +1,11 @@
 --- a/Source/MLX/MLXArray+Bytes.swift
 +++ b/Source/MLX/MLXArray+Bytes.swift
-@@ -2,6 +2,73 @@
+@@ -2,6 +2,74 @@
  
  import Cmlx
  import Foundation
 +
-+/// Completed immutable shared storage, containing no future computation graph.
++/// Completed immutable MLX allocator-owned storage, with no computation graph.
 +/// Acquire on the array's producer before its next functional update. The lease
 +/// prevents donation, including slice assignment, until last release. External
 +/// raw-pointer writes are outside this contract.
@@ -56,7 +56,8 @@
 +}
 +
 +extension MLXArray {
-+    /// Ready-only metadata handoff. Nil means unscheduled, in-flight or failed.
++    /// Ready-only metadata handoff. Nil means unscheduled, in-flight, failed or
++    /// externally managed storage. Custom/no-op weak deleters are not admitted.
 +    /// Never evals, waits, acquires the evaluation lock or casts a dtype. Invoke
 +    /// on the MLX producer, never concurrently with evaluation of this array.
 +    /// Optional admission observes the exact physical allocation on this producer.
@@ -89,7 +90,7 @@
 +  void* ctx;
 +} mlx_ready_buffer;
 +
-+/** Return 0 only for completed, error-free shared Metal storage. NEVER schedules,
++/** Return 0 only for completed, error-free MLX allocator-owned Metal storage. NEVER schedules,
 + * evaluates, waits or numerically converts. Unscheduled and evaluated/no-event
 + * arrays, empty layouts and unsupported backends return 1.
 + */

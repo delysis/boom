@@ -27,21 +27,29 @@ final class ActiveNativeKVTests: XCTestCase {
         return full + [RotatingKVCache(maxSize: window, step: 2)]
       })
   }
-  private func append(_ s: PromptPrefixCache.Session, _ ids: [Int], width: Int = 1) {
+  private func append(_ s: PromptPrefixCache.Session, _ ids: [Int], width: Int = 1, submitted: Bool = true) async {
     let k = MLXArray(ids.map(Float.init), [width, 1, ids.count / width, 1])
     for c in s.cache { _ = c.update(keys: k, values: k + 100) }
-  }
-  private func prefill(_ s: PromptPrefixCache.Session) throws {
-    let ids = s.input.text.tokens.asArray(Int.self)
-    let processed = try s.prefill.forEachChunk(total: ids.count) { range in
-      append(s, Array(ids[range])); asyncEval(s.cache)
+      if submitted {
+      asyncEval(s.cache.flatMap { $0.innerState() })
+      eval(s.cache); s.markCacheSubmitted()
+      s.observeReadySpill(); await s.joinPendingSpill(cancelled: false)
     }
-    append(s, Array(ids[processed...])); s.prefill.progress?(ids.count, ids.count)
-    eval(s.cache); s.markCacheSubmitted()
+  }
+  private func prefill(_ s: PromptPrefixCache.Session) async throws {
+    let ids = s.input.text.tokens.asArray(Int.self)
+    var partition = s.prefill; partition.progress = nil
+    var ranges: [Range<Int>] = []
+    let done = try partition.forEachChunk(total: ids.count) { ranges.append($0) }
+    if done < ids.count { ranges.append(done..<ids.count) }
+    for range in ranges {
+      await append(s, Array(ids[range]))
+      s.prefill.progress?(range.upperBound, ids.count)
+    }
   }
   private func seed(_ store: PromptPrefixCache, _ ids: [Int], _ owner: PromptCacheOwner,
-    globals: Int = 1) throws {
-    let s = try session(store, ids, owner, globals: globals); try prefill(s)
+    globals: Int = 1) async throws {
+    let s = try session(store, ids, owner, globals: globals); try await prefill(s)
     XCTAssertTrue(store.publish(s))
   }
   private func expand(_ s: PromptPrefixCache.Session, width: Int) {
@@ -60,10 +68,10 @@ final class ActiveNativeKVTests: XCTestCase {
     producerJoined: true, existingFenceCompleted: true, checkpointUncertain: false,
     memoryLimitExceeded: false, statelessTextKVVerified: true)
 
-  func testSameWidthGlobalTransfersActualObjectAndSpareCapacity() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testSameWidthGlobalTransfersActualObjectAndSpareCapacity() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let store = PromptPrefixCache(), scope = owner(), ids = Array(0..<9)
-      let s = try session(store, ids, scope); try prefill(s)
+      let s = try session(store, ids, scope); try await prefill(s)
       let native = PrefixKVStorage.unwrap(s.cache[0]), id = ObjectIdentifier(native as AnyObject)
       XCTAssertEqual(native.innerState()[0].dim(2), 12)
       XCTAssertTrue(store.publish(s))
@@ -75,15 +83,15 @@ final class ActiveNativeKVTests: XCTestCase {
       XCTAssertEqual(next.cache[0].state[0].asArray(Float.self), Array(0..<8).map(Float.init))
     }
   }
-  func testWarmFourRowAdmissionAndEveryGeneratedRowRestore() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testWarmFourRowAdmissionAndEveryGeneratedRowRestore() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let ids = Array(0..<9), first = [901, 911, 921, 931], last = [902, 912, 922, 932]
       try ProductCore.admitWritingBatch(width: 4, prompt: ids.count, output: 2, capacity: 16_384)
       // Each selection needs its own real lifetime: native lookup transfers the
       // sole active cache rather than copying a snapshot for four later queries.
       for selectedRow in 0..<4 {
         let store = PromptPrefixCache(byteLimit: 4_096), scope = owner()
-        try seed(store, ids, scope)
+        try await seed(store, ids, scope)
         var admitted: ActiveNativeKVAdmissionPlan?
         let warm = try session(store, ids, scope, batchWidth: 4, admit: { plan in
           admitted = try XCTUnwrap(plan, "This must use warm admission, not a cold four-row control.")
@@ -108,12 +116,12 @@ final class ActiveNativeKVTests: XCTestCase {
         XCTAssertEqual(readmission.observation.checks, 1)
         XCTAssertFalse(flag.isCancelled)
 
-        try prefill(warm); expand(warm, width: 4)
+        try await prefill(warm); expand(warm, width: 4)
         for row in 0..<4 {
           XCTAssertTrue(warm.captureDecodeLane(row: row, width: 4,
             emittedTokenIDs: [first[row]], finished: false))
         }
-        append(warm, first, width: 4); eval(warm.cache); warm.markCacheSubmitted()
+        await append(warm, first, width: 4); eval(warm.cache); warm.markCacheSubmitted()
         for row in 0..<4 {
           XCTAssertTrue(warm.captureFinishedLane(row: row, width: 4,
             emittedTokenIDs: [first[row], last[row]]))
@@ -146,7 +154,7 @@ final class ActiveNativeKVTests: XCTestCase {
         XCTAssertEqual(restored.cache[1].state[0].asArray(Float.self), [6, 7, 8, first[selectedRow]].map(Float.init))
         XCTAssertGreaterThanOrEqual(store.retainedNativeBytesUpperBound, parentBytes,
           "A selected-row view must retain the complete four-row parent until its real joined transfer.")
-        try prefill(restored); expand(restored, width: 4)
+        try await prefill(restored); expand(restored, width: 4)
         XCTAssertTrue(restored.cache.allSatisfy { $0.innerState().allSatisfy { $0.dim(0) == 4 } })
         XCTAssertEqual(restored.cache[0].state[0].asArray(Float.self),
           Array(repeating: query.map(Float.init), count: 4).flatMap { $0 })
@@ -156,21 +164,21 @@ final class ActiveNativeKVTests: XCTestCase {
     }
   }
 
-  func testFullAttentionIncomingPagesAreNotHistoricalStaging() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testFullAttentionIncomingPagesAreNotHistoricalStaging() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let scope = owner(), ids = Array(0..<62), one = PromptPrefixCache(), five = PromptPrefixCache()
-      try seed(one, ids, scope, globals: 1); try seed(five, ids, scope, globals: 5)
+      try await seed(one, ids, scope, globals: 1); try await seed(five, ids, scope, globals: 5)
       XCTAssertEqual(one.retainedBytesUpperBound, five.retainedBytesUpperBound)
       XCTAssertGreaterThan(five.retainedNativeBytesUpperBound, one.retainedNativeBytesUpperBound)
       XCTAssertLessThanOrEqual(one.retainedBytesUpperBound, 1 << 30)
     }
   }
-  func testGeneratedPrefixKeepsDeliveredLedgerAndExcludesLookahead() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testGeneratedPrefixKeepsDeliveredLedgerAndExcludesLookahead() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let store = PromptPrefixCache(), scope = owner(), ids = Array(0..<9)
-      let s = try session(store, ids, scope); try prefill(s)
-      s.didSample?(MLXArray([901])); append(s, [901]); s.didSample?(MLXArray([902]))
-      append(s, [902]); s.didSample?(MLXArray([903])); append(s, [903]); s.didSample?(MLXArray([904]))
+      let s = try session(store, ids, scope); try await prefill(s)
+      s.didSample?(MLXArray([901])); await append(s, [901]); s.didSample?(MLXArray([902]))
+      await append(s, [902]); s.didSample?(MLXArray([903])); await append(s, [903]); s.didSample?(MLXArray([904]))
       eval(s.cache); s.markCacheSubmitted()
       XCTAssertTrue(store.publish(s, completions: [.init(emittedTokenIDs: [901, 902])],
         acknowledged: [.init(emittedTokenIDs: [901])]))
@@ -185,10 +193,10 @@ final class ActiveNativeKVTests: XCTestCase {
       XCTAssertEqual(next.cache[0].state[0].asArray(Float.self), (ids + [901, 902]).map(Float.init))
     }
   }
-  func testWrappedLocalRewindUsesExactWindowAndMaskOffset() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testWrappedLocalRewindUsesExactWindowAndMaskOffset() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let store = PromptPrefixCache(), scope = owner(), ids = Array(0..<9)
-      try seed(store, ids, scope)
+      try await seed(store, ids, scope)
       let next = try session(store, ids, scope)
       XCTAssertEqual(next.cachedTokenCount, 8)
       let local = next.cache[1]
@@ -210,39 +218,40 @@ final class ActiveNativeKVTests: XCTestCase {
         RoPE(dimensions: 2, traditional: true)(input, offset: ref.offset).asArray(Float.self))
     }
   }
-  func testScaledLongPromptTrailingEditUsesBoundedLocalCoverage() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testScaledLongPromptTrailingEditUsesBoundedLocalCoverage() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let store = PromptPrefixCache(), scope = owner(), ids = Array(0..<62)
-      try seed(store, ids, scope)
+      try await seed(store, ids, scope)
       let snapshot = try XCTUnwrap(store.retainedSnapshotObservations.first)
       let ranges = try XCTUnwrap(snapshot.residentLocalCoverage?.first?.intervals)
-      XCTAssertLessThanOrEqual(ranges.reduce(0) { $0 + $1.upperBound - $1.lowerBound }, 10)
+      XCTAssertEqual(ranges, [.init(lowerBound: 0, upperBound: 62)], "Optional disk history remains available until real quota pressure.")
+      XCTAssertEqual(store.retainedBytesUpperBound, 0)
       let next = try session(store, Array(0..<60) + [999, 1000], scope)
       XCTAssertEqual(next.cachedTokenCount, 60)
       XCTAssertEqual(next.cache[1].state[0].asArray(Float.self), [56, 57, 58, 59])
       XCTAssertEqual(next.cache[0].innerState()[0].dim(2), 64)
     }
   }
-  func testMissingOldLocalCoverageNeverFabricatesGlobalOnlyHit() throws {
-    try Device.withDefaultDevice(.cpu) {
-      let store = PromptPrefixCache(), scope = owner(); try seed(store, Array(0..<62), scope)
+  func testMissingOldLocalCoverageNeverFabricatesGlobalOnlyHit() async throws {
+    try await Device.withDefaultDevice(.cpu) {
+      let store = PromptPrefixCache(diskByteLimit: 1), scope = owner(); try await seed(store, Array(0..<62), scope)
       let next = try session(store, Array(0..<8) + [999], scope)
       XCTAssertEqual(next.cachedTokenCount, 0)
     }
   }
-  func testEarlyFinishedBatchRowKeepsExactWindowAndParentCharge() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testEarlyFinishedBatchRowKeepsExactWindowAndParentCharge() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let store = PromptPrefixCache(), scope = owner(), ids = Array(0..<9)
-      let s = try session(store, ids, scope); try prefill(s); expand(s, width: 3)
+      let s = try session(store, ids, scope); try await prefill(s); expand(s, width: 3)
       for row in 0..<3 { XCTAssertTrue(s.captureDecodeLane(row: row, width: 3, emittedTokenIDs: [901 + row * 10], finished: false)) }
-      append(s, [901, 911, 921], width: 3); eval(s.cache); s.markCacheSubmitted()
+      await append(s, [901, 911, 921], width: 3); eval(s.cache); s.markCacheSubmitted()
       XCTAssertTrue(s.captureFinishedLane(row: 0, width: 3, emittedTokenIDs: [901, 902]))
       var lane1 = [911], lane2 = [921]
       for n in 1...12 {
         lane1.append(911 + n); lane2.append(921 + n)
         XCTAssertTrue(s.captureDecodeLane(row: 1, width: 3, emittedTokenIDs: lane1, finished: false))
         XCTAssertTrue(s.captureDecodeLane(row: 2, width: 3, emittedTokenIDs: lane2, finished: false))
-        append(s, [-1, 911 + n, 921 + n], width: 3)
+        await append(s, [-1, 911 + n, 921 + n], width: 3)
       }
       eval(s.cache); s.markCacheSubmitted()
       XCTAssertTrue(store.publish(s, completions: [.init(row: 0, emittedTokenIDs: [901, 902]),
@@ -259,55 +268,55 @@ final class ActiveNativeKVTests: XCTestCase {
       XCTAssertEqual(next.cache[0].state[0].asArray(Float.self), (ids + [901]).map(Float.init))
     }
   }
-  func testClearDoesNotDiscountStillOwnedNativeAliases() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testClearDoesNotDiscountStillOwnedNativeAliases() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let store = PromptPrefixCache(), scope = owner()
       var s: PromptPrefixCache.Session? = try session(store, Array(0..<9), scope)
-      try prefill(s!); XCTAssertTrue(store.publish(s!))
+      try await prefill(s!); XCTAssertTrue(store.publish(s!))
       let held = store.retainedNativeBytesUpperBound; XCTAssertGreaterThan(held, 0)
       store.clear(reason: "workspace_closed")
       XCTAssertFalse(store.hasAnchors); XCTAssertEqual(store.retainedNativeBytesUpperBound, held)
       s = nil; XCTAssertEqual(store.retainedNativeBytesUpperBound, 0)
     }
   }
-  func testWarmAdmissionRefusalOccursBeforeTransferAndColdRemeasures() throws {
-    try Device.withDefaultDevice(.cpu) {
-      let store = PromptPrefixCache(), scope = owner(); try seed(store, Array(0..<9), scope)
+  func testWarmAdmissionRefusalOccursBeforeTransferAndColdRemeasures() async throws {
+    try await Device.withDefaultDevice(.cpu) {
+      let store = PromptPrefixCache(), scope = owner(); try await seed(store, Array(0..<9), scope)
       var sawWarm = false, sawCold = false
       let next = try session(store, Array(0..<9), scope, admit: { plan in
         if plan != nil { sawWarm = true; XCTAssertTrue(store.hasAnchors); throw BoomError.budget("test refusal") }
-        sawCold = true; XCTAssertFalse(store.hasAnchors); XCTAssertEqual(store.retainedNativeBytesUpperBound, 0)
+        sawCold = true; XCTAssertTrue(store.hasAnchors, "Disk history is not retired to claim a native release credit."); XCTAssertEqual(store.retainedNativeBytesUpperBound, 0)
       })
       XCTAssertTrue(sawWarm); XCTAssertTrue(sawCold); XCTAssertEqual(next.cachedTokenCount, 0)
       XCTAssertEqual(next.observation.missReason, "native_admission_refused")
     }
   }
-  func testOneActiveBranchAndNamespaceAuthorityRemainExact() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testOneActiveBranchAndNamespaceAuthorityRemainExact() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let store = PromptPrefixCache(), scope = owner(), ids = Array(0..<9)
-      try seed(store, ids, scope)
+      try await seed(store, ids, scope)
       let privateOwner = PromptCacheOwner(namespace: UUID(), entity: UUID(), route: .consultation)
       XCTAssertNil(try store.nativeAdmissionPlan(owner: privateOwner, tokens: ids,
         prefill: .init(stepSize: 2), outputTokens: 2, batchWidth: 1))
       XCTAssertNil(try store.nativeAdmissionPlan(owner: nil, tokens: ids,
         prefill: .init(stepSize: 2), outputTokens: 2, batchWidth: 1))
       XCTAssertTrue(store.hasAnchors)
-      let changed = try session(store, [0, 1, 900, 901, 902], scope); try prefill(changed)
+      let changed = try session(store, [0, 1, 900, 901, 902], scope); try await prefill(changed)
       XCTAssertTrue(store.publish(changed))
-      XCTAssertEqual(try session(store, ids, scope).cachedTokenCount, 2,
-        "An obsolete global branch is not retained beside the active branch.")
+      XCTAssertEqual(try session(store, ids, scope).cachedTokenCount, 8,
+        "The historical branch is disk-backed while only one native branch stays hot.")
     }
   }
-  func testSelectedBatchRowWithoutAnyCurrentSubmissionCannotAdoptLazyHydration() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testSelectedBatchRowWithoutAnyCurrentSubmissionCannotAdoptLazyHydration() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let store = PromptPrefixCache(), scope = owner(), ids = Array(0..<9)
       var source: PromptPrefixCache.Session? = try session(store, ids, scope)
-      try prefill(source!); expand(source!, width: 3)
+      try await prefill(source!); expand(source!, width: 3)
       for row in 0..<3 {
         XCTAssertTrue(source!.captureDecodeLane(row: row, width: 3,
           emittedTokenIDs: [901 + row * 10], finished: false))
       }
-      append(source!, [901, 911, 921], width: 3); eval(source!.cache); source!.markCacheSubmitted()
+      await append(source!, [901, 911, 921], width: 3); eval(source!.cache); source!.markCacheSubmitted()
       for row in 0..<3 {
         XCTAssertTrue(source!.captureFinishedLane(row: row, width: 3,
           emittedTokenIDs: [901 + row * 10, 902 + row * 10]))
@@ -326,7 +335,8 @@ final class ActiveNativeKVTests: XCTestCase {
       XCTAssertEqual(selected!.submittedTokenCount, 10, "Inherited prefix count is not a current graph submission.")
       // No forward, progress, tensor read, eval or markCacheSubmitted on selected.
       XCTAssertFalse(store.publishJoinedValidPrefix(selected!, proof: constructorProof, authorization: auth))
-      XCTAssertFalse(store.hasAnchors); XCTAssertTrue(store.retainedSnapshotObservations.isEmpty)
+      XCTAssertTrue(store.hasAnchors); XCTAssertEqual(store.retainedSnapshotObservations.count, 3,
+        "Refused current hydration cannot erase previously joined disk history.")
       XCTAssertNotNil(parent)
       XCTAssertGreaterThanOrEqual(store.retainedNativeBytesUpperBound, parentBytes,
         "Refused lazy hydration still holds the complete width-three parent.")
@@ -335,8 +345,8 @@ final class ActiveNativeKVTests: XCTestCase {
       XCTAssertEqual(store.retainedBytesUpperBound, 0)
     }
   }
-  func testSelectedRowHydrationReservesZeroStepEvenWithoutLaterGrowth() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testSelectedRowHydrationReservesZeroStepEvenWithoutLaterGrowth() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let native = KVCacheSimple(); native.step = 4
       native.state = [MLXArray.zeros([3, 2, 8, 3], dtype: .float32),
         MLXArray.zeros([3, 2, 8, 3], dtype: .float32)]
@@ -355,35 +365,37 @@ final class ActiveNativeKVTests: XCTestCase {
         "After actual submission its buffers stay in measured U, not a release credit.")
     }
   }
-  func testConstructorUsesSubmittedCohortAndRejectsUnsubmittedFinalGraph() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testConstructorUsesSubmittedCohortAndRejectsUnsubmittedFinalGraph() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       for finalGraph in [false, true] {
         let store = PromptPrefixCache(), scope = owner(), b = binding(scope), auth = approved(b)
         let s = try session(store, Array(0..<9), scope, binding: b)
-        append(s, Array(0..<8)); asyncEval(s.cache); s.prefill.progress?(8, 9)
-        if finalGraph { append(s, [8]); s.prefill.progress?(9, 9) }
+        await append(s, Array(0..<8)); asyncEval(s.cache); s.prefill.progress?(8, 9)
+        if finalGraph { await append(s, [8], submitted: false); s.prefill.progress?(9, 9) }
         XCTAssertEqual(s.submittedTokenCount, 8)
-        XCTAssertEqual(store.publishJoinedValidPrefix(s, proof: constructorProof, authorization: auth), !finalGraph)
-        if !finalGraph {
-          let next = try session(store, Array(0..<8) + [999], scope)
-          XCTAssertEqual(next.cachedTokenCount, 8)
+        XCTAssertTrue(store.publishJoinedValidPrefix(s, proof: constructorProof, authorization: auth))
+        let next = try session(store, Array(0..<8) + [999], scope)
+        XCTAssertEqual(next.cachedTokenCount, 8)
+        XCTAssertEqual(next.observation.cachedCurrentHotPrefix, !finalGraph)
+        if finalGraph {
+          XCTAssertEqual(s.cache[0].offset, 9, "Only independent disk bytes retained the submitted8; future native9 was not adopted.")
         }
       }
     }
   }
-  func testRevokedGrantAndClearEpochCannotAdoptNativeState() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testRevokedGrantAndClearEpochCannotAdoptNativeState() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       for clear in [false, true] {
         let store = PromptPrefixCache(), scope = owner(), b = binding(scope), auth = approved(b)
         let s = try session(store, Array(0..<9), scope, binding: b)
-        append(s, Array(0..<8)); asyncEval(s.cache); s.prefill.progress?(8, 9)
+        await append(s, Array(0..<8)); asyncEval(s.cache); s.prefill.progress?(8, 9)
         if clear { store.clear(reason: "model_replaced") } else { auth.revoke() }
         XCTAssertFalse(store.publishJoinedValidPrefix(s, proof: constructorProof, authorization: auth))
       }
     }
   }
-  func testAdmissionMatchesPreservedBalancedSuffixStride() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testAdmissionMatchesPreservedBalancedSuffixStride() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let store = PromptPrefixCache(), scope = owner(), ids = Array(0..<14)
       func balanced(_ values: [Int]) throws -> PromptPrefixCache.Session {
         try store.makeSession(owner: scope, input: LMInput(tokens: MLXArray(values, [1, values.count])),
@@ -391,7 +403,7 @@ final class ActiveNativeKVTests: XCTestCase {
           useActiveNative: true, outputTokens: 2, batchWidth: 1,
           makeCache: { let c = KVCacheSimple(); c.step = 4; return [c, RotatingKVCache(maxSize: 8, step: 2)] })
       }
-      let original = try balanced(ids); try prefill(original); XCTAssertTrue(store.publish(original))
+      let original = try balanced(ids); try await prefill(original); XCTAssertTrue(store.publish(original))
       let current = Array(0..<5) + Array(100..<109)
       let plan = try XCTUnwrap(store.nativeAdmissionPlan(owner: scope, tokens: current,
         prefill: .init(stepSize: 6, chunking: .balanced), outputTokens: 2, batchWidth: 1))
@@ -404,8 +416,8 @@ final class ActiveNativeKVTests: XCTestCase {
       XCTAssertEqual(next.prefill.chunkLength(forChunking: 8), 5)
     }
   }
-  func testAdmissionUsesActualCapacityWidthHeadsAndDtypeWithTwoForwardHorizon() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testAdmissionUsesActualCapacityWidthHeadsAndDtypeWithTwoForwardHorizon() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let native = KVCacheSimple(); native.step = 4
       native.state = [MLXArray.zeros([1, 2, 8, 3], dtype: .float32), MLXArray.zeros([1, 2, 8, 3], dtype: .float32)]
       let plan = try ActiveNativeKVStorage.plan(owners: [.init(native: native)], layouts: [.simple(step: 4)],
@@ -419,8 +431,8 @@ final class ActiveNativeKVTests: XCTestCase {
       XCTAssertThrowsError(try plan.transitionAllocations(width: 1, forwards: 3, hydration: false))
     }
   }
-  func testFinalChunkRefusalStillAllowsPreviouslyReservedTailAndDeniesPublication() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testFinalChunkRefusalStillAllowsPreviouslyReservedTailAndDeniesPublication() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let store = PromptPrefixCache(), scope = owner(), b = binding(scope), auth = approved(b), flag = CancellationFlag()
       let request = try session(store, [0, 1, 2], scope, binding: b)
       let watch = ActiveNativeKVReadmission(flag: flag, authorization: auth) { _, _ in
@@ -431,13 +443,17 @@ final class ActiveNativeKVTests: XCTestCase {
       progress.progress = { processed, total in
         recorded?(processed, total); watch.afterSubmittedPrefill(processed: processed, total: total)
       }
-      let done = try progress.forEachChunk(total: 3) { range in
-        append(request, Array([0, 1, 2][range])); asyncEval(request.cache)
+      var partition = progress; partition.progress = nil
+      var ranges: [Range<Int>] = []
+      let done = try partition.forEachChunk(total: 3) { ranges.append($0) }
+      for range in ranges {
+        await append(request, Array([0, 1, 2][range]))
+        progress.progress?(range.upperBound, 3)
       }
       // Actual driver returned after its last nonterminal callback; no new
       // cancellation check exists before the Gemma final-tail graph.
       XCTAssertEqual(done, 2); XCTAssertTrue(watch.denied)
-      append(request, [2]); progress.progress?(3, 3); eval(request.cache); request.markCacheSubmitted()
+      await append(request, [2]); progress.progress?(3, 3); eval(request.cache); request.markCacheSubmitted()
       XCTAssertEqual(request.submittedTokenCount, 3)
       let denied = JoinedKVRetentionProof(termination: .constructorCancelled, producerJoined: true,
         existingFenceCompleted: true, checkpointUncertain: false, memoryLimitExceeded: watch.denied,
@@ -445,7 +461,7 @@ final class ActiveNativeKVTests: XCTestCase {
       XCTAssertFalse(store.publishJoinedValidPrefix(request, proof: denied, authorization: auth))
     }
   }
-  func testLastChunkRefusalRevokesAndTerminalProgressCannotArmDecode() throws {
+  func testLastChunkRefusalRevokesAndTerminalProgressCannotArmDecode() async throws {
     let flag = CancellationFlag(), scope = owner(), b = binding(scope), auth = approved(b)
     let watch = ActiveNativeKVReadmission(flag: flag, authorization: auth) { width, forwards in
       XCTAssertEqual(width, 1); XCTAssertEqual(forwards, 2)

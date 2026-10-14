@@ -26,10 +26,10 @@ struct PromptCacheGeometry: Codable, Equatable, Sendable {
   }
 }
 
-/// Transient, byte-bounded resident KV. The runner binds model/processor identity;
-/// workspace namespaces isolate content. Entity and route do not limit lookup.
-/// Native windows roll: overwritten local history is never archived to disk or
-/// retained without a bound. A hit requires coverage in every actual cache layer.
+/// Transient, bounded KV. The runner binds model/processor identity; workspace
+/// namespaces isolate content. Entity and route do not limit lookup. One native
+/// cache stays hot; additional rotating history uses disposable bounded files.
+/// A hit requires available coverage in every actual cache layer.
 ///
 /// The lock protects index/publication metadata. Tensor access, hydration and
 /// eviction remain on the inference executor under the exclusive model lease.
@@ -49,6 +49,17 @@ final class PromptPrefixCache: @unchecked Sendable {
     let compactLocalCoverage: Bool
     let lastCompleteTokenCount: Int
     let refusalReason: String?
+    var diskReadyMisses: UInt64 = 0
+    var diskBusyMisses: UInt64 = 0
+    var diskWriteMisses: UInt64 = 0
+    var diskAdmissionMisses: UInt64 = 0
+    var diskQuotaMisses: UInt64 = 0
+    var diskBytes: UInt64 = 0
+    var diskSubmittedJobs: UInt64 = 0
+    var diskCreatedFiles: UInt64 = 0
+    var diskWriteCalls: UInt64 = 0
+    var diskWrittenBytes: UInt64 = 0
+    var diskDirectoryPath: String? = nil
   }
   struct ForwardSegment: Codable, Equatable, Sendable {
     let origin: Origin
@@ -120,6 +131,8 @@ final class PromptPrefixCache: @unchecked Sendable {
     var cachedJoinedRetentionProvenance: JoinedKVRetentionProvenance? = nil
     var nativeTensorBytes: UInt64? = nil
     var cachedNativePhysicalWidth: Int? = nil
+    var unavailableDiskBackings: Int = 0
+    var cachedCurrentHotPrefix: Bool = false
   }
   struct Session {
     let input: LMInput
@@ -144,6 +157,15 @@ final class PromptPrefixCache: @unchecked Sendable {
     /// Called only after a known pinned path actually submitted/evaluated this
     /// cache cohort. Terminal prefill progress is deliberately not such proof.
     func markCacheSubmitted() { capture?.markCacheSubmitted() }
+    /// Producer-only checkpoint; no eval, GPU wait, data copy or file IO.
+    func observeReadySpill() { capture?.observeReadySpill(cache.map { PrefixKVStorage.unwrap($0) }) }
+    /// Existing producer join/fence must precede this optimization finalizer.
+    func joinPendingSpill(cancelled: Bool) async {
+      guard let capture else { return }
+      if cancelled { capture.cancelSpill() }
+      await capture.joinSpill()
+      if !cancelled { await capture.drainReadySpills(cache.map { PrefixKVStorage.unwrap($0) }) }
+    }
     var retentionObservation: RetentionObservation? { capture?.observation }
     func discardStagedAnchors() { capture?.discard() }
     var didSample: (@Sendable (MLXArray) -> Void)? {
@@ -168,13 +190,16 @@ final class PromptPrefixCache: @unchecked Sendable {
     let owner: PromptCacheOwner
     let tokens: [Int]
     let layouts: [PrefixKVStorage.Layout]
-    let spans: [[PrefixKVSpan]]
+    var spans: [[PrefixKVSpan]]
     let geometry: PromptCacheGeometry
     let origin: Origin
     let batchWidth: Int
     let row: Int?
     let history: [ForwardSegment]
     var nativeGlobalPrefix: Int? = nil
+    // Metadata witness only: no array/view is stored beside the one hot owner.
+    // ActiveNativeRecord re-admits exact current offset/row/ring coverage.
+    var nativeCurrentPrefix: Int? = nil
     var nativePhysicalWidth: Int? = nil
     var nativeProcessedTokenCount: Int? = nil
     var nativeLedgerRow: Int? = nil
@@ -214,6 +239,7 @@ final class PromptPrefixCache: @unchecked Sendable {
         switch layout {
         case .simple: return nativeGlobalPrefix.map { count <= $0 } ?? Self.covers(0..<count, spans: values)
         case .rotating(let window, let keep, _, _):
+          if nativeCurrentPrefix == count { return true }
           let prefix = min(keep, count)
           return Self.covers(0..<prefix, spans: values)
             && Self.covers(max(prefix, count - (window - keep))..<count, spans: values)
@@ -250,9 +276,9 @@ final class PromptPrefixCache: @unchecked Sendable {
     }
   }
 
-  /// Captures incoming global pages and only a rolling, bounded local tail.
-  /// Every layer's inputs are tapped before its ring write. Descriptors are
-  /// retained without copying full cache arrays or inserting a GPU fence.
+  /// Captures actual forward/token provenance before each native cache update.
+  /// Completed rotating parents spill through the ready-only hook; no incoming
+  /// local array/view is archived and no extra GPU fence is inserted.
   fileprivate final class Capture: @unchecked Sendable {
     private struct Forward {
       let start: Int
@@ -277,10 +303,7 @@ final class PromptPrefixCache: @unchecked Sendable {
         var pieces: [PrefixKVSpan] = []
         func piece(_ range: Range<Int>) -> PrefixKVSpan? {
           guard !range.isEmpty else { return nil }
-          return try? PrefixKVSpan(id: span.id, offset: range.lowerBound, layer: span.layer,
-            keys: span.keys[0..., 0..., (range.lowerBound - span.start)..<(range.upperBound - span.start), 0...],
-            values: span.values[0..., 0..., (range.lowerBound - span.start)..<(range.upperBound - span.start), 0...],
-            backingBytesUpperBound: span.backingBytesUpperBound)
+          return try? span.sliced(positions: (range.lowerBound - span.start)..<(range.upperBound - span.start))
         }
         if span.start < keep, let prefix = piece(span.start..<min(keep, span.end)) {
           pinned.append(prefix); pieces.append(prefix)
@@ -344,6 +367,23 @@ final class PromptPrefixCache: @unchecked Sendable {
     private let retainBacking: @Sendable (UUID, UInt64) -> Void
     private let releaseBacking: @Sendable (UUID) -> Void
     private let closeLease: @Sendable () -> Void
+    private let retainRawBacking: @Sendable (UUID, UUID, UInt64) -> Void
+    private let releaseRawBacking: @Sendable (UUID, UUID) -> Void
+    private let closeRawLease: @Sendable (UUID) -> Void
+    private let disk: PrefixKVDiskStore
+    private let spillIsLive: @Sendable () -> Bool
+    private let reclaimDiskEntry: @Sendable () -> Bool
+    private var spillThrough: [Int]
+    private var nextSpillLayer = 0
+    private var lastSpillEnd = 0
+    private let spillStride: Int
+    private var diskPromptBoundary = 0
+    private let spillCancellation = CancellationFlag()
+    private var diskReadyMisses: UInt64 = 0
+    private var diskBusyMisses: UInt64 = 0
+    private var diskWriteMisses: UInt64 = 0
+    private var diskAdmissionMisses: UInt64 = 0
+    private var lastSpillQuotaRefusal = false
     private let lock = NSLock()
     private var spans: [SpanBuffer]
     private var spanCharges: [UUID: SpanCharge] = [:]
@@ -362,17 +402,35 @@ final class PromptPrefixCache: @unchecked Sendable {
     private var singleValid = true
     private var lanes: [Int: Lane] = [:]
     weak var primaryCache: PrefixKVCache?
+    fileprivate let independentRow: Int?
+    private let independentWidth: Int?
 
     init(layouts: [PrefixKVStorage.Layout], tokens: [Int], cachedCount: Int,
       geometry: PromptCacheGeometry, suffixGeometry: PromptCacheGeometry,
       inherited: Entry?, reserve: @escaping @Sendable (UInt64, Bool) -> ReservationDecision,
       retainBacking: @escaping @Sendable (UUID, UInt64) -> Void,
       releaseBacking: @escaping @Sendable (UUID) -> Void,
-      closeLease: @escaping @Sendable () -> Void, nativeGlobals: Bool = false) {
+      closeLease: @escaping @Sendable () -> Void,
+      retainRawBacking: @escaping @Sendable (UUID, UUID, UInt64) -> Void,
+      releaseRawBacking: @escaping @Sendable (UUID, UUID) -> Void,
+      closeRawLease: @escaping @Sendable (UUID) -> Void, disk: PrefixKVDiskStore,
+      spillIsLive: @escaping @Sendable () -> Bool,
+      reclaimDiskEntry: @escaping @Sendable () -> Bool, nativeGlobals: Bool = false,
+      independentRow: Int? = nil, independentWidth: Int? = nil) {
+      self.independentRow = independentRow; self.independentWidth = independentWidth
       self.layouts = layouts; self.nativeGlobals = nativeGlobals
       self.tokens = tokens; self.cachedCount = cachedCount
       self.geometry = geometry; self.suffixGeometry = suffixGeometry; self.reserve = reserve
       self.retainBacking = retainBacking; self.releaseBacking = releaseBacking; self.closeLease = closeLease
+      self.retainRawBacking = retainRawBacking; self.closeRawLease = closeRawLease
+      self.releaseRawBacking = releaseRawBacking
+      self.disk = disk; self.spillIsLive = spillIsLive; self.reclaimDiskEntry = reclaimDiskEntry
+      compactLocalCoverage = nativeGlobals
+      spillStride = min(64, layouts.compactMap { layout -> Int? in
+        if case .rotating(let window, let keep, _, _) = layout { return max(1, (window - keep) / 2) }
+        return nil
+      }.min() ?? 64)
+      spillThrough = Array(repeating: 0, count: layouts.count)
       inheritedHistory = inherited.map { PromptPrefixCache.clippedHistory($0.history, through: cachedCount) } ?? []
       spans = layouts.map { layout in
         if case .rotating(_, let keep, _, _) = layout { return SpanBuffer(keep: keep) }
@@ -385,17 +443,14 @@ final class PromptPrefixCache: @unchecked Sendable {
           for span in inherited.spans[layer] where span.start < cachedCount {
             let upper = min(span.end, cachedCount) - span.start
             let row = span.batchWidth == 1 ? 0 : inherited.row ?? 0
-            if let cropped = try? PrefixKVSpan(id: span.id, offset: span.start, layer: span.layer,
-              keys: span.keys[row..<(row + 1), 0..., ..<upper, 0...],
-              values: span.values[row..<(row + 1), 0..., ..<upper, 0...],
-              backingBytesUpperBound: span.backingBytesUpperBound) {
-              for piece in spans[layer].append(cropped) {
-                retain(piece, novel: false)
-              }
+            if let cropped = try? span.sliced(positions: 0..<upper, row: row) {
+              for piece in spans[layer].append(cropped) { retain(piece, novel: false) }
+              spillThrough[layer] = max(spillThrough[layer], cropped.end)
             }
           }
         }
       }
+      refreshDiskPromptBoundary()
     }
     // An inherited entry was already joined/fenced. New lazy descriptors alone
     // do not advance this witness; only actual pinned submission points do.
@@ -412,8 +467,15 @@ final class PromptPrefixCache: @unchecked Sendable {
     var stagedBytes: UInt64 { lock.lock(); defer { lock.unlock() }; return novelBytes }
     var observation: RetentionObservation {
       lock.lock(); defer { lock.unlock() }
+      let diskState = disk.observation
       return RetentionObservation(compactLocalCoverage: compactLocalCoverage,
-        lastCompleteTokenCount: max(lastCompleteTokenCount, end), refusalReason: refusalReason?.rawValue)
+        lastCompleteTokenCount: max(lastCompleteTokenCount, end), refusalReason: refusalReason?.rawValue,
+        diskReadyMisses: diskReadyMisses, diskBusyMisses: diskBusyMisses,
+        diskWriteMisses: diskWriteMisses, diskAdmissionMisses: diskAdmissionMisses,
+        diskQuotaMisses: diskState.quotaMisses, diskBytes: diskState.bytes,
+        diskSubmittedJobs: diskState.submittedJobs, diskCreatedFiles: diskState.createdFiles,
+        diskWriteCalls: diskState.writeCalls, diskWrittenBytes: diskState.writtenBytes,
+        diskDirectoryPath: diskState.directoryPath)
     }
     deinit {
       // No consumer remains; release descriptor ownership before its byte lease.
@@ -454,7 +516,9 @@ final class PromptPrefixCache: @unchecked Sendable {
         forward.reservedBytes = actualCohort
       }
       forward.usedBytes = actualCohort
-      for piece in spans[layer].append(span) { retain(piece, novel: true) }
+      if case .simple = layouts[layer] {
+        for piece in spans[layer].append(span) { retain(piece, novel: true) }
+      }
       forward.layers.insert(layer); pending = forward
       if forward.layers.count == layouts.count {
         end = forward.end; lastCompleteTokenCount = end; pending = nil
@@ -468,8 +532,57 @@ final class PromptPrefixCache: @unchecked Sendable {
         pruneLocalTail()
       }
     }
-    /// Native globals are owned once; only bounded local incoming pages enter
-    /// the pool. A declined optimization page does not stop the all-layer
+    /// Valid row tokens in one actual shared forward. The owning wrapper checks
+    /// the full operand shape; padding and peers' inert decode inputs do not
+    /// advance this row's semantic boundary or generated-token ledger.
+    func updateCohort(layer: Int, count: Int, evaluatedCount: Int, width: Int, row: Int) {
+      lock.lock(); defer { lock.unlock() }
+      guard nativeGlobals, independentRow == row, independentWidth == width,
+        !discarded, nativeCoherent, layouts.indices.contains(layer), count > 0,
+        count <= evaluatedCount, evaluatedCount <= 16_384,
+        count <= 16_384, end <= 16_384 - count else { return }
+      if pending == nil {
+        pending = Forward(start: end, end: end + count, width: width, reservedBytes: 0)
+      }
+      guard var forward = pending, forward.width == width, forward.end - forward.start == count,
+        !forward.layers.contains(layer) else { nativeCoherent = false; return }
+      forward.layers.insert(layer); pending = forward
+      if forward.layers.count == layouts.count {
+        end = forward.end; lastCompleteTokenCount = end; pending = nil
+        let origin: Origin = forward.start < tokens.count ? .prefill : .batchDecode
+        history.append(ForwardSegment(origin: origin, startTokenCount: forward.start,
+          endTokenCount: forward.end, batchWidth: width, row: row,
+          promptTokenCount: origin == .prefill ? tokens.count : nil,
+          geometry: origin == .prefill ? suffixGeometry : nil,
+          evaluatedEndTokenCount: forward.start + evaluatedCount))
+        pruneLocalTail()
+      }
+    }
+    func completedPreparation() {
+      lock.lock(); defer { lock.unlock() }
+      complete = nativeCoherent && pending == nil && end == tokens.count
+    }
+    var permitsJoinedHotState: Bool {
+      lock.lock(); defer { lock.unlock() }
+      return nativeCoherent && pending == nil && end == submittedEnd
+    }
+    func cohortSpillStart(layer: Int, actualPosition: Int, finalizing: Bool) -> Int? {
+      lock.lock(); defer { lock.unlock() }
+      guard !discarded, !spillCancellation.isCancelled, pending == nil,
+        layouts.indices.contains(layer), end > 0, actualPosition >= end, spillIsLive() else { return nil }
+      let finishing = lanes.values.contains { $0.finished && $0.frozenLocal == nil && $0.processed > lastSpillEnd }
+      guard finalizing || finishing || end - lastSpillEnd >= spillStride else { return nil }
+      return spillThrough[layer]
+    }
+    func noteCohortSpill(accepted: Bool) {
+      lock.lock(); defer { lock.unlock() }
+      lastSpillEnd = end
+      if !accepted { diskAdmissionMisses &+= 1 }
+    }
+    func acceptCohortSpill(_ values: [PrefixKVSpan]?) { acceptSpill(values) }
+
+    /// Native globals are owned once; local archives contain only disk bytes.
+    /// A declined optimization spill does not stop the all-layer
     /// completed/submitted witness or silently claim unsupported local coverage.
     private var nativeCoherent = true
     private func updateNative(layer: Int, offset: Int, keys: MLXArray, values: MLXArray) {
@@ -484,34 +597,8 @@ final class PromptPrefixCache: @unchecked Sendable {
       }
       guard var forward = pending, forward.start == offset, forward.end == upper,
         forward.width == width, !forward.layers.contains(layer) else { nativeCoherent = false; return }
-      if case .rotating = layouts[layer], accepting {
-        let positionBytes = UInt64(max(0, keys.nbytes + values.nbytes)) / UInt64(length * width)
-        bytesPerPosition[layer] = positionBytes
-        if forward.reservedBytes == 0 {
-          let localBytes = layouts.indices.reduce(UInt64(0)) { total, index in
-            guard case .rotating = layouts[index] else { return total }
-            return PromptPrefixCache.adding(total, bytesPerPosition[index] == 0 ? positionBytes : bytesPerPosition[index])
-          }
-          let incoming = PromptPrefixCache.multiplying(localBytes, UInt64(length * width))
-          if admit(incoming: incoming, checkResidency: true) { forward.reservedBytes = incoming }
-          else { accepting = false }
-        }
-        if accepting, let span = try? PrefixKVSpan(offset: offset, layer: layer, keys: keys, values: values) {
-          let actual = PromptPrefixCache.adding(forward.usedBytes, Self.bytes(span))
-          if actual > forward.reservedBytes, !admit(incoming: Self.bytes(span), checkResidency: false) {
-            accepting = false
-          } else {
-            forward.reservedBytes = max(forward.reservedBytes, actual); forward.usedBytes = actual
-            for piece in spans[layer].append(span) { retain(piece, novel: true) }
-          }
-        }
-        if !accepting {
-          // Discard incomplete descriptor cohorts, not the metadata witness.
-          for index in spans.indices {
-            for span in spans[index].removeIncomplete(start: offset) { release(span) }
-          }
-        }
-      }
+      // Local retention happens only through completed raw ring data on disk.
+      // Incoming keys/values remain owned solely by the actual active native KV.
       forward.layers.insert(layer); pending = forward
       if forward.layers.count == layouts.count {
         end = forward.end; lastCompleteTokenCount = end; pending = nil
@@ -524,6 +611,124 @@ final class PromptPrefixCache: @unchecked Sendable {
         pruneLocalTail()
       }
     }
+    /// The actual model owner calls before the next forward, while every cache
+    /// still represents the same completed cohort. In-flight/partial graphs are
+    /// never waited on. No lazy incoming array or row view becomes an archive.
+    @discardableResult func observeReadySpill(_ caches: [any KVCache], finalizing: Bool = false) -> Bool {
+      lock.lock(); defer { lock.unlock() }
+      lastSpillQuotaRefusal = false
+      guard !discarded, !spillCancellation.isCancelled, pending == nil, end > 0,
+        caches.count == layouts.count, spillIsLive() else { return false }
+      let finishingRow = lanes.values.contains { $0.finished && $0.frozenLocal == nil && $0.processed > lastSpillEnd }
+      // Coalesce normal decode checkpoints, bounded by the actual local window.
+      // Final joined state and an early-finished row may request a checkpoint
+      // immediately. No wait/file IO is inserted into the model iteration.
+      guard finalizing || finishingRow || end - lastSpillEnd >= spillStride else { return false }
+      guard disk.canSubmit else { diskBusyMisses &+= 1; return false }
+      lastSpillEnd = end // declined/unready checkpoints retry at the next interval or final join
+      let rawLeaseID = UUID(), close = closeRawLease
+      let rawLease = PrefixKVDependencyLease { close(rawLeaseID) }
+      let admitParent: (Int) -> (@Sendable () -> Void)? = { [self] allocationBytes in
+        let bytes = UInt64(allocationBytes)
+        guard admit(incoming: bytes, checkResidency: true) else { return nil }
+        let id = UUID(), release = releaseRawBacking
+        retainRawBacking(rawLeaseID, id, bytes)
+        return { release(rawLeaseID, id); withExtendedLifetime(rawLease) {} }
+      }
+      var ready: [PrefixKVDiskStore.ReadySpan] = []
+      // A large real owner cohort may exceed the raw cap. Rotate through bounded
+      // owner groups rather than pinning all parents or adding another job.
+      for index in layouts.indices {
+        let layer = (nextSpillLayer + index) % layouts.count
+        let native = caches[layer]
+        guard native.offset == end, PrefixKVStorage.layout(of: native) == layouts[layer] else {
+          diskReadyMisses &+= 1; continue
+        }
+        let ranges: [(Int, Range<Int>)]
+        switch layouts[layer] {
+        case .simple:
+          let start = min(end, spillThrough[layer])
+          ranges = start < end ? [(start, start..<end)] : []
+        case .rotating:
+          guard let value = try? PrefixKVStorage.readyRingRanges(of: native,
+            after: spillThrough[layer], needsPinned: !Entry.covers(0..<min(end, Self.keep(layouts[layer])),
+              spans: spans[layer].values)) else { diskReadyMisses &+= 1; continue }
+          ranges = value
+        }
+        guard !ranges.isEmpty else { continue }
+        let arrays = native.innerState()
+        guard arrays.count == 2, arrays[0].ndim == 4, arrays[1].ndim == 4,
+          ranges.allSatisfy({ $0.1.upperBound <= arrays[0].dim(2) && $0.1.upperBound <= arrays[1].dim(2) }),
+          let keys = arrays[0].readyBuffer(admitting: admitParent),
+          let values = arrays[1].readyBuffer(admitting: admitParent) else {
+          diskReadyMisses &+= 1
+          if !ready.isEmpty { nextSpillLayer = layer; break }
+          continue
+        }
+        var pieces: [PrefixKVDiskStore.ReadySpan] = []
+        for (start, positions) in ranges {
+          guard let value = try? PrefixKVDiskStore.ReadySpan(start: start, layer: layer,
+            keys: keys, values: values, positions: positions) else { diskReadyMisses &+= 1; return false }
+          pieces.append(value)
+        }
+        if !ready.isEmpty, !disk.fitsEmpty(ready + pieces) { nextSpillLayer = layer; break }
+        ready.append(contentsOf: pieces)
+      }
+      guard !ready.isEmpty else { return false }
+      if let last = ready.last { nextSpillLayer = (last.layer + 1) % layouts.count }
+      let beforeQuotaMisses = disk.observation.quotaMisses
+      let accepted = disk.submit(ready, isLive: { [weak self] in self?.spillStillLive() ?? false },
+        completed: { [weak self] values in self?.acceptSpill(values) })
+      if !accepted {
+        diskAdmissionMisses &+= 1
+        lastSpillQuotaRefusal = disk.observation.quotaMisses != beforeQuotaMisses && disk.fitsEmpty(ready)
+      }
+      return accepted
+    }
+    private var spillQuotaRefused: Bool { lock.lock(); defer { lock.unlock() }; return lastSpillQuotaRefusal }
+    func drainReadySpills(_ caches: [any KVCache]) async {
+      await disk.joinPending()
+      // At most one admitted owner group per layer, after the actual producer
+      // joined/fenced. No wait or write is added to an active decode iteration.
+      var groups = 0, retirements = 0
+      while groups < layouts.count {
+        if observeReadySpill(caches, finalizing: true) {
+          groups += 1; await disk.joinPending(); continue
+        }
+        guard spillQuotaRefused else { break }
+        if retirements < 128, reclaimDiskEntry() { retirements += 1 }
+        else if !shedOptionalDiskCoverage() { break }
+        // Only remove an old index owner here, after the actual producer join.
+        // Escaped hot/capture/lookup references still pin their files. Retry
+        // observes the store's real quota only AFTER the utility unlink joins.
+        await disk.joinPending()
+      }
+    }
+    private static func keep(_ layout: PrefixKVStorage.Layout) -> Int {
+      if case .rotating(_, let keep, _, _) = layout { return keep }; return 0
+    }
+    fileprivate func spillStillLive() -> Bool {
+      return !spillCancellation.isCancelled && spillIsLive()
+    }
+    func cancelSpill() { spillCancellation.cancel() }
+    func joinSpill() async { await disk.joinPending() }
+    private func acceptSpill(_ values: [PrefixKVSpan]?) {
+      lock.lock(); defer { lock.unlock() }
+      guard !discarded, !spillCancellation.isCancelled, spillIsLive() else { return }
+      guard let values else { diskWriteMisses &+= 1; return }
+      for span in values {
+        for piece in spans[span.layer].append(span) { retain(piece, novel: true) }
+        spillThrough[span.layer] = max(spillThrough[span.layer], span.end)
+      }
+      refreshDiskPromptBoundary()
+      // A row may finish while this bounded write is pending. Freeze its real
+      // immutable disk coverage before peers' later tail expiration.
+      for row in Array(lanes.keys) {
+        guard var lane = lanes[row], lane.finished, lane.frozenLocal == nil else { continue }
+        lane.frozenLocal = freezeLocal(row: row, processed: lane.processed); lanes[row] = lane
+      }
+      pruneLocalTail()
+    }
     private static func bytes(_ span: PrefixKVSpan) -> UInt64 {
       span.backingBytesUpperBound
     }
@@ -534,7 +739,30 @@ final class PromptPrefixCache: @unchecked Sendable {
       }
       self.pending = nil
     }
-    private func pruneLocalTail() {
+    private func refreshDiskPromptBoundary() {
+      guard nativeGlobals else { return }
+      let cap = min(end, tokens.count)
+      var candidates = Set(spans.flatMap { $0.values.map(\.end) }.filter { $0 > 0 && $0 <= cap })
+      candidates.insert(cap)
+      for count in candidates.sorted(by: >) where count > diskPromptBoundary {
+        let supported = layouts.indices.allSatisfy { layer in
+          let values = spans[layer].values
+          switch layouts[layer] {
+          case .simple: return Entry.covers(0..<count, spans: values)
+          case .rotating(let window, let keep, _, _):
+            let pinned = min(keep, count)
+            return Entry.covers(0..<pinned, spans: values)
+              && Entry.covers(max(pinned, count - (window - keep))..<count, spans: values)
+          }
+        }
+        if supported { diskPromptBoundary = count; break }
+      }
+    }
+    private func pruneLocalTail(forceDisk: Bool = false) {
+      // Disk intervals stay eligible for earlier edits while quota admits them.
+      // Only joined disk pressure sheds optional middle intervals. Required
+      // current/initial/finished-row coverage keeps its actual file references.
+      if nativeGlobals && !forceDisk { return }
       for layer in layouts.indices {
         guard case .rotating(let window, let keep, _, _) = layouts[layer] else { continue }
         // Pressure keeps both the initial reusable prompt boundary and current
@@ -550,14 +778,16 @@ final class PromptPrefixCache: @unchecked Sendable {
       return overflow ? keep : max(keep, count - min(count, length))
     }
     private func initialLocalRange(window: Int, keep: Int, through count: Int) -> Range<Int> {
-      let boundary = min(count, max(0, tokens.count - 1)), pinned = min(keep, boundary)
+      let boundary = min(count, min(max(0, tokens.count - 1), nativeGlobals ? diskPromptBoundary : count))
+      let pinned = min(keep, boundary)
       return max(pinned, boundary - (window - keep))..<boundary
     }
     /// Pressure reduces optional past coverage, never the required native tail.
     /// Whole incoming pages and all row views keep their immutable full charge.
-    private func shedOptionalLocalCoverage() {
+    private func shedOptionalLocalCoverage(forceDisk: Bool = false) {
       compactLocalCoverage = true
-      pruneLocalTail()
+      pruneLocalTail(forceDisk: forceDisk)
+      if nativeGlobals && !forceDisk { return } // RAM pressure cannot reclaim disk-only bytes.
       for row in Array(lanes.keys) {
         guard var lane = lanes[row], var frozen = lane.frozenLocal else { continue }
         for layer in layouts.indices {
@@ -576,6 +806,16 @@ final class PromptPrefixCache: @unchecked Sendable {
         lane.frozenLocal = frozen; lanes[row] = lane
       }
     }
+    fileprivate func shedOptionalDiskCoverage() -> Bool {
+      lock.lock(); defer { lock.unlock() }
+      func files() -> Set<UUID> {
+        let frozen = lanes.values.flatMap { $0.frozenLocal?.flatMap { $0 } ?? [] }
+        return Set((spans.flatMap { $0.values } + frozen).compactMap(\.diskFileID))
+      }
+      let before = files()
+      shedOptionalLocalCoverage(forceDisk: true)
+      return !before.subtracting(files()).isEmpty
+    }
     private func admit(incoming: UInt64, checkResidency: Bool) -> Bool {
       var decision = reserve(incoming, checkResidency)
       if decision == .admitted { return true }
@@ -592,6 +832,7 @@ final class PromptPrefixCache: @unchecked Sendable {
       return true
     }
     private func retain(_ span: PrefixKVSpan, novel: Bool) {
+      guard span.backingBytesUpperBound > 0 else { return }
       if var charge = spanCharges[span.id] { charge.references += 1; spanCharges[span.id] = charge }
       else {
         spanCharges[span.id] = SpanCharge(bytes: Self.bytes(span), novel: novel, references: 1)
@@ -619,11 +860,8 @@ final class PromptPrefixCache: @unchecked Sendable {
         // A following query may end one token earlier or diverge inside it.
         for span in spans[layer].values where span.start < processed {
           let upper = min(span.end, processed), selected = span.batchWidth == 1 ? 0 : row
-          guard selected < span.batchWidth, let view = try? PrefixKVSpan(id: span.id,
-            offset: span.start, layer: layer,
-            keys: span.keys[selected..<(selected + 1), 0..., ..<(upper - span.start), 0...],
-            values: span.values[selected..<(selected + 1), 0..., ..<(upper - span.start), 0...],
-            backingBytesUpperBound: span.backingBytesUpperBound) else { return nil }
+          guard selected < span.batchWidth,
+            let view = try? span.sliced(positions: 0..<(upper - span.start), row: selected) else { return nil }
           frozen[layer].append(view)
         }
         guard required.allSatisfy({ Entry.covers($0, spans: frozen[layer]) }) else { return nil }
@@ -653,19 +891,21 @@ final class PromptPrefixCache: @unchecked Sendable {
     func observeLane(row: Int, width: Int, completion: Completion, finished: Bool) -> Bool {
       lock.lock(); defer { lock.unlock() }
       guard !discarded, samples.isEmpty, (1...4).contains(width), (0..<width).contains(row),
-        completion.row == row, let processed = primaryCache?.offset,
+        completion.row == row, let processed = primaryCache?.offset ?? (independentRow == row ? end : nil),
         processed >= tokens.count, processed - tokens.count <= completion.observedTokenIDs.count else { return false }
       if let previous = lanes[row] {
         guard previous.width == width, !previous.finished, processed >= previous.processed,
           completion.observedTokenIDs.starts(with: previous.ledger) else { return false }
       }
       let frozen = finished ? freezeLocal(row: row, processed: min(processed, end)) : nil
-      if finished, frozen == nil { return false }
+      // Finishing is an actual decode ledger fact. Optional disk coverage can
+      // still be in flight; final entry coverage checks remain strict.
       lanes[row] = Lane(width: width, processed: processed,
         ledger: completion.observedTokenIDs, finished: finished, frozenLocal: frozen)
       return true
     }
     func discard() {
+      spillCancellation.cancel()
       lock.lock(); defer { lock.unlock() }
       discarded = true; accepting = false; spans.removeAll(); samples.removeAll(); lanes.removeAll()
       spanCharges.removeAll(); novelBytes = 0; end = 0; pending = nil
@@ -695,7 +935,8 @@ final class PromptPrefixCache: @unchecked Sendable {
             return spans[layer].values.filter { $0.start < count }
           }, geometry: geometry,
           origin: selectedHistory.last?.origin ?? .prefill, batchWidth: width, row: row,
-          history: selectedHistory, nativeGlobalPrefix: nativeGlobals ? count : nil)
+          history: selectedHistory, nativeGlobalPrefix: nativeGlobals ? count : nil,
+          nativeCurrentPrefix: nativeGlobals && count == end ? count : nil)
         if nativeGlobals {
           guard let supported = value.maximumSupportedPrefix(upTo: count) else { return nil }
           let clipped = PromptPrefixCache.clippedHistory(selectedHistory, through: supported)
@@ -703,9 +944,11 @@ final class PromptPrefixCache: @unchecked Sendable {
           return Entry(id: value.id, owner: owner, tokens: Array(ids.prefix(supported)), layouts: layouts,
             spans: value.spans.map { $0.filter { $0.start < supported } }, geometry: geometry,
             origin: source?.origin ?? .prefill, batchWidth: source?.batchWidth ?? width,
-            row: source?.origin == .batchDecode ? source?.row ?? row : nil, history: clipped,
-            nativeGlobalPrefix: supported, nativeProcessedTokenCount: row == nil ? end : processed,
-            nativeLedgerRow: row)
+            row: independentRow ?? (source?.origin == .batchDecode ? source?.row ?? row : nil), history: clipped,
+            nativeGlobalPrefix: supported,
+            nativeCurrentPrefix: supported == end ? supported : nil,
+            nativeProcessedTokenCount: row == nil ? end : processed,
+            nativeLedgerRow: independentRow ?? row)
         }
         return value.supports(count) ? value : nil
       }
@@ -756,7 +999,8 @@ final class PromptPrefixCache: @unchecked Sendable {
           retained.contains(where: { $0.contains(where: { $0.batchWidth != 1 }) }) { return nil }
         let candidate = Entry(id: UUID(), owner: owner, tokens: ids, layouts: layouts,
           spans: retained, geometry: geometry, origin: .prefill,
-          batchWidth: width, row: row, history: [], nativeGlobalPrefix: nativeGlobals ? cap : nil)
+          batchWidth: width, row: row, history: [], nativeGlobalPrefix: nativeGlobals ? cap : nil,
+          nativeCurrentPrefix: nativeGlobals && cap == end ? cap : nil)
         guard let count = candidate.maximumSupportedPrefix(upTo: cap) else { return nil }
         let selectedHistory = PromptPrefixCache.clippedHistory(fullHistory, through: count).map { segment in
           ForwardSegment(origin: segment.origin, startTokenCount: segment.startTokenCount,
@@ -766,13 +1010,14 @@ final class PromptPrefixCache: @unchecked Sendable {
             evaluatedEndTokenCount: segment.evaluatedEndTokenCount)
         }
         let source = selectedHistory.last
-        let sourceRow = source?.origin == .batchDecode ? source?.row ?? row : nil
+        let sourceRow = independentRow ?? (source?.origin == .batchDecode ? source?.row ?? row : nil)
         return Entry(id: UUID(), owner: owner, tokens: Array(ids.prefix(count)), layouts: layouts,
           spans: retained.map { $0.filter { $0.start < count } }, geometry: geometry,
           origin: source?.origin ?? .prefill, batchWidth: source?.batchWidth ?? width, row: sourceRow,
           history: selectedHistory, nativeGlobalPrefix: nativeGlobals ? count : nil,
+          nativeCurrentPrefix: nativeGlobals && count == end ? count : nil,
           nativeProcessedTokenCount: nativeGlobals ? (row == nil ? end : processed) : nil,
-          nativeLedgerRow: row, joinedAcknowledgedRow: row)
+          nativeLedgerRow: independentRow ?? row, joinedAcknowledgedRow: row)
       }
       var result: [Entry] = []
       if !lanes.isEmpty {
@@ -816,6 +1061,7 @@ final class PromptPrefixCache: @unchecked Sendable {
   private struct Backing { let bytes: UInt64; var references: Int }
   private let lock = NSLock()
   private let byteLimit: UInt64
+  private let disk: PrefixKVDiskStore
   private var indices: [UUID: PrefixTokenIndex] = [:]
   private var entries: [UUID: Stored] = [:]
   private var backings: [UUID: Backing] = [:]
@@ -827,7 +1073,13 @@ final class PromptPrefixCache: @unchecked Sendable {
   private var clock: UInt64 = 0
   private var publicationTicket: UUID?
   private var pendingMissReason: String?
-  init(byteLimit: UInt64 = PromptPrefixCache.defaultByteLimit) { self.byteLimit = byteLimit }
+  init(byteLimit: UInt64 = PromptPrefixCache.defaultByteLimit,
+    diskByteLimit: UInt64 = 4_294_967_296, temporaryParent: URL? = nil) {
+    self.byteLimit = byteLimit; disk = PrefixKVDiskStore(byteLimit: diskByteLimit, temporaryParent: temporaryParent)
+  }
+  private func spillTicketIsLive(_ ticket: UUID) -> Bool {
+    lock.lock(); defer { lock.unlock() }; return publicationTicket == ticket
+  }
   func clear(reason: String? = nil) {
     lock.lock()
     let retired = activeNative; activeNative = nil
@@ -864,6 +1116,436 @@ final class PromptPrefixCache: @unchecked Sendable {
   }
   var activeCaptureLeaseCount: Int { lock.lock(); defer { lock.unlock() }; return captureLeases.count }
 
+  struct TextCohortInput {
+    let owner: PromptCacheOwner
+    let tokens: [Int]
+    let joinedBinding: JoinedKVRetentionBinding?
+  }
+  struct TextCohortRetention {
+    let completion: Completion
+    let acknowledged: Completion?
+    // Nil proof means a successful request. Failed/cancelled requests require
+    // the existing joined proof and existing revocable owner authorization.
+    let proof: JoinedKVRetentionProof?
+    let authorization: JoinedKVRetentionAuthorization?
+  }
+  /// One existing operation ticket and one actual batch cache. MLX and mutable
+  /// delivery metadata stay on its producer; only immutable ready bytes leave it.
+  final class TextCohort: @unchecked Sendable {
+    let input: LMInput
+    private(set) var cache: [any KVCache] = []
+    let rows: [Session]
+    let parentIDs: [UUID?]
+    let cacheLengths: [[Int]]
+    let cacheWidths: [Int]
+    let maskDigest: String
+    let prefill: PrefillParameters
+    fileprivate let resources: [PrefixKVNativeOwnership]
+    fileprivate let captures: [Capture]
+    private var preparing = true
+    private var processedByLayer: [Int]
+    private var finalized: Set<Int> = []
+    private var active: [Bool]
+    fileprivate var nextSpillLayer = 0
+    private let spill: (TextCohort, Bool) -> (accepted: Bool, quotaRefused: Bool)
+    fileprivate init(input: LMInput, rows: [Session], parentIDs: [UUID?],
+      cacheLengths: [[Int]], cacheWidths: [Int], maskDigest: String,
+      prefill: PrefillParameters, resources: [PrefixKVNativeOwnership], captures: [Capture],
+      spill: @escaping (TextCohort, Bool) -> (accepted: Bool, quotaRefused: Bool)) {
+      self.input = input; self.rows = rows; self.parentIDs = parentIDs
+      self.cacheLengths = cacheLengths; self.cacheWidths = cacheWidths; self.maskDigest = maskDigest
+      self.prefill = prefill; self.resources = resources; self.captures = captures; self.spill = spill
+      processedByLayer = Array(repeating: 0, count: resources.count)
+      active = Array(repeating: true, count: rows.count)
+    }
+    fileprivate func installObservers() {
+      cache = resources.enumerated().map { layer, resource in
+        PrefixBatchKVCache(layer: layer, ownership: resource, onUpdate: { [weak self] layer, keys, values in
+          self?.update(layer: layer, keys: keys, values: values)
+        }, onFinalize: { [weak self] layer in self?.didFinalize(layer) })
+      }
+    }
+    private func update(layer: Int, keys: MLXArray, values: MLXArray) {
+      precondition(keys.ndim == 4 && values.ndim == 4 && keys.dim(0) == rows.count
+        && values.dim(0) == rows.count && keys.dim(2) == values.dim(2))
+      if layer == 0 { observeReadySpill() } // previous completed immutable graph, before this update
+      let length = keys.dim(2)
+      for row in rows.indices {
+        let count = preparing
+          ? min(length, max(0, rows[row].fullPromptTokenCount - rows[row].cachedTokenCount - processedByLayer[layer]))
+          : (active[row] ? length : 0)
+        captures[row].updateCohort(layer: layer, count: count, evaluatedCount: length, width: rows.count, row: row)
+      }
+      if preparing { processedByLayer[layer] += length }
+    }
+    private func didFinalize(_ layer: Int) {
+      finalized.insert(layer)
+      if finalized.count == resources.count { preparing = false }
+    }
+    func finishedPreparation() {
+      for capture in captures { capture.completedPreparation() }
+      observeReadySpill(finalizing: true)
+    }
+    func markCacheSubmitted() { for capture in captures { capture.markCacheSubmitted() } }
+    @discardableResult func captureLane(_ row: Int, emitted: [Int], stop: Int?, finished: Bool) -> Bool {
+      if finished { active[row] = false }
+      return captures[row].observeLane(row: row, width: rows.count,
+        completion: Completion(row: row, emittedTokenIDs: emitted, stopTokenID: stop), finished: finished)
+    }
+    @discardableResult func observeReadySpill(finalizing: Bool = false) -> (accepted: Bool, quotaRefused: Bool) {
+      spill(self, finalizing)
+    }
+    func discard() { for capture in captures { capture.discard() } }
+  }
+
+  /// Look up every row under the SAME untouched hot record, then consume that
+  /// record once. No per-row makeSession may overwrite this operation's ticket.
+  func makeTextCohort(_ inputs: [TextCohortInput], prefill: PrefillParameters,
+    allowSnapshot: (@Sendable (UInt64) -> Bool)?,
+    admit: ([Int]) throws -> Void,
+    outputLimits: [Int], makeCache: () throws -> [any KVCache]) throws -> TextCohort {
+    guard (2...4).contains(inputs.count), inputs.count == outputLimits.count,
+      inputs.allSatisfy({ !$0.tokens.isEmpty && $0.tokens.count <= 16_384
+        && ($0.joinedBinding == nil || $0.joinedBinding?.owner == $0.owner) }) else {
+      throw BoomError.invalid("Invalid independent text cohort.")
+    }
+    var choices = inputs.map { activeChoice(owner: $0.owner, tokens: $0.tokens) }
+    // This admission never clears the selected source. A ragged miss changes
+    // padding, so it is readmitted before any new hydration/merge allocation.
+    try admit(choices.map { $0?.2 ?? 0 })
+    var selectedOwners: [[PrefixKVNativeOwnership]] = []
+    var lengths: [[Int]] = []
+    for row in inputs.indices {
+      var owners: [PrefixKVNativeOwnership]?
+      var excluded: Set<UUID> = [], unavailableFiles: Set<UUID> = []
+      while let choice = choices[row] {
+        do {
+          owners = try choice.1.layouts.indices.map { layer in
+            guard let record = choice.0 else {
+              let restored = try PrefixKVStorage.hydrate(layout: choice.1.layouts[layer],
+                spans: choice.1.spans[layer], prefix: choice.2,
+                row: choice.1.nativeLedgerRow ?? choice.1.row ?? 0,
+                batchWidth: choice.1.nativePhysicalWidth ?? choice.1.batchWidth)
+              return self.makeNativeOwner(restored)
+            }
+            let source = record.owners[layer]
+            switch choice.1.layouts[layer] {
+            case .simple:
+              return try ActiveNativeKVStorage.selectedGlobal(source, prefix: choice.2,
+                row: choice.1.nativeLedgerRow ?? choice.1.row ?? 0, preservingSource: true,
+                makeOwner: { self.makeNativeOwner($0, sources: $1, materialized: $2) })
+            case .rotating:
+              let selected = choice.1.nativeLedgerRow ?? choice.1.row ?? 0
+              if PrefixKVStorage.currentRingSupports(source.native, prefix: choice.2, row: selected) {
+                if let batch = source.native as? any BatchKVCacheProtocol {
+                  return self.makeNativeOwner(try batch.extract(row: selected, through: choice.2),
+                    sources: [source], materialized: true)
+                }
+                let views = try PrefixKVStorage.residentWindowSpans(of: source.native, layer: layer)
+                let restored = try PrefixKVStorage.hydrate(layout: choice.1.layouts[layer],
+                  spans: views, prefix: choice.2, row: selected,
+                  batchWidth: try ActiveNativeKVStorage.rowWidth([source]))
+                return self.makeNativeOwner(restored, sources: [source])
+              }
+              let leaseID = UUID(), lease = PrefixKVDependencyLease { [weak self] in self?.releaseLease(leaseID) }
+              let restored = try PrefixKVStorage.hydrate(layout: choice.1.layouts[layer],
+                spans: choice.1.spans[layer], prefix: choice.2, row: choice.1.row ?? 0,
+                batchWidth: choice.1.batchWidth,
+                onSourceBacking: { [weak self] id, bytes in self?.retainLease(leaseID, id: id, bytes: bytes) })
+              return self.makeNativeOwner(restored, dependencies: lease)
+            }
+          }
+          break
+        } catch {
+          // Disposable optimization data may miss. The old record is untouched;
+          // try the next actual supported row, then use the actual cold layout.
+          owners = nil
+          if let failure = error as? PrefixKVDiskUnavailable { unavailableFiles.insert(failure.fileID) }
+          else { excluded.insert(choice.1.id) }
+          choices[row] = activeChoice(owner: inputs[row].owner, tokens: inputs[row].tokens,
+            excluding: excluded, excludingFiles: unavailableFiles)
+          try admit(choices.map { $0?.2 ?? 0 })
+        }
+      }
+      let values = try owners ?? makeCache().map { makeNativeOwner($0) }
+      guard !values.isEmpty, values.allSatisfy({ PrefixKVStorage.layout(of: $0.native) != nil }) else {
+        throw BoomError.invalid("Independent text requires concrete full-precision caches.")
+      }
+      selectedOwners.append(values)
+      lengths.append(values.map { value in
+        if case .rotating(let window, _, _, _) = PrefixKVStorage.layout(of: value.native) {
+          return min(value.native.offset, window)
+        }
+        return value.native.offset
+      })
+    }
+    let layerCount = selectedOwners[0].count
+    guard layerCount <= 128, selectedOwners.allSatisfy({ $0.count == layerCount }) else {
+      throw BoomError.invalid("Independent rows have incompatible cache layers.")
+    }
+    try admit(choices.map { $0?.2 ?? 0 })
+    let resources = try (0..<layerCount).map { layer in
+      let sources = selectedOwners.map { $0[layer] }
+      let batch = try mergeBatchKVCache(sources.map(\.native))
+      return makeNativeOwner(batch, sources: sources, materialized: true)
+    }
+    let layouts = resources.compactMap { PrefixKVStorage.layout(of: $0.native) }
+    guard layouts.count == layerCount else { throw BoomError.invalid("Unknown independent batch layout.") }
+    let ticket = UUID()
+    lock.lock()
+    for choice in choices.compactMap({ $0 }) {
+      guard storageEpoch == choice.3,
+        choice.0.map({ activeNative === $0 }) ?? (entries[choice.1.id] != nil) else {
+        lock.unlock(); throw BoomError.stale("The actual cohort cache source changed before transfer.")
+      }
+    }
+    let retired = activeNative; activeNative = nil
+    // Existing disk-only history remains indexed under its own namespaces.
+    publicationTicket = ticket
+    lock.unlock()
+    let counts = choices.map { $0?.2 ?? 0 }
+    let suffixes = inputs.indices.map { Array(inputs[$0].tokens.dropFirst(counts[$0])) }
+    let width = suffixes.map(\.count).max()!
+    let masks = suffixes.flatMap { Array(repeating: Int32(1), count: $0.count) + Array(repeating: Int32(0), count: width - $0.count) }
+    let tokenIDs = suffixes.flatMap { $0.map(Int32.init) + Array(repeating: Int32(0), count: width - $0.count) }
+    let input = LMInput(text: .init(tokens: MLXArray(tokenIDs).reshaped([inputs.count, width]),
+      mask: MLXArray(masks).reshaped([inputs.count, width])))
+    let commonGeometry = PromptCacheGeometry(promptTokens: width, prefill: prefill)
+    var captures: [Capture] = [], sessions: [Session] = []
+    for row in inputs.indices {
+      let leaseID = UUID(), inherited = choices[row]?.1
+      let capture = Capture(layouts: layouts, tokens: inputs[row].tokens, cachedCount: counts[row],
+        geometry: PromptCacheGeometry(promptTokens: inputs[row].tokens.count, prefill: prefill),
+        suffixGeometry: commonGeometry, inherited: inherited,
+        reserve: { [weak self] bytes, check in self?.reserve(incoming: bytes, epoch: ticket,
+          allow: check ? allowSnapshot : nil) ?? .staleTicket },
+        retainBacking: { [weak self] id, bytes in self?.retainLease(leaseID, id: id, bytes: bytes) },
+        releaseBacking: { [weak self] id in self?.releaseLeaseBacking(leaseID, id: id) },
+        closeLease: { [weak self] in self?.releaseLease(leaseID) },
+        retainRawBacking: { [weak self] lease, id, bytes in self?.retainLease(lease, id: id, bytes: bytes) },
+        releaseRawBacking: { [self] lease, id in releaseLeaseBacking(lease, id: id) },
+        closeRawLease: { [self] lease in releaseLease(lease) }, disk: disk,
+        spillIsLive: { [weak self] in self?.spillTicketIsLive(ticket) ?? false },
+        reclaimDiskEntry: { [weak self] in self?.retireOldestDiskEntry(epoch: ticket) ?? false },
+        nativeGlobals: true,
+        independentRow: row, independentWidth: inputs.count)
+      let history = inherited.map { Self.clippedHistory($0.history, through: counts[row]) } ?? []
+      let observation = Observation(algorithm: Self.activeAlgorithm, originalGeometry: capture.geometry,
+        suffixGeometry: commonGeometry, fullPromptTokens: inputs[row].tokens.count,
+        cachedPromptTokens: counts[row], suffixPromptTokens: suffixes[row].count,
+        missReason: counts[row] > 0 ? nil : "no_active_supported_prefix",
+        cachedOrigin: history.last?.origin, cachedBatchWidth: inherited?.batchWidth, cachedRow: inherited?.row,
+        cachedForwardHistory: history, retainedBytes: retainedBytesUpperBound, byteLimit: byteLimit,
+        cachedJoinedRetentionProvenance: inherited?.joinedRetentionProvenance,
+        nativeTensorBytes: retainedNativeBytesUpperBound, cachedNativePhysicalWidth: inherited?.nativePhysicalWidth)
+      sessions.append(Session(input: LMInput(tokens: MLXArray(suffixes[row])), cache: resources.map(\.native),
+        prefill: prefill, cachedTokenCount: counts[row], fullPromptTokenCount: inputs[row].tokens.count,
+        preservesChunkBoundaries: false, observation: observation, owner: inputs[row].owner, epoch: ticket,
+        joinedRetentionBinding: inputs[row].joinedBinding, capture: capture, nativeOwners: resources))
+      captures.append(capture)
+    }
+    let cohort = TextCohort(input: input, rows: sessions, parentIDs: choices.map { $0?.1.id },
+      cacheLengths: lengths, cacheWidths: (0..<layerCount).map { layer in lengths.map { $0[layer] }.max()! },
+      maskDigest: Digest.sha256(try JSONEncoder().encode(masks)), prefill: prefill,
+      resources: resources, captures: captures, spill: { [weak self] value, finalizing in
+        self?.observeTextCohortSpill(value, ticket: ticket, allowSnapshot: allowSnapshot,
+          finalizing: finalizing) ?? (false, false)
+      })
+    cohort.installObservers()
+    lock.lock()
+    if publicationTicket == ticket {
+      for choice in choices.compactMap({ $0 }) where choice.0 == nil {
+        if var stored = entries[choice.1.id] {
+          clock &+= 1; stored.touched = clock; entries[choice.1.id] = stored
+        }
+      }
+    }
+    lock.unlock(); withExtendedLifetime(retired) {}
+    return cohort
+  }
+
+  private func observeTextCohortSpill(_ cohort: TextCohort, ticket: UUID,
+    allowSnapshot: (@Sendable (UInt64) -> Bool)?, finalizing: Bool
+  ) -> (accepted: Bool, quotaRefused: Bool) {
+    guard spillTicketIsLive(ticket), disk.canSubmit else { return (false, false) }
+    // Acquire each full physical parent once, even when several rows/ring
+    // pieces borrow it. Only ready immutable storage goes to the file worker.
+    let leaseID = UUID()
+    func admitParent(_ allocation: Int) -> (@Sendable () -> Void)? {
+      let bytes = UInt64(allocation)
+      guard reserve(incoming: bytes, epoch: ticket, allow: allowSnapshot) == .admitted else { return nil }
+      let id = UUID(); retainLease(leaseID, id: id, bytes: bytes)
+      return { [self] in releaseLeaseBacking(leaseID, id: id) }
+    }
+    var selected: [(PrefixKVDiskStore.ReadySpan, Int)] = []
+    var attempted: Set<Int> = []
+    for index in cohort.resources.indices {
+      let layer = (cohort.nextSpillLayer + index) % cohort.resources.count
+      let native = cohort.resources[layer].native
+      guard let batch = native as? any BatchKVCacheProtocol,
+        let metadata = PrefixKVStorage.readyBatchPositions(batch) else { continue }
+      var wanted: [(Int, Int, Range<Int>)] = []
+      for row in cohort.rows.indices {
+        guard let after = cohort.captures[row].cohortSpillStart(layer: layer,
+          actualPosition: metadata.positions[row], finalizing: finalizing) else { continue }
+        let end = cohort.captures[row].coveredEnd
+        attempted.insert(row)
+        if let rotating = batch as? BatchRotatingKVCache {
+          guard let ranges = try? rotating.residentRanges(position: metadata.positions[row],
+            padding: metadata.padding[row], after: after, through: end) else { continue }
+          wanted += ranges.map { (row, $0.0, $0.1) }
+        } else if after < end {
+          let padding = metadata.padding[row]
+          guard padding >= 0 else { continue }
+          wanted.append((row, after, (padding + after)..<(padding + end)))
+        }
+      }
+      guard !wanted.isEmpty else { continue }
+      let arrays = batch.innerState().filter { $0.ndim == 4 }
+      guard arrays.count == 2,
+        wanted.allSatisfy({ $0.2.upperBound <= arrays[0].dim(2) && $0.2.upperBound <= arrays[1].dim(2) }),
+        let keys = arrays[0].readyBuffer(admitting: admitParent),
+        let values = arrays[1].readyBuffer(admitting: admitParent) else {
+        if !selected.isEmpty { cohort.nextSpillLayer = layer; break }
+        continue
+      }
+      let pieces = wanted.compactMap { row, start, physical -> (PrefixKVDiskStore.ReadySpan, Int)? in
+        (try? PrefixKVDiskStore.ReadySpan(start: start, layer: layer, keys: keys, values: values,
+          positions: physical, rows: row..<(row + 1))).map { ($0, row) }
+      }
+      if !selected.isEmpty, !disk.fitsEmpty(selected.map { $0.0 } + pieces.map { $0.0 }) {
+        cohort.nextSpillLayer = layer; break
+      }
+      selected += pieces
+    }
+    guard !selected.isEmpty else { return (false, false) }
+    if let last = selected.last { cohort.nextSpillLayer = (last.0.layer + 1) % cohort.resources.count }
+    // The existing store writes files in sorted layer order. Keep row/interval
+    // correspondence explicit instead of zipping results to a rotated input.
+    selected.sort { a, b in
+      if a.0.layer != b.0.layer { return a.0.layer < b.0.layer }
+      if a.1 != b.1 { return a.1 < b.1 }
+      return a.0.start < b.0.start
+    }
+    let ready = selected.map { $0.0 }, rows = selected.map { $0.1 }, captures = cohort.captures
+    let before = disk.observation.quotaMisses
+    let accepted = disk.submit(ready, isLive: { [weak self] in
+      self?.spillTicketIsLive(ticket) == true && captures.contains { $0.spillStillLive() }
+    }, completed: { values in
+      for row in captures.indices {
+        let own = values.map { values in zip(rows, values).compactMap { $0.0 == row ? $0.1 : nil } }
+        if own?.isEmpty == false { captures[row].acceptCohortSpill(own) }
+      }
+    })
+    for row in attempted { captures[row].noteCohortSpill(accepted: accepted) }
+    return (accepted, !accepted && disk.observation.quotaMisses != before && disk.fitsEmpty(ready))
+  }
+  func joinTextCohortSpill(_ cohort: TextCohort, cancelled: Bool) async {
+    if cancelled { for capture in cohort.captures { capture.cancelSpill() } }
+    await disk.joinPending()
+    guard !cancelled, let ticket = cohort.rows.first?.epoch else { return }
+    var groups = 0, retirements = 0
+    while groups < cohort.resources.count {
+      let result = cohort.observeReadySpill(finalizing: true)
+      if result.accepted { groups += 1; await disk.joinPending(); continue }
+      guard result.quotaRefused else { break }
+      if retirements < 128, retireOldestDiskEntry(epoch: ticket) { retirements += 1 }
+      else {
+        var shed = false
+        for capture in cohort.captures where capture.shedOptionalDiskCoverage() { shed = true }
+        if !shed { break }
+      }
+      // Producer/fence has already joined. Only completed utility unlinks
+      // credit disk quota; required/borrowed spans keep their actual ownership.
+      await disk.joinPending()
+    }
+  }
+  /// One final installation into the existing hot slot. A failed row may retain
+  /// only its acknowledged joined prefix under its original owner permission;
+  /// it cannot cancel, publish or mint another row's receiving result.
+  @discardableResult func publishTextCohort(_ cohort: TextCohort,
+    retention: [TextCohortRetention?]) -> Bool {
+    guard retention.count == cohort.rows.count, let epoch = cohort.rows.first?.epoch else { return false }
+    lock.lock(); let current = publicationTicket == epoch; lock.unlock()
+    guard current else { return false }
+    var candidates: [(Entry, TextCohortRetention, JoinedKVRetentionBinding?, Bool)] = []
+    for row in cohort.rows.indices {
+      guard let disposition = retention[row], let owner = cohort.rows[row].owner,
+        disposition.completion.row == row, cohort.captures[row].workingGraphWasSubmitted else { continue }
+      let capture = cohort.captures[row]
+      let values: [Entry]
+      if let proof = disposition.proof {
+        guard proof.permitsRetention, let authorization = disposition.authorization,
+          let binding = cohort.rows[row].joinedRetentionBinding, authorization.binding == binding,
+          authorization.withAuthorization(binding: binding, { true }) == true else { continue }
+        values = capture.joinedEntries(owner: owner, acknowledged: disposition.acknowledged.map { [$0] } ?? [])
+      } else {
+        values = capture.entries(owner: owner, completions: [disposition.completion])
+      }
+      for original in values {
+        var value = original
+        let actualRow = value.nativeLedgerRow ?? value.row ?? row
+        guard actualRow == row else { continue }
+        let hot = (disposition.proof?.termination != .constructorCancelled || capture.permitsJoinedHotState)
+          && cohort.resources.indices.allSatisfy { layer in
+            let native = cohort.resources[layer].native
+            guard PrefixKVStorage.layout(of: native) == value.layouts[layer],
+              let batch = native as? any BatchKVCacheProtocol,
+              let positions = PrefixKVStorage.readyBatchPositions(batch),
+              positions.positions[row] >= value.tokens.count else { return false }
+            return true
+          }
+        if hot {
+          value.nativePhysicalWidth = cohort.rows.count
+          if !Self.hasCurrentHot(value, owners: cohort.resources) { value.nativeCurrentPrefix = nil }
+        }
+        value.nativeRowReceipt = NativeRowReceipt(completedTokenCount: capture.coveredEnd,
+          submittedTokenCount: capture.submittedTokenCount,
+          processedTokenCount: value.nativeProcessedTokenCount ?? value.tokens.count,
+          deliveredGeneratedTokenCount: disposition.completion.emittedTokenIDs.count,
+          acknowledgedGeneratedTokenCount: disposition.acknowledged?.observedTokenIDs.count ?? 0,
+          observedStopTokenID: disposition.completion.stopTokenID)
+        if let proof = disposition.proof, let binding = cohort.rows[row].joinedRetentionBinding {
+          value.joinedRetentionProvenance = JoinedKVRetentionProvenance(binding: binding,
+            termination: proof.termination, promptTokenCount: cohort.rows[row].fullPromptTokenCount,
+            representedTokenCount: value.tokens.count, lastCompleteCohortTokenCount: capture.coveredEnd,
+            lastSubmittedCohortTokenCount: capture.submittedTokenCount,
+            acknowledgedGeneratedTokenCount: disposition.acknowledged?.observedTokenIDs.count ?? 0,
+            representedGeneratedTokenCount: max(0, value.tokens.count - cohort.rows[row].fullPromptTokenCount))
+        }
+        candidates.append((value, disposition, cohort.rows[row].joinedRetentionBinding,
+          hot && value.supports(value.tokens.count)))
+      }
+    }
+    let leaseID = UUID(), localLease = PrefixKVDependencyLease { [weak self] in self?.releaseLease(leaseID) }
+    for candidate in candidates where candidate.3 { for span in candidate.0.spans.flatMap({ $0 }) {
+      retainLease(leaseID, id: span.id, bytes: span.backingBytesUpperBound)
+    } }
+    lock.lock()
+    guard publicationTicket == epoch else { lock.unlock(); return false }
+    var rows: [Entry] = [], diskAdded = false
+    for (value, disposition, binding, hot) in candidates {
+      let install = {
+        diskAdded = self.retainDiskRows([value]) || diskAdded // strips ALL native coverage witnesses
+        if hot { rows.append(value) }
+      }
+      if let authorization = disposition.authorization, let binding {
+        _ = authorization.withAuthorization(binding: binding, install)
+      } else { install() }
+    }
+    let retired = activeNative
+    activeNative = rows.isEmpty ? nil : ActiveNativeRecord(owners: cohort.resources, rows: rows, localLease: localLease)
+    publicationTicket = nil
+    lock.unlock(); withExtendedLifetime(retired) {}
+    for cache in cohort.cache { (cache as? PrefixBatchKVCache)?.sealForJoinedTransfer() }
+    // An unsafe/unsubmitted future stays owned until its real caller joins it;
+    // disk-only disposition must never evaluate it to grant a native transfer.
+    if !rows.isEmpty {
+      for resource in cohort.resources { resource.releaseMaterializedSourcesAfterJoinedSubmission() }
+    }
+    return !rows.isEmpty || diskAdded
+  }
+
   func makeSession(owner: PromptCacheOwner?, input: LMInput, promptTokenIDs: [Int],
     prefill: PrefillParameters, state: LMOutput.State? = nil,
     allowSnapshot: (@Sendable (UInt64) -> Bool)? = nil,
@@ -886,117 +1568,24 @@ final class PromptPrefixCache: @unchecked Sendable {
         prefill: prefill, allowSnapshot: allowSnapshot, joinedRetentionBinding: joinedRetentionBinding,
         outputTokens: outputTokens, batchWidth: batchWidth, admitNative: admitNative, makeCache: makeCache)
     }
-    // A diagnostic/unsupported cold path cannot leave another global branch
-    // indexed beside its own. True escaped owners/graph leases remain charged.
+    // Non-stateless/masked/media or unowned input executes normally but cannot
+    // acquire another reusable RAM archive. Only the admitted native text path
+    // above owns hot state and disk-backed history.
     retireNativeOwned()
     let ticket = UUID()
     lock.lock(); publicationTicket = ticket
-    let emptyReason = pendingMissReason; pendingMissReason = nil
-    var candidates: [(id: UUID, count: Int, insertedAt: UInt64)] = []
-    var hasTokenMatch = false
-    if let owner, textOnly, let index = indices[owner.namespace] {
-      for match in index.matches(tokens: promptTokenIDs, maximumCount: promptTokenIDs.count - 1) {
-        hasTokenMatch = true
-        if let stored = entries[match.id],
-          let supported = stored.entry.maximumSupportedPrefix(upTo: match.tokenCount) {
-          candidates.append((stored.entry.id, supported, stored.insertedAt))
-        }
-      }
-    }
-    candidates.sort { $0.count == $1.count ? $0.insertedAt > $1.insertedAt : $0.count > $1.count }
-    lock.unlock()
-    var selected: Entry?, count = 0, working: [KVCache]?, selectedBorrow: UUID?
-    var hydrationDependencies: PrefixKVDependencyLease?
-    defer { if let selectedBorrow { releaseLease(selectedBorrow) } }
-    for (id, matched, _) in candidates {
-      let borrowed = UUID()
-      guard let value = borrow(id: id, lease: borrowed, epoch: ticket) else { continue }
-      let dependencyID = UUID()
-      let dependencies = PrefixKVDependencyLease { [weak self] in
-        self?.releaseLease(dependencyID)
-      }
-      let hydrated = try? {
-        let trace = PerformanceTrace.begin("Model.PrefixCacheHydration")
-        defer { PerformanceTrace.end("Model.PrefixCacheHydration", trace) }
-        return try value.layouts.indices.map { layer in
-          try PrefixKVStorage.hydrate(layout: value.layouts[layer], spans: value.spans[layer],
-            prefix: matched, row: value.row ?? 0, batchWidth: value.batchWidth,
-            onSourceBacking: { [weak self] id, bound in
-              self?.retainLease(dependencyID, id: id, bytes: bound)
-            })
-        }
-      }()
-      if let hydrated {
-        selected = value; count = matched; working = hydrated; selectedBorrow = borrowed
-        hydrationDependencies = dependencies
-        break
-      }
-      releaseLease(borrowed)
-    }
-    if let selected {
-      lock.lock(); clock &+= 1
-      if var stored = entries[selected.id] { stored.touched = clock; entries[selected.id] = stored }
-      lock.unlock()
-    }
-    let native = try working ?? makeCache()
-    let layouts = native.compactMap { PrefixKVStorage.layout(of: $0) }
-    let canCapture = owner != nil && textOnly && !native.isEmpty && layouts.count == native.count
-    let narrowed: LMInput
-    if count > 0 {
-      let ids = input.text.tokens
-      narrowed = LMInput(tokens: ids.ndim == 1 ? ids[count...] : ids[0..., count...])
-    } else { narrowed = input }
-    var suffix = prefill
-    let inheritedHistory = selected.map { Self.clippedHistory($0.history, through: count) } ?? []
-    let preserves = Self.preservesGeometry(inheritedHistory, count: count, prompt: promptTokenIDs.count, prefill: prefill)
-    if count > 0, preserves, let stride = geometry.chunkStride {
-      suffix.chunking = .remainder; suffix.stepSize = stride
-    }
-    let suffixGeometry = PromptCacheGeometry(promptTokens: promptTokenIDs.count - count, prefill: suffix)
-    let capture = canCapture ? Capture(layouts: layouts, tokens: promptTokenIDs, cachedCount: count,
-      geometry: geometry, suffixGeometry: suffixGeometry, inherited: selected,
-      reserve: { [weak self] incoming, checkResidency in
-        self?.reserve(incoming: incoming, epoch: ticket,
-          allow: checkResidency ? allowSnapshot : nil) ?? .staleTicket
-      },
-      retainBacking: { [weak self] id, bound in self?.retainLease(ticket, id: id, bytes: bound) },
-      releaseBacking: { [weak self] id in self?.releaseLeaseBacking(ticket, id: id) },
-      closeLease: { [weak self] in self?.releaseLease(ticket) }) : nil
-    let cache: [KVCache] = native.enumerated().map { layer, base in
-      if let capture {
-        return PrefixKVCache(layer: layer, base: base, dependencyLease: hydrationDependencies) {
-          capture.update(layer: $0, offset: $1, keys: $2, values: $3)
-        }
-      }
-      if let hydrationDependencies {
-        return PrefixKVCache(layer: layer, base: base, dependencyLease: hydrationDependencies) {
-          _, _, _, _ in
-        }
-      }
-      return base
-    }
-    capture?.primaryCache = cache.first as? PrefixKVCache
-    let sourceProgress = prefill.progress
-    let reusedTokenCount = count
-    if let capture {
-      suffix.progress = { processed, total in
-        capture.progress(processed: processed, total: total)
-        sourceProgress?(reusedTokenCount + processed, reusedTokenCount + total)
-      }
-    }
-    let miss: String? = count > 0 ? nil : owner == nil ? "no_owner" : !textOnly ? "unsupported_input"
-      : emptyReason ?? (candidates.isEmpty ? (hasTokenMatch ? "local_coverage_missing" : "no_resident_prefix") : "unsupported_cache")
-    let observation = Observation(algorithm: Self.algorithm, originalGeometry: geometry,
-      suffixGeometry: suffixGeometry, fullPromptTokens: promptTokenIDs.count,
-      cachedPromptTokens: count, suffixPromptTokens: promptTokenIDs.count - count,
-      missReason: miss, cachedOrigin: inheritedHistory.last?.origin, cachedBatchWidth: selected?.batchWidth,
-      cachedRow: selected?.row, cachedForwardHistory: inheritedHistory,
-      retainedBytes: retainedBytesUpperBound, byteLimit: byteLimit,
-      cachedJoinedRetentionProvenance: selected?.joinedRetentionProvenance)
-    return Session(input: narrowed, cache: cache, prefill: suffix, cachedTokenCount: count,
-      fullPromptTokenCount: promptTokenIDs.count, preservesChunkBoundaries: preserves,
-      observation: observation, owner: owner, epoch: ticket,
-      joinedRetentionBinding: joinedRetentionBinding, capture: capture)
+    let emptyReason = pendingMissReason; pendingMissReason = nil; lock.unlock()
+    let cache = try makeCache()
+    let reason = !textOnly ? "non_stateless_text" : owner == nil ? "owner_unavailable"
+      : emptyReason ?? "native_cache_path_unverified"
+    return Session(input: input, cache: cache, prefill: prefill, cachedTokenCount: 0,
+      fullPromptTokenCount: promptTokenIDs.count, preservesChunkBoundaries: true,
+      observation: Observation(algorithm: Self.activeAlgorithm, originalGeometry: geometry,
+        suffixGeometry: geometry, fullPromptTokens: promptTokenIDs.count, cachedPromptTokens: 0,
+        suffixPromptTokens: promptTokenIDs.count, missReason: reason, cachedOrigin: nil,
+        cachedBatchWidth: nil, cachedRow: nil, cachedForwardHistory: [],
+        retainedBytes: retainedBytesUpperBound, byteLimit: byteLimit),
+      owner: owner, epoch: ticket, joinedRetentionBinding: joinedRetentionBinding, capture: nil)
   }
   private func makeNativeOwner(_ base: any KVCache,
     sources: [PrefixKVNativeOwnership] = [], materialized: Bool = false,
@@ -1009,18 +1598,54 @@ final class PromptPrefixCache: @unchecked Sendable {
         guard let self else { return }; self.lock.lock(); self.nativeCharges.removeValue(forKey: id); self.lock.unlock()
       })
   }
-  private func activeChoice(owner: PromptCacheOwner, tokens: [Int]) -> (ActiveNativeRecord, Entry, Int, UUID)? {
+  private func activeChoice(owner: PromptCacheOwner, tokens: [Int], excluding: Set<UUID> = [],
+    excludingFiles: Set<UUID> = [])
+    -> (ActiveNativeRecord?, Entry, Int, UUID)? {
     lock.lock(); defer { lock.unlock() }
-    guard let record = activeNative else { return nil }
-    var selected: Entry?, longest = 0
-    for row in record.rows where row.owner.namespace == owner.namespace {
+    let record = activeNative
+    var candidates = record?.rows.map { ($0, record) } ?? []
+    if let index = indices[owner.namespace] {
+      for match in index.matches(tokens: tokens, maximumCount: tokens.count - 1) {
+        if let entry = entries[match.id]?.entry,
+          entry.spans.flatMap({ $0 }).allSatisfy({ $0.diskFileID != nil }) {
+          candidates.append((entry, nil))
+        }
+      }
+    }
+    var selected: Entry?, selectedRecord: ActiveNativeRecord?, longest = 0
+    for (original, source) in candidates where original.owner.namespace == owner.namespace && !excluding.contains(original.id) {
+      var row = original
+      if source == nil || !Self.hasCurrentHot(row, owners: source!.owners) { row.nativeCurrentPrefix = nil }
+      if !excludingFiles.isEmpty {
+        row.spans = row.spans.map { $0.filter { span in
+          span.diskFileID.map { !excludingFiles.contains($0) } ?? true
+        } }
+      }
       let lexical = zip(tokens, row.tokens).prefix(while: { $0.0 == $0.1 }).count
       guard let count = row.maximumSupportedPrefix(upTo: min(lexical, tokens.count - 1)),
         count > longest else { continue }
-      selected = row; longest = count
+      selected = row; selectedRecord = source; longest = count
     }
     guard let selected else { return nil }
-    return (record, selected, longest, storageEpoch)
+    return (selectedRecord, selected, longest, storageEpoch)
+  }
+  private static func hasCurrentHot(_ row: Entry, owners: [PrefixKVNativeOwnership]) -> Bool {
+    guard let prefix = row.nativeCurrentPrefix, prefix == row.tokens.count,
+      owners.count == row.layouts.count, let width = try? ActiveNativeKVStorage.rowWidth(owners) else { return false }
+    let selected = row.nativeLedgerRow ?? row.row ?? 0
+    guard selected >= 0, selected < width else { return false }
+    return owners.indices.allSatisfy { layer in
+      let native = owners[layer].native
+      if let batch = native as? any BatchKVCacheProtocol {
+        guard let positions = PrefixKVStorage.readyBatchPositions(batch), selected < positions.positions.count,
+          positions.positions[selected] >= prefix else { return false }
+      } else if native.offset != prefix { return false }
+      guard PrefixKVStorage.layout(of: native) == row.layouts[layer] else { return false }
+      if case .rotating = row.layouts[layer] {
+        return PrefixKVStorage.currentRingSupports(native, prefix: prefix, row: selected)
+      }
+      return true
+    }
   }
   /// Read-only sizing for source/context preflight. It never consumes a slot,
   /// clears native ownership, or fabricates a prefix from missing local rows.
@@ -1029,9 +1654,13 @@ final class PromptPrefixCache: @unchecked Sendable {
     guard let owner, let (record, row, count, _) = activeChoice(owner: owner, tokens: tokens) else { return nil }
     let suffix = Self.nativeSuffixPrefill(history: Self.clippedHistory(row.history, through: count),
       count: count, prompt: tokens.count, prefill: prefill)
-    return try ActiveNativeKVStorage.plan(owners: record.owners, layouts: row.layouts,
-      prefix: count, prompt: tokens.count, output: outputTokens, width: batchWidth,
-      row: row.row, prefill: suffix)
+    if let record {
+      return try ActiveNativeKVStorage.plan(owners: record.owners, layouts: row.layouts,
+        prefix: count, prompt: tokens.count, output: outputTokens, width: batchWidth,
+        row: row.nativeLedgerRow ?? row.row, prefill: suffix)
+    }
+    return try ActiveNativeKVStorage.diskPlan(layouts: row.layouts, spans: row.spans,
+      prefix: count, prompt: tokens.count, output: outputTokens, width: batchWidth, prefill: suffix)
   }
   /// This returns only after the retired record's real strong leases leave this
   /// scope. Any escaped working alias still owns/charges its source; admission
@@ -1046,52 +1675,114 @@ final class PromptPrefixCache: @unchecked Sendable {
     admitNative: ((ActiveNativeKVAdmissionPlan?) throws -> Void)?,
     makeCache: () throws -> [KVCache]) throws -> Session {
     var chosen = activeChoice(owner: owner, tokens: promptTokenIDs)
-    var admissionRefused = false
-    if chosen != nil {
-      let plan = try { () -> ActiveNativeKVAdmissionPlan in
-        let value = chosen!
-        let suffix = Self.nativeSuffixPrefill(history: Self.clippedHistory(value.1.history, through: value.2),
-          count: value.2, prompt: promptTokenIDs.count, prefill: prefill)
-        return try ActiveNativeKVStorage.plan(owners: value.0.owners, layouts: value.1.layouts,
-          prefix: value.2, prompt: promptTokenIDs.count, output: outputTokens,
-          width: batchWidth, row: value.1.row, prefill: suffix)
-      }()
+    var admissionRefused = false, diskUnavailable = false
+    var excluded: Set<UUID> = [], unavailableFiles: Set<UUID> = []
+    var preparedLocals: [Int: PrefixKVNativeOwnership] = [:]
+    while let candidate = chosen {
+      let suffix = Self.nativeSuffixPrefill(history: Self.clippedHistory(candidate.1.history, through: candidate.2),
+        count: candidate.2, prompt: promptTokenIDs.count, prefill: prefill)
+      let plan: ActiveNativeKVAdmissionPlan
+      if let record = candidate.0 {
+        plan = try ActiveNativeKVStorage.plan(owners: record.owners, layouts: candidate.1.layouts,
+          prefix: candidate.2, prompt: promptTokenIDs.count, output: outputTokens,
+          width: batchWidth, row: candidate.1.nativeLedgerRow ?? candidate.1.row, prefill: suffix)
+      } else {
+        plan = try ActiveNativeKVStorage.diskPlan(layouts: candidate.1.layouts, spans: candidate.1.spans,
+          prefix: candidate.2, prompt: promptTokenIDs.count, output: outputTokens, width: batchWidth, prefill: suffix)
+      }
       do { try admitNative?(plan) }
       catch BoomError.budget {
-        // No tensor work or destructive native trim has happened. A real fit
-        // failure may reclaim the slot and try ordinary *admission*, never retry
-        // a model run or alter its prompt/width/policy.
-        chosen = nil; admissionRefused = true
-        retireNativeOwned()
-        try admitNative?(nil)
+        chosen = nil; admissionRefused = true; break
       }
-    } else {
-      retireNativeOwned()
-      try admitNative?(nil)
+      // File reads/hydration happen on the existing inference executor BEFORE
+      // decode or destructive source transfer. No read IO is added to a token.
+      do {
+        for layer in candidate.1.layouts.indices {
+          guard let record = candidate.0 else {
+            let restored = try PrefixKVStorage.hydrate(layout: candidate.1.layouts[layer],
+              spans: candidate.1.spans[layer], prefix: candidate.2,
+              row: candidate.1.nativeLedgerRow ?? candidate.1.row ?? 0,
+              batchWidth: candidate.1.nativePhysicalWidth ?? candidate.1.batchWidth)
+            preparedLocals[layer] = makeNativeOwner(restored)
+            continue
+          }
+          guard case .rotating = candidate.1.layouts[layer] else { continue }
+          let source = record.owners[layer], native = source.native
+          let direct = native.innerState().allSatisfy { $0.dim(0) == 1 }
+            && (native.offset == candidate.2 || native.isTrimmable && native.offset >= candidate.2)
+          if direct { continue }
+          if candidate.1.nativeCurrentPrefix == candidate.2 {
+            let row = candidate.1.nativeLedgerRow ?? candidate.1.row ?? 0
+            if let batch = native as? any BatchKVCacheProtocol {
+              let restored = try batch.extract(row: row, through: candidate.2)
+              preparedLocals[layer] = makeNativeOwner(restored, sources: [source], materialized: true)
+              continue
+            }
+            // Borrow the current ring ONLY after warm admission, for this
+            // selected lookup. No row view is retained in historical metadata.
+            let borrowed = try PrefixKVStorage.residentWindowSpans(of: native, layer: layer)
+            let restored = try PrefixKVStorage.hydrate(layout: candidate.1.layouts[layer],
+              spans: borrowed, prefix: candidate.2, row: candidate.1.nativeLedgerRow ?? candidate.1.row ?? 0,
+              batchWidth: candidate.1.nativePhysicalWidth ?? candidate.1.batchWidth, copyResidentPieces: true)
+            preparedLocals[layer] = makeNativeOwner(restored, sources: [source], materialized: true)
+            continue
+          }
+          let dependencyID = UUID()
+          let lease = PrefixKVDependencyLease { [weak self] in self?.releaseLease(dependencyID) }
+          let restored = try PrefixKVStorage.hydrate(layout: candidate.1.layouts[layer],
+            spans: candidate.1.spans[layer], prefix: candidate.2,
+            row: candidate.1.row ?? 0, batchWidth: candidate.1.batchWidth,
+            onSourceBacking: { [weak self] id, bytes in self?.retainLease(dependencyID, id: id, bytes: bytes) })
+          preparedLocals[layer] = makeNativeOwner(restored, dependencies: lease)
+        }
+        break
+      } catch {
+        // Keep the greatest feasible prefix from surviving files/actual rows.
+        // No cache object has yet been trimmed, split or consumed.
+        preparedLocals.removeAll(); diskUnavailable = true
+        if let failed = error as? PrefixKVDiskUnavailable { unavailableFiles.insert(failed.fileID) }
+        else { excluded.insert(candidate.1.id) }
+        chosen = activeChoice(owner: owner, tokens: promptTokenIDs,
+          excluding: excluded, excludingFiles: unavailableFiles)
+      }
+    }
+    if chosen == nil {
+      preparedLocals.removeAll(); retireNativeOwned()
+      try admitNative?(nil) // actual OS/MLX remeasurement, never release credit
     }
     let ticket = UUID(), geometry = PromptCacheGeometry(promptTokens: promptTokenIDs.count, prefill: prefill)
     lock.lock()
-    if let value = chosen, storageEpoch != value.3 || activeNative !== value.0 {
-      lock.unlock(); throw BoomError.stale("The active native cache was invalidated during admission.")
+    if let value = chosen {
+      guard storageEpoch == value.3,
+        value.0.map({ activeNative === $0 }) ?? (entries[value.1.id] != nil) else {
+        lock.unlock(); throw BoomError.stale("The selected native/disk cache was invalidated during admission.")
+      }
     }
     let retired = activeNative; activeNative = nil
-    // A native adoption/operation keeps no historical global KV branches.
-    for id in Array(entries.keys) { remove(id) }; indices.removeAll()
+    // Historical entries own only disk descriptors; the sole hot native owner
+    // moves independently. Its unrelated namespaces never become query input.
     publicationTicket = ticket
     let emptyReason = pendingMissReason; pendingMissReason = nil
     lock.unlock()
     let selected = chosen?.1, count = chosen?.2 ?? 0
-    let sourceOwners = chosen?.0.owners ?? []
+    let sourceOwners = chosen?.0?.owners ?? []
     var owners: [PrefixKVNativeOwnership] = []
     if let selected {
       let trace = PerformanceTrace.begin("Model.ActiveNativeKVTransfer")
       defer { PerformanceTrace.end("Model.ActiveNativeKVTransfer", trace) }
       for layer in selected.layouts.indices {
+        if chosen?.0 == nil {
+          guard let restored = preparedLocals.removeValue(forKey: layer) else {
+            throw BoomError.invalid("Admitted disk KV disappeared before transfer.")
+          }
+          owners.append(restored); continue
+        }
         let source = sourceOwners[layer]
         switch selected.layouts[layer] {
         case .simple:
           owners.append(try ActiveNativeKVStorage.selectedGlobal(source, prefix: count,
-            row: selected.row ?? 0, makeOwner: { self.makeNativeOwner($0, sources: $1, materialized: $2) }))
+            row: selected.nativeLedgerRow ?? selected.row ?? 0,
+            makeOwner: { self.makeNativeOwner($0, sources: $1, materialized: $2) }))
         case .rotating:
           let native = source.native
           let direct = native.innerState().allSatisfy { $0.dim(0) == 1 }
@@ -1101,14 +1792,10 @@ final class PromptPrefixCache: @unchecked Sendable {
             guard native.offset == count else { throw BoomError.invalid("Native local transfer changed its offset.") }
             owners.append(source)
           } else {
-            let trace = PerformanceTrace.begin("Model.ActiveLocalKVHydration")
-            defer { PerformanceTrace.end("Model.ActiveLocalKVHydration", trace) }
-            let dependencyID = UUID()
-            let lease = PrefixKVDependencyLease { [weak self] in self?.releaseLease(dependencyID) }
-            let native = try PrefixKVStorage.hydrate(layout: selected.layouts[layer], spans: selected.spans[layer],
-              prefix: count, row: selected.row ?? 0, batchWidth: selected.batchWidth,
-              onSourceBacking: { [weak self] id, bytes in self?.retainLease(dependencyID, id: id, bytes: bytes) })
-            owners.append(makeNativeOwner(native, dependencies: lease))
+            guard let restored = preparedLocals.removeValue(forKey: layer) else {
+              throw BoomError.invalid("Admitted local KV disappeared before transfer.")
+            }
+            owners.append(restored)
           }
         }
       }
@@ -1138,9 +1825,17 @@ final class PromptPrefixCache: @unchecked Sendable {
         self?.reserve(incoming: incoming, epoch: ticket, allow: check ? allowSnapshot : nil) ?? .staleTicket
       }, retainBacking: { [weak self] id, bytes in self?.retainLease(ticket, id: id, bytes: bytes) },
       releaseBacking: { [weak self] id in self?.releaseLeaseBacking(ticket, id: id) },
-      closeLease: { [weak self] in self?.releaseLease(ticket) }, nativeGlobals: true)
+      closeLease: { [weak self] in self?.releaseLease(ticket) },
+      retainRawBacking: { [weak self] lease, id, bytes in self?.retainLease(lease, id: id, bytes: bytes) },
+      releaseRawBacking: { [weak self] lease, id in self?.releaseLeaseBacking(lease, id: id) },
+      closeRawLease: { [self] lease in releaseLease(lease) }, disk: disk,
+      spillIsLive: { [weak self] in self?.spillTicketIsLive(ticket) ?? false },
+      reclaimDiskEntry: { [weak self] in self?.retireOldestDiskEntry(epoch: ticket) ?? false }, nativeGlobals: true)
     let cache: [KVCache] = owners.enumerated().map { layer, resource in
-      PrefixKVCache(layer: layer, ownership: resource) { capture.update(layer: $0, offset: $1, keys: $2, values: $3) }
+      PrefixKVCache(layer: layer, ownership: resource) {
+        if $0 == 0 { capture.observeReadySpill(owners.map { $0.native }) }
+        capture.update(layer: $0, offset: $1, keys: $2, values: $3)
+      }
     }
     capture.primaryCache = cache.first as? PrefixKVCache
     let sourceProgress = prefill.progress
@@ -1150,11 +1845,21 @@ final class PromptPrefixCache: @unchecked Sendable {
     let observation = Observation(algorithm: Self.activeAlgorithm, originalGeometry: geometry,
       suffixGeometry: suffixGeometry, fullPromptTokens: promptTokenIDs.count,
       cachedPromptTokens: count, suffixPromptTokens: promptTokenIDs.count - count,
-      missReason: count > 0 ? nil : admissionRefused ? "native_admission_refused" : emptyReason ?? "no_active_supported_prefix",
+      missReason: count > 0 ? nil : diskUnavailable ? "disk_span_unavailable"
+        : admissionRefused ? "native_admission_refused" : emptyReason ?? "no_active_supported_prefix",
       cachedOrigin: history.last?.origin, cachedBatchWidth: selected?.batchWidth,
       cachedRow: selected?.row, cachedForwardHistory: history, retainedBytes: retainedBytesUpperBound,
       byteLimit: byteLimit, cachedJoinedRetentionProvenance: selected?.joinedRetentionProvenance,
-      nativeTensorBytes: retainedNativeBytesUpperBound, cachedNativePhysicalWidth: selected?.nativePhysicalWidth)
+      nativeTensorBytes: retainedNativeBytesUpperBound, cachedNativePhysicalWidth: selected?.nativePhysicalWidth,
+      unavailableDiskBackings: unavailableFiles.count,
+      cachedCurrentHotPrefix: selected?.nativeCurrentPrefix == count)
+    if let chosen, chosen.0 == nil {
+      lock.lock()
+      if publicationTicket == ticket, var stored = entries[chosen.1.id] {
+        clock &+= 1; stored.touched = clock; entries[chosen.1.id] = stored
+      }
+      lock.unlock()
+    }
     // Capture now owns inherited pages; previous slot ownership leaves only
     // true working/materialization aliases. Its descriptors never become an archive.
     withExtendedLifetime(retired) {}
@@ -1182,8 +1887,10 @@ final class PromptPrefixCache: @unchecked Sendable {
         resources[layer].native.offset >= row.tokens.count
           && PrefixKVStorage.layout(of: resources[layer].native) == row.layouts[layer]
       }
-    }.map { original -> Entry in
+    }.compactMap { original -> Entry? in
       var value = original; value.nativePhysicalWidth = physical
+      if !Self.hasCurrentHot(value, owners: resources) { value.nativeCurrentPrefix = nil }
+      guard value.supports(value.tokens.count) else { return nil }
       let row = value.nativeLedgerRow ?? value.joinedAcknowledgedRow ?? value.row ?? 0
       let delivered = completions.first { $0.row == row }, ack = acknowledged.first { $0.row == row }
       value.nativeRowReceipt = NativeRowReceipt(completedTokenCount: capture.coveredEnd,
@@ -1205,7 +1912,7 @@ final class PromptPrefixCache: @unchecked Sendable {
     guard publicationTicket == session.epoch else { lock.unlock(); return false }
     let retired = activeNative
     let install = {
-      for id in Array(self.entries.keys) { self.remove(id) }; self.indices.removeAll()
+      self.retainDiskRows(rows)
       self.activeNative = ActiveNativeRecord(owners: resources, rows: rows, localLease: localLease)
       self.publicationTicket = nil
       return true
@@ -1225,6 +1932,39 @@ final class PromptPrefixCache: @unchecked Sendable {
     }
     return accepted
   }
+  /// Called only in the existing authorized joined publication, with the index
+  /// lock held. Metadata/files survive hot-cache switching; no native array,
+  /// unverified global witness or second RAM archive enters this index.
+  @discardableResult private func retainDiskRows(_ rows: [Entry]) -> Bool {
+    var added = false
+    for original in rows {
+      var available = original
+      available.spans = original.spans.map { $0.filter { $0.diskFileID != nil } }
+      available.nativeGlobalPrefix = nil; available.nativeCurrentPrefix = nil
+      guard let count = available.maximumSupportedPrefix(upTo: original.tokens.count) else { continue }
+      let history = Self.clippedHistory(original.history, through: count)
+      let archived = Entry(id: UUID(), owner: original.owner,
+        tokens: Array(original.tokens.prefix(count)), layouts: original.layouts,
+        spans: available.spans.map { values in values.compactMap { span in
+          guard span.start < count else { return nil }
+          return try? span.sliced(positions: 0..<(min(count, span.end) - span.start))
+        } }, geometry: original.geometry, origin: history.last?.origin ?? .prefill,
+        batchWidth: original.batchWidth, row: original.nativeLedgerRow ?? original.row,
+        history: history, nativePhysicalWidth: original.nativePhysicalWidth,
+        nativeProcessedTokenCount: original.nativeProcessedTokenCount,
+        nativeLedgerRow: original.nativeLedgerRow, nativeRowReceipt: original.nativeRowReceipt,
+        joinedAcknowledgedRow: original.joinedAcknowledgedRow,
+        joinedRetentionProvenance: original.joinedRetentionProvenance)
+      for old in entries.values.filter({ $0.entry.owner.namespace == archived.owner.namespace
+        && $0.entry.tokens == archived.tokens }).map({ $0.entry.id }) { remove(old) }
+      insert(archived); added = true
+    }
+    while entries.count > 128 {
+      guard let oldest = entries.min(by: { $0.value.touched < $1.value.touched })?.key else { break }
+      remove(oldest) // final file owners unlink on the existing utility queue
+    }
+    return added
+  }
   /// Caller retains the coordinator/executor lease across producer join, the
   /// existing fence, owner approval and this retention-only publication. This
   /// never reopens a journal, displays a result, or makes cancellation succeed.
@@ -1237,7 +1977,8 @@ final class PromptPrefixCache: @unchecked Sendable {
       proof.termination != .constructorCancelled || acknowledged.isEmpty else { return false }
     defer { session.capture?.discard() }
     guard let owner = session.owner, let binding = session.joinedRetentionBinding,
-      binding.owner == owner, binding == authorization.binding, let capture = session.capture else { return false }
+      binding.owner == owner, binding == authorization.binding, let capture = session.capture,
+      capture.independentRow == nil else { return false }
     lock.lock(); let current = publicationTicket == session.epoch; lock.unlock()
     guard current,
       authorization.withAuthorization(binding: binding, { true }) == true else { return false }
@@ -1253,8 +1994,20 @@ final class PromptPrefixCache: @unchecked Sendable {
       return value
     }
     if session.usesActiveNativeState {
-      return adoptNative(session, values: values, completions: acknowledged,
-        acknowledged: acknowledged, authorization: authorization, binding: binding)
+      if adoptNative(session, values: values, completions: acknowledged,
+        acknowledged: acknowledged, authorization: authorization, binding: binding) { return true }
+      // A later half-layer/unsubmitted future cannot become the hot cache.
+      // Earlier actual completed file bytes are independent of those owners.
+      // Re-admit only disk-supported coverage under this SAME joined ticket;
+      // never inspect/evaluate/trim a future native graph or change cancellation.
+      guard capture.workingGraphWasSubmitted else { return false }
+      lock.lock(); defer { lock.unlock() }
+      guard publicationTicket == session.epoch else { return false }
+      return authorization.withAuthorization(binding: binding) {
+        let added = retainDiskRows(values) // clears every native coverage witness
+        if added { publicationTicket = nil }
+        return added
+      } ?? false
     }
     lock.lock(); defer { lock.unlock() }
     guard publicationTicket == session.epoch else { return false }
@@ -1277,7 +2030,7 @@ final class PromptPrefixCache: @unchecked Sendable {
     acknowledged: [Completion] = []) -> Bool {
     let trace = PerformanceTrace.begin("Model.KVRetentionPublish")
     defer { PerformanceTrace.end("Model.KVRetentionPublish", trace) }
-    guard let owner = session.owner else { return false }
+    guard let owner = session.owner, session.capture?.independentRow == nil else { return false }
     lock.lock(); let current = publicationTicket == session.epoch; lock.unlock()
     guard current, let capture = session.capture else {
       session.capture?.discard(); return false
@@ -1304,22 +2057,37 @@ final class PromptPrefixCache: @unchecked Sendable {
     }
     return added && values.contains { entries[$0.id] != nil }
   }
+  /// Cold historical owners only. Strong span ownership protects borrowed and
+  /// current rows; quota credit is exclusively the store's completed unlink.
+  /// Called from the joined finalizer, never from an active decode update.
+  private func retireOldestDiskEntry(epoch: UUID) -> Bool {
+    lock.lock(); defer { lock.unlock() }
+    guard publicationTicket == epoch else { return false }
+    let historical = entries.filter { pair in
+      !pair.value.entry.spans.isEmpty
+        && pair.value.entry.spans.flatMap({ $0 }).allSatisfy { $0.diskFileID != nil }
+    }
+    guard let oldest = historical.min(by: { $0.value.touched < $1.value.touched })?.key else { return false }
+    remove(oldest)
+    return true
+  }
   private func reserve(incoming: UInt64, epoch: UUID,
     allow: (@Sendable (UInt64) -> Bool)?) -> ReservationDecision {
     let trace = PerformanceTrace.begin("Model.KVRetentionReserve")
     defer { PerformanceTrace.end("Model.KVRetentionReserve", trace) }
     lock.lock()
     guard publicationTicket == epoch else { lock.unlock(); return .staleTicket }
-    var evicted = false
     while Self.adding(bytes, incoming) > byteLimit {
-      guard let oldest = entries.min(by: { $0.value.touched < $1.value.touched })?.key else { break }
-      // Capture and exact hydration leases protect source backings after entry
-      // retirement; releasing optional descriptors does not credit lazy inputs.
-      remove(oldest); evicted = true
+      let resident = entries.filter { $0.value.entry.spans.contains { values in
+        values.contains { $0.backingBytesUpperBound > 0 }
+      } }
+      guard let oldest = resident.min(by: { $0.value.touched < $1.value.touched })?.key else { break }
+      // Disk-only metadata cannot free GPU/RAM bytes. Genuine escaped capture
+      // and hydration leases keep resident backing charged after retirement.
+      remove(oldest)
     }
     let withinPool = Self.adding(bytes, incoming) <= byteLimit
     lock.unlock()
-    if evicted { Memory.clearCache() }
     guard withinPool else { return .poolLimit }
     guard allow?(incoming) != false else { return .residency }
     lock.lock(); let current = publicationTicket == epoch; lock.unlock()
@@ -1339,7 +2107,7 @@ final class PromptPrefixCache: @unchecked Sendable {
   }
   private func retainLeaseLocked(_ lease: UUID, id: UUID, bytes amount: UInt64) {
     // Mutate the set in place; copying it per span would make decode quadratic.
-    guard captureLeases[lease, default: []].insert(id).inserted else { return }
+    guard amount > 0, captureLeases[lease, default: []].insert(id).inserted else { return }
     if var backing = backings[id] {
       precondition(backing.bytes == amount, "Immutable backing charges must agree.")
       backing.references += 1; backings[id] = backing
@@ -1372,7 +2140,7 @@ final class PromptPrefixCache: @unchecked Sendable {
     let index = indices[entry.owner.namespace] ?? PrefixTokenIndex()
     index.insert(tokens: entry.tokens, id: entry.id); indices[entry.owner.namespace] = index
     var seen: Set<UUID> = []
-    for span in entry.spans.flatMap({ $0 }) where seen.insert(span.id).inserted {
+    for span in entry.spans.flatMap({ $0 }) where span.backingBytesUpperBound > 0 && seen.insert(span.id).inserted {
       if var backing = backings[span.id] { backing.references += 1; backings[span.id] = backing }
       else {
         let amount = span.backingBytesUpperBound
@@ -1384,7 +2152,7 @@ final class PromptPrefixCache: @unchecked Sendable {
     guard let stored = entries.removeValue(forKey: id) else { return }
     indices[stored.entry.owner.namespace]?.remove(id: id)
     var seen: Set<UUID> = []
-    for span in stored.entry.spans.flatMap({ $0 }) where seen.insert(span.id).inserted {
+    for span in stored.entry.spans.flatMap({ $0 }) where span.backingBytesUpperBound > 0 && seen.insert(span.id).inserted {
       releaseBackingLocked(span.id)
     }
   }

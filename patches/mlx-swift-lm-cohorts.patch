@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/Libraries/MLXLMCommon/BatchKVCache.swift
-@@ -0,0 +1,390 @@
+@@ -0,0 +1,458 @@
 +// SPDX-License-Identifier: MIT
 +// Batch padding and ring algorithms adapted from MIT-licensed mlx-lm/models/cache.py.
 +// The existing dependency LICENSE retains the original Apple Inc. attribution.
@@ -12,6 +12,11 @@
 +/// All mutation, extraction and evaluation belong to the model's existing producer.
 +public protocol BatchKVCacheProtocol: BatchPositionedKVCache {
 +    var batchSize: Int { get }
++    /// Existing producer only. Position arrays are actual cache state, not host
++    /// guesses; ready-only consumers may decline without evaluating them.
++    var rowPositionState: [MLXArray] { get }
++    func logicalOffset(row: Int) throws -> Int
++    func extract(row: Int, through position: Int) throws -> any KVCache
 +    func extract(row: Int) throws -> any KVCache
 +}
 +
@@ -61,6 +66,11 @@
 +        super.init()
 +    }
 +
++    public var rowPositionState: [MLXArray] { [batchOffset, leftPadding] }
++    public func logicalOffset(row: Int) throws -> Int {
++        guard (0..<batchSize).contains(row) else { throw KVCacheError(message: "Invalid cache row.") }
++        return batchOffset.asArray(Int.self)[row]
++    }
 +    public override var ropeOffset: RoPEOffset { .batch(batchOffset + 0) }
 +
 +    public override func innerState() -> [MLXArray] {
@@ -152,16 +162,23 @@
 +    }
 +
 +    public func extract(row: Int) throws -> any KVCache {
-+        guard (0 ..< batchSize).contains(row), ends == nil else {
-+            throw KVCacheError(message: "Extract a finalized batch row.")
++        try extract(row: row, through: logicalOffset(row: row))
++    }
++    public func extract(row: Int, through position: Int) throws -> any KVCache {
++        let actual = try logicalOffset(row: row)
++        guard ends == nil, position >= 0, position <= actual else {
++            throw KVCacheError(message: "Extract a finalized known row prefix.")
 +        }
 +        let result = KVCacheSimple()
-+        guard let keys, let values else { return result }
++        guard position > 0, let keys, let values else { return result }
 +        let padding = leftPadding.asArray(Int.self)[row]
-+        guard (0 ... offset).contains(padding) else { throw KVCacheError(message: "Invalid batch padding.") }
-+        // The copy graph retains the cohort allocation until evaluation. The
-+        // caller must charge both parents and row outputs through that fence.
-+        result.state = [copyRow(keys, row: row, start: padding, end: offset), copyRow(values, row: row, start: padding, end: offset)]
++        guard (0 ... offset).contains(padding), position <= offset - padding else {
++            throw KVCacheError(message: "Invalid batch padding.")
++        }
++        // The exact prefix excludes peers' later inert inputs. The raw copy
++        // retains its shared parent through the existing evaluation/join fence.
++        result.state = [copyRow(keys, row: row, start: padding, end: padding + position),
++            copyRow(values, row: row, start: padding, end: padding + position)]
 +        return result
 +    }
 +}
@@ -191,6 +208,11 @@
 +    }
 +
 +    public override var maxSize: Int? { capacity }
++    public var rowPositionState: [MLXArray] { [batchOffset, leftPadding] }
++    public func logicalOffset(row: Int) throws -> Int {
++        guard (0..<batchSize).contains(row) else { throw KVCacheError(message: "Invalid cache row.") }
++        return batchOffset.asArray(Int.self)[row]
++    }
 +    public override var ropeOffset: RoPEOffset { .batch(batchOffset + 0) }
 +    public override func innerState() -> [MLXArray] {
 +        [keys, values, batchOffset, leftPadding, ends].compactMap { $0 }
@@ -335,19 +357,65 @@
 +        return result
 +    }
 +
-+    public func extract(row: Int) throws -> any KVCache {
-+        guard (0 ..< batchSize).contains(row), ends == nil else { throw KVCacheError(message: "Extract a finalized batch row.") }
++    public func extract(row: Int, through position: Int) throws -> any KVCache {
++        let actual = try logicalOffset(row: row)
++        guard ends == nil, position >= 0, position <= actual else {
++            throw KVCacheError(message: "Extract an actually retained row prefix.")
++        }
 +        let result = RotatingKVCache(maxSize: capacity)
 +        result.capacityOrigin = capacityOrigin
-+        guard let keys, let values else { return result }
++        guard position > 0, let keys, let values else { return result }
 +        let k = ordered(keys), v = ordered(values)
 +        let padding = max(0, leftPadding.asArray(Int.self)[row])
-+        let count = k.dim(2) - padding
-+        let position = batchOffset.asArray(Int.self)[row]
-+        guard count >= 0 && position >= count else { throw KVCacheError(message: "Invalid rotating batch padding.") }
-+        result.state = [copyRow(k, row: row, start: padding, end: k.dim(2)), copyRow(v, row: row, start: padding, end: v.dim(2))]
++        let available = k.dim(2) - padding
++        let first = actual - available, wanted = max(0, position - capacity)
++        guard available >= 0, first >= 0, wanted >= first else {
++            throw KVCacheError(message: "This exact native prefix was overwritten; use retained disk coverage.")
++        }
++        let start = padding + wanted - first, count = position - wanted
++        guard count > 0, start >= 0, count <= k.dim(2) - start else {
++            throw KVCacheError(message: "Invalid retained row coordinates.")
++        }
++        result.state = [copyRow(k, row: row, start: start, end: start + count),
++            copyRow(v, row: row, start: start, end: start + count)]
 +        result.metaState = ["0", String(capacity), "256", String(position), String(count), capacityOrigin.rawValue, "false"]
 +        return result
++    }
++
++    /// Physical ring ranges for an ACTUALLY ready row position/padding pair.
++    /// The caller reads that pair from rowPositionState on the model producer;
++    /// this method never evaluates or creates a tensor view.
++    public func residentRanges(position: Int, padding: Int, after: Int,
++        through: Int? = nil) throws -> [(Int, Range<Int>)] {
++        let filled = keys?.dim(2) ?? 0
++        let held = rotated ? filled : index
++        let invalid = max(0, padding)
++        guard (ends == nil || through != nil), position >= 0, after >= 0, invalid <= held,
++            index >= 0, index <= filled, !rotated || filled == capacity,
++            position >= held - invalid, (0...position).contains(through ?? position) else {
++            throw KVCacheError(message: "Invalid ready row geometry.")
++        }
++        guard held > 0 else { return [] }
++        var logical = position - held
++        let firstValid = logical + invalid
++        let pieces = rotated ? [index..<filled, 0..<index] : [0..<held]
++        var result: [(Int, Range<Int>)] = []
++        for piece in pieces where !piece.isEmpty {
++            let lower = max(firstValid, max(after, logical))
++            let physicalEnd = logical + piece.count
++            // During preparation a short row's right-padding and later peers'
++            // inert inputs are physical cache positions, never its source data.
++            let upper = min(physicalEnd, through ?? position)
++            if lower < upper {
++                result.append((lower, (piece.lowerBound + lower - logical)..<(piece.lowerBound + upper - logical)))
++            }
++            logical = physicalEnd
++        }
++        return result
++    }
++
++    public func extract(row: Int) throws -> any KVCache {
++        try extract(row: row, through: logicalOffset(row: row))
 +    }
 +}
 +

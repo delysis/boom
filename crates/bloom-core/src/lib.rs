@@ -904,6 +904,15 @@ pub enum Request {
         width: u64,
         prefill: Option<sampling_policy::Prefill>,
     },
+    IndependentKvAllocation {
+        configuration: memory::CacheConfiguration,
+        prompts: Vec<u64>,
+        cached: Vec<u64>,
+        outputs: Vec<u64>,
+        prefill: sampling_policy::Prefill,
+        initial: bool,
+        value_bytes: u64,
+    },
     IncrementalKvAdmission {
         application_bytes: u64,
         used_bytes: u64,
@@ -1381,6 +1390,9 @@ pub fn execute(request: Request) -> Result<Value, Error> {
             width,
             prefill.unwrap_or_default(),
         )?),
+        Request::IndependentKvAllocation { configuration, prompts, cached, outputs, prefill, initial, value_bytes } =>
+            serde_json::to_value(memory::independent_kv_allocation(
+                &configuration, &prompts, &cached, &outputs, prefill, initial, value_bytes)?),
         Request::IncrementalKvAdmission {
             application_bytes,
             used_bytes,

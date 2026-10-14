@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import BoomCore
 import Foundation
 import SwiftUI
@@ -1674,4 +1675,120 @@ private final class LiveBackupCopyHold: @unchecked Sendable {
     try await joinedClose(model); try await removeJoinedScratch(parent)
   }
 
+
+  func testStopDispositionsAcceptedIndependentQuestionsWithoutStartingQueuedGeneration() async throws {
+    let failures = testRun?.failureCount ?? 0
+    let url = try diagnosticRoot(), store = try WorkspaceStore(rootOverride: url)
+    let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    Self.failedModel = model
+    if model.selectedChat == nil { try model.newChat() }
+    let chat = try XCTUnwrap(model.selectedChat), entered = expectation(description: "actual foreground entered")
+    model.work("Public queue stop control") { flag in
+      entered.fulfill()
+      try await Task.sleep(for: .seconds(10))
+      try flag.check()
+      XCTFail("Stopped foreground continued")
+    }
+    await fulfillment(of: [entered], timeout: 5)
+    try model.enqueueIndependentQuestion("First independent question", in: chat, attachments: [])
+    try model.enqueueIndependentQuestion("Second independent question", in: chat, attachments: [])
+    XCTAssertEqual(model.pendingConsultationCount, 2)
+    model.cancel()
+    XCTAssertEqual(model.pendingConsultationCount, 0)
+    let messages = try XCTUnwrap(model.state.chats.first(where: { $0.id == chat.id })).messages
+    XCTAssertEqual(messages.suffix(2).map(\.text), ["First independent question", "Second independent question"])
+    XCTAssertEqual(messages.suffix(2).map(\.state), [.cancelled, .cancelled])
+    XCTAssertNil(model.selectedMLXRunner) // this control never enters a model
+    try await model.shutdown() // joins actual foreground and file writers
+    Self.failedModel = nil
+    let reopened = try WorkspaceStore(rootOverride: url), persisted = try await reopened.loadState()
+    let saved = try XCTUnwrap(persisted.chats.first(where: { $0.id == chat.id })).messages
+    XCTAssertEqual(saved.suffix(2).map(\.text), messages.suffix(2).map(\.text))
+    XCTAssertEqual(saved.suffix(2).map(\.state), [.cancelled, .cancelled])
+    guard (testRun?.failureCount ?? 0) == failures else {
+      throw BoomError.invalid("Accepted queue disposition failed; original question/files retained.")
+    }
+    try await removeJoinedScratch(url)
+  }
+
+  func testShutdownRetainsEveryAcceptedQueuedQuestionAndJoinsItsOriginalForeground() async throws {
+    let failures = testRun?.failureCount ?? 0
+    let url = try diagnosticRoot(), store = try WorkspaceStore(rootOverride: url)
+    let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    Self.failedModel = model
+    if model.selectedChat == nil { try model.newChat() }
+    let chat = try XCTUnwrap(model.selectedChat), entered = expectation(description: "actual foreground entered")
+    model.work("Public queue shutdown control") { flag in
+      entered.fulfill(); try await Task.sleep(for: .seconds(10)); try flag.check()
+      XCTFail("Shutdown foreground continued")
+    }
+    await fulfillment(of: [entered], timeout: 5)
+    for text in ["One 👩🏽‍💻", "Two é", "Three"] {
+      try model.enqueueIndependentQuestion(text, in: chat, attachments: [])
+    }
+    XCTAssertEqual(model.pendingConsultationCount, 3)
+    try await model.shutdown()
+    Self.failedModel = nil
+    XCTAssertEqual(model.pendingConsultationCount, 0); XCTAssertFalse(model.isBusy)
+    XCTAssertNil(model.selectedMLXRunner)
+    let reopened = try WorkspaceStore(rootOverride: url), persisted = try await reopened.loadState()
+    let messages = try XCTUnwrap(persisted.chats.first(where: { $0.id == chat.id })).messages
+    XCTAssertEqual(messages.suffix(3).map(\.text), ["One 👩🏽‍💻", "Two é", "Three"])
+    XCTAssertEqual(messages.suffix(3).map(\.state), [.cancelled, .cancelled, .cancelled])
+    guard (testRun?.failureCount ?? 0) == failures else {
+      throw BoomError.invalid("Accepted queue disposition failed; original question/files retained.")
+    }
+    try await removeJoinedScratch(url)
+  }
+
+  func testStopBeforeActualQueuedBodyEntersRetainsAcceptedQuestionAndDoesNotRestartIt() async throws {
+    let failures = testRun?.failureCount ?? 0
+    let url = try diagnosticRoot(), store = try WorkspaceStore(rootOverride: url)
+    let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    Self.failedModel = model
+    if model.selectedChat == nil { try model.newChat() }
+    let chat = try XCTUnwrap(model.selectedChat)
+    let entered = expectation(description: "actual original foreground entered")
+    let stopped = expectation(description: "actual queued foreground canceled before body")
+    var release: CheckedContinuation<Void, Never>?
+    model.work("Public queued entry control") { flag in
+      await withCheckedContinuation { release = $0; entered.fulfill() }
+      try flag.check()
+    }
+    let deadline = Task { @MainActor in
+      do {
+        try await Task.sleep(for: .seconds(10))
+        let continuation = release; release = nil; continuation?.resume()
+      } catch {}
+    }
+    defer {
+      deadline.cancel()
+      let continuation = release; release = nil; continuation?.resume()
+    }
+    await fulfillment(of: [entered], timeout: 5)
+    try model.enqueueIndependentQuestion("Original queued question é🙂", in: chat, attachments: [])
+    var didStop = false
+    // Actual @Published entry notification runs synchronously on Main before
+    // the queued foreground Task gets its first turn. No producer is faked.
+    let observation = model.$isBusy.dropFirst().sink { busy in
+      if busy && !didStop {
+        didStop = true; model.cancel(); stopped.fulfill()
+      }
+    }
+    let continuation = try XCTUnwrap(release); release = nil; continuation.resume()
+    await fulfillment(of: [stopped], timeout: 5)
+    observation.cancel(); deadline.cancel(); await deadline.value
+    XCTAssertTrue(didStop); XCTAssertEqual(model.pendingConsultationCount, 0)
+    try await model.shutdown()
+    Self.failedModel = nil
+    XCTAssertNil(model.selectedMLXRunner)
+    let reopened = try WorkspaceStore(rootOverride: url), persisted = try await reopened.loadState()
+    let message = try XCTUnwrap(persisted.chats.first(where: { $0.id == chat.id })?.messages.last)
+    XCTAssertEqual(message.text, "Original queued question é🙂")
+    XCTAssertEqual(message.state, .cancelled)
+    guard (testRun?.failureCount ?? 0) == failures else {
+      throw BoomError.invalid("Zero-entry queue Stop failed; original question/files retained.")
+    }
+    try await removeJoinedScratch(url)
+  }
 }

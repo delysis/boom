@@ -84,32 +84,157 @@ final class PrefixKVCache: KVCache {
   }
 }
 
+/// The same observation wrapper for a genuine independent-row cache. A scalar
+/// wrapper never conforms to the batch protocol, so ordinary prepare stays scalar.
+final class PrefixBatchKVCache: BatchKVCacheProtocol {
+  private var ownership: PrefixKVNativeOwnership?
+  fileprivate var base: any BatchKVCacheProtocol { ownership!.native as! any BatchKVCacheProtocol }
+  private let layer: Int
+  private let onUpdate: (Int, MLXArray, MLXArray) -> Void
+  private let onFinalize: (Int) -> Void
+  private var sealed = false
+  init(layer: Int, ownership: PrefixKVNativeOwnership,
+    onUpdate: @escaping (Int, MLXArray, MLXArray) -> Void,
+    onFinalize: @escaping (Int) -> Void) {
+    self.layer = layer; self.ownership = ownership
+    self.onUpdate = onUpdate; self.onFinalize = onFinalize
+  }
+  deinit { ownership = nil }
+  var offset: Int { base.offset }
+  var batchSize: Int { base.batchSize }
+  var batchOffset: MLXArray { base.batchOffset }
+  var rowPositionState: [MLXArray] { base.rowPositionState }
+  var ropeOffset: RoPEOffset { base.ropeOffset }
+  var maxSize: Int? { base.maxSize }
+  var state: [MLXArray] {
+    get { base.state }
+    set { precondition(!sealed); var target = base; target.state = newValue; ownership?.refreshCapacity() }
+  }
+  var metaState: [String] {
+    get { base.metaState }
+    set { precondition(!sealed); var target = base; target.metaState = newValue }
+  }
+  var isTrimmable: Bool { base.isTrimmable }
+  func isTrimmable(after positions: Int) -> Bool { base.isTrimmable(after: positions) }
+  func trim(_ n: Int) -> Int { precondition(!sealed); return base.trim(n) }
+  func makeMask(n: Int, windowSize: Int?, returnArray: Bool) -> MLXFast.ScaledDotProductAttentionMaskMode {
+    base.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
+  }
+  func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+    precondition(!sealed); onUpdate(layer, keys, values)
+    let value = base.update(keys: keys, values: values)
+    ownership?.refreshCapacity(); return value
+  }
+  func prepare(lengths: [Int]?) { precondition(!sealed); base.prepare(lengths: lengths) }
+  func prepare(lengths: MLXArray?) { precondition(!sealed); base.prepare(lengths: lengths) }
+  func finalize() { precondition(!sealed); base.finalize(); onFinalize(layer) }
+  func innerState() -> [MLXArray] { base.innerState() }
+  func logicalOffset(row: Int) throws -> Int { try base.logicalOffset(row: row) }
+  func extract(row: Int) throws -> any KVCache { try base.extract(row: row) }
+  func extract(row: Int, through position: Int) throws -> any KVCache {
+    try base.extract(row: row, through: position)
+  }
+  func copy() -> any KVCache {
+    guard let ownership else { return base.copy() }
+    return PrefixBatchKVCache(layer: layer,
+      ownership: PrefixKVNativeOwnership(native: base.copy(), sources: [ownership]),
+      onUpdate: { _, _, _ in }, onFinalize: { _ in })
+  }
+  func sealForJoinedTransfer() { sealed = true }
+}
+
 /// Immutable descriptors of one chronological incoming span. IDs identify its
 /// backing across row views and entry forks; constructing a descriptor never
 /// evaluates, fences, decodes or reads tensor contents.
 struct PrefixKVSpan {
+  private enum Storage {
+    case resident(MLXArray, MLXArray)
+    case disk(PrefixKVDiskFile, keysOffset: UInt64, valuesOffset: UInt64)
+  }
   let id: UUID
   let start: Int
   let end: Int
   let batchWidth: Int
   let layer: Int
-  let keys: MLXArray
-  let values: MLXArray
+  let keyShape: [Int]
+  let valueShape: [Int]
+  let keyType: DType
+  let valueType: DType
+  /// RAM bound; immutable disk spans charge zero resident bytes. The store
+  /// separately charges disk bytes, while ready in-flight parents stay charged.
   let backingBytesUpperBound: UInt64
+  private let storage: Storage
+  private let sourcePositions: Range<Int>
+  private let sourceRows: Range<Int>
 
   init(id: UUID = UUID(), offset: Int, layer: Int, keys: MLXArray, values: MLXArray,
     backingBytesUpperBound: UInt64? = nil) throws {
-    guard offset >= 0, layer >= 0 else { throw BoomError.invalid("Invalid KV span coordinates.") }
     try PrefixKVStorage.validatePair(keys, values)
-    let (end, overflow) = offset.addingReportingOverflow(keys.dim(2))
-    guard !overflow else { throw BoomError.invalid("KV span coordinates overflowed.") }
     let bytes = try PrefixKVStorage.pairBytes(keys, values)
     guard backingBytesUpperBound.map({ $0 >= bytes }) ?? true else {
       throw BoomError.invalid("The KV backing bound is smaller than its declared view.")
     }
-    self.id = id; start = offset; self.end = end; batchWidth = keys.dim(0); self.layer = layer
-    self.keys = keys[.ellipsis]; self.values = values[.ellipsis]
-    self.backingBytesUpperBound = backingBytesUpperBound ?? bytes
+    try self.init(id: id, offset: offset, layer: layer,
+      keyShape: keys.shape, valueShape: values.shape, keyType: keys.dtype, valueType: values.dtype,
+      storage: .resident(keys, values), rows: 0..<keys.dim(0), positions: 0..<keys.dim(2),
+      bound: backingBytesUpperBound ?? bytes)
+  }
+  init(disk: PrefixKVDiskFile, offset: Int, layer: Int, keyShape: [Int], valueShape: [Int],
+    keyType: DType, valueType: DType, keysOffset: UInt64, valuesOffset: UInt64) throws {
+    guard keyShape.count == 4, valueShape.count == 4 else {
+      throw BoomError.invalid("Invalid disk KV dimensions.")
+    }
+    try self.init(id: UUID(), offset: offset, layer: layer,
+      keyShape: keyShape, valueShape: valueShape, keyType: keyType, valueType: valueType,
+      storage: .disk(disk, keysOffset: keysOffset, valuesOffset: valuesOffset),
+      rows: 0..<keyShape[0], positions: 0..<keyShape[2], bound: 0)
+  }
+  private init(id: UUID, offset: Int, layer: Int, keyShape: [Int], valueShape: [Int],
+    keyType: DType, valueType: DType, storage: Storage, rows: Range<Int>,
+    positions: Range<Int>, bound: UInt64) throws {
+    let floating: [DType] = [.float16, .bfloat16, .float32]
+    guard offset >= 0, layer >= 0, keyShape.count == 4, valueShape.count == 4,
+      keyShape.allSatisfy({ $0 > 0 }), valueShape.allSatisfy({ $0 > 0 }),
+      keyShape[0...2] == valueShape[0...2], floating.contains(keyType), floating.contains(valueType),
+      !rows.isEmpty, rows.lowerBound >= 0, rows.upperBound <= keyShape[0],
+      !positions.isEmpty, positions.lowerBound >= 0, positions.upperBound <= keyShape[2] else {
+      throw BoomError.invalid("Invalid native KV span metadata.")
+    }
+    let (upper, overflow) = offset.addingReportingOverflow(positions.count)
+    guard !overflow else { throw BoomError.invalid("KV span coordinates overflowed.") }
+    self.id = id; start = offset; end = upper; self.layer = layer; batchWidth = rows.count
+    self.keyShape = keyShape; self.valueShape = valueShape; self.keyType = keyType; self.valueType = valueType
+    self.storage = storage; sourceRows = rows; sourcePositions = positions; backingBytesUpperBound = bound
+  }
+  /// Relative logical slicing never builds/evaluates another MLX graph or reads disk.
+  func sliced(positions: Range<Int>, row: Int? = nil) throws -> PrefixKVSpan {
+    guard positions.lowerBound >= 0, !positions.isEmpty, positions.upperBound <= end - start,
+      row.map({ $0 >= 0 && $0 < batchWidth }) ?? true else {
+      throw BoomError.invalid("Invalid KV span slice.")
+    }
+    let rows = row.map { (sourceRows.lowerBound + $0)..<(sourceRows.lowerBound + $0 + 1) } ?? sourceRows
+    return try PrefixKVSpan(id: id, offset: start + positions.lowerBound, layer: layer,
+      keyShape: keyShape, valueShape: valueShape, keyType: keyType, valueType: valueType,
+      storage: storage, rows: rows,
+      positions: (sourcePositions.lowerBound + positions.lowerBound)..<(sourcePositions.lowerBound + positions.upperBound),
+      bound: backingBytesUpperBound)
+  }
+  var diskFileID: UUID? {
+    if case .disk(let file, _, _) = storage { return file.id }; return nil
+  }
+  func materialize(row: Int, positions: Range<Int>) throws -> (MLXArray, MLXArray) {
+    let view = try sliced(positions: positions, row: row)
+    let selected = view.sourceRows.lowerBound, local = view.sourcePositions
+    switch storage {
+    case .resident(let keys, let values):
+      return (keys[selected..<(selected + 1), 0..., local, 0...],
+        values[selected..<(selected + 1), 0..., local, 0...])
+    case .disk(let file, let keysOffset, let valuesOffset):
+      do {
+        return (try file.read(offset: keysOffset, shape: keyShape, dtype: keyType, row: selected, positions: local),
+          try file.read(offset: valuesOffset, shape: valueShape, dtype: valueType, row: selected, positions: local))
+      } catch { throw PrefixKVDiskUnavailable(fileID: file.id, original: error) }
+    }
   }
 }
 
@@ -125,12 +250,22 @@ enum PrefixKVStorage {
     // Borrow for metadata inspection within the owner's cache lifetime. An
     // unwrapped native cache or state array must not escape that owned scope.
     var current = cache
-    while let observed = current as? PrefixKVCache { current = observed.base }
-    return current
+    while true {
+      if let observed = current as? PrefixKVCache { current = observed.base }
+      else if let observed = current as? PrefixBatchKVCache { current = observed.base }
+      else { return current }
+    }
   }
 
   static func layout(of cache: any KVCache) -> Layout? {
     let native = unwrap(cache), type = ObjectIdentifier(type(of: native))
+    if native is BatchKVCache { return .simple(step: 256) }
+    if let batch = native as? BatchRotatingKVCache {
+      let meta = batch.metaState
+      guard meta.count == 5, let window = Int(meta[0]), window > 0,
+        ["modelNative", "requested"].contains(meta[4]) else { return nil }
+      return .rotating(window: window, keep: 0, step: 256, capacityOrigin: meta[4])
+    }
     if type == ObjectIdentifier(KVCacheSimple.self), let simple = native as? KVCacheSimple {
       return simple.step > 0 ? .simple(step: simple.step) : nil
     }
@@ -158,6 +293,94 @@ enum PrefixKVStorage {
     let (bytes, overflow) = UInt64(keys.nbytes).addingReportingOverflow(UInt64(values.nbytes))
     guard !overflow else { throw BoomError.invalid("KV byte accounting overflowed.") }
     return bytes
+  }
+
+  /// Concrete physical ring chronology without creating an MLX view. A
+  /// temporal prefill buffer can hold additional valid rows beyond W; retaining
+  /// them on disk preserves feasible earlier prefixes. Only real held rows are
+  /// admitted. The caller retains the original completed raw parent.
+  static func readyRingRanges(of cache: any KVCache, after: Int,
+    needsPinned: Bool) throws -> [(Int, Range<Int>)] {
+    let native = unwrap(cache)
+    guard let layout = layout(of: native), case let .rotating(window, keep, _, _) = layout, after >= 0 else {
+      throw BoomError.invalid("Require an admitted native rotating ring.")
+    }
+    let meta = native.metaState, arrays = native.innerState()
+    guard arrays.count == 2, let offset = Int(meta[3]), let idx = Int(meta[4]),
+      let wrapped = Bool(meta[6]) else { throw BoomError.invalid("Invalid ready ring metadata.") }
+    try validatePair(arrays[0], arrays[1])
+    let capacity = arrays[0].dim(2), held = wrapped ? capacity : idx
+    let pinned = min(keep, offset), tailCount = held - pinned
+    guard idx <= capacity, held <= offset, held >= pinned,
+      !wrapped || (capacity == window && idx >= keep) else {
+      throw BoomError.invalid("Invalid ready ring extent.")
+    }
+    var result: [(Int, Range<Int>)] = []
+    if needsPinned, pinned > 0 { result.append((0, 0..<pinned)) }
+    let physical = wrapped && idx < held ? [idx..<held, pinned..<idx] : [pinned..<held]
+    var absolute = offset - tailCount
+    for range in physical {
+      let end = absolute + range.count, start = max(absolute, after, pinned)
+      if start < end { result.append((start, (range.lowerBound + start - absolute)..<range.upperBound)) }
+      absolute = end
+    }
+    return result
+  }
+
+  /// Actual completed position vectors. Never calls eval/asArray or changes a
+  /// producer event. An unready vector is an optimization miss on this producer.
+  static func readyBatchPositions(_ cache: any BatchKVCacheProtocol) -> (positions: [Int], padding: [Int])? {
+    let values = cache.rowPositionState
+    guard values.count == 2 else { return nil }
+    func integers(_ value: MLXArray) -> [Int]? {
+      guard let buffer = value.readyBuffer(), buffer.dtype == .int32,
+        buffer.shape == [cache.batchSize], buffer.strides.count == 1 else { return nil }
+      return buffer.withUnsafeBytes { bytes in
+        (0..<cache.batchSize).map { row in
+          Int(bytes.loadUnaligned(fromByteOffset: buffer.byteOffset + row * buffer.strides[0] * 4, as: Int32.self))
+        }
+      }
+    }
+    guard let positions = integers(values[0]), let padding = integers(values[1]) else { return nil }
+    return (positions, padding)
+  }
+
+  /// Current-hot eligibility is metadata only. The actual joined native owner
+  /// must still hold this exact offset/row and every required ring interval.
+  /// Historical prefixes and ragged Batch caches cannot use this scalar path.
+  static func currentRingSupports(_ cache: any KVCache, prefix: Int, row: Int) -> Bool {
+    let native = unwrap(cache)
+    if let batch = native as? BatchRotatingKVCache {
+      guard prefix > 0, (0..<batch.batchSize).contains(row),
+        let metadata = readyBatchPositions(batch), metadata.positions[row] >= prefix,
+        let window = batch.maxSize,
+        let ranges = try? batch.residentRanges(position: metadata.positions[row],
+          padding: metadata.padding[row], after: max(0, prefix - window)) else { return false }
+      var end = max(0, prefix - window)
+      for (start, physical) in ranges where start + physical.count > end {
+        guard start <= end else { return false }
+        end = min(prefix, start + physical.count)
+        if end == prefix { return true }
+      }
+      return false
+    }
+    guard prefix > 0, native.offset == prefix,
+      let layout = layout(of: native), case let .rotating(window, keep, _, _) = layout,
+      let ranges = try? readyRingRanges(of: native, after: 0, needsPinned: true) else { return false }
+    let arrays = native.innerState()
+    guard arrays.count == 2, row >= 0, row < arrays[0].dim(0) else { return false }
+    let pinned = min(keep, prefix)
+    let required = pinned > 0 ? [0..<pinned, max(pinned, prefix - (window - keep))..<prefix]
+      : [max(0, prefix - window)..<prefix]
+    return required.allSatisfy { wanted in
+      var end = wanted.lowerBound
+      for (start, range) in ranges where start + range.count > end {
+        guard start <= end else { return false }
+        end = min(wanted.upperBound, start + range.count)
+        if end == wanted.upperBound { return true }
+      }
+      return wanted.isEmpty
+    }
   }
 
   /// Read at one admitted boundary. These are only current resident views,
@@ -221,7 +444,8 @@ enum PrefixKVStorage {
   /// `batchWidth` is the source entry's width, not the new consumer's width.
   /// Width-one spans are shared prefill or already selected inherited row views.
   static func hydrate(layout: Layout, spans: [PrefixKVSpan], prefix: Int, row: Int,
-    batchWidth: Int? = nil, onSourceBacking: ((UUID, UInt64) -> Void)? = nil) throws -> any KVCache {
+    batchWidth: Int? = nil, copyResidentPieces: Bool = false,
+    onSourceBacking: ((UUID, UInt64) -> Void)? = nil) throws -> any KVCache {
     let width = batchWidth ?? spans.map(\.batchWidth).max() ?? 1
     guard prefix >= 0, width > 0, row >= 0, row < width else {
       throw BoomError.invalid("Invalid requested KV prefix or source row.")
@@ -250,13 +474,12 @@ enum PrefixKVStorage {
     if let first = sorted.first {
       var previousEnd = 0
       for span in sorted {
-        try validatePair(span.keys, span.values)
         guard span.layer == first.layer, span.start >= previousEnd, span.end > span.start,
-          span.end - span.start == span.keys.dim(2), span.batchWidth == span.keys.dim(0),
+          span.batchWidth > 0,
           span.batchWidth == 1 || span.batchWidth == width,
-          span.keys.dim(1) == first.keys.dim(1), span.keys.dim(3) == first.keys.dim(3),
-          span.values.dim(3) == first.values.dim(3), span.keys.dtype == first.keys.dtype,
-          span.values.dtype == first.values.dtype else {
+          span.keyShape[1] == first.keyShape[1], span.keyShape[3] == first.keyShape[3],
+          span.valueShape[3] == first.valueShape[3], span.keyType == first.keyType,
+          span.valueType == first.valueType else {
           throw BoomError.invalid("KV spans overlap or change their native layer, width or dimensions.")
         }
         previousEnd = span.end
@@ -274,8 +497,8 @@ enum PrefixKVStorage {
         // one position, or a single-piece alias. Duplicate IDs are deduplicated
         // by the owning lease; unused optional local/future pages are excluded.
         onSourceBacking?(span.id, span.backingBytesUpperBound)
-        keyPieces.append(span.keys[selected..<(selected + 1), 0..., local, 0...])
-        valuePieces.append(span.values[selected..<(selected + 1), 0..., local, 0...])
+        let arrays = try span.materialize(row: selected, positions: local)
+        keyPieces.append(arrays.0); valuePieces.append(arrays.1)
         position = end
         if position == range.upperBound { break }
       }
@@ -284,8 +507,17 @@ enum PrefixKVStorage {
     guard !keyPieces.isEmpty, keyPieces.count == valuePieces.count else {
       throw BoomError.invalid("Required KV prefix has no retained tensors.")
     }
-    let keys = keyPieces.count == 1 ? keyPieces[0] : concatenated(keyPieces, axis: 2)
-    let values = valuePieces.count == 1 ? valuePieces[0] : concatenated(valuePieces, axis: 2)
+    // Two nonempty pieces already allocate one compact destination. A lone
+    // hot-row slice needs Gather's raw copy; no arithmetic or whole-parent copy.
+    func combine(_ pieces: [MLXArray]) -> MLXArray {
+      if pieces.count > 1 { return concatenated(pieces, axis: 2) }
+      let piece = pieces[0]
+      if copyResidentPieces {
+        return take(piece, MLXArray([Int32(0)]), axis: 0)
+      }
+      return piece
+    }
+    let keys = combine(keyPieces), values = combine(valuePieces)
     var restored = native
     restored.state = [keys, values]
     if case let .rotating(window, keep, step, origin) = layout {

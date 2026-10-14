@@ -112,4 +112,36 @@ final class GenerationExecutionOriginTests: XCTestCase {
     }
     try await model.shutdown()
   }
+
+  func testDecodedCorruptCohortRowIntExtremesRefuseBeforeSuffixArithmetic() throws {
+    func row(_ prompt: Int, _ cached: Int, _ length: Int, _ padding: Int) -> [String: Any] {
+      ["operationID": UUID().uuidString, "attemptID": UUID().uuidString,
+        "namespace": UUID().uuidString, "recordID": UUID().uuidString,
+        "requestDigest": String(repeating: "a", count: 64),
+        "preparedTokenDigest": String(repeating: "b", count: 64),
+        "promptTokens": prompt, "cachedTokens": cached, "seed": 17, "outputLimit": 4,
+        "samplingDigest": String(repeating: "c", count: 64),
+        "cacheHistoryDigest": String(repeating: "d", count: 64),
+        "cacheLengths": [length], "cachePadding": [padding]]
+    }
+    let rows = [row(12, 0, 0, 4), row(10, 4, 4, 0)]
+    let wire: [String: Any] = ["schema": 1, "cohortID": UUID().uuidString, "row": 0,
+      "rows": rows, "policyDigest": String(repeating: "e", count: 64), "promptWidth": 12,
+      "maskDigest": String(repeating: "f", count: 64), "cacheWidths": [4],
+      "prefill": ["chunking": "remainder", "tokenCeiling": 512, "chunkStride": 11]]
+    let decoder = JSONDecoder()
+    let valid = try decoder.decode(IndependentTextCohortOrigin.self,
+      from: JSONSerialization.data(withJSONObject: wire))
+    XCTAssertTrue(valid.isValid(promptTokens: 12, cachedTokens: 0))
+    // Corrupt the OTHER decoded row so the own-row initial guard still passes.
+    // Both differences overflow Int unless bounded validation runs first.
+    for (prompt, cached) in [(Int.min, Int.max), (Int.max, Int.min), (10, Int.min)] {
+      var changed = wire, corrupted = rows
+      corrupted[1]["promptTokens"] = prompt; corrupted[1]["cachedTokens"] = cached
+      changed["rows"] = corrupted
+      let decoded = try decoder.decode(IndependentTextCohortOrigin.self,
+        from: JSONSerialization.data(withJSONObject: changed))
+      XCTAssertFalse(decoded.isValid(promptTokens: 12, cachedTokens: 0))
+    }
+  }
 }

@@ -3,11 +3,11 @@
     "directory": ".deps/MLXSwiftLM",
     "revision": "9afc3b55f75a0d41a3d0c11330b9df6a036d24e4",
     "patch": "patches/mlx-swift-lm-cohorts.patch",
-    "patchSHA256": "72fc84591fe8c9c3e9ed8d30ece30b59bd6840d5bc87d59ce1ff263493492a81",
+    "patchSHA256": "457cb4b9258cf26da3e6e0b17165108736d51e67eb2748511f0860630998768b",
     "files": [
       {
         "path": "Libraries/MLXLMCommon/BatchKVCache.swift",
-        "sha256": "b83a082cf9857d9c213072fabce129514fe1d9770bb6dd4129e6c7dddaac66c2"
+        "sha256": "169b0f79a9fa52cbd3cf2d9ebd1a0e7999d9b08dd9d6691b165b74975b6481b7"
       },
       {
         "path": "Libraries/MLXLMCommon/Evaluate.swift",
@@ -27,18 +27,18 @@
     "directory": "App/.build/checkouts/mlx-swift",
     "revision": "19601207e9a0de51e03ee6ec0c3c5f3784275075",
     "patch": "patches/mlx-swift-ready-buffer.patch",
-    "patchSHA256": "8315b1486c232fdc94224f1d5d1f6e510ba350187b0755996cc877f61a6f35b2",
+    "patchSHA256": "5cfeffc124a0bb6f670a297d62cb9e1ac803fdd64adfa7936ad29155d97706fc",
     "submodules": [
       "Source/Cmlx/mlx-c"
     ],
     "files": [
       {
         "path": "Source/MLX/MLXArray+Bytes.swift",
-        "sha256": "731f4500bbb125720660dca4dbcdecce492250a2d551cc0a754d0e093e87fa9e"
+        "sha256": "0641591f68e632b34cf71320b9640375d663c10c3bdf7aac7d634e2acd7f321b"
       },
       {
         "path": "Source/Cmlx/include/mlx/c/array.h",
-        "sha256": "aeb01e844c5b33a6b16e6de2f241fb30cf8d666195f746576c1cd3a448fffbdc"
+        "sha256": "ca107802d1061ebeffeab9316555208a612e9e5d7e5486c0a010e25f9abbdb6e"
       }
     ]
   },
@@ -46,15 +46,15 @@
     "directory": "App/.build/checkouts/mlx-swift/Source/Cmlx/mlx-c",
     "revision": "ebc88f10caa1b625e6b581437a8dea6df8a70085",
     "patch": "patches/mlx-c-ready-buffer.patch",
-    "patchSHA256": "0f3857364bc5ff555902ec97c1cf3e74fe32a34abae9f47520dbe1a7d133019f",
+    "patchSHA256": "9a91175bc7e7a0b5ccfe9c031348e98e15c474f444c3e4579604e7e7df680bde",
     "files": [
       {
         "path": "mlx/c/array.cpp",
-        "sha256": "2f314db65c17eb28cdfc5d6c4f1fc75fdc5037b595b0f0a633496772d4b6eb5e"
+        "sha256": "84b3be12134e2b9469becef40a064f3152d8f6836ccbff077fc1c55cdc1599bd"
       },
       {
         "path": "mlx/c/array.h",
-        "sha256": "aeb01e844c5b33a6b16e6de2f241fb30cf8d666195f746576c1cd3a448fffbdc"
+        "sha256": "ca107802d1061ebeffeab9316555208a612e9e5d7e5486c0a010e25f9abbdb6e"
       }
     ]
   }

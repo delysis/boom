@@ -21,13 +21,13 @@ final class PromptPrefixCachePressureTests: XCTestCase {
     allow: (@Sendable (UInt64) -> Bool)? = nil) throws -> PromptPrefixCache.Session {
     try store.makeSession(owner: owner, input: LMInput(tokens: MLXArray(ids)),
       promptTokenIDs: ids, prefill: PrefillParameters(stepSize: 2, chunking: .remainder),
-      allowSnapshot: allow, makeCache: {
+      allowSnapshot: allow, useActiveNative: true, makeCache: {
         var caches: [any KVCache] = (0..<5).map { _ in RotatingKVCache(maxSize: 4, step: 2) }
         let full = KVCacheSimple(); full.step = 2; caches.append(full)
         return caches
       })
   }
-  private func append(_ request: PromptPrefixCache.Session, rows: [[Int]]) {
+  private func append(_ request: PromptPrefixCache.Session, rows: [[Int]], submitted: Bool = true) async {
     precondition(!rows.isEmpty && rows.allSatisfy({ $0.count == rows[0].count }))
     for (layer, cache) in request.cache.enumerated() {
       let heads = layer < 5 ? 4 : 1
@@ -35,14 +35,22 @@ final class PromptPrefixCachePressureTests: XCTestCase {
       let array = MLXArray(values, [rows.count, heads, rows[0].count, 1])
       _ = cache.update(keys: array, values: array + 10000)
     }
-  }
-  private func prefill(_ request: PromptPrefixCache.Session) throws {
-    let ids = request.input.text.tokens.asArray(Int.self)
-    let completed = try request.prefill.forEachChunk(total: ids.count) { range in
-      append(request, rows: [Array(ids[range])])
+      if submitted {
+      asyncEval(request.cache.flatMap { $0.innerState() })
+      eval(request.cache); request.markCacheSubmitted()
+      request.observeReadySpill(); await request.joinPendingSpill(cancelled: false)
     }
-    append(request, rows: [Array(ids[completed...])])
-    request.prefill.progress?(ids.count, ids.count)
+  }
+  private func prefill(_ request: PromptPrefixCache.Session) async throws {
+    let ids = request.input.text.tokens.asArray(Int.self)
+    var partition = request.prefill; partition.progress = nil
+    var ranges: [Range<Int>] = []
+    let done = try partition.forEachChunk(total: ids.count) { ranges.append($0) }
+    if done < ids.count { ranges.append(done..<ids.count) }
+    for range in ranges {
+      await append(request, rows: [Array(ids[range])])
+      request.prefill.progress?(range.upperBound, ids.count)
+    }
   }
   private func expand(_ request: PromptPrefixCache.Session) {
     for var cache in request.cache {
@@ -55,23 +63,23 @@ final class PromptPrefixCachePressureTests: XCTestCase {
         emittedTokenIDs: [first[row], second[row]]))
     }
   }
-  private func completed(_ store: PromptPrefixCache, _ scope: PromptCacheOwner) throws {
+  private func completed(_ store: PromptPrefixCache, _ scope: PromptCacheOwner) async throws {
     let ids = Array(0..<63), value = try request(store, ids, owner: scope)
-    try prefill(value); expand(value)
-    append(value, rows: [[901], [911], [921]])
+    try await prefill(value); expand(value)
+    await append(value, rows: [[901], [911], [921]])
     finish(value, first: [901, 911, 921], second: [902, 912, 922])
     XCTAssertTrue(store.publish(value, completions: [
       .init(row: 0, emittedTokenIDs: [901, 902]), .init(row: 1, emittedTokenIDs: [911, 912]),
       .init(row: 2, emittedTokenIDs: [921, 922])]))
   }
 
-  func testPressureCompletesScaledFullContextWithoutIncreasingPool() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testPressureCompletesScaledFullContextWithoutIncreasingPool() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let store = PromptPrefixCache(byteLimit: 2048), scope = owner(), ids = Array(0..<63)
-      let value = try request(store, ids, owner: scope); try prefill(value)
+      let value = try request(store, ids, owner: scope); try await prefill(value)
       XCTAssertTrue(value.retentionObservation?.compactLocalCoverage == true)
       XCTAssertEqual(value.retentionObservation?.lastCompleteTokenCount, 63)
-      expand(value); append(value, rows: [[901], [911], [921]])
+      expand(value); await append(value, rows: [[901], [911], [921]])
       finish(value, first: [901, 911, 921], second: [902, 912, 922])
       XCTAssertLessThanOrEqual(store.retainedBytesUpperBound, 2048)
       XCTAssertTrue(store.publish(value, completions: [
@@ -79,47 +87,50 @@ final class PromptPrefixCachePressureTests: XCTestCase {
         .init(row: 2, emittedTokenIDs: [921, 922])]))
       XCTAssertEqual(store.retainedSnapshotObservations.count, 3)
       XCTAssertTrue(store.retainedSnapshotObservations.allSatisfy({ $0.tokenIDs.count == 64 }))
-      XCTAssertEqual(store.retainedBytesUpperBound, 1808, "All three rows share full backing charges once.")
+      XCTAssertEqual(store.retainedBytesUpperBound, 0, "Joined raw pins leave only disk history and the actual hot KV.")
+      XCTAssertGreaterThan(store.retainedNativeBytesUpperBound, 0)
       XCTAssertEqual(store.activeCaptureLeaseCount, 0)
       let selected = try request(store, ids + [911, 912], owner: scope)
       XCTAssertEqual(selected.cachedTokenCount, 64)
       XCTAssertEqual(selected.cache[5].state[0].asArray(Float.self), (ids + [911]).map(Float.init))
     }
   }
-  func testRetiredSelectedEntryStillChargesInheritedCroppedBackings() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testRetiredSelectedEntryStillChargesInheritedCroppedBackings() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let store = PromptPrefixCache(byteLimit: 2048), scope = owner(), ids = Array(0..<63)
-      try completed(store, scope)
+      try await completed(store, scope)
       let next = try request(store, ids, owner: scope)
       XCTAssertEqual(next.cachedTokenCount, 62)
-      XCTAssertEqual(store.activeCaptureLeaseCount, 2, "Capture and hydrated cache have separate ownership.")
-      try prefill(next); expand(next)
-      append(next, rows: [[931], [941], [951]])
-      XCTAssertFalse(store.hasAnchors, "LRU may retire the selected stored entry; the active lease remains.")
-      XCTAssertEqual(store.activeCaptureLeaseCount, 2)
-      XCTAssertEqual(store.retainedBytesUpperBound, 1808,
-        "Inherited source pages keep full charges after stored entries retire; row cropping is no credit.")
+      XCTAssertEqual(store.activeCaptureLeaseCount, 0, "Disk descriptors carry no resident lease.")
+      try await prefill(next); expand(next)
+      await append(next, rows: [[931], [941], [951]])
+      XCTAssertTrue(store.hasAnchors, "Zero-RAM disk history survives raw pressure.")
+      XCTAssertEqual(store.activeCaptureLeaseCount, 0)
+      XCTAssertEqual(store.retainedBytesUpperBound, 0)
+      XCTAssertGreaterThan(store.retainedNativeBytesUpperBound, 0,
+        "Actual source aliases remain in native ownership; cropping is no release credit.")
       XCTAssertEqual(next.cache[5].state[0].dim(2), 64)
       finish(next, first: [931, 941, 951], second: [932, 942, 952])
       XCTAssertTrue(store.publish(next, completions: [
         .init(row: 0, emittedTokenIDs: [931, 932]), .init(row: 1, emittedTokenIDs: [941, 942]),
         .init(row: 2, emittedTokenIDs: [951, 952])]))
-      XCTAssertEqual(store.retainedBytesUpperBound, 1808)
-      XCTAssertEqual(store.activeCaptureLeaseCount, 1, "Working caches still own the hydration lease.")
+      XCTAssertEqual(store.retainedBytesUpperBound, 0)
+      XCTAssertEqual(store.activeCaptureLeaseCount, 0)
+      XCTAssertGreaterThan(store.retainedNativeBytesUpperBound, 0)
     }
   }
-  func testEarlyEOSRetainsPreviousPrefixAfterPeersAdvanceBeyondTwoWindows() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testEarlyEOSRetainsPreviousPrefixAfterPeersAdvanceBeyondTwoWindows() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let store = PromptPrefixCache(byteLimit: 8192), scope = owner(), ids = Array(0..<63), soft = SoftPressure()
       let value = try request(store, ids, owner: scope, allow: { soft.allow($0) })
-      try prefill(value); expand(value)
+      try await prefill(value); expand(value)
       XCTAssertTrue(value.captureFinishedLane(row: 0, width: 3, emittedTokenIDs: [], stopTokenID: 999))
       var first: [Int] = [], second: [Int] = []
       for step in 0..<12 {
         first.append(901 + step); second.append(951 + step)
         XCTAssertTrue(value.captureDecodeLane(row: 1, width: 3, emittedTokenIDs: first, finished: false))
         XCTAssertTrue(value.captureDecodeLane(row: 2, width: 3, emittedTokenIDs: second, finished: false))
-        append(value, rows: [[-1], [901 + step], [951 + step]])
+        await append(value, rows: [[-1], [901 + step], [951 + step]])
       }
       first.append(913); second.append(963)
       XCTAssertTrue(value.captureFinishedLane(row: 1, width: 3, emittedTokenIDs: first))
@@ -135,45 +146,47 @@ final class PromptPrefixCachePressureTests: XCTestCase {
         (0..<4).flatMap { _ in [58, 59, 60, 61].map(Float.init) })
     }
   }
-  func testClearAndStalePublicationCannotEraseLiveLeaseCharges() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testClearAndStalePublicationCannotEraseLiveLeaseCharges() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let store = PromptPrefixCache(byteLimit: 2048), scope = owner()
-      let value = try request(store, Array(0..<63), owner: scope); try prefill(value)
-      let charged = store.retainedBytesUpperBound
+      let value = try request(store, Array(0..<63), owner: scope); try await prefill(value)
+      let charged = store.retainedNativeBytesUpperBound
       XCTAssertGreaterThan(charged, 0)
       store.clear(reason: "residency_evicted")
-      XCTAssertFalse(store.hasAnchors); XCTAssertEqual(store.retainedBytesUpperBound, charged)
+      XCTAssertFalse(store.hasAnchors); XCTAssertEqual(store.retainedNativeBytesUpperBound, charged)
       XCTAssertFalse(store.publish(value))
       XCTAssertEqual(store.retainedBytesUpperBound, 0); XCTAssertEqual(store.activeCaptureLeaseCount, 0)
       let next = try request(store, Array(0..<63), owner: scope)
       XCTAssertEqual(next.cachedTokenCount, 0); XCTAssertEqual(next.observation.missReason, "residency_evicted")
     }
   }
-  func testMidCohortPoolRefusalCannotLeaveHalfLayerCoverageOrCharges() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testMidCohortPoolRefusalCannotLeaveHalfLayerCoverageOrCharges() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let store = PromptPrefixCache(byteLimit: 60), scope = owner()
       let value = try store.makeSession(owner: scope, input: LMInput(tokens: MLXArray([0, 1, 2])),
-        promptTokenIDs: [0, 1, 2], prefill: PrefillParameters(stepSize: 2), makeCache: {
+        promptTokenIDs: [0, 1, 2], prefill: PrefillParameters(stepSize: 2), useActiveNative: true, makeCache: {
           [KVCacheSimple(), RotatingKVCache(maxSize: 4)]
         })
       let small = MLXArray([Float(0), 1], [1, 1, 2, 1])
       _ = value.cache[0].update(keys: small, values: small)
-      XCTAssertEqual(store.retainedBytesUpperBound, 16)
+      XCTAssertEqual(store.retainedBytesUpperBound, 0)
       let large = MLXArray((0..<8).map(Float.init), [1, 4, 2, 1])
       _ = value.cache[1].update(keys: large, values: large)
       XCTAssertEqual(store.retainedBytesUpperBound, 0)
+      eval(value.cache) // actual bytes are completed, deliberately no submitted-prefix proof
+      value.observeReadySpill(); await value.joinPendingSpill(cancelled: false)
       XCTAssertEqual(value.retentionObservation?.refusalReason, "pool_limit")
       value.prefill.progress?(3, 3)
       XCTAssertFalse(store.publish(value)); XCTAssertFalse(store.hasAnchors)
       XCTAssertEqual(store.activeCaptureLeaseCount, 0)
     }
   }
-  func testDiscardDropsOptimizationLeaseWithoutChangingWorkingKV() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testDiscardDropsOptimizationLeaseWithoutChangingWorkingKV() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let store = PromptPrefixCache(byteLimit: 2048), scope = owner()
-      let value = try request(store, Array(0..<63), owner: scope); try prefill(value)
+      let value = try request(store, Array(0..<63), owner: scope); try await prefill(value)
       let before = value.cache[5].state[0].asArray(Float.self)
-      XCTAssertGreaterThan(store.retainedBytesUpperBound, 0)
+      XCTAssertGreaterThan(store.retainedNativeBytesUpperBound, 0)
       value.discardStagedAnchors()
       XCTAssertEqual(store.retainedBytesUpperBound, 0); XCTAssertEqual(store.activeCaptureLeaseCount, 0)
       XCTAssertEqual(value.cache[5].state[0].asArray(Float.self), before)
@@ -181,35 +194,39 @@ final class PromptPrefixCachePressureTests: XCTestCase {
     }
   }
 
-  func testHydratedOnePieceAliasAndCacheCopyKeepFullSourceCharge() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testHydratedOnePieceAliasAndCacheCopyKeepFullSourceCharge() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let store = PromptPrefixCache(byteLimit: 256), scope = owner(), ids = [10, 11, 12, 13]
-      let cold = try store.makeSession(owner: scope, input: LMInput(tokens: MLXArray(ids)),
-        promptTokenIDs: ids, prefill: PrefillParameters(stepSize: 4), makeCache: { [KVCacheSimple()] })
+      var cold: PromptPrefixCache.Session? = try store.makeSession(owner: scope, input: LMInput(tokens: MLXArray(ids)),
+        promptTokenIDs: ids, prefill: PrefillParameters(stepSize: 4), useActiveNative: true,
+        makeCache: { let cache = KVCacheSimple(); cache.step = 4; return [cache] })
       let array = MLXArray(ids.map(Float.init), [1, 1, 4, 1])
-      _ = cold.cache[0].update(keys: array, values: array + 100)
-      cold.prefill.progress?(4, 4)
-      XCTAssertTrue(store.publish(cold)); XCTAssertEqual(store.retainedBytesUpperBound, 32)
+      _ = cold!.cache[0].update(keys: array, values: array + 100)
+      cold!.prefill.progress?(4, 4)
+      asyncEval(cold!.cache.flatMap { $0.innerState() }); eval(cold!.cache); cold!.markCacheSubmitted()
+      await cold!.joinPendingSpill(cancelled: false)
+      XCTAssertTrue(store.publish(cold!)); cold = nil
+      XCTAssertEqual(store.retainedBytesUpperBound, 0)
 
       var warm: PromptPrefixCache.Session? = try store.makeSession(owner: scope,
         input: LMInput(tokens: MLXArray(ids)), promptTokenIDs: ids,
-        prefill: PrefillParameters(stepSize: 4), makeCache: { [KVCacheSimple()] })
+        prefill: PrefillParameters(stepSize: 4), useActiveNative: true, makeCache: { let cache = KVCacheSimple(); cache.step = 4; return [cache] })
       XCTAssertEqual(warm?.cachedTokenCount, 3)
       var copy: (any KVCache)? = warm!.cache[0].copy()
       store.clear(); warm!.discardStagedAnchors(); warm = nil
-      XCTAssertEqual(store.retainedBytesUpperBound, 32,
+      XCTAssertGreaterThanOrEqual(store.retainedNativeBytesUpperBound, 32,
         "A three-position view still owns the original four-position backing.")
-      XCTAssertEqual(store.activeCaptureLeaseCount, 1)
+      XCTAssertEqual(store.activeCaptureLeaseCount, 0)
       XCTAssertEqual(copy!.state[0].asArray(Float.self), [10, 11, 12])
-      XCTAssertEqual(store.retainedBytesUpperBound, 32,
+      XCTAssertGreaterThanOrEqual(store.retainedNativeBytesUpperBound, 32,
         "Evaluation is no proof that a one-piece view stopped aliasing its source.")
       copy = nil
-      XCTAssertEqual(store.retainedBytesUpperBound, 0); XCTAssertEqual(store.activeCaptureLeaseCount, 0)
+      XCTAssertEqual(store.retainedNativeBytesUpperBound, 0); XCTAssertEqual(store.retainedBytesUpperBound, 0)
     }
   }
 
-  func testHydrationReportsOnlyRequiredIDsWithFullBatchedBacking() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testHydrationReportsOnlyRequiredIDsWithFullBatchedBacking() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let first = try PrefixKVSpan(offset: 0, layer: 0,
         keys: MLXArray((0..<12).map(Float.init), [3, 1, 4, 1]),
         values: MLXArray((100..<112).map(Float.init), [3, 1, 4, 1]))
@@ -241,18 +258,20 @@ final class PromptPrefixCachePressureTests: XCTestCase {
     }
   }
 
-  func testPressureCannotCreditSourceStillNeededByHydratedWorkingCache() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testPressureCannotCreditSourceStillNeededByHydratedWorkingCache() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let store = PromptPrefixCache(byteLimit: 56), scope = owner(), ids = Array(0..<6)
       let cold = try store.makeSession(owner: scope, input: LMInput(tokens: MLXArray(ids)),
         promptTokenIDs: ids, prefill: PrefillParameters(stepSize: 6),
-        makeCache: { [RotatingKVCache(maxSize: 4)] })
+        useActiveNative: true, makeCache: { [RotatingKVCache(maxSize: 4)] })
       let source = MLXArray(ids.map(Float.init), [1, 1, 6, 1])
       _ = cold.cache[0].update(keys: source, values: source + 100)
-      cold.prefill.progress?(6, 6); XCTAssertTrue(store.publish(cold))
+      cold.prefill.progress?(6, 6)
+      asyncEval(cold.cache.flatMap { $0.innerState() }); eval(cold.cache); cold.markCacheSubmitted()
+      await cold.joinPendingSpill(cancelled: false); XCTAssertTrue(store.publish(cold))
       var warm: PromptPrefixCache.Session? = try store.makeSession(owner: scope,
         input: LMInput(tokens: MLXArray(ids)), promptTokenIDs: ids,
-        prefill: PrefillParameters(stepSize: 6), makeCache: { [RotatingKVCache(maxSize: 4)] })
+        prefill: PrefillParameters(stepSize: 6), useActiveNative: true, makeCache: { [RotatingKVCache(maxSize: 4)] })
       XCTAssertEqual(warm?.cachedTokenCount, 5)
       let final = MLXArray([Float(5)], [1, 1, 1, 1])
       _ = warm!.cache[0].update(keys: final, values: final + 100)
@@ -260,29 +279,32 @@ final class PromptPrefixCachePressureTests: XCTestCase {
       let next = MLXArray([Float(901)], [1, 1, 1, 1])
       _ = warm!.cache[0].update(keys: next, values: next + 100)
       XCTAssertEqual(warm!.cache[0].offset, 7, "The valid model forward still proceeds.")
-      XCTAssertEqual(warm!.retentionObservation?.lastCompleteTokenCount, 6)
-      XCTAssertEqual(warm!.retentionObservation?.refusalReason, "pool_limit")
+      eval(warm!.cache); warm!.markCacheSubmitted(); await warm!.joinPendingSpill(cancelled: false)
+      XCTAssertEqual(warm!.retentionObservation?.lastCompleteTokenCount, 7)
+      XCTAssertNil(warm!.retentionObservation?.refusalReason,
+        "Eliminating the extra immutable RAM archive removes this former artificial pool refusal; actual native aliases still stay charged.")
       XCTAssertTrue(warm!.retentionObservation?.compactLocalCoverage == true)
       XCTAssertLessThanOrEqual(store.retainedBytesUpperBound, 56)
       store.clear(); warm!.discardStagedAnchors()
-      XCTAssertEqual(store.retainedBytesUpperBound, 48,
+      XCTAssertGreaterThanOrEqual(store.retainedNativeBytesUpperBound, 48,
         "Optional descriptor release cannot erase the aliased full source backing.")
       warm = nil
       XCTAssertEqual(store.retainedBytesUpperBound, 0)
+      XCTAssertGreaterThan(store.retainedNativeBytesUpperBound, 0, "The explicitly held cold session still owns its real native cache.")
     }
   }
 
-  func testPageAlignedPromptKeepsInitialReusableWindowUnderPressure() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testPageAlignedPromptKeepsInitialReusableWindowUnderPressure() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let store = PromptPrefixCache(byteLimit: 2048), scope = owner(), ids = Array(0..<62)
-      let value = try request(store, ids, owner: scope); try prefill(value); expand(value)
-      append(value, rows: [[901], [911], [921]])
+      let value = try request(store, ids, owner: scope); try await prefill(value); expand(value)
+      await append(value, rows: [[901], [911], [921]])
       finish(value, first: [901, 911, 921], second: [902, 912, 922])
       XCTAssertTrue(value.retentionObservation?.compactLocalCoverage == true)
       XCTAssertTrue(store.publish(value, completions: [
         .init(row: 0, emittedTokenIDs: [901, 902]), .init(row: 1, emittedTokenIDs: [911, 912]),
         .init(row: 2, emittedTokenIDs: [921, 922])]))
-      XCTAssertEqual(store.retainedBytesUpperBound, 1960)
+      XCTAssertEqual(store.retainedBytesUpperBound, 0)
       let identical = try request(store, ids, owner: scope)
       XCTAssertEqual(identical.cachedTokenCount, 61,
         "Pressure must preserve the initial window one token before the raw prompt endpoint.")
@@ -291,12 +313,12 @@ final class PromptPrefixCachePressureTests: XCTestCase {
     }
   }
 
-  private func completedGap(_ store: PromptPrefixCache, scope: PromptCacheOwner) throws {
+  private func completedGap(_ store: PromptPrefixCache, scope: PromptCacheOwner) async throws {
     let ids = Array(0..<6), pressure = SoftPressure()
     let value = try request(store, ids, owner: scope, allow: { pressure.allow($0) })
-    try prefill(value); expand(value)
+    try await prefill(value); expand(value)
     for step in 0..<11 {
-      append(value, rows: [[901 + step], [951 + step], [1001 + step]])
+      await append(value, rows: [[901 + step], [951 + step], [1001 + step]])
     }
     let emitted = (0..<3).map { row in (0..<12).map { 901 + row * 50 + $0 } }
     for row in 0..<3 {
@@ -307,33 +329,33 @@ final class PromptPrefixCachePressureTests: XCTestCase {
     }))
   }
 
-  func testLexicalMatchInCoverageGapFallsBackToGreatestValidPrefix() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testLexicalMatchInCoverageGapFallsBackToGreatestValidPrefix() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let store = PromptPrefixCache(byteLimit: 8192), scope = owner()
-      try completedGap(store, scope: scope)
+      try await completedGap(store, scope: scope)
       let incoming = Array(0..<6) + [901, 902, 9999]
       let value = try request(store, incoming, owner: scope)
-      XCTAssertEqual(value.cachedTokenCount, 5,
-        "A lexical match through8 falls in the gap, but the protected prompt prefix through5 remains valid.")
+      XCTAssertEqual(value.cachedTokenCount, 8,
+        "Admitted zero-RAM disk middle intervals retain the full lexical prefix.")
       XCTAssertEqual(value.cache[0].state[0].asArray(Float.self),
-        (0..<4).flatMap { _ in [1, 2, 3, 4].map(Float.init) })
+        (0..<4).flatMap { _ in [4, 5, 901, 902].map(Float.init) })
     }
   }
 
-  func testCrossEntrySelectionUsesAdjustedValidCountsInsteadOfLexicalCounts() throws {
-    try Device.withDefaultDevice(.cpu) {
+  func testCrossEntrySelectionUsesAdjustedValidCountsInsteadOfLexicalCounts() async throws {
+    try await Device.withDefaultDevice(.cpu) {
       let store = PromptPrefixCache(byteLimit: 8192), scope = owner()
       let parentIDs = Array(0..<6) + [901, 902]
-      let parent = try request(store, parentIDs, owner: scope); try prefill(parent)
+      let parent = try request(store, parentIDs, owner: scope); try await prefill(parent)
       XCTAssertTrue(store.publish(parent))
-      try completedGap(store, scope: scope)
+      try await completedGap(store, scope: scope)
       let incoming = Array(0..<6) + [901, 902, 903, 9999]
       let value = try request(store, incoming, owner: scope)
-      XCTAssertEqual(value.cachedTokenCount, 8,
-        "The parent lexical8/valid8 beats the child lexical9/valid5.")
-      XCTAssertNil(value.observation.cachedRow)
+      XCTAssertEqual(value.cachedTokenCount, 9,
+        "The child now has actual disk coverage through its lexical9, so it beats parent8.")
+      XCTAssertEqual(value.observation.cachedRow, 0)
       XCTAssertEqual(value.cache[0].state[0].asArray(Float.self),
-        (0..<4).flatMap { _ in [4, 5, 901, 902].map(Float.init) })
+        (0..<4).flatMap { _ in [5, 901, 902, 903].map(Float.init) })
     }
   }
 }

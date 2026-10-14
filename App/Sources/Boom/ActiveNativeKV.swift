@@ -166,7 +166,7 @@ final class ActiveNativeKVReadmission: @unchecked Sendable {
 
 enum ActiveNativeKVStorage {
   static func rowWidth(_ owners: [PrefixKVNativeOwnership]) throws -> Int {
-    let widths = Set(owners.flatMap { $0.native.innerState().map { $0.dim(0) } })
+    let widths = Set(owners.flatMap { $0.native.innerState().filter { $0.ndim == 4 }.map { $0.dim(0) } })
     guard widths.count == 1, let width = widths.first, (1...4).contains(width) else {
       throw BoomError.invalid("Active native KV has no coherent physical row width.")
     }
@@ -185,8 +185,9 @@ enum ActiveNativeKVStorage {
     let stride = prefill.chunkLength(forChunking: max(0, suffix - 1))
     let chunk = stride.map { max(1, min($0, max(1, suffix - 1))) } ?? suffix
     let values = try owners.indices.map { layer -> ActiveNativeKVAllocation in
-      let native = owners[layer].native, arrays = native.innerState()
-      guard arrays.count == 2, native.offset >= prefix else { throw BoomError.invalid("Active native KV does not cover its authorized prefix.") }
+      let native = owners[layer].native, arrays = native.innerState().filter { $0.ndim == 4 }
+      let actualOffset = try rowOffset(native, row: row ?? 0)
+      guard arrays.count == 2, actualOffset >= prefix else { throw BoomError.invalid("Active native KV does not cover its authorized prefix.") }
       try PrefixKVStorage.validatePair(arrays[0], arrays[1])
       let keys = arrays[0], vals = arrays[1], capacity = keys.dim(2)
       let positionBytes = try sum(try product(UInt64(keys.dim(1)), UInt64(keys.dim(3)), UInt64(keys.dtype.size)),
@@ -248,9 +249,71 @@ enum ActiveNativeKVStorage {
       reservedOutputTokenCount: output, consumerWidth: width, sourceWidth: sourceWidth,
       sourceRow: row, layers: values)
   }
+  /// Historical candidates have file-owned metadata, not a pretend native
+  /// cache. Reserve their real row read buffer and newly hydrated allocation
+  /// before file IO; the unrelated current hot owner remains in measured U.
+  static func diskPlan(layouts: [PrefixKVStorage.Layout], spans: [[PrefixKVSpan]],
+    prefix: Int, prompt: Int, output: Int, width: Int, prefill: PrefillParameters
+  ) throws -> ActiveNativeKVAdmissionPlan {
+    guard !layouts.isEmpty, layouts.count == spans.count, prefix > 0, prefix < prompt,
+      output > 0, (1...4).contains(width) else { throw BoomError.invalid("Invalid disk KV admission coordinates.") }
+    let (target, overflow) = prompt.addingReportingOverflow(output)
+    guard !overflow, target <= 16_384 else { throw BoomError.budget("The request exceeds the context ceiling.") }
+    let suffix = prompt - prefix
+    let stride = prefill.chunkLength(forChunking: max(0, suffix - 1))
+    let chunk = stride.map { max(1, min($0, max(1, suffix - 1))) } ?? suffix
+    let layers = try layouts.indices.map { layer -> ActiveNativeKVAllocation in
+      guard let first = spans[layer].first, first.diskFileID != nil,
+        spans[layer].allSatisfy({ $0.diskFileID != nil && $0.layer == layer
+          && $0.keyShape[1] == first.keyShape[1] && $0.keyShape[3] == first.keyShape[3]
+          && $0.valueShape[3] == first.valueShape[3]
+          && $0.keyType == first.keyType && $0.valueType == first.valueType }) else {
+        throw BoomError.invalid("Historical KV has no coherent disk-owned layer geometry.")
+      }
+      let position = try sum(try product(UInt64(first.keyShape[1]), UInt64(first.keyShape[3]), UInt64(first.keyType.size)),
+        try product(UInt64(first.valueShape[1]), UInt64(first.valueShape[3]), UInt64(first.valueType.size)))
+      let capacity: Int, extensionSize: Int, hydratedPositions: Int, grows: Bool
+      switch layouts[layer] {
+      case .simple(let step):
+        guard step > 0 else { throw BoomError.invalid("Invalid historical full-attention step.") }
+        let (padded, paddingOverflow) = target.addingReportingOverflow(step - 1)
+        let (ceilInput, ceilOverflow) = chunk.addingReportingOverflow(step - 1)
+        let (extensionValue, extensionOverflow) = (ceilInput / step).multipliedReportingOverflow(by: step)
+        guard !paddingOverflow, !ceilOverflow, !extensionOverflow else { throw BoomError.invalid("Disk KV capacity overflowed.") }
+        capacity = padded; extensionSize = extensionValue; hydratedPositions = prefix; grows = true
+      case .rotating(let window, let keep, let step, _):
+        guard window > keep, keep >= 0, step > 0 else { throw BoomError.invalid("Invalid historical sliding geometry.") }
+        let (temporary, tempOverflow) = window.addingReportingOverflow(chunk - 1)
+        guard !tempOverflow else { throw BoomError.invalid("Disk sliding capacity overflowed.") }
+        let initial = min(prefix, window)
+        capacity = max(initial, min(target, temporary))
+        extensionSize = target > initial && initial < window ? min(step, window - initial) : 0
+        hydratedPositions = initial; grows = chunk > 1 || extensionSize > 0
+      }
+      // Host pread bytes, immediate native raw-data copies and a possible
+      // concatenate destination can coexist. Reserve all three, no release credit.
+      let hydration = try product(position, UInt64(hydratedPositions), 3)
+      return ActiveNativeKVAllocation(destinationBytes: try product(position, UInt64(capacity), UInt64(width)),
+        zeroExtensionBytes: try product(position, UInt64(extensionSize), UInt64(width)),
+        hydrationBytes: hydration,
+        sharedPrefillBytes: width > 1 ? try product(position, UInt64(capacity)) : 0, grows: grows)
+    }
+    return ActiveNativeKVAdmissionPlan(cachedTokenCount: prefix, promptTokenCount: prompt,
+      reservedOutputTokenCount: output, consumerWidth: width, sourceWidth: 1, sourceRow: nil, layers: layers)
+  }
+  static func rowOffset(_ cache: any KVCache, row: Int) throws -> Int {
+    if let batch = PrefixKVStorage.unwrap(cache) as? any BatchKVCacheProtocol {
+      return try batch.logicalOffset(row: row)
+    }
+    return cache.offset
+  }
   static func selectedGlobal(_ source: PrefixKVNativeOwnership, prefix: Int, row: Int,
-    makeOwner: (any KVCache, [PrefixKVNativeOwnership], Bool) -> PrefixKVNativeOwnership
+    preservingSource: Bool = false, makeOwner: (any KVCache, [PrefixKVNativeOwnership], Bool) -> PrefixKVNativeOwnership
   ) throws -> PrefixKVNativeOwnership {
+    if let batch = source.native as? BatchKVCache {
+      let extracted = try batch.extract(row: row, through: prefix)
+      return makeOwner(extracted, [source], true)
+    }
     guard let original = source.native as? KVCacheSimple, original.offset >= prefix,
       prefix > 0 else { throw BoomError.invalid("Invalid active full-attention prefix.") }
     let arrays = original.innerState()
@@ -259,6 +322,12 @@ enum ActiveNativeKVStorage {
     let width = arrays[0].dim(0)
     guard (0..<width).contains(row) else { throw BoomError.invalid("Invalid active full-attention row.") }
     if width == 1 {
+      if preservingSource {
+        let fork = original.copy()
+        _ = fork.trim(fork.offset - prefix)
+        guard fork.offset == prefix else { throw BoomError.invalid("Native prefix fork has another offset.") }
+        return makeOwner(fork, [source], false)
+      }
       guard original.trim(original.offset - prefix) >= 0, original.offset == prefix else {
         throw BoomError.invalid("Native full-attention offset transfer failed.")
       }

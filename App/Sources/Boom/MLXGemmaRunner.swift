@@ -17,7 +17,25 @@ actor GenerationCoordinator {
   private var producer: Task<Void, Never>?
   private var cancelProducer: (@Sendable () -> Void)?
   private var activity: NSObjectProtocol?
-  private var waiting: [(CancellationFlag?, Bool, UUID?, CheckedContinuation<Void, Never>)] = []
+  private struct TextWaiting {
+    let request: MLXGemmaRunner.IndependentTextRequest
+    let epoch: UUID
+    let compatibility: String
+    let perform: @Sendable ([MLXGemmaRunner.IndependentTextRequest], CancellationFlag) async -> [Result<MLXGemmaRunner.Output, Error>]
+    let continuation: CheckedContinuation<Result<MLXGemmaRunner.Output, Error>, Never>
+  }
+  private enum Waiting {
+    case operation(CancellationFlag?, Bool, UUID?, CheckedContinuation<Void, Never>)
+    case text(TextWaiting)
+    var isBackground: Bool { if case .operation(_, let value, _, _) = self { return value }; return false }
+    var epoch: UUID? {
+      switch self { case .operation(_, _, let value, _): value; case .text(let value): value.epoch }
+    }
+    func cancel() {
+      switch self { case .operation(let flag, _, _, _): flag?.cancel(); case .text(let value): value.request.flag.cancel() }
+    }
+  }
+  private var waiting: [Waiting] = []
   var queuedOperations: Int { waiting.count }
   private func admitOwner(flag: CancellationFlag?, background: Bool, runnerEpoch: UUID?) {
     occupied = true; activeFlag = flag; self.background = background; self.runnerEpoch = runnerEpoch
@@ -28,30 +46,93 @@ actor GenerationCoordinator {
   func enter(flag: CancellationFlag? = nil, background: Bool = false, runnerEpoch: UUID? = nil) async {
     if !occupied { admitOwner(flag: flag, background: background, runnerEpoch: runnerEpoch); return }
     if !background, self.background { activeFlag?.cancel(); cancelProducer?() }
-    await withCheckedContinuation { waiting.append((flag, background, runnerEpoch, $0)) }
+    await withCheckedContinuation { waiting.append(.operation(flag, background, runnerEpoch, $0)) }
+  }
+  /// Rows are payloads in the existing wait queue, not separate GPU tasks. Only
+  /// already-ready requests for this exact runner and policy share a fixed batch.
+  func submitIndependentText(_ request: MLXGemmaRunner.IndependentTextRequest,
+    runnerEpoch: UUID, compatibility: String,
+    perform: @escaping @Sendable ([MLXGemmaRunner.IndependentTextRequest], CancellationFlag) async -> [Result<MLXGemmaRunner.Output, Error>]
+  ) async throws -> MLXGemmaRunner.Output {
+    let result = await withCheckedContinuation { continuation in
+      waiting.append(.text(TextWaiting(request: request, epoch: runnerEpoch,
+        compatibility: compatibility, perform: perform, continuation: continuation)))
+      if occupied {
+        if background { activeFlag?.cancel(); cancelProducer?() }
+      } else { startNext() }
+    }
+    return try result.get()
   }
   func own<R: Sendable, E: Error>(_ task: Task<R, E>) {
     cancelProducer = { task.cancel() }
     producer = Task { _ = try? await task.value }
-    // A foreground request can arrive between lease acquisition and task
-    // registration. The new owner must observe that earlier cancellation.
     if activeFlag?.isCancelled == true { task.cancel() }
   }
   func cancel(runnerEpoch: UUID) {
     if self.runnerEpoch == runnerEpoch { activeFlag?.cancel(); cancelProducer?() }
-    for queued in waiting where queued.2 == runnerEpoch { queued.0?.cancel() }
+    for queued in waiting where queued.epoch == runnerEpoch { queued.cancel() }
+  }
+  private func startNext() {
+    guard !waiting.isEmpty else { occupied = false; background = false; return }
+    let index = waiting.firstIndex { !$0.isBackground } ?? 0
+    switch waiting.remove(at: index) {
+    case .operation(let flag, let background, let epoch, let continuation):
+      admitOwner(flag: flag, background: background, runnerEpoch: epoch); continuation.resume()
+    case .text(let first):
+      let flag = CancellationFlag()
+      admitOwner(flag: flag, background: false, runnerEpoch: first.epoch)
+      // Reserve the existing owner before yielding once to other ready callers.
+      // There is no batching timer and no new request may join after this step.
+      Task { await Task.yield(); self.beginTextCohort(first: first, flag: flag) }
+    }
+  }
+  private func beginTextCohort(first: TextWaiting, flag: CancellationFlag) {
+    var selected = [first]
+    var index = 0
+    while selected.count < 4, index < waiting.count {
+      if case .text(let next) = waiting[index], next.epoch == first.epoch,
+        next.compatibility == first.compatibility {
+        selected.append(next); waiting.remove(at: index)
+      } else { index += 1 }
+    }
+    let cohortWaiting = selected
+    let requests = cohortWaiting.map(\.request)
+    let work = Task(priority: .userInitiated) {
+      let cancellations = requests.map { request in
+        request.flag.onCancel {
+          if requests.allSatisfy({ $0.flag.isCancelled }) { flag.cancel() }
+        }
+      }
+      defer {
+        for (request, registration) in zip(requests, cancellations) {
+          request.flag.removeCancellationHandler(registration)
+        }
+      }
+      if requests.allSatisfy({ $0.flag.isCancelled }) {
+        return requests.map { _ in Result<MLXGemmaRunner.Output, Error>.failure(CancellationError()) }
+      }
+      return await first.perform(requests, flag)
+    }
+    let cancellation = flag.onCancel { work.cancel() }
+    own(work)
+    Task {
+      let results = await work.value // actual body/fence, not a row cancellation
+      flag.removeCancellationHandler(cancellation)
+      await self.completeText(cohortWaiting, results: results)
+    }
+  }
+  private func completeText(_ selected: [TextWaiting], results: [Result<MLXGemmaRunner.Output, Error>]) async {
+    await leave()
+    for (index, request) in selected.enumerated() {
+      request.continuation.resume(returning: results.indices.contains(index) ? results[index]
+        : .failure(BoomError.invalid("The real cohort returned another row count.")))
+    }
   }
   func leave() async {
     if let producer { await producer.value }
     producer = nil; cancelProducer = nil; activeFlag = nil; runnerEpoch = nil
     if let activity { ProcessInfo.processInfo.endActivity(activity) }
-    activity = nil
-    if waiting.isEmpty { occupied = false; background = false }
-    else {
-      let index = waiting.firstIndex { !$0.1 } ?? 0
-      let next = waiting.remove(at: index)
-      admitOwner(flag: next.0, background: next.1, runnerEpoch: next.2); next.3.resume()
-    }
+    activity = nil; startNext()
   }
 }
 
@@ -494,7 +575,7 @@ actor MLXGemmaRunner {
           let capacity = try self.requestCapacityOwned(required: required,
             batchWidth: request.declaration.sharedWidth, forceCold: false)
           guard capacity.capacity >= required else { throw BoomError.budget("Insufficient context for the bounded public parity control.") }
-          return try NeuralPrefixParitySmoke.execute(request, model: context.model, manager: self.promptCache,
+          return try await NeuralPrefixParitySmoke.execute(request, model: context.model, manager: self.promptCache,
             prefill: prefill, policy: policy, layerWindows: windows, flag: flag,
             allowSnapshot: allowSnapshot, fence: { Self.synchronizeGPU() }, evidence: evidence)
         }
@@ -785,7 +866,7 @@ actor MLXGemmaRunner {
       media: compiled.media.isEmpty ? nil : compiled.media)
   }
   func run(plan: ConsultationPlan, images: [Data], media: [WritingMediaData] = [], maxTokens: Int, seed: UInt64? = nil,
-    flag: CancellationFlag,
+    flag: CancellationFlag, independentIdentity: GenerationIdentity? = nil,
     cacheOwner: PromptCacheOwner? = nil, executionPolicy: ModelGenerationPolicy? = nil,
     joinedRetention: JoinedKVRetentionRequest? = nil,
     beforeCachePublication: (@Sendable () async throws -> Void)? = nil,
@@ -794,7 +875,20 @@ actor MLXGemmaRunner {
     onPrefill: (@Sendable (PrefillProgress) -> Void)? = nil,
     onCheckpoint: (@Sendable (GenerationProgress, String?, Int?) async throws -> Void)? = nil,
     onText: @escaping @Sendable (String) -> Void) async throws -> Output {
-    try await generate(plan: plan, raw: nil, images: images, media: media, maxTokens: maxTokens,
+    if let independentIdentity, let cacheOwner, images.isEmpty, media.isEmpty,
+      verifiedStatelessTextKV, diagnostic == nil {
+      let policy = try ProductCore.resolvedGenerationPolicy(executionPolicy ?? generationPolicy, loaded: generationPolicy)
+      guard independentIdentity.seed == seed, independentIdentity.maxTokens == maxTokens,
+        independentIdentity.requestDigest == Digest.sha256(plan.rawPrompt) else {
+        throw BoomError.stale("The independent consultation lost its captured seed or prompt.")
+      }
+      return try await submitIndependentText(.init(identity: independentIdentity, owner: cacheOwner,
+        input: .consultation(plan), settings: try ProductCore.sampling(.standard), flag: flag, policy: policy,
+        joinedRetention: joinedRetention, pairedAdmission: pairedAdmission,
+        beforeCachePublication: beforeCachePublication,
+        onPrefill: onPrefill, onCheckpoint: onCheckpoint, onText: onText))
+    }
+    return try await generate(plan: plan, raw: nil, images: images, media: media, maxTokens: maxTokens,
       settings: ProductCore.sampling(.standard), seed: seed, flag: flag,
       cacheOwner: cacheOwner, executionPolicy: executionPolicy, joinedRetention: joinedRetention,
       beforeCachePublication: beforeCachePublication, pairedAdmission: pairedAdmission, diagnostic: diagnostic, onPrefill: onPrefill,
@@ -882,6 +976,245 @@ actor MLXGemmaRunner {
       return result
     } catch { await GenerationCoordinator.shared.leave(); throw error }
   }
+  /// Fixed independent attempts enter the existing coordinator concurrently;
+  /// its one ready queue chooses compatible rows, never one GPU owner per row.
+  func runIndependentText(_ requests: [IndependentTextRequest]) async -> [Result<Output, Error>] {
+    guard (1...4).contains(requests.count) else {
+      return requests.map { _ in .failure(BoomError.invalid("At most four independent attempts form a cohort.")) }
+    }
+    return await withTaskGroup(of: (Int, Result<Output, Error>).self) { group in
+      for (index, request) in requests.enumerated() {
+        group.addTask {
+          do { return (index, .success(try await self.submitIndependentText(request))) }
+          catch { return (index, .failure(error)) }
+        }
+      }
+      var values = Array<Result<Output, Error>>(repeating: .failure(CancellationError()), count: requests.count)
+      for await (index, value) in group { values[index] = value }
+      return values
+    }
+  }
+  private func submitIndependentText(_ request: IndependentTextRequest) async throws -> Output {
+    guard verifiedStatelessTextKV, request.identity.batch == nil,
+      request.identity.model == identity, request.identity.operationID == request.flag.operationID,
+      request.identity.generationPolicy == request.policy else {
+      throw BoomError.invalid("An independent request lost its actual runner or captured attempt.")
+    }
+    let policy = try ProductCore.resolvedGenerationPolicy(request.policy, loaded: generationPolicy)
+    let compatibility = processorIdentity + ":" + (try Self.policyDigest(policy))
+    return try await withTaskCancellationHandler {
+      try await PairedContextAdmission.perform(using: request.pairedAdmission, flag: request.flag) { attempt in
+        var prepared = request; prepared.pairedAttempt = attempt
+        return try await GenerationCoordinator.shared.submitIndependentText(prepared,
+          runnerEpoch: self.cacheRunnerEpoch, compatibility: compatibility) { requests, flag in
+            await self.generateIndependentOwned(requests, flag: flag)
+          }
+      }
+    } onCancel: { request.flag.cancel() } // never cancels a peer's shared producer
+  }
+  private struct IndependentCohortDoesNotFit: Error { let message: String }
+  private struct IndependentPreparationRefusals: Error {
+    let rows: [(Int, Error)]
+  }
+  private func generateIndependentSingle(_ row: IndependentTextRequest,
+    watch: OperationMemoryWatch) async -> Result<Output, Error> {
+    do {
+      try row.flag.check()
+      let plan: ConsultationPlan?, raw: String?
+      switch row.input { case .consultation(let value): plan = value; raw = nil; case .raw(let value): plan = nil; raw = value }
+      return .success(try await generateOwned(plan: plan, raw: raw, images: [], media: [],
+        maxTokens: row.identity.maxTokens, settings: row.settings, seed: row.identity.seed,
+        flag: row.flag, cacheOwner: row.owner, executionPolicy: row.policy,
+        joinedRetention: row.joinedRetention, budgetWasExceeded: { watch.exceeded },
+        beforeCachePublication: row.beforeCachePublication, pairedAttempt: row.pairedAttempt,
+        onPrefill: row.onPrefill, onCheckpoint: row.onCheckpoint, onText: row.onText))
+    } catch { return .failure(error) }
+  }
+  private func generateIndependentOwned(_ original: [IndependentTextRequest],
+    flag: CancellationFlag) async -> [Result<Output, Error>] {
+    let participating = original.indices.filter { !original[$0].flag.isCancelled }
+    guard !participating.isEmpty else { return original.map { _ in .failure(CancellationError()) } }
+    var values = Array<Result<Output, Error>>(repeating: .failure(CancellationError()), count: original.count)
+    let watch: OperationMemoryWatch
+    do {
+      watch = try OperationMemoryWatch(flag: flag, onExceeded: {
+        for index in participating { original[index].joinedRetention?.authorization.revoke() }
+      })
+    } catch { return original.map { _ in .failure(error) } }
+    defer { watch.stop() }
+    do {
+      // At most four captured rows. A refused preparation or padded allocation
+      // may regroup ONLY before any forward/ticket transfer; completed rows
+      // are never replayed. All groups retain this same exclusive GPU owner.
+      var groups = [participating]
+      while !groups.isEmpty {
+        let indexes = groups.removeFirst()
+        if indexes.count == 1 {
+          values[indexes[0]] = await generateIndependentSingle(original[indexes[0]], watch: watch)
+          continue
+        }
+        let requests = indexes.map { original[$0] }
+        do {
+          let results = try await container.perform { context in
+            try await InferenceExecutor.shared.perform { _ in
+              try await self.generateIndependentPrepared(requests, context: context, flag: flag, watch: watch)
+            }
+          }
+          guard results.count == indexes.count else {
+            throw BoomError.invalid("The real independent cohort lost a result row.")
+          }
+          for (index, result) in zip(indexes, results) { values[index] = result }
+        } catch let refusal as IndependentPreparationRefusals {
+          guard !refusal.rows.isEmpty,
+            refusal.rows.allSatisfy({ indexes.indices.contains($0.0) }),
+            Set(refusal.rows.map { $0.0 }).count == refusal.rows.count else {
+            throw BoomError.invalid("Independent preparation returned another row's refusal.")
+          }
+          for (row, error) in refusal.rows { values[indexes[row]] = .failure(error) }
+          let ready = indexes.enumerated().compactMap { row, index in
+            refusal.rows.contains(where: { $0.0 == row }) ? nil : index
+          }
+          if !ready.isEmpty { groups.insert(ready, at: 0) }
+        } catch is IndependentCohortDoesNotFit {
+          // Keep useful two/three-row batches when a wider padded shape cannot
+          // fit. Its declined admission has not entered a forward or a ticket.
+          let split = indexes.count == 3 ? 2 : indexes.count / 2
+          groups.insert(Array(indexes[split...]), at: 0)
+          groups.insert(Array(indexes[..<split]), at: 0)
+        }
+      }
+      try ModelResidency.check()
+      if watch.exceeded { throw BoomError.budget("The actual independent cohort reached the application memory budget.") }
+      return values
+    } catch {
+      for index in participating { values[index] = .failure(error) }
+      return values
+    }
+  }
+  private nonisolated func generateIndependentPrepared(_ requests: [IndependentTextRequest],
+    context: ModelContext, flag: CancellationFlag, watch: OperationMemoryWatch
+  ) async throws -> [Result<Output, Error>] {
+    var didFence = false
+    defer { if !didFence { Self.synchronizeGPU() } }
+    let policy = try ProductCore.resolvedGenerationPolicy(requests[0].policy, loaded: generationPolicy)
+    guard requests.allSatisfy({ $0.policy == policy && $0.identity.model == identity }) else {
+      throw BoomError.invalid("Independent rows require the same actual weights, processor and execution policy.")
+    }
+    var preparedIDs: [[Int]] = [], bindings: [JoinedKVRetentionBinding?] = []
+    let prefill = try prefillParameters(nil, operationID: flag.operationID, policy: policy)
+    var refused: [(Int, Error)] = []
+    for (row, request) in requests.enumerated() {
+      try flag.check() // only cancellation of the actual whole producer
+      do {
+        try request.flag.check()
+        let input: LMInput
+        switch request.input {
+        case .consultation(let plan): input = try await Self.chatInput(plan, images: [], media: [], context: context)
+        case .raw(let prompt): input = try RawWritingInput.prepare(prompt, media: [], context: context)
+        }
+        guard canUseNative(input, owner: request.owner) else {
+          throw BoomError.invalid("This captured attempt is not independent stateless text.")
+        }
+        let ids = input.text.tokens.asArray(Int.self)
+        guard !ids.isEmpty, ids.count + request.identity.maxTokens <= verifiedContextCeiling else {
+          throw BoomError.budget("An independent row exceeds the actual context ceiling.")
+        }
+        // This is the original independent request's width-one prepared input.
+        // A reclamation retry validates this exact row before regrouping peers;
+        // runtime allocation separately admits the actual padded cohort width.
+        _ = try pairedAdmissionRequest(ids: ids, owner: request.owner,
+          output: request.identity.maxTokens, width: 1, policy: policy, flag: request.flag,
+          attempt: request.pairedAttempt)
+        preparedIDs.append(ids)
+        let parameters = GenerateParameters(maxTokens: request.identity.maxTokens, prefill: prefill)
+        bindings.append(try admittedJoinedBinding(request.joinedRetention, owner: request.owner,
+          operationID: request.flag.operationID, policy: policy, input: input, parameters: parameters))
+      } catch {
+        refused.append((row, error))
+      }
+    }
+    // No cache selection, producer forward or publication has entered yet.
+    // Return only original errors; the owner can regroup surviving requests.
+    if !refused.isEmpty { throw IndependentPreparationRefusals(rows: refused) }
+    let inputs = requests.indices.map { PromptPrefixCache.TextCohortInput(owner: requests[$0].owner,
+      tokens: preparedIDs[$0], joinedBinding: bindings[$0]) }
+    guard let geometry = policy.prefill else { throw BoomError.invalid("Missing independent prefill geometry.") }
+    let limits = try ModelResidency.limits()
+    let prompts = preparedIDs.map(\.count), outputLimits = requests.map { $0.identity.maxTokens }
+    func admission(_ cached: [Int], initial: Bool, valueBytes: Int = 4) throws {
+      let allocation = try ProductCore.independentKVAllocation(configuration: self.cacheConfiguration,
+        prompts: prompts, cached: cached, outputs: outputLimits, prefill: geometry,
+        initial: initial, valueBytes: valueBytes)
+      _ = try self.admitNativeAllowance(allocation, limits: limits)
+    }
+    let cohort = try promptCache.makeTextCohort(inputs, prefill: prefill,
+      allowSnapshot: try Self.cacheRetentionGuard(), admit: { cached in
+        do { try admission(cached, initial: true) }
+        catch BoomError.budget(let message) { throw IndependentCohortDoesNotFit(message: message) }
+      }, outputLimits: outputLimits,
+      makeCache: { try context.model.newCache(parameters: GenerateParameters(prefill: prefill)) })
+    defer { cohort.discard() }
+    let origins = try Self.independentOrigins(requests: requests, preparedIDs: preparedIDs,
+      cohort: cohort, policy: policy)
+    let decoded: IndependentTextDecoded
+    do {
+      decoded = try await Self.decodeIndependentText(requests: requests, model: context.model,
+        tokenizer: context.tokenizer, cohort: cohort, origins: origins, policy: policy, flag: flag,
+        admitNext: {
+          try flag.check()
+          let arrays = cohort.cache.flatMap { $0.innerState() }.filter { $0.ndim == 4 }
+          guard arrays.allSatisfy({ $0.dtype == .float16 || $0.dtype == .bfloat16 || $0.dtype == .float32 }) else {
+            throw BoomError.invalid("Independent Gemma KV has an unsupported actual dtype.")
+          }
+          // No eval/readback: cold caches reserve float32, then every actual
+          // forward uses the submitted parents' real scalar byte size.
+          try admission(cohort.rows.map(\.cachedTokenCount), initial: false,
+            valueBytes: arrays.map { $0.dtype.size }.max() ?? 4)
+        })
+    } catch {
+      Self.synchronizeGPU(); didFence = true
+      await promptCache.joinTextCohortSpill(cohort, cancelled: true)
+      if error is CancellationError, !watch.exceeded {
+        var retained = Array<PromptPrefixCache.TextCohortRetention?>(repeating: nil, count: requests.count)
+        for row in requests.indices {
+          guard let request = requests[row].joinedRetention,
+            await request.authorizeAfterJoin(), !watch.exceeded else { continue }
+          retained[row] = .init(completion: .init(row: row, emittedTokenIDs: []), acknowledged: nil,
+            proof: JoinedKVRetentionProof(termination: .constructorCancelled, producerJoined: true,
+              existingFenceCompleted: true, checkpointUncertain: false, memoryLimitExceeded: false,
+              statelessTextKVVerified: true), authorization: request.authorization)
+        }
+        // Cancellation remains the original result. Only completed disk bytes
+        // or an exactly submitted joined hot prefix can consume this ticket.
+        promptCache.publishTextCohort(cohort, retention: retained)
+      }
+      throw error
+    }
+    Self.synchronizeGPU(); didFence = true
+    await promptCache.joinTextCohortSpill(cohort, cancelled: false)
+    var results = decoded.outputs
+    var retention = Array<PromptPrefixCache.TextCohortRetention?>(repeating: nil, count: requests.count)
+    for row in requests.indices {
+      guard !decoded.checkpointUncertain[row], !watch.exceeded else { continue }
+      do {
+        if !decoded.cancelled[row] { try await requests[row].beforeCachePublication?() }
+        if decoded.cancelled[row] {
+          guard let request = requests[row].joinedRetention, await request.authorizeAfterJoin() else { continue }
+          retention[row] = .init(completion: decoded.completions[row], acknowledged: decoded.acknowledged[row],
+            proof: JoinedKVRetentionProof(termination: .decodeCancelled, producerJoined: true,
+              existingFenceCompleted: true, checkpointUncertain: false, memoryLimitExceeded: false,
+              statelessTextKVVerified: true), authorization: request.authorization)
+        } else {
+          retention[row] = .init(completion: decoded.completions[row], acknowledged: decoded.acknowledged[row],
+            proof: nil, authorization: nil)
+        }
+      } catch { results[row] = .failure(error) }
+    }
+    try ModelResidency.check()
+    promptCache.publishTextCohort(cohort, retention: retention)
+    return results
+  }
+
   /// One producer, one prompt prefill, and one weight-reading forward pass per
   /// decoding step. Rows never compact: their shape is part of seeded replay.
   func runBatch(rawPrompt: String, media: [WritingMediaData] = [], maxTokens: Int, settings: SamplingSettings, seeds: [UInt64],
@@ -1058,8 +1391,9 @@ actor MLXGemmaRunner {
         }
         // Batch construction/decode run synchronously on this owned executor;
         // there is no separate token producer to join.
-        func joinAndFence() {
+        func joinAndFence() async {
           if !didFence { Self.synchronizeGPU(); didFence = true }
+          await cacheSession.joinPendingSpill(cancelled: flag.isCancelled || Task.isCancelled)
         }
         do {
           let setupStarted = clock.now
@@ -1081,6 +1415,7 @@ actor MLXGemmaRunner {
           var logits = initial.logits[0..., -1, 0...]
           let initialTrace = PerformanceTrace.begin("Model.BatchInitialEvaluation")
           eval(logits); eval(cache)
+          cacheSession.observeReadySpill()
           if joinedBinding != nil || cacheSession.usesActiveNativeState { cacheSession.markCacheSubmitted() }; constructedAndSubmitted = true
           PerformanceTrace.end("Model.BatchInitialEvaluation", initialTrace)
           diagnostic?.native?.logits(logits, width: 1, active: nil, initialBatch: true)
@@ -1103,6 +1438,7 @@ actor MLXGemmaRunner {
             guard entry.offset == offset else { throw BoomError.invalid("Batch expansion changed the native logical offset.") }
           }
           eval(cache)
+          cacheSession.observeReadySpill()
           logits = broadcast(logits, to: [seeds.count, logits.dim(1)])
           diagnostic?.native?.expanded(width: seeds.count)
           try diagnostic?.native?.requireSuccessful()
@@ -1216,6 +1552,7 @@ actor MLXGemmaRunner {
                 let next = output.logits[0..., -1, 0...]
                 guard next.ndim == 2, next.dim(0) == seeds.count else { throw BoomError.invalid("The model lost its batch rows.") }
                 eval(next); eval(cache)
+                cacheSession.observeReadySpill()
                 if joinedBinding != nil || cacheSession.usesActiveNativeState { cacheSession.markCacheSubmitted() }
                 if let event = diagnosticEvent { diagnostic?.matrix?(event) }
                 return next
@@ -1244,7 +1581,7 @@ actor MLXGemmaRunner {
           }
           // The original operation fence runs once, before immutable anchors can
           // become eligible for the next owner-bound request.
-          joinAndFence()
+          await joinAndFence()
           diagnostic?.native?.joined(); try diagnostic?.native?.requireSuccessful()
           if cacheOwner != nil, !cacheSession.stagedAnchorTokenCounts.isEmpty,
             !flag.isCancelled, !Task.isCancelled {
@@ -1279,7 +1616,7 @@ actor MLXGemmaRunner {
               executionOrigin: executionOrigin)
           }
         } catch {
-          joinAndFence()
+          await joinAndFence()
           if error is CancellationError, !checkpointUncertain {
             await retainJoinedPrefix(constructedAndSubmitted ? .decodeCancelled : .constructorCancelled)
           }
@@ -1438,7 +1775,10 @@ actor MLXGemmaRunner {
             if joinedBinding != nil || cacheSession.usesActiveNativeState { cacheSession.markCacheSubmitted() }
             producer = nil
           }
-          if completeFence, !didFence { Self.synchronizeGPU(); didFence = true }
+          if completeFence {
+            if !didFence { Self.synchronizeGPU(); didFence = true }
+            await cacheSession.joinPendingSpill(cancelled: flag.isCancelled || Task.isCancelled)
+          }
         }
         do {
           // TokenIterator performs prompt prefill during task construction.
