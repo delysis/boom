@@ -26,8 +26,11 @@ final class InlineMediaTests: XCTestCase {
     let model = try await model()
     let documentID = try XCTUnwrap(model.selectedDocumentID, "This actual Author component requires its selected document.")
     try await NativeCheckEvidence.replacePublicDocument(model, text: "Before 👩‍💻\nAfter", id: documentID, caret: 0)
-    let destination = try XCTUnwrap(model.documentAttachmentDestination(id: documentID,
-      range: NSRange(location: "Before 👩‍💻\n".utf16.count, length: 0)))
+    let insertion = NSRange(location: "Before 👩‍💻\n".utf16.count, length: 0)
+    let editor = try XCTUnwrap(model.pagedInput?.activeView)
+    editor.setSelectedRange(insertion)
+    XCTAssertEqual(editor.selectedRange(), insertion)
+    let destination = try XCTUnwrap(model.documentAttachmentDestination(id: documentID, range: insertion))
     let bytes = try Self.image()
     model.attach([.bytes(name: "Public café.png", data: bytes)], to: destination)
     try await finish(model)
