@@ -2748,7 +2748,7 @@ private struct BoundedConsultationContext: Sendable {
       guard selection.utf16Length > 0 else { return }
       let observed = try input.observeSelection()
       let (engine, publisher) = try pagedOwners()
-      let clipboardChange = NSPasteboard.general.changeCount
+      let clipboardIntent = ClipboardIntent.begin()
       _ = try commands.requestDocumentClipboard(selection, cutting: cutting) { [weak self] captured in
         guard let self, self.pagedInput === input, input.activeView === view,
           self.pagedSession === session, try input.observeSelection() == observed,
@@ -2757,6 +2757,7 @@ private struct BoundedConsultationContext: Sendable {
           throw BoomError.stale("The clipboard selection changed before its immutable source capture.")
         }
         try session.admitLogicalRead(captured)
+        guard clipboardIntent.isCurrent else { throw BoomError.stale("A newer clipboard request is already present.") }
         let snapshot = captured.source
         guard selection.utf16Offset <= snapshot.summary.utf16,
           selection.utf16Length <= snapshot.summary.utf16 - selection.utf16Offset else {
@@ -2775,10 +2776,11 @@ private struct BoundedConsultationContext: Sendable {
         }
         try Task.checkCancellation()
         let result = try self.publishClipboardSelection(snapshot: snapshot, engine: engine,
-          publisher: publisher, start: start, end: end, expectedChange: clipboardChange)
+          publisher: publisher, start: start, end: end, intent: clipboardIntent)
         if cutting {
           try await withTaskCancellationHandler { try await result.value } onCancel: { result.cancel() }
           try Task.checkCancellation()
+          guard clipboardIntent.isLatest else { throw BoomError.stale("A newer clipboard request superseded this Cut.") }
         }
       }
     } catch {
@@ -2847,7 +2849,7 @@ private struct BoundedConsultationContext: Sendable {
 
   private func publishClipboardSelection(snapshot: PagedNativeLogicalSnapshot,
     engine: PagedTextEngineAdapter, publisher: PagedWorkspacePublisher,
-    start: UInt64, end: UInt64, expectedChange: Int) throws -> Task<Void, Error> {
+    start: UInt64, end: UInt64, intent: ClipboardIntent) throws -> Task<Void, Error> {
     guard pagedExportTaskCount < Self.maximumPagedExportTasks else {
       throw BoomError.budget("Eight file publications are already owned.")
     }
@@ -2866,11 +2868,13 @@ private struct BoundedConsultationContext: Sendable {
       do {
         if let previous {
           await previous.task.value
-          if let result = previous.clipboardResult { try await result.value }
+          // Join the actual previous producer; its retained failure belongs to
+          // that request and must not poison this newer Copy.
+          if let result = previous.clipboardResult { _ = await result.result }
         }
         try Task.checkCancellation()
         let pasteboard = NSPasteboard.general
-        guard pasteboard.changeCount == expectedChange else {
+        guard intent.isCurrent else {
           throw BoomError.stale("A newer clipboard item is already present.")
         }
         let retained = (pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
@@ -2881,7 +2885,7 @@ private struct BoundedConsultationContext: Sendable {
             throw BoomError.invalid("Clipboard text did not contain the complete selected logical range.")
           }
           try Task.checkCancellation()
-          guard pasteboard.changeCount == expectedChange else { throw BoomError.stale("The clipboard changed while selected text was read.") }
+          guard intent.isCurrent else { throw BoomError.stale("The clipboard changed while selected text was read.") }
           pasteboard.clearContents()
           guard pasteboard.writeObjects([text as NSString]) else { throw BoomError.unavailable("The selected text was not written to the clipboard.") }
           status = "Copied"
@@ -2892,7 +2896,7 @@ private struct BoundedConsultationContext: Sendable {
           })
           preparedFile = file
           try Task.checkCancellation()
-          guard pasteboard.changeCount == expectedChange else { throw BoomError.stale("The clipboard changed while the selected file was prepared.") }
+          guard intent.isCurrent else { throw BoomError.stale("The clipboard changed while the selected file was prepared.") }
           try PagedClipboardTextFile.write(file, to: pasteboard)
           status = "Copied file"
         }

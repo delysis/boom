@@ -806,6 +806,82 @@ private final class LiveBackupCopyHold: @unchecked Sendable {
     try await joinedClose(model); try await removeJoinedScratch(scratch)
   }
 
+  func testActualFailedStreamedCopyDoesNotPoisonTheNextCopyOrDestroyThePriorClipboard() async throws {
+    let failures = testRun?.failureCount ?? 0
+    let scratch = try root(), model = try await open(scratch.appendingPathComponent("workspace"))
+    let source = try await writeSource(scratch, edgeText: "e\u{301}🙂")
+    try await model.importDocuments([source], flag: CancellationFlag())
+    try await focusCurrentEditor(model)
+    let record = try XCTUnwrap(model.pagedSelectedRecord)
+    let commands = try XCTUnwrap(model.pagedCommands), input = try XCTUnwrap(model.pagedInput)
+    let publisher = try XCTUnwrap(model.pagedPublisher)
+    let selection = PagedNativeNavigationSelection(utf16Offset: 0,
+      utf16Length: record.document.revision.summary.utf16, focusAtEnd: true)
+    try input.setDocumentSelection(selection)
+    let directory = try FileManager.default.url(for: .cachesDirectory, in: .userDomainMask,
+      appropriateFor: nil, create: false).appendingPathComponent("Bloom/Clipboard", isDirectory: true)
+      .appendingPathComponent(publisher.storeID.uuidString.lowercased(), isDirectory: true)
+    // Arm cleanup before the detached negative control can change permissions.
+    defer {
+      if FileManager.default.fileExists(atPath: directory.path) {
+        do { try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path) }
+        catch { XCTFail("The owned clipboard-directory permission cleanup failed: \(error.localizedDescription)") }
+      }
+    }
+    let expectedFailure = try await Task.detached {
+      let manager = FileManager.default
+      try manager.createDirectory(at: directory, withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700])
+      try manager.setAttributes([.posixPermissions: 0o000], ofItemAtPath: directory.path)
+      do {
+        _ = try manager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        throw BoomError.invalid("The real clipboard-directory permission negative control was not denied.")
+      } catch let error as CocoaError where error.code == .fileReadNoPermission {
+        return error.localizedDescription
+      }
+    }.value
+    let board = NSPasteboard.general
+    board.clearContents(); XCTAssertTrue(board.setString("prior public clipboard", forType: .string))
+    var statuses: [String] = []
+    let observation = model.$status.sink { statuses.append($0) }
+    defer { observation.cancel() }
+    try XCTUnwrap(input.activeView).doCommand(by: NSSelectorFromString("copy:"))
+    try await commands.joinPendingCommand()
+    // The existing backup owner joins the actual prior clipboard producer.
+    // Its already-independent failure handling must not manufacture a Copy pass.
+    _ = try await model.exportWorkspaceBackup(to: scratch.appendingPathComponent("after-failed-copy.bloom")).value
+    try await model.joinWorkspaceOperation()
+    XCTAssertTrue(statuses.contains(expectedFailure), "The first actual streamed Copy must report its real permission failure.")
+    XCTAssertEqual(board.string(forType: .string), "prior public clipboard")
+    XCTAssertEqual(model.pagedSelectedRecord?.document.revision, record.document.revision)
+    try await Task.detached {
+      try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+    }.value
+    try await focusCurrentEditor(model)
+    try input.setDocumentSelection(selection)
+    try XCTUnwrap(input.activeView).doCommand(by: NSSelectorFromString("copy:"))
+    try await commands.joinPendingCommand()
+    _ = try await model.exportWorkspaceBackup(to: scratch.appendingPathComponent("after-successful-copy.bloom")).value
+    try await model.joinWorkspaceOperation()
+    let clipboard = try XCTUnwrap(try PagedClipboardTextFile.read(board))
+    let exactBytes = try await Task.detached {
+      try Data(contentsOf: clipboard.url) == Data(contentsOf: source)
+    }.value
+    XCTAssertTrue(exactBytes, "The second actual Copy must publish every selected byte despite the retained first failure.")
+    XCTAssertNil(board.string(forType: .string), "This is the actual streamed file route, not eager whole text.")
+    XCTAssertEqual(model.pagedSelectedRecord?.document.revision, record.document.revision)
+    XCTAssertEqual(try input.currentDocumentSelection(), selection)
+    XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+    guard (testRun?.failureCount ?? 0) == failures else {
+      throw BoomError.invalid("Actual failed-then-successful clipboard assertions failed; the public native graph is retained.")
+    }
+    board.clearContents()
+    try await joinedClose(model)
+    try await Task.detached { try FileManager.default.removeItem(at: directory) }.value
+    try await removeJoinedScratch(scratch)
+  }
+
   func testActualClipboardTextIntentCapturesOriginalDescriptorAcrossBoardAndPathChanges() async throws {
     let failures = testRun?.failureCount ?? 0
     let scratch = try root(), source = try await writeSource(scratch)

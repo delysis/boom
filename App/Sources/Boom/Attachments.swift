@@ -34,6 +34,20 @@ extension NSPasteboard.PasteboardType {
 }
 private struct ClipboardMedia: Codable { let name: String; let data: Data }
 
+/// One ordered intent for asynchronous text AND media Copy/Cut. The previous
+/// real clipboard remains available until prepared content is published.
+struct ClipboardIntent: Sendable {
+  private let id: UUID
+  private let changeCount: Int
+  @MainActor private static var latest = UUID()
+  @MainActor static func begin() -> Self {
+    let id = UUID(); latest = id
+    return Self(id: id, changeCount: NSPasteboard.general.changeCount)
+  }
+  @MainActor var isLatest: Bool { Self.latest == id }
+  @MainActor var isCurrent: Bool { isLatest && NSPasteboard.general.changeCount == changeCount }
+}
+
 enum AttachmentInput {
   case file(URL)
   case bytes(name: String, data: Data)
