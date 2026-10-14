@@ -81,15 +81,17 @@ impl Policy {
                 "Invalid, repeated, or unordered model control tokens.",
             )?;
         }
+        // Membership relies on the strict ordering admitted above.
         require(
             !self.eos_token_ids.is_empty()
                 && self.control_token_ids.len() < self.vocabulary_size as usize
                 && self
                     .eos_token_ids
                     .iter()
-                    .all(|id| self.control_token_ids.contains(id))
+                    .all(|id| self.control_token_ids.binary_search(id).is_ok())
                 && self.suppressed_token_ids.iter().all(|id| {
-                    self.control_token_ids.contains(id) && !self.eos_token_ids.contains(id)
+                    self.control_token_ids.binary_search(id).is_ok()
+                        && self.eos_token_ids.binary_search(id).is_err()
                 }),
             "The checkpoint suppresses an end token or an ordinary prose token.",
         )

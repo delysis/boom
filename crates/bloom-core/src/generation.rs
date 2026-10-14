@@ -271,25 +271,24 @@ fn valid(checkpoint: &Checkpoint, expected: &Identity) -> Result<(), Error> {
     if let Some(policy) = &expected.generation_policy {
         policy.validate()?;
         require(
-            progress
-                .token_ids
-                .iter()
-                .all(|id| *id < policy.vocabulary_size && !policy.control_token_ids.contains(id)),
+            progress.token_ids.iter().all(|id| {
+                *id < policy.vocabulary_size && policy.control_token_ids.binary_search(id).is_err()
+            }),
             "A generation checkpoint contains a control token in its prose ledger.",
         )?;
         let reason = checkpoint.stop_reason.as_deref();
         let stop = checkpoint.stop_token_id;
         require(
             match (reason, stop) {
-                (Some("eos"), Some(id)) => policy.eos_token_ids.contains(&id),
+                (Some("eos"), Some(id)) => policy.eos_token_ids.binary_search(&id).is_ok(),
                 (Some("model_control"), Some(id)) => {
-                    policy.control_token_ids.contains(&id)
-                        && !policy.eos_token_ids.contains(&id)
-                        && !policy.suppressed_token_ids.contains(&id)
+                    policy.control_token_ids.binary_search(&id).is_ok()
+                        && policy.eos_token_ids.binary_search(&id).is_err()
+                        && policy.suppressed_token_ids.binary_search(&id).is_err()
                 }
                 (Some("cancelled"), Some(id)) => {
-                    policy.control_token_ids.contains(&id)
-                        && !policy.suppressed_token_ids.contains(&id)
+                    policy.control_token_ids.binary_search(&id).is_ok()
+                        && policy.suppressed_token_ids.binary_search(&id).is_err()
                 }
                 (Some("eos" | "model_control"), None) => false,
                 (_, None) => true,
