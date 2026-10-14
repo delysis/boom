@@ -7,21 +7,34 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
-fn destination_in_pieces(text: &str, quantum: usize) -> Result<Option<(usize, std::ops::Range<u64>)>, Box<dyn std::error::Error>> {
+fn destination_in_pieces(
+    text: &str,
+    quantum: usize,
+) -> Result<Option<(usize, std::ops::Range<u64>)>, Box<dyn std::error::Error>> {
     use pulldown_cmark::paged::{DestinationStatus, LinkDestinationStream, PROBE_BYTES};
     assert!((4..=PROBE_BYTES).contains(&quantum));
     let mut scanner = LinkDestinationStream::new(32);
     let mut at = 0usize;
     loop {
         let mut end = (at + quantum).min(text.len());
-        while !text.is_char_boundary(end) { end -= 1; }
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
         let step = scanner.feed(&text[at..end], end == text.len(), &mut || false)?;
         assert!(step.consumed <= end - at);
         assert_eq!(scanner.retained_text_bytes(), 0);
         at += step.consumed;
         match step.status {
-            DestinationStatus::Pending => { assert_eq!(at, end); assert!(end < text.len()); }
-            DestinationStatus::Matched => return Ok(Some((at, scanner.raw_range().expect("matched raw destination")))),
+            DestinationStatus::Pending => {
+                assert_eq!(at, end);
+                assert!(end < text.len());
+            }
+            DestinationStatus::Matched => {
+                return Ok(Some((
+                    at,
+                    scanner.raw_range().expect("matched raw destination"),
+                )));
+            }
             DestinationStatus::Rejected => return Ok(None),
         }
     }
@@ -36,13 +49,21 @@ fn shared_raw_destination_chunks_preserve_actual_pinned_link_choices_and_endpoin
         (r"a\)b) after", Some((4, 0..4))),
         (r"<a\>b>after", Some((6, 1..5))),
         ("é🙂) after", Some((6, 0..6))),
-        ("<a\nb>", None), ("<a<b>", None), ("<unclosed", None),
-        ("a(b c)", None), ("a(b", None),
-        ("a\\\nb", Some((2, 0..2))), ("", Some((0, 0..0))),
+        ("<a\nb>", None),
+        ("<a<b>", None),
+        ("<unclosed", None),
+        ("a(b c)", None),
+        ("a(b", None),
+        ("a\\\nb", Some((2, 0..2))),
+        ("", Some((0, 0..0))),
     ];
     for (raw, expected) in cases {
         for quantum in [4, 5, 7, pulldown_cmark::paged::PROBE_BYTES] {
-            assert_eq!(destination_in_pieces(raw, quantum)?, expected, "raw={raw:?}, quantum={quantum}");
+            assert_eq!(
+                destination_in_pieces(raw, quantum)?,
+                expected,
+                "raw={raw:?}, quantum={quantum}"
+            );
         }
     }
     for (text, expected) in [
@@ -51,16 +72,30 @@ fn shared_raw_destination_chunks_preserve_actual_pinned_link_choices_and_endpoin
         (r"[body](a\)b)", Some(("a)b", ""))),
         (r"[body](<a\>b>)", Some(("a>b", ""))),
         ("[body](é🙂 \"title\")", Some(("é🙂", "title"))),
-        ("[body](<a\nb>)", None), ("[body](a(b c))", None),
+        ("[body](<a\nb>)", None),
+        ("[body](a(b c))", None),
     ] {
-        let links: Vec<_> = Parser::new(text).into_offset_iter().filter_map(|(event, range)| {
-            if let Event::Start(Tag::Link { dest_url, title, .. }) = event {
-                Some((dest_url.to_string(), title.to_string(), range))
-            } else { None }
-        }).collect();
+        let links: Vec<_> = Parser::new(text)
+            .into_offset_iter()
+            .filter_map(|(event, range)| {
+                if let Event::Start(Tag::Link {
+                    dest_url, title, ..
+                }) = event
+                {
+                    Some((dest_url.to_string(), title.to_string(), range))
+                } else {
+                    None
+                }
+            })
+            .collect();
         if let Some((destination, title)) = expected {
-            assert_eq!(links, vec![(destination.to_string(), title.to_string(), 0..text.len())]);
-        } else { assert!(links.is_empty(), "actual parser must reject {text:?}"); }
+            assert_eq!(
+                links,
+                vec![(destination.to_string(), title.to_string(), 0..text.len())]
+            );
+        } else {
+            assert!(links.is_empty(), "actual parser must reject {text:?}");
+        }
     }
     Ok(())
 }
@@ -68,62 +103,114 @@ fn shared_raw_destination_chunks_preserve_actual_pinned_link_choices_and_endpoin
 #[test]
 fn actual_raw_destination_parenthesis_and_pointy_control_rules_remain_pinned() -> TestResult {
     let accepted = format!("{}é🙂{}) rest", "(".repeat(33), ")".repeat(33));
-    let result = destination_in_pieces(&accepted, 4)?.expect("pinned check-before-increment admits depth33");
+    let result =
+        destination_in_pieces(&accepted, 4)?.expect("pinned check-before-increment admits depth33");
     assert_eq!(result.0, accepted.len() - ") rest".len());
     assert_eq!(result.1, 0..result.0 as u64);
     let refused = format!("{}x{})", "(".repeat(34), ")".repeat(34));
     assert!(destination_in_pieces(&refused, 5)?.is_none());
     let pointy = "<a\u{0}b\t\u{b}\u{c}🙂> trailing";
-    let result = destination_in_pieces(pointy, 4)?.expect("only CR/LF/< reject the pinned angle production");
-    assert_eq!(result.0, pointy.find("> trailing").expect("real closing delimiter") + 1);
+    let result =
+        destination_in_pieces(pointy, 4)?.expect("only CR/LF/< reject the pinned angle production");
+    assert_eq!(
+        result.0,
+        pointy.find("> trailing").expect("real closing delimiter") + 1
+    );
     assert_eq!(result.1, 1..(result.0 - 1) as u64);
     assert!(destination_in_pieces("<a\rb>", 4)?.is_none());
     assert!(destination_in_pieces("<a\\\rb>", 4)?.is_none());
-    assert_eq!(destination_in_pieces("bare\\", 4)?, Some((5, 0..5)), "a genuine EOF leaves a final unescaped slash literal");
+    assert_eq!(
+        destination_in_pieces("bare\\", 4)?,
+        Some((5, 0..5)),
+        "a genuine EOF leaves a final unescaped slash literal"
+    );
     Ok(())
 }
 
 #[test]
-fn actual_multimegabyte_raw_destination_has_no_text_archive_and_requires_true_end_or_delimiter() -> TestResult {
-    use pulldown_cmark::paged::{DestinationStatus, InlineRunError, LinkDestinationStream, PROBE_BYTES};
+fn actual_multimegabyte_raw_destination_has_no_text_archive_and_requires_true_end_or_delimiter()
+-> TestResult {
+    use pulldown_cmark::paged::{
+        DestinationStatus, InlineRunError, LinkDestinationStream, PROBE_BYTES,
+    };
     let body = "é🙂".repeat(530_000);
     assert!(body.len() > 3 * 1024 * 1024);
     let raw = format!("<{body}>");
     let mut scanner = LinkDestinationStream::new(32);
     assert!(std::mem::size_of_val(&scanner) <= 128);
-    let mut at = 0usize; let mut turns = 0usize;
+    let mut at = 0usize;
+    let mut turns = 0usize;
     while at < raw.len() {
         let mut end = (at + PROBE_BYTES).min(raw.len());
-        while !raw.is_char_boundary(end) { end -= 1; }
+        while !raw.is_char_boundary(end) {
+            end -= 1;
+        }
         let step = scanner.feed(&raw[at..end], false, &mut || false)?;
-        assert_eq!(step.consumed, end - at); assert_eq!(scanner.retained_text_bytes(), 0);
-        at = end; turns += 1;
-        assert_eq!(step.status, if end == raw.len() { DestinationStatus::Matched } else { DestinationStatus::Pending });
+        assert_eq!(step.consumed, end - at);
+        assert_eq!(scanner.retained_text_bytes(), 0);
+        at = end;
+        turns += 1;
+        assert_eq!(
+            step.status,
+            if end == raw.len() {
+                DestinationStatus::Matched
+            } else {
+                DestinationStatus::Pending
+            }
+        );
     }
-    assert!(turns > 96); assert_eq!(scanner.raw_range(), Some(1..(raw.len() - 1) as u64));
-    assert!(scanner.feed("", true, &mut || false).is_err(), "a consumed destination cannot be resumed");
+    assert!(turns > 96);
+    assert_eq!(scanner.raw_range(), Some(1..(raw.len() - 1) as u64));
+    assert!(
+        scanner.feed("", true, &mut || false).is_err(),
+        "a consumed destination cannot be resumed"
+    );
     // Test-only full pinned parser: this reaches the actual ordinary
     // scan_inline_link -> scan_link_dest caller over many real quanta.
     // The public2MiB Core entry limit and paged producer bounds stay intact.
     let document = format!("[body]({raw})");
     let mut links = 0usize;
     for (event, range) in Parser::new(&document).into_offset_iter() {
-        if let Event::Start(Tag::Link { dest_url, title, .. }) = event {
+        if let Event::Start(Tag::Link {
+            dest_url, title, ..
+        }) = event
+        {
             assert_eq!(dest_url.as_ref(), body.as_str());
-            assert!(title.is_empty()); assert_eq!(range, 0..document.len()); links += 1;
+            assert!(title.is_empty());
+            assert_eq!(range, 0..document.len());
+            links += 1;
         }
     }
     assert_eq!(links, 1);
     let mut bare = LinkDestinationStream::new(32);
-    assert_eq!(bare.feed("target", false, &mut || false)?.status, DestinationStatus::Pending);
-    assert!(bare.raw_range().is_none(), "a copied source edge cannot fabricate a bare destination endpoint");
-    assert_eq!(bare.feed("", true, &mut || false)?.status, DestinationStatus::Matched);
+    assert_eq!(
+        bare.feed("target", false, &mut || false)?.status,
+        DestinationStatus::Pending
+    );
+    assert!(
+        bare.raw_range().is_none(),
+        "a copied source edge cannot fabricate a bare destination endpoint"
+    );
+    assert_eq!(
+        bare.feed("", true, &mut || false)?.status,
+        DestinationStatus::Matched
+    );
     assert_eq!(bare.raw_range(), Some(0..6));
     let mut cancelled = LinkDestinationStream::new(32);
-    assert_eq!(cancelled.feed("<pending", false, &mut || false)?.status, DestinationStatus::Pending);
+    assert_eq!(
+        cancelled.feed("<pending", false, &mut || false)?.status,
+        DestinationStatus::Pending
+    );
     let mut checks = 0usize;
-    assert_eq!(cancelled.feed(&"x".repeat(PROBE_BYTES), false, &mut || { checks += 1; checks == 7 }), Err(InlineRunError::Cancelled));
-    assert!(checks <= 7); assert!(cancelled.raw_range().is_none());
+    assert_eq!(
+        cancelled.feed(&"x".repeat(PROBE_BYTES), false, &mut || {
+            checks += 1;
+            checks == 7
+        }),
+        Err(InlineRunError::Cancelled)
+    );
+    assert!(checks <= 7);
+    assert!(cancelled.raw_range().is_none());
     assert!(cancelled.feed(">", true, &mut || false).is_err());
     Ok(())
 }
@@ -285,10 +372,16 @@ fn assert_logical_source_bytes(
     let mut at = 0usize;
     while at < expected.len() {
         let mut end = (at + 64 * 1024).min(expected.len());
-        while !expected.is_char_boundary(end) { end -= 1; }
+        while !expected.is_char_boundary(end) {
+            end -= 1;
+        }
         assert!(at < end);
         let actual = engine.logical_read_range(snapshot, at as u64..end as u64, &mut || false)?;
-        assert_eq!(actual.as_slice(), &expected.as_bytes()[at..end], "exact source bytes {at}..{end}");
+        assert_eq!(
+            actual.as_slice(),
+            &expected.as_bytes()[at..end],
+            "exact source bytes {at}..{end}"
+        );
         at = end;
     }
     assert_eq!(at, expected.len());
@@ -630,7 +723,8 @@ fn corrupt_derived_page_refuses_without_changing_source_and_cancel_does_not_adop
 }
 
 #[test]
-fn bounded_inline_media_completes_while_large_reference_and_dense_fuel_stay_explicitly_incomplete() -> TestResult {
+fn bounded_inline_media_completes_while_large_reference_and_dense_fuel_stay_explicitly_incomplete()
+-> TestResult {
     let id = "884646c1-14b4-490d-be8c-8953af793315";
     let text = format!(
         "# known\n\n{}[late](boom-attachment:{id})",
@@ -640,7 +734,13 @@ fn bounded_inline_media_completes_while_large_reference_and_dense_fuel_stay_expl
     let snapshot = source.capture_for_publication()?;
     let (completed, progress) = index(&mut engine, &snapshot, MarkupMode::Media)?;
     assert!(completed.complete() && !progress.incomplete_block);
-    let view = context(&mut engine, &snapshot, completed, snapshot.summary().utf16, 256)?;
+    let view = context(
+        &mut engine,
+        &snapshot,
+        completed,
+        snapshot.summary().utf16,
+        256,
+    )?;
     let actual = paged_media_spans(&view)?;
     assert_eq!(actual.len(), 1);
     assert_eq!(actual[0].id.to_string(), id);
@@ -3104,20 +3204,42 @@ fn actual_long_type7_openings_and_rejected_real_line_choices_match_the_full_pars
     let plain = "ordinary é🙂 source ".repeat(4000);
     let spaces = " ".repeat(70_000);
     for (case, text) in [
-        ("preceding-root", format!("# Before\n\n<widget title='{plain}'>\n**opaque** `opaque`\n\n# Outside\n")),
-        ("closing-tag", format!("</widget{spaces}>\n**opaque**\n\n# Outside\n")),
-        ("blank-after-tag", format!("<widget>{spaces}\n**opaque**\n\n# Outside\n")),
+        (
+            "preceding-root",
+            format!("# Before\n\n<widget title='{plain}'>\n**opaque** `opaque`\n\n# Outside\n"),
+        ),
+        (
+            "closing-tag",
+            format!("</widget{spaces}>\n**opaque**\n\n# Outside\n"),
+        ),
+        (
+            "blank-after-tag",
+            format!("<widget>{spaces}\n**opaque**\n\n# Outside\n"),
+        ),
         ("actual-eof", format!("<widget title='{plain}'>")),
-        ("nonblank-fallback", format!("<widget>{spaces}é **paragraph** `real code`\n\n# Outside\n")),
-        ("multiline-fallback", format!("<widget title='{plain}\ncontinued'> **paragraph**\n\n# Outside\n")),
-        ("unclosed-fallback", format!("<widget title='{plain} **unclosed paragraph**")),
+        (
+            "nonblank-fallback",
+            format!("<widget>{spaces}é **paragraph** `real code`\n\n# Outside\n"),
+        ),
+        (
+            "multiline-fallback",
+            format!("<widget title='{plain}\ncontinued'> **paragraph**\n\n# Outside\n"),
+        ),
+        (
+            "unclosed-fallback",
+            format!("<widget title='{plain} **unclosed paragraph**"),
+        ),
     ] {
         let (mut engine, mut source, _) = self::source(&text)?;
         let snapshot = source.capture_for_publication()?;
         let (style, progress) = index(&mut engine, &snapshot, MarkupMode::Style)?;
-        assert!(style.complete() && !progress.incomplete_block,
+        assert!(
+            style.complete() && !progress.incomplete_block,
             "case={case}, indexed_bytes={}, buffered_bytes={}, incomplete={}",
-            progress.indexed_bytes, progress.buffered_bytes, progress.incomplete_block);
+            progress.indexed_bytes,
+            progress.buffered_bytes,
+            progress.incomplete_block
+        );
         for anchor in [
             0,
             32_767,
@@ -3250,31 +3372,52 @@ fn actual_distant_type7_decision_edit_invalidates_early_literal_proof_and_undo_r
     Ok(())
 }
 
-
 #[test]
 fn actual_completed_root_blank_lines_release_long_html_without_inventing_page_eof() -> TestResult {
     use pulldown_cmark::paged::completed_root_blank_prefix;
     for (text, expected) in [
-        ("\n \t\r\n<widget", Some(5)), ("\rX", Some(1)),
-        (" \t\r\n<widget", Some(4)), ("\n \t", Some(1)),
-        (" \t", None), (" \t\r", None), ("\r", None),
-        ("    <widget>", None), ("> \n", None), ("\n#", Some(1)),
+        ("\n \t\r\n<widget", Some(5)),
+        ("\rX", Some(1)),
+        (" \t\r\n<widget", Some(4)),
+        ("\n \t", Some(1)),
+        (" \t", None),
+        (" \t\r", None),
+        ("\r", None),
+        ("    <widget>", None),
+        ("> \n", None),
+        ("\n#", Some(1)),
     ] {
-        assert_eq!(completed_root_blank_prefix(text), expected, "real source={text:?}");
+        assert_eq!(
+            completed_root_blank_prefix(text),
+            expected,
+            "real source={text:?}"
+        );
     }
     for blank in ["\n", "\r\n", " \t\r\n", "\n \t\n"] {
-        let text = format!("# Before\n{blank}<widget title='{}'>\n**opaque** `opaque`\n\n# Outside\n",
-            "ordinary é🙂 source ".repeat(4000));
+        let text = format!(
+            "# Before\n{blank}<widget title='{}'>\n**opaque** `opaque`\n\n# Outside\n",
+            "ordinary é🙂 source ".repeat(4000)
+        );
         assert!(text.len() > 2 * pulldown_cmark::paged::PROBE_BYTES);
-        let blocks: Vec<_> = Parser::new_ext(&text, MarkupMode::Style.options()).filter_map(|event| {
-            match event { Event::Start(Tag::HtmlBlock) => Some("html"),
-                Event::Start(Tag::Heading { .. }) => Some("heading"), _ => None }
-        }).collect();
-        assert_eq!(blocks, vec!["heading", "html", "heading"], "actual pinned grammar, blank={blank:?}");
+        let blocks: Vec<_> = Parser::new_ext(&text, MarkupMode::Style.options())
+            .filter_map(|event| match event {
+                Event::Start(Tag::HtmlBlock) => Some("html"),
+                Event::Start(Tag::Heading { .. }) => Some("heading"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            blocks,
+            vec!["heading", "html", "heading"],
+            "actual pinned grammar, blank={blank:?}"
+        );
         let (mut engine, mut source, _) = self::source(&text)?;
         let snapshot = source.capture_for_publication()?;
         let (style, progress) = index(&mut engine, &snapshot, MarkupMode::Style)?;
-        assert!(style.complete() && !progress.incomplete_block, "blank={blank:?}");
+        assert!(
+            style.complete() && !progress.incomplete_block,
+            "blank={blank:?}"
+        );
         for anchor in [0, 32_767, snapshot.summary().utf16.saturating_sub(32)] {
             assert_oracle(&text, &mut engine, &snapshot, anchor, 384)?;
         }
@@ -3285,8 +3428,11 @@ fn actual_completed_root_blank_lines_release_long_html_without_inventing_page_eo
 }
 
 #[test]
-fn actual_indented_type7_root_retains_source_spaces_through_pending_choice_and_paragraph_fallback() -> TestResult {
-    use pulldown_cmark::paged::{BlockCarry, HtmlBlockWork, PROBE_BYTES, begin_unfinished_html_work};
+fn actual_indented_type7_root_retains_source_spaces_through_pending_choice_and_paragraph_fallback()
+-> TestResult {
+    use pulldown_cmark::paged::{
+        BlockCarry, HtmlBlockWork, PROBE_BYTES, begin_unfinished_html_work,
+    };
     let body = "authored é🙂 *opaque* `opaque` ".repeat(2400);
     for spaces in 0..=3 {
         for (ending, html) in [
@@ -3295,32 +3441,67 @@ fn actual_indented_type7_root_retains_source_spaces_through_pending_choice_and_p
         ] {
             let text = format!("{}<widget title='{body}'>{ending}", " ".repeat(spaces));
             let mut edge = PROBE_BYTES;
-            while !text.is_char_boundary(edge) { edge -= 1; }
-            let work = begin_unfinished_html_work(&text[..edge], MarkupMode::Style.options(), &BlockCarry::default())
-                .expect("the actual indented root has one still pending type7 choice");
-            let HtmlBlockWork::Opening(opening) = work else { panic!("an unfinished quoted tag cannot be a fixed HTML choice"); };
-            assert_eq!(opening.scanned_bytes(), edge as u64,
-                "initial source counters include actual indentation rather than losing it at the tag slice");
-            assert_eq!(Parser::new(&text).any(|event| matches!(event, Event::Start(Tag::HtmlBlock))), html,
-                "actual full parser is the root classification precondition");
+            while !text.is_char_boundary(edge) {
+                edge -= 1;
+            }
+            let work = begin_unfinished_html_work(
+                &text[..edge],
+                MarkupMode::Style.options(),
+                &BlockCarry::default(),
+            )
+            .expect("the actual indented root has one still pending type7 choice");
+            let HtmlBlockWork::Opening(opening) = work else {
+                panic!("an unfinished quoted tag cannot be a fixed HTML choice");
+            };
+            assert_eq!(
+                opening.scanned_bytes(),
+                edge as u64,
+                "initial source counters include actual indentation rather than losing it at the tag slice"
+            );
+            assert_eq!(
+                Parser::new(&text).any(|event| matches!(event, Event::Start(Tag::HtmlBlock))),
+                html,
+                "actual full parser is the root classification precondition"
+            );
             let (mut engine, mut source, _) = self::source(&text)?;
             let snapshot = source.capture_for_publication()?;
             let (indexed, progress) = index(&mut engine, &snapshot, MarkupMode::Style)?;
             assert!(indexed.complete() && !progress.incomplete_block);
-            for anchor in [0, 32_767, snapshot.summary().utf16 / 2, snapshot.summary().utf16 - 32] {
+            for anchor in [
+                0,
+                32_767,
+                snapshot.summary().utf16 / 2,
+                snapshot.summary().utf16 - 32,
+            ] {
                 assert_oracle(&text, &mut engine, &snapshot, anchor, 384)?;
             }
             let mut first_bytes = 64;
-            while !text.is_char_boundary(first_bytes) { first_bytes -= 1; }
-            assert_eq!(engine.logical_read_range(&snapshot, 0..first_bytes as u64, &mut || false)?.as_slice(), &text.as_bytes()[..first_bytes]);
+            while !text.is_char_boundary(first_bytes) {
+                first_bytes -= 1;
+            }
+            assert_eq!(
+                engine
+                    .logical_read_range(&snapshot, 0..first_bytes as u64, &mut || false)?
+                    .as_slice(),
+                &text.as_bytes()[..first_bytes]
+            );
             assert!(source.capture().same(&snapshot));
         }
     }
     let code = format!("    <widget title='{body}'>\n");
     let mut edge = PROBE_BYTES;
-    while !code.is_char_boundary(edge) { edge -= 1; }
-    assert!(begin_unfinished_html_work(&code[..edge], MarkupMode::Style.options(), &BlockCarry::default()).is_none(),
-        "four source spaces remain the real indented-code choice, never an HTML witness");
+    while !code.is_char_boundary(edge) {
+        edge -= 1;
+    }
+    assert!(
+        begin_unfinished_html_work(
+            &code[..edge],
+            MarkupMode::Style.options(),
+            &BlockCarry::default()
+        )
+        .is_none(),
+        "four source spaces remain the real indented-code choice, never an HTML witness"
+    );
     assert!(Parser::new(&code).any(|event| matches!(event, Event::Start(Tag::CodeBlock(_)))));
     let text = format!("   <widget>{}", " ".repeat(70_000));
     let (mut engine, mut source, _) = self::source(&text)?;
@@ -3328,53 +3509,90 @@ fn actual_indented_type7_root_retains_source_spaces_through_pending_choice_and_p
     let (before, progress) = index(&mut engine, &original, MarkupMode::Style)?;
     assert!(before.complete() && !progress.incomplete_block);
     let end = engine.logical_window(&original, original.summary().utf16, 256, &mut || false)?;
-    let at = end.text().len(); source.replace_window(&end, at..at, "é **after actual EOF**")?;
+    let at = end.text().len();
+    source.replace_window(&end, at..at, "é **after actual EOF**")?;
     let appended = source.capture_for_publication()?;
     let (after, progress) = index(&mut engine, &appended, MarkupMode::Style)?;
     assert!(after.complete() && !progress.incomplete_block && progress.reused_bytes == 0);
-    assert_oracle(&format!("{text}é **after actual EOF**"), &mut engine, &appended, appended.summary().utf16, 384)?;
+    assert_oracle(
+        &format!("{text}é **after actual EOF**"),
+        &mut engine,
+        &appended,
+        appended.summary().utf16,
+        384,
+    )?;
     source.restore(&original)?;
     let writes = engine.stats().page_writes;
     let (restored, _) = index(&mut engine, &source.capture(), MarkupMode::Style)?;
-    assert!(Arc::ptr_eq(&restored, &before)); assert_eq!(engine.stats().page_writes, writes);
+    assert!(Arc::ptr_eq(&restored, &before));
+    assert_eq!(engine.stats().page_writes, writes);
     assert!(source.capture().same(&original));
     Ok(())
 }
 
 #[test]
-fn actual_bounded_inline_subtree_uses_pinned_image_exception_and_child_emphasis_scope() -> TestResult {
+fn actual_bounded_inline_subtree_uses_pinned_image_exception_and_child_emphasis_scope() -> TestResult
+{
     use pulldown_cmark::paged::probe_inline_link;
     for (node, image) in [
         ("[**é🙂** *inner*](https://unit.test/a(b)c 'title')", false),
-        ("![outer [*inside*](https://inside.test)](https://image.test \"caption\")", true),
-        ("[outer ![**alt**](https://image.test)](https://outer.test)", false),
-        ("[multi\n  *line*](https://unit.test\n  'actual\n  title')", false),
-        ("[]()", false), ("![]()", true),
+        (
+            "![outer [*inside*](https://inside.test)](https://image.test \"caption\")",
+            true,
+        ),
+        (
+            "[outer ![**alt**](https://image.test)](https://outer.test)",
+            false,
+        ),
+        (
+            "[multi\n  *line*](https://unit.test\n  'actual\n  title')",
+            false,
+        ),
+        ("[]()", false),
+        ("![]()", true),
     ] {
         let input = format!("{node} trailing [unknown]");
         let proof = probe_inline_link(&input, MarkupMode::Style.options(), &mut || false)?
             .expect("actual complete inline node, independent of the later reference");
-        assert_eq!(proof.end(), node.len()); assert_eq!(proof.is_image(), image);
+        assert_eq!(proof.end(), node.len());
+        assert_eq!(proof.is_image(), image);
         let wrapped = format!("prefix {node} suffix");
         let first = "prefix ".encode_utf16().count();
-        let expected = clipped(&spans(&wrapped)?, first, first + node.encode_utf16().count());
-        let parser = Parser::new_inline_fragment(node, MarkupMode::Style.options()).expect("bounded exact inline source");
-        assert_eq!(coverage(spans_from_parser(node, parser)?), coverage(expected));
+        let expected = clipped(
+            &spans(&wrapped)?,
+            first,
+            first + node.encode_utf16().count(),
+        );
+        let parser = Parser::new_inline_fragment(node, MarkupMode::Style.options())
+            .expect("bounded exact inline source");
+        assert_eq!(
+            coverage(spans_from_parser(node, parser)?),
+            coverage(expected)
+        );
     }
     let invalid = "[outer [inside](https://inside.test)](https://outer.test)";
-    assert!(probe_inline_link(invalid, MarkupMode::Style.options(), &mut || false)?.is_none(),
-        "an accepted inner Link disables the earlier outer Link; no outer subtree can be invented");
-    let links: Vec<_> = Parser::new(invalid).into_offset_iter().filter_map(|(event, range)| {
-        matches!(event, Event::Start(Tag::Link { .. })).then_some(range)
-    }).collect();
-    assert_eq!(links.len(), 1); assert!(links[0].start > 0);
+    assert!(
+        probe_inline_link(invalid, MarkupMode::Style.options(), &mut || false)?.is_none(),
+        "an accepted inner Link disables the earlier outer Link; no outer subtree can be invented"
+    );
+    let links: Vec<_> = Parser::new(invalid)
+        .into_offset_iter()
+        .filter_map(|(event, range)| {
+            matches!(event, Event::Start(Tag::Link { .. })).then_some(range)
+        })
+        .collect();
+    assert_eq!(links.len(), 1);
+    assert!(links[0].start > 0);
     Ok(())
 }
 
 #[test]
-fn actual_long_paragraph_link_children_and_many_tiny_subtrees_match_the_full_parser() -> TestResult {
-    let text = format!("ordinary {} **outer [*child*](https://unit.test/a(b)c 'title') after** ![outer [**inside**](https://inside.test)](https://image.test) [outer ![*alt*](https://image.test)](https://outer.test)\n\n# Outside\n",
-        "authored é🙂 body ".repeat(5000));
+fn actual_long_paragraph_link_children_and_many_tiny_subtrees_match_the_full_parser() -> TestResult
+{
+    let text = format!(
+        "ordinary {} **outer [*child*](https://unit.test/a(b)c 'title') after** ![outer [**inside**](https://inside.test)](https://image.test) [outer ![*alt*](https://image.test)](https://outer.test)\n\n# Outside\n",
+        "authored é🙂 body ".repeat(5000)
+    );
     let (mut engine, mut source, _) = self::source(&text)?;
     let snapshot = source.capture_for_publication()?;
     let target = text.find("**outer").expect("actual outer delimiter");
@@ -3384,7 +3602,11 @@ fn actual_long_paragraph_link_children_and_many_tiny_subtrees_match_the_full_par
     }
     let (indexed, _) = index(&mut engine, &snapshot, MarkupMode::Style)?;
     let view = context(&mut engine, &snapshot, indexed, anchor, 384)?;
-    assert!(view.fragments.iter().any(|fragment| fragment.inline_only && fragment.inline_ready));
+    assert!(
+        view.fragments
+            .iter()
+            .any(|fragment| fragment.inline_only && fragment.inline_ready)
+    );
     let rows = paged_spans(&view)?;
     assert!(rows.iter().any(|span| span.kind == "strong"));
     assert!(rows.iter().any(|span| span.kind == "emphasis"));
@@ -3393,18 +3615,31 @@ fn actual_long_paragraph_link_children_and_many_tiny_subtrees_match_the_full_par
     // A large paragraph with512 adjacent short links must use bounded small
     // prefix probes, not serialize/reparse its complete32KiB tail per link.
     // This is a functional work-shape control, not a timing acceptance claim.
-    let tiny = format!("{}{} tail", "plain Unicode é🙂 ".repeat(2400), "[x](u) ".repeat(512));
+    let tiny = format!(
+        "{}{} tail",
+        "plain Unicode é🙂 ".repeat(2400),
+        "[x](u) ".repeat(512)
+    );
     let (mut engine, mut source, _) = self::source(&tiny)?;
     let snapshot = source.capture_for_publication()?;
     let (indexed, progress) = index(&mut engine, &snapshot, MarkupMode::Style)?;
     assert!(indexed.complete() && !progress.incomplete_block);
-    let anchor = tiny[..tiny.find("[x]").expect("actual tiny link start")].encode_utf16().count() as u64;
-    assert_oracle(&tiny, &mut engine, &snapshot, anchor, bloom_text::NATIVE_WINDOW_BYTES)?;
+    let anchor = tiny[..tiny.find("[x]").expect("actual tiny link start")]
+        .encode_utf16()
+        .count() as u64;
+    assert_oracle(
+        &tiny,
+        &mut engine,
+        &snapshot,
+        anchor,
+        bloom_text::NATIVE_WINDOW_BYTES,
+    )?;
     Ok(())
 }
 
 #[test]
-fn actual_multimegabyte_inline_media_subtree_edit_and_logical_undo_keep_exact_source_and_ranges() -> TestResult {
+fn actual_multimegabyte_inline_media_subtree_edit_and_logical_undo_keep_exact_source_and_ranges()
+-> TestResult {
     let old = "884646c1-14b4-490d-be8c-8953af793315";
     let new = "adfcd7f6-e0c9-4d06-a75c-f64794d7760b";
     let inline = format!("![**original**](boom-attachment:{old} 'title')");
@@ -3418,35 +3653,55 @@ fn actual_multimegabyte_inline_media_subtree_edit_and_logical_undo_keep_exact_so
     assert!(indexed.complete() && !progress.incomplete_block);
     let view = context(&mut engine, &snapshot, Arc::clone(&indexed), anchor, 256)?;
     let media = paged_media_spans(&view)?;
-    assert_eq!(media.len(), 1); assert_eq!(media[0].id.to_string(), old);
+    assert_eq!(media.len(), 1);
+    assert_eq!(media[0].id.to_string(), old);
     assert_eq!(media[0].location as u64 + view.window_start.utf16, anchor);
     assert_eq!(media[0].length, inline.encode_utf16().count());
     assert_large_pinned_parser_oracle(&text, &mut engine, &snapshot, anchor, 384)?;
     let window = engine.logical_window(&snapshot, anchor, 256, &mut || false)?;
-    let local = window.text().find(old).expect("actual original id in exact source window");
+    let local = window
+        .text()
+        .find(old)
+        .expect("actual original id in exact source window");
     source.replace_window(&window, local..local + old.len(), new)?;
     let edited = source.capture_for_publication()?;
     let (after, progress) = index(&mut engine, &edited, MarkupMode::Media)?;
     assert!(after.complete() && !progress.incomplete_block);
     let media = paged_media_spans(&context(&mut engine, &edited, after, anchor, 256)?)?;
-    assert_eq!(media.len(), 1); assert_eq!(media[0].id.to_string(), new);
-    assert_large_pinned_parser_oracle(&text.replacen(old, new, 1), &mut engine, &edited, anchor, 384)?;
+    assert_eq!(media.len(), 1);
+    assert_eq!(media[0].id.to_string(), new);
+    assert_large_pinned_parser_oracle(
+        &text.replacen(old, new, 1),
+        &mut engine,
+        &edited,
+        anchor,
+        384,
+    )?;
     source.restore(&snapshot)?;
     let writes = engine.stats().page_writes;
     let (restored, _) = index(&mut engine, &source.capture(), MarkupMode::Media)?;
-    assert!(Arc::ptr_eq(&restored, &indexed)); assert_eq!(engine.stats().page_writes, writes);
+    assert!(Arc::ptr_eq(&restored, &indexed));
+    assert_eq!(engine.stats().page_writes, writes);
     let mut at = 0;
     while at < text.len() {
         let mut end = (at + 64 * 1024).min(text.len());
-        while !text.is_char_boundary(end) { end -= 1; }
-        assert_eq!(engine.logical_read_range(&source.capture(), at as u64..end as u64, &mut || false)?.as_slice(), &text.as_bytes()[at..end]);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        assert_eq!(
+            engine
+                .logical_read_range(&source.capture(), at as u64..end as u64, &mut || false)?
+                .as_slice(),
+            &text.as_bytes()[at..end]
+        );
         at = end;
     }
     Ok(())
 }
 
 #[test]
-fn actual_unproved_reference_code_or_outer_link_never_becomes_a_completed_inline_subtree() -> TestResult {
+fn actual_unproved_reference_code_or_outer_link_never_becomes_a_completed_inline_subtree()
+-> TestResult {
     use pulldown_cmark::paged::{InlineRunError, probe_inline_link};
     for node in [
         "[outer [missing]](https://unit.test)",
@@ -3462,41 +3717,91 @@ fn actual_unproved_reference_code_or_outer_link_never_becomes_a_completed_inline
         let snapshot = source.capture_for_publication()?;
         let (indexed, progress) = index(&mut engine, &snapshot, MarkupMode::Style)?;
         assert!(!indexed.complete() && progress.incomplete_block);
-        let view = context(&mut engine, &snapshot, indexed, snapshot.summary().utf16 / 2, 256)?;
-        assert!(!view.complete_blocks); assert!(!view.reference_budget_proven);
+        let view = context(
+            &mut engine,
+            &snapshot,
+            indexed,
+            snapshot.summary().utf16 / 2,
+            256,
+        )?;
+        assert!(!view.complete_blocks);
+        assert!(!view.reference_budget_proven);
         assert!(paged_spans(&view)?.is_empty());
         let (media, progress) = index(&mut engine, &snapshot, MarkupMode::Media)?;
         assert!(!media.complete() && progress.incomplete_block);
-        assert!(paged_media_spans(&context(&mut engine, &snapshot, media, snapshot.summary().utf16 / 2, 256)?)?.is_empty());
+        assert!(
+            paged_media_spans(&context(
+                &mut engine,
+                &snapshot,
+                media,
+                snapshot.summary().utf16 / 2,
+                256
+            )?)?
+            .is_empty()
+        );
         assert!(source.capture().same(&snapshot));
     }
-    assert!(matches!(probe_inline_link("[**body**](https://unit.test)", MarkupMode::Style.options(), &mut || true), Err(InlineRunError::Cancelled)));
+    assert!(matches!(
+        probe_inline_link(
+            "[**body**](https://unit.test)",
+            MarkupMode::Style.options(),
+            &mut || true
+        ),
+        Err(InlineRunError::Cancelled)
+    ));
     Ok(())
 }
-
 
 #[test]
 fn actual_closed_code_and_html_children_keep_pinned_inline_precedence() -> TestResult {
     use pulldown_cmark::paged::probe_inline_link;
     for (node, image) in [
-        ("[body `code ](not-a-link)` **strong**](<https://unit.test/a>)", false),
-        ("[body <i data-k='v'>é🙂</i> *inner*](https://unit.test)", false),
-        ("![body <https://inside.test/a> `é🙂`](boom-attachment:884646c1-14b4-490d-be8c-8953af793315 'title')", true),
-        ("![body <!-- actual comment --> **alt**](https://image.test)", true),
+        (
+            "[body `code ](not-a-link)` **strong**](<https://unit.test/a>)",
+            false,
+        ),
+        (
+            "[body <i data-k='v'>é🙂</i> *inner*](https://unit.test)",
+            false,
+        ),
+        (
+            "![body <https://inside.test/a> `é🙂`](boom-attachment:884646c1-14b4-490d-be8c-8953af793315 'title')",
+            true,
+        ),
+        (
+            "![body <!-- actual comment --> **alt**](https://image.test)",
+            true,
+        ),
         (r"[escaped \`literal](https://unit.test)", false),
-        ("[pointy destination](<https://unit.test/a> 'actual title')", false),
+        (
+            "[pointy destination](<https://unit.test/a> 'actual title')",
+            false,
+        ),
     ] {
         let input = format!("{node} unrelated unfinished ` and [missing]");
         let accepted = probe_inline_link(&input, MarkupMode::Style.options(), &mut || false)?
             .expect("closed actual higher-precedence children are independent of later failures");
-        assert_eq!(accepted.end(), node.len()); assert_eq!(accepted.is_image(), image);
+        assert_eq!(accepted.end(), node.len());
+        assert_eq!(accepted.is_image(), image);
         let expected = format!("prefix {node} suffix");
         let first = "prefix ".encode_utf16().count();
-        let parser = Parser::new_inline_fragment(node, MarkupMode::Style.options()).expect("bounded actual inline operand");
-        assert_eq!(coverage(spans_from_parser(node, parser)?),
-            coverage(clipped(&spans(&expected)?, first, first + node.encode_utf16().count())));
-        let text = format!("{} {node} **outside**\n\n# Actual block\n", "authored é🙂 ".repeat(4000));
-        let anchor = text[..text.find(node).expect("actual node")].encode_utf16().count() as u64;
+        let parser = Parser::new_inline_fragment(node, MarkupMode::Style.options())
+            .expect("bounded actual inline operand");
+        assert_eq!(
+            coverage(spans_from_parser(node, parser)?),
+            coverage(clipped(
+                &spans(&expected)?,
+                first,
+                first + node.encode_utf16().count()
+            ))
+        );
+        let text = format!(
+            "{} {node} **outside**\n\n# Actual block\n",
+            "authored é🙂 ".repeat(4000)
+        );
+        let anchor = text[..text.find(node).expect("actual node")]
+            .encode_utf16()
+            .count() as u64;
         let (mut engine, mut source, _) = self::source(&text)?;
         let snapshot = source.capture_for_publication()?;
         assert_oracle(&text, &mut engine, &snapshot, anchor, 512)?;
@@ -3504,7 +3809,9 @@ fn actual_closed_code_and_html_children_keep_pinned_inline_precedence() -> TestR
     }
     let node = "[body `closed` <i>é🙂</i> **strong**](https://unit.test)";
     let text = format!("{} {node} tail", "plain ".repeat(7000));
-    let anchor = text[..text.find(node).expect("real node")].encode_utf16().count() as u64;
+    let anchor = text[..text.find(node).expect("real node")]
+        .encode_utf16()
+        .count() as u64;
     let (mut engine, mut source, _) = self::source(&text)?;
     let original = source.capture_for_publication()?;
     let (before, _) = index(&mut engine, &original, MarkupMode::Style)?;
@@ -3514,12 +3821,15 @@ fn actual_closed_code_and_html_children_keep_pinned_inline_precedence() -> TestR
     source.replace_window(&window, closing..closing + 1, "")?;
     let changed = source.capture_for_publication()?;
     let (after, progress) = index(&mut engine, &changed, MarkupMode::Style)?;
-    assert!(!after.complete() && progress.incomplete_block,
-        "removing the real child closer cannot preserve its old accepted subtree");
+    assert!(
+        !after.complete() && progress.incomplete_block,
+        "removing the real child closer cannot preserve its old accepted subtree"
+    );
     source.restore(&original)?;
     let writes = engine.stats().page_writes;
     let (restored, _) = index(&mut engine, &source.capture(), MarkupMode::Style)?;
-    assert!(Arc::ptr_eq(&restored, &before)); assert_eq!(engine.stats().page_writes, writes);
+    assert!(Arc::ptr_eq(&restored, &before));
+    assert_eq!(engine.stats().page_writes, writes);
     assert_oracle(&text, &mut engine, &source.capture(), anchor, 512)?;
     Ok(())
 }
@@ -3529,26 +3839,48 @@ fn actual_far_code_or_html_close_invalidates_the_local_apparent_link() -> TestRe
     use pulldown_cmark::paged::{InlineRunError, probe_inline_link};
     for (prefix, tail) in [
         ("[unclosed `code](https://unit.test)", " later ` after"),
-        ("[unclosed <i title='x](https://unit.test)", " later'> after"),
+        (
+            "[unclosed <i title='x](https://unit.test)",
+            " later'> after",
+        ),
     ] {
-        let local_links = Parser::new_ext(prefix, MarkupMode::Style.options()).filter(|event|
-            matches!(event, Event::Start(Tag::Link { .. }))).count();
-        assert_eq!(local_links, 1, "the copied prefix genuinely appears to accept a Link");
+        let local_links = Parser::new_ext(prefix, MarkupMode::Style.options())
+            .filter(|event| matches!(event, Event::Start(Tag::Link { .. })))
+            .count();
+        assert_eq!(
+            local_links, 1,
+            "the copied prefix genuinely appears to accept a Link"
+        );
         let completed = format!("{prefix}{tail}");
-        assert_eq!(Parser::new_ext(&completed, MarkupMode::Style.options()).filter(|event|
-            matches!(event, Event::Start(Tag::Link { .. }))).count(), 0,
-            "the actual later higher-precedence close consumes the apparent bracket");
+        assert_eq!(
+            Parser::new_ext(&completed, MarkupMode::Style.options())
+                .filter(|event| matches!(event, Event::Start(Tag::Link { .. })))
+                .count(),
+            0,
+            "the actual later higher-precedence close consumes the apparent bracket"
+        );
         assert!(probe_inline_link(prefix, MarkupMode::Style.options(), &mut || false)?.is_none());
-        assert!(probe_inline_link(&completed, MarkupMode::Style.options(), &mut || false)?.is_none());
-        let text = format!("{} {completed}\n\n# Actual block\n", "plain é🙂 ".repeat(4000));
+        assert!(
+            probe_inline_link(&completed, MarkupMode::Style.options(), &mut || false)?.is_none()
+        );
+        let text = format!(
+            "{} {completed}\n\n# Actual block\n",
+            "plain é🙂 ".repeat(4000)
+        );
         let (mut engine, mut source, _) = self::source(&text)?;
         let snapshot = source.capture_for_publication()?;
         let (indexed, progress) = index(&mut engine, &snapshot, MarkupMode::Style)?;
         assert!(!indexed.complete() && progress.incomplete_block);
         assert!(source.capture().same(&snapshot));
     }
-    assert!(matches!(probe_inline_link("[body `closed`](<https://unit.test>)",
-        MarkupMode::Style.options(), &mut || true), Err(InlineRunError::Cancelled)));
+    assert!(matches!(
+        probe_inline_link(
+            "[body `closed`](<https://unit.test>)",
+            MarkupMode::Style.options(),
+            &mut || true
+        ),
+        Err(InlineRunError::Cancelled)
+    ));
     Ok(())
 }
 
@@ -3556,16 +3888,27 @@ fn actual_far_code_or_html_close_invalidates_the_local_apparent_link() -> TestRe
 fn actual_image_adjacency_never_crosses_a_physical_paragraph_continuation() -> TestResult {
     for ending in ["\n", "\r\n"] {
         for indentation in ["", " ", "   "] {
-            let text = format!("{} !{ending}{indentation}[**body é🙂**](https://unit.test) tail\n\n# Actual block\n",
-                "plain ".repeat(7000));
-            let parsed: Vec<_> = Parser::new_ext(&text, MarkupMode::Style.options()).into_offset_iter()
+            let text = format!(
+                "{} !{ending}{indentation}[**body é🙂**](https://unit.test) tail\n\n# Actual block\n",
+                "plain ".repeat(7000)
+            );
+            let parsed: Vec<_> = Parser::new_ext(&text, MarkupMode::Style.options())
+                .into_offset_iter()
                 .filter_map(|(event, range)| match event {
                     Event::Start(Tag::Link { .. }) => Some((false, range)),
-                    Event::Start(Tag::Image { .. }) => Some((true, range)), _ => None,
-                }).collect();
-            assert_eq!(parsed.len(), 1); assert!(!parsed[0].0,
-                "the actual first pass has no MaybeImage spanning a line ending");
-            assert_eq!(&text[parsed[0].1.clone()], "[**body é🙂**](https://unit.test)");
+                    Event::Start(Tag::Image { .. }) => Some((true, range)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(parsed.len(), 1);
+            assert!(
+                !parsed[0].0,
+                "the actual first pass has no MaybeImage spanning a line ending"
+            );
+            assert_eq!(
+                &text[parsed[0].1.clone()],
+                "[**body é🙂**](https://unit.test)"
+            );
             let anchor = text[..parsed[0].1.start].encode_utf16().count() as u64;
             let (mut engine, mut source, _) = self::source(&text)?;
             let snapshot = source.capture_for_publication()?;

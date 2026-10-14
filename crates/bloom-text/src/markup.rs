@@ -2941,7 +2941,9 @@ impl MarkupQuery {
                 cancelled,
             )?)
             .map_err(|_| Error::Invalid("markup inline subtree UTF8"))?;
-            let start = engine.logical_byte_position(&self.snapshot, first.bytes)?.point();
+            let start = engine
+                .logical_byte_position(&self.snapshot, first.bytes)?
+                .point();
             let summary = TextSummary::of(&text);
             if start.utf16 != first.utf16 || start.checked_add(summary)?.utf16 != last.utf16 {
                 return Err(Error::Invalid("markup inline subtree source counters"));
