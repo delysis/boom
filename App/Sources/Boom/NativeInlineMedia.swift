@@ -68,12 +68,14 @@ struct InlineMediaSpan: Decodable {
   func layoutManager(_ manager: NSLayoutManager, shouldGenerateGlyphs glyphs: UnsafePointer<CGGlyph>,
     properties props: UnsafePointer<NSLayoutManager.GlyphProperty>, characterIndexes indexes: UnsafePointer<Int>,
     font: NSFont, forGlyphRange range: NSRange) -> Int {
+    // The no-media return has no scan or allocation. Avoid flooding the
+    // diagnostic ring with two phase records for this constant-time branch.
+    guard hasMedia, let storage = manager.textStorage else { return 0 }
     // Existing diagnostic stage: low bit is media presence, remaining bits
     // are glyph count. No text or attributed-buffer copies enter the trace.
     let event = UInt64(clamping: range.length) << 1 | (hasMedia ? 1 : 0)
     let trace = PerformanceTrace.begin("Editor.MediaLayout", event: event)
     defer { PerformanceTrace.end("Editor.MediaLayout", trace) }
-    guard hasMedia, let storage = manager.textStorage else { return 0 }
     // Glyph batches usually share one attribute run. Reuse that run for both
     // directions of character indexes, including reordered/bidirectional glyphs.
     // Unknown media presence remains conservative without a lookup per glyph.

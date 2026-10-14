@@ -215,6 +215,9 @@ final class PagedNativeTextStorage: NSTextStorage {
     inputBinding: PagedNativeInputBinding? = nil,
     stagedNavigationTicket: PagedNativeNavigationInstallationTicket? = nil,
     canonicalOpening: PagedNativeCanonicalOpening? = nil) throws {
+    // Existing Update stage, events 1...5 identify constructor substeps.
+    let construction = PerformanceTrace.begin("Editor.Update", event: 1)
+    defer { PerformanceTrace.end("Editor.Update", construction) }
     if let canonicalOpening {
       guard stagedNavigationTicket == nil, canonicalOpening.sessionID == session.sessionID,
         session.canonicalOpening?.record == canonicalOpening.record else {
@@ -224,16 +227,20 @@ final class PagedNativeTextStorage: NSTextStorage {
     self.session = session
     self.inputBinding = inputBinding
     managedInputClient = inputBinding.map { PagedNativeTextInputClient(identity: $0.identity) }
+    let storageTrace = PerformanceTrace.begin("Editor.Update", event: 2)
     let storage = try PagedNativeTextStorage(session: session,
       attributes: [.font: MarkdownStyle.body],
       inputBinding: inputBinding, stagedNavigationTicket: stagedNavigationTicket)
     boundedStorage = storage
+    PerformanceTrace.end("Editor.Update", storageTrace)
+    let graphTrace = PerformanceTrace.begin("Editor.Update", event: 3)
     let manager = NSLayoutManager()
     manager.allowsNonContiguousLayout = true
     let container = NSTextContainer(size: NSSize(width: max(1, frame.width), height: max(1, frame.height)))
     container.widthTracksTextView = true; container.heightTracksTextView = false
     storage.addLayoutManager(manager); manager.addTextContainer(container)
     super.init(frame: frame, textContainer: container)
+    PerformanceTrace.end("Editor.Update", graphTrace)
     documentID = session.logicalWindow.snapshot.sourceRevision.documentID
     isEditable = true; isSelectable = true; isRichText = false
     // Canonical Undo uses registered root/group handles. TextKit must not also
@@ -242,7 +249,10 @@ final class PagedNativeTextStorage: NSTextStorage {
     drawsBackground = false; writingToolsBehavior = .none
     isAutomaticQuoteSubstitutionEnabled = false; isAutomaticDashSubstitutionEnabled = false
     isAutomaticTextReplacementEnabled = false; isAutomaticSpellingCorrectionEnabled = false
-    isAutomaticLinkDetectionEnabled = false; isContinuousSpellCheckingEnabled = true
+    isAutomaticLinkDetectionEnabled = false
+    let checkingTrace = PerformanceTrace.begin("Editor.Update", event: 4)
+    isContinuousSpellCheckingEnabled = true
+    PerformanceTrace.end("Editor.Update", checkingTrace)
     importsGraphics = false
     isHorizontallyResizable = false; isVerticallyResizable = false
     textContainerInset = NSSize(width: 16, height: 16)
@@ -263,12 +273,14 @@ final class PagedNativeTextStorage: NSTextStorage {
       }
       return try self.session.nativeSelection(self.selectedRange())
     }
+    let selectionTrace = PerformanceTrace.begin("Editor.Update", event: 5)
     if let stagedNavigationTicket {
       super.setSelectedRange(stagedNavigationTicket.localSelection, affinity: stagedNavigationTicket.selectionAffinity, stillSelecting: false)
     } else if let canonicalOpening {
       super.setSelectedRange(NSRange(location: canonicalOpening.localCaretUTF16, length: 0),
         affinity: .downstream, stillSelecting: false)
     }
+    PerformanceTrace.end("Editor.Update", selectionTrace)
     managedInputClient?.bindOnce(to: self)
     constructingView = false
     MarkdownStyle.apply(to: self)

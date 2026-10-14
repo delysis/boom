@@ -2,19 +2,23 @@ import AppKit
 import BoomCore
 import SwiftUI
 
-/// The complete TextKit graph exists at construction, even for standalone or
-/// newly reparented controls. Updating a prompt never rewires that graph.
+/// An empty editor creates its placeholder's TextKit graph on first draw.
+/// Ordinary nonempty mounts allocate no second graph; later prompt updates
+/// reuse the same graph without rewiring it.
 @MainActor final class NativeTextPlaceholder {
-  var text: String
-  private let storage = NSTextStorage()
-  private let layout = NSLayoutManager()
-  private let container = NSTextContainer(size: .zero)
-  init(_ text: String) {
-    self.text = text
-    storage.addLayoutManager(layout); layout.addTextContainer(container)
+  @MainActor private final class Graph {
+    let storage = NSTextStorage()
+    let layout = NSLayoutManager()
+    let container = NSTextContainer(size: .zero)
+    init() { storage.addLayoutManager(layout); layout.addTextContainer(container) }
   }
+  var text: String
+  private lazy var graph = Graph()
+  init(_ text: String) { self.text = text }
   func draw(in view: NSTextView) {
-    guard view.string.isEmpty, !view.hasMarkedText(), let source = view.textContainer else { return }
+    guard !text.isEmpty, view.textStorage?.length == 0,
+      !view.hasMarkedText(), let source = view.textContainer else { return }
+    let storage = graph.storage, layout = graph.layout, container = graph.container
     var attributes = view.typingAttributes
     attributes[.font] = view.font ?? NSFont.systemFont(ofSize: 14)
     attributes[.foregroundColor] = NSColor.placeholderTextColor
