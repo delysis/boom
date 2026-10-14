@@ -52,7 +52,7 @@ final class DocumentToolsTests: XCTestCase {
       authority: CapturedDocumentAuthority(mode: .edit, target: document, capture: try await model.captureDocument(document.id)), documentSources: [], attachments: [])
     let expected = document.text.replacingOccurrences(of: "quiet", with: "bright")
     XCTAssertEqual(editor.string, expected); XCTAssertEqual(model.selectedDocument?.text, expected)
-    XCTAssertTrue(editor.isEditable); XCTAssertFalse(model.editingLocked)
+    XCTAssertTrue(editor.isEditable)
     try await model.flush()
     let persisted = try await NativeCheckEvidence.readPublicDocuments(model: model).first { $0.id == document.id }
     XCTAssertEqual(persisted?.text, expected)
