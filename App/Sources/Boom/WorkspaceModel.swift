@@ -1458,40 +1458,45 @@ private struct BoundedConsultationContext: Sendable {
             let joinedRetention = try self.makeJoinedRetentionRequest(owner: cacheOwner,
               runner: runner, policy: executionPolicy, operationID: flag.operationID)
             defer { self.finishJoinedRetentionRequest(joinedRetention) }
-            let result: MLXGemmaRunner.Output
-            result = try await runner.run(plan: plan, images: images, media: media.media, maxTokens: outputLimit,
-              seed: seed, flag: flag, independentIdentity: generation, cacheOwner: cacheOwner, executionPolicy: executionPolicy,
-              joinedRetention: joinedRetention,
-              beforeCachePublication: { [weak self] in
-                guard let self else { throw CancellationError() }
-                try await self.revalidateResponseSources(cacheSources,
-                  attachments: attachmentSources, targetID: cacheTargetID)
-                try await MainActor.run {
-                  try flag.check()
-                  guard self.activeFlag === ownerFlag,
-                    self.state.chats.contains(where: { $0.id == chat.id }),
-                    interaction == .ask || self.state.selectedDocument == document?.id else {
-                    throw BoomError.stale("The request owner changed before prompt-cache publication.")
-                  }
+            let delivery = MainActorTextDelivery { [weak self] text in
+              guard let self, self.activeFlag === ownerFlag, !flag.isCancelled else { return }
+              if interaction == .ask {
+                self.streamingText = text
+                if let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
+                  let m = self.state.chats[c].messages.firstIndex(where: { $0.id == replyIDs[offset] }),
+                  self.state.chats[c].messages[m].state == .pending {
+                  self.state.chats[c].messages[m].text = text
                 }
-              },
-              pairedAdmission: generationPairedAdmission,
-              onCheckpoint: { progress, stop, token in
-                try await checkpointStore.checkpoint(progress, identity: generation, stopReason: stop, stopTokenID: token)
-              }) { [weak self] text in
-                Task { @MainActor in
-                  guard let self, self.activeFlag === ownerFlag, !flag.isCancelled else { return }
-                  if interaction == .ask {
-                    self.streamingText = text
-                    if let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
-                      let m = self.state.chats[c].messages.firstIndex(where: { $0.id == replyIDs[offset] }),
-                      self.state.chats[c].messages[m].state == .pending {
-                      self.state.chats[c].messages[m].text = text
-                    }
-                    deliveryTrace?.published()
-                  }
-                }
+                deliveryTrace?.published()
               }
+            }
+            let result: MLXGemmaRunner.Output
+            do {
+              result = try await runner.run(plan: plan, images: images, media: media.media, maxTokens: outputLimit,
+                seed: seed, flag: flag, independentIdentity: generation, cacheOwner: cacheOwner, executionPolicy: executionPolicy,
+                joinedRetention: joinedRetention,
+                beforeCachePublication: { [weak self] in
+                  guard let self else { throw CancellationError() }
+                  try await self.revalidateResponseSources(cacheSources,
+                    attachments: attachmentSources, targetID: cacheTargetID)
+                  try await MainActor.run {
+                    try flag.check()
+                    guard self.activeFlag === ownerFlag,
+                      self.state.chats.contains(where: { $0.id == chat.id }),
+                      interaction == .ask || self.state.selectedDocument == document?.id else {
+                      throw BoomError.stale("The request owner changed before prompt-cache publication.")
+                    }
+                  }
+                },
+                pairedAdmission: generationPairedAdmission,
+                onCheckpoint: { progress, stop, token in
+                  try await checkpointStore.checkpoint(progress, identity: generation, stopReason: stop, stopTokenID: token)
+                }) { text in delivery.submit(text) }
+            } catch {
+              await delivery.closeAndJoin()
+              throw error
+            }
+            await delivery.closeAndJoin()
             receipt.promptDigest = result.promptDigest; receipt.tokenIDs = result.tokenIDs
             receipt.stopReason = result.stopReason; receipt.firstTokenSeconds = result.firstTokenSeconds
             receipt.stopTokenID = result.stopTokenID
@@ -1507,6 +1512,7 @@ private struct BoundedConsultationContext: Sendable {
               let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
               let m = self.state.chats[c].messages.firstIndex(where: { $0.id == replyID }) {
               self.state.chats[c].messages[m].text = result.text
+              deliveryTrace?.published()
             }
             try flag.check()
             try await self.revalidateResponseSources(try self.sourceReferences(for: sourceDocuments), attachments: attachmentSources, targetID: responseAuthority.target?.id)
