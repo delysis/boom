@@ -984,7 +984,7 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
       let attachmentBytes = Data("Public backup attachment".utf8)
       backupControlStage = "cold-restore"
       _ = try diskExtent(reservingReceipt: true, forBackupPreparation: true,
-        reservingWorkspaceCopies: 1, reservingDirectories: 2)
+        reservingWorkspaceCopies: 1, reservingDirectories: 2, copyingBackupSnapshot: true)
       let restoredStore = try WorkspaceStore(rootOverride: restoredRoot)
       try await restoredStore.restoreBackup(from: backup)
       let restored: WorkspaceModel
@@ -1795,18 +1795,23 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
     /// byte ceilings, including
     /// the owner's public TMPDIR. Never inspect a directory during typing.
     private func diskExtent(reservingReceipt: Bool, forBackupPreparation: Bool = false,
-      reservingWorkspaceCopies: Int = 0, reservingDirectories: Int = 0) throws -> UInt64 {
+      reservingWorkspaceCopies: Int = 0, reservingDirectories: Int = 0,
+      copyingBackupSnapshot: Bool = false) throws -> UInt64 {
       // Only the fixed short backup setup/restore may hold three same-volume
       // workspace trees. Steady observations retain the original16-dir bound.
       let directoryLimit = forBackupPreparation && plan.utf8Bytes == 72_196 ? 20 : 16
       guard (0...2).contains(reservingWorkspaceCopies), (0...2).contains(reservingDirectories),
-        forBackupPreparation || (reservingWorkspaceCopies == 0 && reservingDirectories == 0) else {
+        forBackupPreparation || (reservingWorkspaceCopies == 0 && reservingDirectories == 0),
+        !copyingBackupSnapshot || (forBackupPreparation && reservingWorkspaceCopies == 1 && reservingDirectories == 2) else {
         throw BoomError.invalid("Backup preparation reservation differs from its fixed phase.")
       }
       var pending: [(URL, Int)] = [(root, 0), (temporaryRoot, 0)]
       var files = 0, directories = 0, bytes: UInt64 = 0
       var workspaceFiles = 0, workspaceDirectories = 0, workspaceBytes: UInt64 = 0
-      let workspaceRoot = root.appendingPathComponent("workspace", isDirectory: true)
+      // Restore copies the captured snapshot, not the workspace that kept
+      // receiving edits after that snapshot. Count its actual existing tree
+      // in this same bounded traversal; all original caps remain unchanged.
+      let workspaceRoot = root.appendingPathComponent(copyingBackupSnapshot ? "backup-controls/snapshot" : "workspace", isDirectory: true)
       while let (directory, depth) = pending.popLast() {
         guard depth < 6, directories < directoryLimit else {
           throw BoomError.budget("Public fixture directory bound exceeded.")
@@ -1839,8 +1844,12 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
           }
         }
       }
-      let reservedBytes = bytes.addingReportingOverflow(workspaceBytes * UInt64(reservingWorkspaceCopies))
-      guard !reservedBytes.overflow,
+      guard reservingWorkspaceCopies == 0 || workspaceDirectories > 0 else {
+        throw BoomError.invalid("Backup reservation lost its actual copy source.")
+      }
+      let copiedBytes = workspaceBytes.multipliedReportingOverflow(by: UInt64(reservingWorkspaceCopies))
+      let reservedBytes = bytes.addingReportingOverflow(copiedBytes.partialValue)
+      guard !copiedBytes.overflow, !reservedBytes.overflow,
         files + workspaceFiles * reservingWorkspaceCopies <= (reservingReceipt ? 31 : 32),
         directories + workspaceDirectories * reservingWorkspaceCopies + reservingDirectories <= directoryLimit,
         reservedBytes.partialValue <= plan.diskLimit - (reservingReceipt ? 16_384 : 0) else {
