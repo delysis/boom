@@ -1622,17 +1622,28 @@ final class PromptPrefixCache: @unchecked Sendable {
     -> (ActiveNativeRecord?, Entry, Int, UUID)? {
     lock.lock(); defer { lock.unlock() }
     let record = activeNative
-    var candidates = record?.rows.map { ($0, record) } ?? []
+    // The radix index already proves each disk candidate's exact prefix under
+    // this same lock. Compare only the unindexed hot rows.
+    var candidates: [(Entry, ActiveNativeRecord?, Int)] = []
+    let limit = max(0, tokens.count - 1)
+    if let record {
+      for row in record.rows where row.owner.namespace == owner.namespace && !excluding.contains(row.id) {
+        let bound = min(limit, row.tokens.count)
+        var matched = 0
+        while matched < bound, tokens[matched] == row.tokens[matched] { matched += 1 }
+        candidates.append((row, record, matched))
+      }
+    }
     if let index = indices[owner.namespace] {
       for match in index.matches(tokens: tokens, maximumCount: tokens.count - 1) {
         if let entry = entries[match.id]?.entry,
           entry.spans.flatMap({ $0 }).allSatisfy({ $0.diskFileID != nil }) {
-          candidates.append((entry, nil))
+          candidates.append((entry, nil, match.tokenCount))
         }
       }
     }
     var selected: Entry?, selectedRecord: ActiveNativeRecord?, longest = 0
-    for (original, source) in candidates where original.owner.namespace == owner.namespace && !excluding.contains(original.id) {
+    for (original, source, cap) in candidates where original.owner.namespace == owner.namespace && !excluding.contains(original.id) {
       var row = original
       if source == nil || !Self.hasCurrentHot(row, owners: source!.owners) { row.nativeCurrentPrefix = nil }
       if !excludingFiles.isEmpty {
@@ -1640,8 +1651,6 @@ final class PromptPrefixCache: @unchecked Sendable {
           span.diskFileID.map { !excludingFiles.contains($0) } ?? true
         } }
       }
-      let lexical = zip(tokens, row.tokens).prefix(while: { $0.0 == $0.1 }).count
-      let cap = min(lexical, tokens.count - 1)
       if let source, cap > 0 {
         // Probe the sole joined hot owner's actual coverage. No resident view
         // is archived; an earlier covered prefix is hydrated after admission.
