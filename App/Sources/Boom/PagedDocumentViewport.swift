@@ -460,7 +460,7 @@ import Foundation
       utf16Length: max(anchor, focus) - min(anchor, focus), focusAtEnd: focus >= anchor,
       affinity: original.affinity)
     let id = try owner.beginOrderedDocumentPointer(read, selection: selected,
-      extending: event.modifierFlags.contains(.shift), from: native) { [weak self] id in
+      extending: event.modifierFlags.contains(.shift), mouseDown: event, from: native) { [weak self] id in
       guard let self, orderedMousePointer?.id == id else { return }
       orderedMousePointer = nil
       revealEditableWindow()

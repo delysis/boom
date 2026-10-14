@@ -1259,6 +1259,91 @@ import XCTest
   }
 
 
+  func testActualQueuedTabAndBacktabThenPointerAndTypingMatchOrdinaryNativeInterpretation() async throws {
+    let line = "abcdefghijklmné🙂\n"
+    for shifting in [false, true] {
+      try await fixture(#function, text: String(repeating: line, count: 3_000)) { f in
+        let input = f.input!, source = f.session!, commands = f.commands!, window = f.window!, viewport = f.scroll!
+        let flags: NSEvent.ModifierFlags = shifting ? [.shift] : []
+        let characters = shifting ? "\u{19}" : "\t"
+        @MainActor func tab() throws -> NSEvent {
+          try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: flags,
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+            context: nil, characters: characters, charactersIgnoringModifiers: "\t", isARepeat: false, keyCode: 48))
+        }
+        // The actual ordinary NSTextView decides whether this native key
+        // inserts, moves focus, or only moves selection. No guessed Tab text.
+        let reference = NativeContextReferenceTextView(frame: NSRect(x: 0, y: 260, width: 280, height: 48))
+        reference.isRichText = false; reference.string = "ab"
+        let before = NSTextField(frame: NSRect(x: 300, y: 260, width: 100, height: 24))
+        let after = NSTextField(frame: NSRect(x: 410, y: 260, width: 100, height: 24))
+        window.contentView!.addSubview(reference); window.contentView!.addSubview(before); window.contentView!.addSubview(after)
+        before.nextKeyView = reference; reference.nextKeyView = after
+        after.nextKeyView = f.view; f.view.nextKeyView = before
+        reference.setSelectedRange(NSRange(location: 1, length: 0))
+        XCTAssertTrue(window.makeFirstResponder(reference)); window.sendEvent(try tab())
+        let ordinary = reference.string
+        guard ordinary.hasPrefix("a"), ordinary.hasSuffix("b"), ordinary.utf16.count <= 34 else {
+          throw BoomError.invalid("The ordinary native Tab oracle produced an unsupported edit shape: \(ordinary.debugDescription)")
+        }
+        let inserted = String(ordinary.dropFirst().dropLast())
+        XCTAssertFalse(reference.interpretedCommands.isEmpty, "The reference must actually interpret the native key.")
+        let ordinaryKeptFocus = window.firstResponder === reference
+        print("Ordinary native \(shifting ? "Backtab" : "Tab"): insertedUTF16=\(inserted.utf16.count), keptEditorFocus=\(ordinaryKeptFocus)")
+        try await PagedNativeFixtureApplication.focus(f.view, in: window)
+        try viewport.enableDocumentNavigation(engine: f.engine!, publisher: f.publisher!)
+        try viewport.requestScroll(toUTF16: 40_000); try await viewport.joinPresentation()
+        let projection = try XCTUnwrap(viewport.visibleScrollWindow)
+        let surface = try XCTUnwrap(viewport.subviews.compactMap { $0 as? NSScrollView }.first { !$0.isHidden })
+        let display = try XCTUnwrap(surface.documentView as? NSTextView)
+        let point = NSPoint(x: display.textContainerOrigin.x + 22, y: display.textContainerOrigin.y + 10)
+        let local = display.characterIndexForInsertion(at: point)
+        let capturedCaret = try projection.position(localUTF16: local).utf16
+        let navigationCaret: UInt64 = 12_001
+        XCTAssertGreaterThan(capturedCaret, navigationCaret)
+        let generation = source.generation
+        let hold = try await f.route!.holdNext(.windowAfter)
+        let loading = try f.startNavigation(anchor: 12_000, caret: navigationCaret)
+        try await f.route!.awaitHeld(hold)
+        window.sendEvent(try tab())
+        XCTAssertEqual(commands.queuedRawKeyCount, 1)
+        XCTAssertTrue(commands.canOrderPointerAfterNavigation, "An admitted Tab cannot discard the later real pointer intent.")
+        let location = display.convert(point, to: nil)
+        @MainActor func mouse(_ type: NSEvent.EventType) throws -> NSEvent {
+          try XCTUnwrap(NSEvent.mouseEvent(with: type, location: location, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+            context: nil, eventNumber: type == .leftMouseDown ? 1 : 2, clickCount: 1,
+            pressure: type == .leftMouseUp ? 0 : 1))
+        }
+        window.sendEvent(try mouse(.leftMouseDown)); window.sendEvent(try mouse(.leftMouseUp))
+        let y = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+          timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+          context: nil, characters: "Y", charactersIgnoringModifiers: "Y", isARepeat: false, keyCode: 16))
+        window.sendEvent(y)
+        XCTAssertEqual(commands.queuedRawKeyCount, 2); XCTAssertEqual(commands.retainedRefusedInputCount, 0)
+        try await f.route!.release(hold); _ = try await loading.value
+        try await commands.joinPendingCommand()
+        let mappedCaret = capturedCaret + UInt64(inserted.utf16.count)
+        let expected = NSMutableString(string: f.originalText)
+        expected.insert(inserted, at: Int(navigationCaret)); expected.insert("Y", at: Int(mappedCaret))
+        try await f.assertSource(expected as String)
+        XCTAssertEqual(source.generation, generation + (inserted.isEmpty ? 1 : 2))
+        XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, mappedCaret + 1)
+        XCTAssertTrue(window.firstResponder === f.view, "The later actual mouse-down follows Backtab's focus transition.")
+        XCTAssertEqual(commands.queuedRawKeyCount, 0); XCTAssertEqual(commands.retainedInputBytes, 0)
+        XCTAssertEqual(commands.retainedRefusedInputCount, 0); XCTAssertNil(viewport.presentationFailure)
+        XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+        try await commands.joinPendingCommand()
+        let beforeY = NSMutableString(string: f.originalText); beforeY.insert(inserted, at: Int(navigationCaret))
+        try await f.assertSource(beforeY as String)
+        XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, mappedCaret)
+        XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("redo:"), to: nil, from: nil))
+        try await commands.joinPendingCommand(); try await f.assertSource(expected as String)
+        XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+      }
+    }
+  }
+
   func testActualCloseSettlesUnfinishedPointerAtLastDragPointWithoutLosingEarlierOrLaterKeys() async throws {
     let line = "abcdefghijklmné🙂\n"
     try await fixture(#function, text: String(repeating: line, count: 3_000)) { f in

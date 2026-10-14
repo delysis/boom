@@ -81,12 +81,14 @@ import Foundation
     var source: PagedNativeLogicalSnapshot
     var selection: PagedNativeNavigationSelection
     let extending: Bool
+    let mouseDown: NSEvent
     var complete = false
     var failure: Error?
     private var terminal: (@MainActor (UUID) -> Void)?
     init(source: PagedNativeLogicalSnapshot, selection: PagedNativeNavigationSelection, extending: Bool,
-      installed: @escaping @MainActor (UUID) -> Void) {
-      original = source; self.source = source; self.selection = selection; self.extending = extending; terminal = installed
+      mouseDown: NSEvent, installed: @escaping @MainActor (UUID) -> Void) {
+      original = source; self.source = source; self.selection = selection; self.extending = extending
+      self.mouseDown = mouseDown; terminal = installed
     }
     @MainActor func settle() {
       let delivered = terminal; terminal = nil
@@ -1128,20 +1130,23 @@ import Foundation
       commandTask == nil, capturedEditTask == nil, queuedPointerCount == 0 else { return false }
     return queue.allSatisfy {
       guard case .rawKey(let key) = $0 else { return false }
-      // Shift-Tab may move physical focus; preserve the predecessor pending
-      // behavior until that chronological focus transition is explicitly owned.
-      return key.event.keyCode != 48 && key.event.modifierFlags.intersection([.command, .control, .option]).isEmpty
+      // Tab/Backtab keep their actual Cocoa/completion interpretation. Its
+      // accepted primitives map the later pointer; a source-neutral focus
+      // transition is followed by the pointer's own retained mouse-down.
+      return key.event.modifierFlags.intersection([.command, .control, .option]).isEmpty
     }
   }
   func beginOrderedDocumentPointer(_ read: PagedNativeLogicalReadSnapshot,
-    selection: PagedNativeNavigationSelection, extending: Bool, from view: PagedNativeTextView,
+    selection: PagedNativeNavigationSelection, extending: Bool, mouseDown: NSEvent, from view: PagedNativeTextView,
     installed: @escaping @MainActor (UUID) -> Void) throws -> UUID {
     guard canOrderPointerAfterNavigation, input.session.isCurrent(read),
+      mouseDown.type == .leftMouseDown, mouseDown.windowNumber == view.window?.windowNumber,
       selection.utf16Offset <= read.source.summary.utf16,
       selection.utf16Length <= read.source.summary.utf16 - selection.utf16Offset else {
       throw BoomError.stale("The pointer has no exact source-neutral chronological navigation.")
     }
-    let pointer = PointerSelection(source: read.source, selection: selection, extending: extending, installed: installed)
+    let pointer = PointerSelection(source: read.source, selection: selection, extending: extending,
+      mouseDown: mouseDown, installed: installed)
     try enqueueSourceCommand(.pointerSelection(pointer), from: view, chargedBytes: 512)
     queuedPointerCount += 1
     return pointer.id
@@ -1212,10 +1217,22 @@ import Foundation
   }
   private func deliverPointer(_ pointer: PointerSelection) throws {
     if let failure = pointer.failure { throw failure }
-    let read = try input.session.captureLogicalState(), observed = try input.observeSelection()
-    guard pointer.complete, pointer.source.isSame(read.source) else {
-      throw BoomError.stale("The ordered pointer lost its actual mapped logical source.")
+    let read = try input.session.captureLogicalState()
+    guard pointer.complete, pointer.source.isSame(read.source), let view = input.activeView,
+      let nativeWindow = view.window, pointer.mouseDown.type == .leftMouseDown,
+      pointer.mouseDown.windowNumber == nativeWindow.windowNumber else {
+      throw BoomError.stale("The ordered pointer lost its actual mapped logical source or mouse window.")
     }
+    // A preceding replayed Backtab may legitimately move focus. This later
+    // actual mouse intent follows that observed transition in the SAME queue.
+    // Do not steal focus from a newer, unaccounted external focus transition.
+    if nativeWindow.firstResponder !== view, nativeWindow.isKeyWindow,
+      let replayObservation, try input.observeSelection() == replayObservation {
+      guard nativeWindow.makeFirstResponder(view), nativeWindow.firstResponder === view else {
+        throw BoomError.unavailable("The ordered mouse-down could not focus its original document client.")
+      }
+    }
+    let observed = try input.observeSelection()
     let window = input.session.logicalWindow, focus = pointer.selection.focusUTF16
     let selected: PagedNativeNavigationSelection
     if pointer.extending {
