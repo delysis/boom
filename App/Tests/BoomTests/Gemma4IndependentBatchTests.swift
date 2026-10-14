@@ -525,6 +525,104 @@ struct Gemma4IndependentBatchTests {
         }
     }
 
+    @Test("Homogeneous scalar prepare, broadcast and shared decode retain every completed row")
+    func homogeneousSubmittedRootsRetainExactDecodedRows() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let model = try Self.model()
+            let prompt = Self.tokens(9, row: 0).map(Int.init), width = 3
+            let owner = PromptCacheOwner(namespace: UUID(), entity: UUID(), route: .writing)
+            let parent = ProcessInfo.processInfo.environment["TMPDIR"].flatMap {
+                $0.hasPrefix("/") ? URL(fileURLWithPath: $0, isDirectory: true) : nil
+            }
+            let manager = PromptPrefixCache(temporaryParent: parent)
+            let session = try manager.makeSession(owner: owner,
+                input: LMInput(tokens: MLXArray(prompt.map(Int32.init))), promptTokenIDs: prompt,
+                prefill: .init(stepSize: 4, chunking: .remainder), useActiveNative: true,
+                outputTokens: 2, batchWidth: width, makeCache: { try model.newCache(parameters: nil) })
+            defer { session.discardStagedAnchors(); manager.clear(reason: "homogeneous_roots_joined") }
+            do {
+                var prefill = session.prefill
+                prefill.observeTextForward = session.bindForwardOperands(model: Digest.sha256("tiny-local-homogeneous-forward"),
+                    requests: (0..<width).map { Digest.sha256("homogeneous-row-\($0)") })
+                let prepared = try model.prepare(session.input, cache: session.cache, state: nil, prefill: prefill)
+                guard case .logits(let output) = prepared else { throw TestFailure.notLogits }
+                let initial = output.logits[0..., -1, 0...]
+                asyncEval([initial] + session.cache.flatMap { $0.innerState() })
+                eval(initial); session.observeReadySpill(); session.markCacheSubmitted()
+                #expect(session.cache.flatMap { $0.innerState() }.allSatisfy { $0.readyBuffer() != nil })
+                for var entry in session.cache {
+                    let state = entry.innerState(), offset = entry.offset, metadata = entry.metaState
+                    if state.isEmpty { continue }
+                    #expect(state.count == 2 && state.allSatisfy { $0.ndim == 4 && $0.dim(0) == 1 })
+                    entry.state = state.map { broadcast($0, to: [width] + Array($0.shape.dropFirst())) }
+                    if case .simple = PrefixKVStorage.layout(of: entry) { _ = entry.trim(entry.offset - offset) }
+                    else { entry.metaState = metadata }
+                    #expect(entry.offset == offset)
+                }
+                let expanded = session.cache.flatMap { $0.innerState() }
+                asyncEval(expanded); eval(expanded); session.observeReadySpill()
+                #expect(expanded.allSatisfy { $0.readyBuffer() != nil })
+                let sampled = [3, 7, 11]
+                for row in 0..<width {
+                    #expect(session.captureDecodeLane(row: row, width: width,
+                        emittedTokenIDs: [sampled[row]], finished: false))
+                }
+                session.observeDecodeOperands(sampled, active: Array(repeating: true, count: width))
+                let forwarded = model(LMInput.Text(tokens: MLXArray(sampled.map(Int32.init)).reshaped([width, 1])),
+                    cache: session.cache, state: nil)
+                let next = forwarded.logits[0..., -1, 0...]
+                asyncEval([next] + session.cache.flatMap { $0.innerState() })
+                eval(next); session.observeReadySpill(); session.markCacheSubmitted()
+                #expect(session.cache.flatMap { $0.innerState() }.allSatisfy { $0.readyBuffer() != nil })
+                for row in 0..<width {
+                    // The second delivered token has not been forwarded. It must
+                    // not enter the retained prefix, matching ordinary decoding.
+                    #expect(session.captureDecodeLane(row: row, width: width,
+                        emittedTokenIDs: [sampled[row], 2], finished: true))
+                }
+                for row in 0..<width {
+                    let oracleCache = try model.newCache(parameters: nil)
+                    let oracle = try Self.prepare(model,
+                        rows: [(prompt + [sampled[row]]).map(Int32.init)], cache: oracleCache, step: 4)
+                    Self.expectMatch(next[row..<row + 1, 0...], oracle)
+                }
+                Stream.defaultStream.synchronize()
+                await session.joinPendingSpill(cancelled: false)
+                let expected = session.cache.map { PrefixKVStorage.unwrap($0).state.filter { $0.ndim == 4 } }
+                #expect(manager.publish(session, completions: (0..<width).map {
+                    .init(row: $0, emittedTokenIDs: [sampled[$0], 2])
+                }))
+                for row in 0..<width {
+                    let query = prompt + [sampled[row], 30]
+                    let warm = try manager.makeSession(owner: owner,
+                        input: LMInput(tokens: MLXArray(query.map(Int32.init))), promptTokenIDs: query,
+                        prefill: .init(stepSize: 4, chunking: .remainder), useActiveNative: true,
+                        makeCache: { try model.newCache(parameters: nil) })
+                    defer { warm.discardStagedAnchors() }
+                    #expect(warm.cachedTokenCount == prompt.count + 1)
+                    for layer in warm.cache.indices {
+                        let actual = PrefixKVStorage.unwrap(warm.cache[layer]).state.filter { $0.ndim == 4 }
+                        #expect(actual.count == expected[layer].count)
+                        for (value, reference) in zip(actual, expected[layer]) {
+                            let selected = reference[row..<row + 1, 0..., 0..., 0...]
+                            eval(value, selected)
+                            #expect(value.shape == selected.shape)
+                            #expect(value.asArray(Float.self).map(\.bitPattern) == selected.asArray(Float.self).map(\.bitPattern))
+                        }
+                    }
+                }
+                manager.clear(reason: "homogeneous_roots_joined")
+                await manager.joinPendingDiskCleanup()
+            } catch {
+                Stream.defaultStream.synchronize()
+                await session.joinPendingSpill(cancelled: true)
+                manager.clear(reason: "homogeneous_roots_failed_join")
+                await manager.joinPendingDiskCleanup()
+                throw error
+            }
+        }
+    }
+
     @Test("Cancellation before the actual prepare cannot publish predicted forward operands")
     func cancelledBeforePrepareHasNoSubmittedOperandBinding() async throws {
         try await Device.withDefaultDevice(.cpu) {

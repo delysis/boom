@@ -1453,7 +1453,8 @@ actor MLXGemmaRunner {
           guard initial.state == nil else { throw BoomError.invalid("This checkpoint needs unsupported per-row inference state.") }
           var logits = initial.logits[0..., -1, 0...]
           let initialTrace = PerformanceTrace.begin("Model.BatchInitialEvaluation")
-          eval(logits); eval(cache)
+          asyncEval([logits] + cache.flatMap { $0.innerState() })
+          eval(logits)
           cacheSession.observeReadySpill()
           if joinedBinding != nil || cacheSession.usesActiveNativeState { cacheSession.markCacheSubmitted() }; constructedAndSubmitted = true
           PerformanceTrace.end("Model.BatchInitialEvaluation", initialTrace)
@@ -1476,7 +1477,8 @@ actor MLXGemmaRunner {
             } else { entry.metaState = metadata }
             guard entry.offset == offset else { throw BoomError.invalid("Batch expansion changed the native logical offset.") }
           }
-          eval(cache)
+          let expandedRoots = cache.flatMap { $0.innerState() }
+          asyncEval(expandedRoots); eval(expandedRoots)
           cacheSession.observeReadySpill()
           logits = broadcast(logits, to: [seeds.count, logits.dim(1)])
           diagnostic?.native?.expanded(width: seeds.count)
@@ -1591,7 +1593,8 @@ actor MLXGemmaRunner {
                 guard output.state == nil else { throw BoomError.invalid("Unexpected batch inference state.") }
                 let next = output.logits[0..., -1, 0...]
                 guard next.ndim == 2, next.dim(0) == seeds.count else { throw BoomError.invalid("The model lost its batch rows.") }
-                eval(next); eval(cache)
+                asyncEval([next] + cache.flatMap { $0.innerState() })
+                eval(next)
                 cacheSession.observeReadySpill()
                 if joinedBinding != nil || cacheSession.usesActiveNativeState { cacheSession.markCacheSubmitted() }
                 if let event = diagnosticEvent { diagnostic?.matrix?(event) }
