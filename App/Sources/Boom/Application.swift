@@ -29,7 +29,10 @@ import SwiftUI
       do { try DeveloperStackDiagnostics.startOwnedEntryLifetime() }
       catch { fputs("Public editor lifetime admission refused.\n", stderr); exit(1) }
       let recipe = URL(fileURLWithPath: CommandLine.arguments[3])
-      let app = NSApplication.shared; app.setActivationPolicy(.prohibited)
+      let app = NSApplication.shared
+      guard app.setActivationPolicy(.regular) else {
+        fputs("Public editor activation policy refused.\n", stderr); exit(1)
+      }
       Task {
         do { try await DeveloperEditorFixture.run(recipe: recipe); exit(0) }
         catch { fputs("Public editor diagnostic failed: \(error.localizedDescription)\n", stderr); exit(1) }

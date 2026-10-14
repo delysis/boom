@@ -77,6 +77,7 @@ import SwiftUI
     private var startupUndoAttempted = false, startupUndoJoined = false
     private var primingBefore: [String: Any]?, primingAfterInsert: [String: Any]?, primingAfterDelete: [String: Any]?
     private var vmBefore: [String: Any]?, vmAfter: [String: Any]?
+    private var applicationBeforeFocus: [String: Any]?, applicationAfterFocus: [String: Any]?
 
     init(recipe: URL, plan: DeveloperStackDiagnostics.PublicEditorPlan) throws {
       guard plan.operations == (plan.isMixed ? 200 : Self.cycles) else {
@@ -175,6 +176,7 @@ import SwiftUI
         window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
       }
       for _ in 0..<10 { host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(25)) }
+      if plan.isMixed { try await receiveActualKeyWindow(window) }
       guard let view = model.pagedViewport?.textView as? PagedNativeTextView,
         model.pagedInput?.activeView === view, window.makeFirstResponder(view), view.isEditable else {
         throw BoomError.invalid("Ordinary managed public editor focus was unavailable.")
@@ -235,6 +237,51 @@ import SwiftUI
       try await verifyOrdinaryExport(named: "prepared-export.txt"); preparationExportJoined = true
       _ = try diskExtent(reservingReceipt: true)
       vmBefore = currentVMCategories()
+    }
+
+    private func applicationState(_ window: NSWindow) -> [String: Any] {
+      ["running": NSApp.isRunning, "active": NSApp.isActive, "hidden": NSApp.isHidden,
+        "activation_policy": NSApp.activationPolicy().rawValue,
+        "actual_key_window": NSApp.keyWindow === window, "window_is_key": window.isKeyWindow,
+        "window_visible": window.isVisible, "window_can_become_key": window.canBecomeKey]
+    }
+
+    // Real AppKit readiness, outside donation/timing and inside the existing
+    // preparation deadline. Both readiness and deadline tasks actually join;
+    // an absent notification never substitutes for the strict key-window test.
+    private func receiveActualKeyWindow(_ window: NSWindow) async throws {
+      applicationBeforeFocus = applicationState(window)
+      defer { applicationAfterFocus = applicationState(window) }
+      if NSApp.isRunning, NSApp.isActive, window.isKeyWindow { return }
+      let (signals, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+      let key = NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification,
+        object: window, queue: .main) { _ in continuation.yield(()) }
+      let active = NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification,
+        object: NSApp, queue: .main) { _ in continuation.yield(()) }
+      defer {
+        NotificationCenter.default.removeObserver(key); NotificationCenter.default.removeObserver(active)
+        continuation.finish()
+      }
+      try await withThrowingTaskGroup(of: Void.self) { group in
+        defer { group.cancelAll() }
+        group.addTask { @MainActor in
+          if NSApp.isRunning, NSApp.isActive, window.isKeyWindow { return }
+          for await _ in signals {
+            try Task.checkCancellation()
+            if NSApp.isRunning, NSApp.isActive, window.isKeyWindow { return }
+          }
+          throw CancellationError()
+        }
+        group.addTask {
+          try await Task.sleep(for: .seconds(5))
+          throw BoomError.unavailable("Actual public App/key-window readiness exceeded its fixed5s preparation bound.")
+        }
+        window.makeKeyAndOrderFront(nil); NSApp.activate()
+        try await group.next()
+      }
+      guard NSApp.isRunning, NSApp.isActive, NSApp.keyWindow === window, window.isKeyWindow else {
+        throw BoomError.unavailable("The actual public App did not retain its received key-window state.")
+      }
     }
 
     // Fixed scalar provenance only, outside timed operations; no source bytes.
@@ -800,6 +847,8 @@ import SwiftUI
         "priming_after_delete": primingAfterDelete ?? ["available": false],
         "vm_categories_before_capture": vmBefore ?? ["available": false],
         "vm_categories_after_capture": vmAfter ?? ["available": false],
+        "application_before_focus": applicationBeforeFocus ?? ["available": false],
+        "application_after_focus": applicationAfterFocus ?? ["available": false],
         "synchronous_cpu_stage": "Editor.PublicInputDispatch",
         "ready_wait_stage": "Editor.PublicReadyWait",
         "end_to_ready_stage": "Editor.PublicMixedOperation",
