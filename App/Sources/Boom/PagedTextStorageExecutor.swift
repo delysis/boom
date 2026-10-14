@@ -66,11 +66,16 @@ final class PagedTextStorageExecutor: @unchecked Sendable {
     _ work: @escaping @Sendable () throws -> T) async throws -> T {
     try await withCheckedThrowingContinuation { continuation in
       let job = Job(priority: priority) {
+        let result: Result<T, Error>
         do {
           if cancellation?.isCancelled == true { throw CancellationError() }
-          continuation.resume(returning: try autoreleasepool(invoking: work))
-        } catch { continuation.resume(throwing: error) }
+          result = .success(try autoreleasepool(invoking: work))
+        } catch { result = .failure(error) }
+        // A resumed producer may immediately submit its next quantum on
+        // another thread. Its completed job must already have released the
+        // admission slot, including when work failed or was cancelled.
         self.finished(priority)
+        continuation.resume(with: result)
       }
       let result = state.withLock { s -> (Bool, Bool) in
         guard (!s.closing || priority == .cleanup || priority == .lifecycle), s.jobs.count < 64 else { return (false, false) }

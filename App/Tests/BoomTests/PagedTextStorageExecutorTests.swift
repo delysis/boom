@@ -52,6 +52,45 @@ final class PagedTextStorageExecutorTests: XCTestCase {
     XCTAssertEqual(executor.snapshot.bulkOperations, 1)
   }
 
+  func testCompletedJobsReleaseAdmissionBeforeTheirProducersContinue() async throws {
+    let executor = PagedTextStorageExecutor()
+    // Lifecycle has one actual slot. A sequential caller must never compete
+    // with its own completed predecessor, on either success or failure.
+    for value in 0..<256 {
+      let actual = try await executor.run(priority: .lifecycle) { value }
+      XCTAssertEqual(actual, value)
+    }
+    do {
+      let _: Int = try await executor.run(priority: .lifecycle) {
+        throw BoomError.invalid("Public failed source job")
+      }
+      XCTFail("The actual failed work unexpectedly returned")
+    } catch {
+      XCTAssertEqual(error.localizedDescription, BoomError.invalid("Public failed source job").localizedDescription)
+    }
+    let following = try await executor.run(priority: .lifecycle) { true }
+    XCTAssertTrue(following)
+    // This is the real two-mode producer shape: each producer submits its
+    // next bounded step only after its own previous step has returned.
+    let total = try await withThrowingTaskGroup(of: Int.self) { group in
+      for _ in 0..<2 {
+        group.addTask {
+          var sum = 0
+          for value in 0..<2_000 {
+            sum += try await executor.run(priority: .background) { value }
+          }
+          return sum
+        }
+      }
+      var sum = 0
+      for try await value in group { sum += value }
+      return sum
+    }
+    XCTAssertEqual(total, 2 * (1_999 * 2_000 / 2))
+    XCTAssertEqual(executor.snapshot.backgroundRequests, 0)
+    XCTAssertFalse(executor.snapshot.closing)
+  }
+
   func testCloseCancelsAndJoinsWholeBulkLifetimeBeforeCallbackRelease() async throws {
     let executor = PagedTextStorageExecutor(), cancellation = PagedTextCancellation()
     let lease = try executor.reserveBulk(cancellation)
