@@ -483,17 +483,30 @@ final class PrefixKVDiskTests: XCTestCase {
         source?.discardStagedAnchors(); source = nil
         var escaped: PromptPrefixCache.Session? = try Self.session(store, ids + [9], owner: owner)
         XCTAssertEqual(escaped?.cachedTokenCount, 6)
-        XCTAssertFalse(try Self.files(root).isEmpty, "Require actual completed private-file spills.")
+        let beforeClear = try Dictionary(uniqueKeysWithValues: Self.files(root).map { file in
+          (file, Digest.sha256(try Data(contentsOf: file)))
+        })
+        XCTAssertFalse(beforeClear.isEmpty, "Require actual completed private-file spills.")
 
         store.clear()
         await store.joinPendingDiskCleanup()
         XCTAssertFalse(store.hasAnchors)
-        XCTAssertFalse(try Self.files(root).isEmpty,
+        let surviving = try Self.files(root)
+        XCTAssertFalse(surviving.isEmpty,
           "Joined clear must not unlink spans still owned by a genuine warm reader.")
+        for file in surviving {
+          XCTAssertEqual(Digest.sha256(try Data(contentsOf: file)), try XCTUnwrap(beforeClear[file]),
+            "Actual owned disk bytes remain readable and unchanged after joined clear.")
+        }
         if let reader = escaped {
           XCTAssertGreaterThan(reader.retentionObservation?.diskBytes ?? 0, 0)
           XCTAssertEqual(reader.cache[0].state[0].asArray(Float.self), ids.map(Float.init))
-          XCTAssertEqual(reader.cache[1].state[0].asArray(Float.self), [Float(2), 3, 4, 5])
+          XCTAssertEqual(reader.cache[1].state[0].asArray(Float.self), [Float(5), 2, 3, 4])
+          let ordered = try PrefixKVStorage.hydrate(
+            layout: XCTUnwrap(PrefixKVStorage.layout(of: reader.cache[1])),
+            spans: PrefixKVStorage.residentWindowSpans(of: reader.cache[1], layer: 1, through: 6),
+            prefix: 6, row: 0)
+          XCTAssertEqual(ordered.state[0].asArray(Float.self), [Float(2), 3, 4, 5])
           reader.discardStagedAnchors()
         }
         escaped = nil // the last cache/capture file owners, not a forced purge

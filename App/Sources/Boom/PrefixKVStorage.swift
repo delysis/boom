@@ -396,7 +396,7 @@ enum PrefixKVStorage {
   /// bounded by the native window; overwritten sliding history is unavailable.
   /// Wrapped buffers are described as separate chronological slices, never
   /// concatenated or cloned here. Every slice shares the snapshot's backing ID.
-  static func residentWindowSpans(of cache: any KVCache, layer: Int) throws -> [PrefixKVSpan] {
+  static func residentWindowSpans(of cache: any KVCache, layer: Int, through prefix: Int? = nil) throws -> [PrefixKVSpan] {
     let native = unwrap(cache)
     guard let layout = layout(of: native),
       case let .rotating(window, keep, _, _) = layout else {
@@ -406,6 +406,8 @@ enum PrefixKVStorage {
     guard let offset = Int(meta[3]), let idx = Int(meta[4]), let wrapped = Bool(meta[6]), layer >= 0 else {
       throw BoomError.invalid("Invalid resident KV metadata.")
     }
+    let target = prefix ?? offset
+    guard target >= 0, target <= offset else { throw BoomError.invalid("Resident KV prefix exceeds its source.") }
     let arrays = native.innerState()
     if arrays.isEmpty {
       guard offset == 0, idx == 0, !wrapped else { throw BoomError.invalid("Resident KV metadata has no tensor state.") }
@@ -422,7 +424,9 @@ enum PrefixKVStorage {
     }
     guard held > 0 else { return [] }
     let pinned = min(keep, held), tailCount = held - pinned
-    let retainedTail = min(tailCount, window - keep), wantedStart = offset - retainedTail
+    // Restrict temporary views to the QUERY's required window. Prefill can
+    // physically retain more than W positions, including an earlier endpoint.
+    let wantedStart = max(pinned, target - (window - keep))
     let id = UUID(), backing = try pairBytes(keys, values)
     var result: [PrefixKVSpan] = []
     func view(_ physical: Range<Int>, absolute: Int) throws {
@@ -431,16 +435,16 @@ enum PrefixKVStorage {
         keys: keys[0..., 0..., physical, 0...], values: values[0..., 0..., physical, 0...],
         backingBytesUpperBound: backing))
     }
-    try view(0..<pinned, absolute: 0)
+    try view(0..<min(pinned, target), absolute: 0)
     let physicalTail: [Range<Int>]
     if wrapped, idx < held { physicalTail = [idx..<held, pinned..<idx] }
     else { physicalTail = [pinned..<held] }
     var absolute = offset - tailCount
     for physical in physicalTail {
       let end = absolute + physical.count
-      let start = max(absolute, wantedStart)
-      if start < end {
-        try view((physical.lowerBound + start - absolute)..<physical.upperBound, absolute: start)
+      let start = max(absolute, wantedStart), upper = min(end, target)
+      if start < upper {
+        try view((physical.lowerBound + start - absolute)..<(physical.lowerBound + upper - absolute), absolute: start)
       }
       absolute = end
     }

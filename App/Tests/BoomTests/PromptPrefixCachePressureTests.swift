@@ -313,8 +313,12 @@ final class PromptPrefixCachePressureTests: XCTestCase {
       XCTAssertEqual(next.cachedTokenCount, 5,
         "The sole hot ring still physically covers this prefix even though its disk spill was refused.")
       XCTAssertEqual(next.cache[0].offset, 5)
-      XCTAssertEqual(next.cache[0].state[0].asArray(Float.self), [1, 2, 3, 4])
-      XCTAssertEqual(next.cache[0].state[1].asArray(Float.self), [101, 102, 103, 104])
+      let restoredState = next.cache[0].state
+      XCTAssertEqual(restoredState.count, 2)
+      let restoredKeys = try XCTUnwrap(restoredState.first)
+      let restoredValues = try XCTUnwrap(restoredState.count == 2 ? restoredState.last : nil)
+      XCTAssertEqual(restoredKeys.asArray(Float.self), [1, 2, 3, 4])
+      XCTAssertEqual(restoredValues.asArray(Float.self), [101, 102, 103, 104])
       XCTAssertEqual(cold.cache[0].offset, 6)
       XCTAssertEqual(cold.cache[0].state[0].asArray(Float.self), ids.map(Float.init))
       XCTAssertGreaterThanOrEqual(store.retainedNativeBytesUpperBound, 48)

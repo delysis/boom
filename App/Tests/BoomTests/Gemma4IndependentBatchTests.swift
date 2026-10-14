@@ -322,11 +322,14 @@ struct Gemma4IndependentBatchTests {
                     #expect(manager.publishTextCohort(cohort, retention: dispositions))
                     let retained = manager.retainedSnapshotObservations
                     #expect(!retained.isEmpty)
-                    #expect(retained.allSatisfy { value in
-                        value.row.map { row in requests.indices.contains(row) && dispositions[row] != nil
-                            && value.namespace == requests[row].owner.namespace
-                            && value.nativePhysicalWidth == requests.count } == true
-                    })
+                    for value in retained {
+                        let row = try #require(value.row)
+                        #expect(requests.indices.contains(row))
+                        guard requests.indices.contains(row) else { continue }
+                        #expect(dispositions[row] != nil)
+                        #expect(value.namespace == requests[row].owner.namespace)
+                        #expect(value.nativePhysicalWidth == requests.count)
+                    }
                     if faults {
                         #expect(retained.contains { $0.row == 2 && $0.namespace == requests[2].owner.namespace })
                         #expect(!retained.contains { $0.row == 0 || $0.row == 1 })

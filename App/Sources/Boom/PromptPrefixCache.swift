@@ -1245,7 +1245,7 @@ final class PromptPrefixCache: @unchecked Sendable {
                   return self.makeNativeOwner(try batch.extract(row: selected, through: choice.2),
                     sources: [source], materialized: true)
                 }
-                let views = try PrefixKVStorage.residentWindowSpans(of: source.native, layer: layer)
+                let views = try PrefixKVStorage.residentWindowSpans(of: source.native, layer: layer, through: choice.2)
                 let restored = try PrefixKVStorage.hydrate(layout: choice.1.layouts[layer],
                   spans: views, prefix: choice.2, row: selected,
                   batchWidth: try ActiveNativeKVStorage.rowWidth([source]))
@@ -1499,10 +1499,10 @@ final class PromptPrefixCache: @unchecked Sendable {
               positions.positions[row] >= value.tokens.count else { return false }
             return true
           }
-        if hot {
-          value.nativePhysicalWidth = cohort.rows.count
-          if !Self.hasCurrentHot(value, owners: cohort.resources) { value.nativeCurrentPrefix = nil }
-        }
+        // Physical forward width remains known when only its joined disk
+        // coverage survives. It is independent of current-hot eligibility.
+        value.nativePhysicalWidth = cohort.rows.count
+        if hot, !Self.hasCurrentHot(value, owners: cohort.resources) { value.nativeCurrentPrefix = nil }
         value.nativeRowReceipt = NativeRowReceipt(completedTokenCount: capture.coveredEnd,
           submittedTokenCount: capture.submittedTokenCount,
           processedTokenCount: value.nativeProcessedTokenCount ?? value.tokens.count,
@@ -1739,7 +1739,7 @@ final class PromptPrefixCache: @unchecked Sendable {
             }
             // Borrow the current ring ONLY after warm admission, for this
             // selected lookup. No row view is retained in historical metadata.
-            let borrowed = try PrefixKVStorage.residentWindowSpans(of: native, layer: layer)
+            let borrowed = try PrefixKVStorage.residentWindowSpans(of: native, layer: layer, through: candidate.2)
             let restored = try PrefixKVStorage.hydrate(layout: candidate.1.layouts[layer],
               spans: borrowed, prefix: candidate.2, row: candidate.1.nativeLedgerRow ?? candidate.1.row ?? 0,
               batchWidth: candidate.1.nativePhysicalWidth ?? candidate.1.batchWidth, copyResidentPieces: true)
