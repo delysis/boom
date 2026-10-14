@@ -352,6 +352,7 @@ fn label(source: &ReferenceIdentity, index: usize) -> String {
     )
 }
 
+#[cfg(test)]
 pub fn context_v3(
     documents: &[Document], attachments: &[ReferenceAttachment], authority: &Authority,
 ) -> Result<RenderedReferenceContext, Error> {
