@@ -306,7 +306,9 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
         window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
       }
       for _ in 0..<10 { host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(25)) }
-      if plan.isMixed || normalMemory { try await receiveActualKeyWindow(window) }
+      // Initial external foreground delivery is preparation, outside measured
+      // work. Later restoration/reactivation keeps its existing five-second bound.
+      if plan.isMixed || normalMemory { try await receiveActualKeyWindow(window, within: .seconds(15)) }
       guard let view = model.pagedViewport?.textView as? PagedNativeTextView,
         model.pagedInput?.activeView === view, window.makeFirstResponder(view), view.isEditable else {
         throw BoomError.invalid("Ordinary managed public editor focus was unavailable.")
@@ -701,7 +703,7 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
     // Real AppKit readiness, outside donation/timing and inside the existing
     // preparation deadline. Both readiness and deadline tasks actually join;
     // an absent notification never substitutes for the strict key-window test.
-    private func receiveActualKeyWindow(_ window: NSWindow) async throws {
+    private func receiveActualKeyWindow(_ window: NSWindow, within timeout: Duration = .seconds(5)) async throws {
       applicationBeforeFocus = applicationState(window)
       defer { applicationAfterFocus = applicationState(window) }
       if NSApp.isRunning, NSApp.isActive, window.isKeyWindow { return }
@@ -725,8 +727,8 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
           throw CancellationError()
         }
         group.addTask {
-          try await Task.sleep(for: .seconds(5))
-          throw BoomError.unavailable("Actual public App/key-window readiness exceeded its fixed5s preparation bound.")
+          try await Task.sleep(for: timeout)
+          throw BoomError.unavailable("Actual public App/key-window readiness exceeded its bounded allowance: \(timeout).")
         }
         window.makeKeyAndOrderFront(nil); NSApp.activate()
         try await group.next()
