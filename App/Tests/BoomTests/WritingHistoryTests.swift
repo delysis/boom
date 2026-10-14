@@ -3,6 +3,25 @@ import XCTest
 @testable import Boom
 
 final class WritingHistoryTests: XCTestCase {
+  func testCancelledHistoryDoesNotReadMissingCandidateRecords() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-cancelled-history-" + UUID().uuidString)
+    let store = try WorkspaceStore(rootOverride: root)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let missing = UUID(), document = UUID()
+    let request = Task.detached { () -> Bool in
+      withUnsafeCurrentTask { $0?.cancel() }
+      do {
+        _ = try await store.candidateHistory(for: document, ids: [missing])
+        return false
+      } catch { return error is CancellationError }
+    }
+    let cancelledBeforeRead = await request.value
+    XCTAssertTrue(cancelledBeforeRead, "An obsolete request must stop before opening a missing candidate.")
+    let history = try await store.candidateHistory(for: document, ids: [])
+    XCTAssertTrue(history.explorations.isEmpty)
+    XCTAssertNil(history.latest)
+  }
+
   private func bundle(_ document: DocumentSnapshot, prose: String, budget: Int = 256) throws -> CandidateBundle {
     let compiled = try ProductCore.writingPrompt(document, caret: document.text.utf16.count,
       examples: [], retaining: Int.max)

@@ -408,8 +408,10 @@ actor WorkspaceStore {
     try vault.get(.attachment, id: id, limit: 67_108_864)
   }
   func candidateHistory(for documentID: UUID, ids: [UUID]) throws -> SavedWritingHistory {
+    try Task.checkCancellation()
     var entries: [WritingHistoryEntry] = [], previews: [UUID: String] = [:]
     for id in ids {
+      try Task.checkCancellation()
       let value = try autoreleasepool { () throws -> (WritingHistoryEntry, String) in
         let bundle = try readCandidate(id)
         let prose = bundle.candidates.indices.contains(bundle.selected) ? bundle.candidates[bundle.selected].text : ""
@@ -419,6 +421,7 @@ actor WorkspaceStore {
       }
       entries.append(value.0); previews[id] = value.1
     }
+    try Task.checkCancellation()
     let plan = try ProductCore.writingHistory(documentID: documentID, entries: entries)
     return SavedWritingHistory(explorations: plan.explorations.map { SavedExploration(id: $0,
       preview: previews[$0] ?? "No prose retained") }, latest: plan.latest)
