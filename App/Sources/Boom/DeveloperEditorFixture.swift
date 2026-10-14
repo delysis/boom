@@ -192,6 +192,7 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
     private var heldWriterFailureState: [String: Any]?
     private var documentInputStage = "unentered"
     private var documentContextVerified = false, adoptingFinalVerified = false, tabPointerVerified = false
+    private var firstKeyFocusVerified = false
     private var adoptingFinalQueuedAtFocus: Int?
     private var nativeTabObservations: [[String: Any]] = []
     private var warmMarkedStates: [[String: Any]] = []
@@ -407,6 +408,9 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
       documentInputStage = "tab-pointer"
       try await verifyTabPointer(original: original, bytes: bytes)
       tabPointerVerified = true
+      documentInputStage = "first-key-focus"
+      try await verifyFirstKeyFocus(original: original, bytes: bytes)
+      firstKeyFocusVerified = true
       try await mixedCaret(0, event: 0, measured: false)
       try await model.flush()
       try await requireDocumentInputSource(bytes, root: original)
@@ -691,6 +695,88 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
             "reference_kept_focus": ordinaryFocus, "captured_pointer_utf16": caret, "mapped_pointer_utf16": mappedCaret])
         } catch { let failure = await joinedDocumentInputFailure(error); throw failure }
       }
+    }
+
+    private func verifyFirstKeyFocus(original: PagedNativeLogicalSnapshot, bytes: Data) async throws {
+      guard let model = workspace, let input = model.pagedInput, let session = model.pagedSession,
+        let commands = model.pagedCommands, let viewport = model.pagedViewport, let window else {
+        throw BoomError.stale("First-key focus control lost its actual document graph.")
+      }
+      try await mixedCaret(0, event: 0, measured: false)
+      let view = try currentMixedView()
+      guard let context = view.inputContext, let client = context.client as? PagedNativeTextInputClient else {
+        throw BoomError.invalid("The first-key focus control has no actual document context.")
+      }
+      let other = NSTextView(frame: NSRect(x: 800, y: 80, width: 240, height: 48))
+      other.string = "Other"; window.contentView!.addSubview(other)
+      defer { other.removeFromSuperview() }
+      do {
+        let selected = PagedNativeNavigationSelection(utf16Offset: 1_024, utf16Length: 48_976,
+          focusAtEnd: false, affinity: .upstream)
+        try input.setDocumentSelection(selected)
+        let before = try session.captureLogicalState(), history = try commands.captureLogicalHistory()
+        let retained = commands.retainedInputBytes, arena = session.arenaID
+        guard try input.currentDocumentSelection() == selected,
+          selected.focusUTF16 < session.logicalWindow.start.utf16 + session.logicalWindow.summary.utf16,
+          selected.anchorUTF16 > session.logicalWindow.start.utf16 + session.logicalWindow.summary.utf16,
+          selected.anchorUTF16 < before.source.summary.utf16,
+          selected.utf16Length > UInt64(view.selectedRange().length),
+          commands.queuedRawKeyCount == 0 else {
+          throw BoomError.invalid("The first-key control requires a genuine partial nonresident selection.")
+        }
+        guard let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+          timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+          context: nil, characters: "z", charactersIgnoringModifiers: "z", isARepeat: false, keyCode: 6) else {
+          throw BoomError.invalid("The actual first-key event is unavailable.")
+        }
+        // Same native turn: the MainActor preparation Task has not received an
+        // async turn before the actual responder moves. This is a pre-entry
+        // boundary, not the SDK control's held, entered backend completion.
+        window.sendEvent(event)
+        guard commands.queuedRawKeyCount == 1, commands.retainedInputBytes == retained + 514,
+          commands.retainedRefusedInputCount == 0,
+          try session.captureLogicalState().source.isSame(before.source),
+          session.generation == before.generation, session.arenaID == arena else {
+          throw BoomError.invalid("The real first key was not retained before its nonresident preparation.")
+        }
+        guard window.makeFirstResponder(other), window.firstResponder === other else {
+          throw BoomError.unavailable("The actual first-key control could not move its responder.")
+        }
+        try await commands.joinPendingCommand(); try await viewport.joinPresentation()
+        guard window.firstResponder === other, other.string == "Other", input.activeView === view,
+          view.inputContext === context, !client.isRetired,
+          commands.queuedRawKeyCount == 0, commands.retainedInputBytes == retained,
+          commands.retainedRefusedInputCount == 0, commands.unretainedRawKeyCount == 0,
+          session.generation == before.generation + 2,
+          try input.currentDocumentSelection().utf16Offset == selected.utf16Offset + 1,
+          try input.currentDocumentSelection().utf16Length == 0,
+          try commands.captureLogicalHistory().undo.count == history.undo.count + 1 else {
+          throw BoomError.invalid("The admitted original key was lost, retargeted, split or stole actual focus.")
+        }
+        let expected = (String(decoding: bytes, as: UTF8.self) as NSString)
+          .replacingCharacters(in: NSRange(location: Int(selected.utf16Offset), length: Int(selected.utf16Length)), with: "z")
+        try await requireDocumentInputSource(Data(expected.utf8))
+        let after = try session.captureLogicalState().source
+        guard window.makeFirstResponder(view), window.firstResponder === view else {
+          throw BoomError.unavailable("The actual editor could not receive responder Undo after the focus control.")
+        }
+        try await mixedResponder(false, event: 0, measured: false)
+        try await requireDocumentInputSource(bytes, root: original)
+        guard try input.currentDocumentSelection() == selected else {
+          throw BoomError.invalid("Responder Undo did not restore the original nonresident selection.")
+        }
+        try await mixedResponder(true, event: 0, measured: false)
+        try await requireDocumentInputSource(Data(expected.utf8), root: after)
+        guard try input.currentDocumentSelection().utf16Offset == selected.utf16Offset + 1 else {
+          throw BoomError.invalid("Responder Redo lost the admitted original key's actual caret.")
+        }
+        try await mixedResponder(false, event: 0, measured: false)
+        try await requireDocumentInputSource(bytes, root: original)
+        guard input.firstRefusal == nil, commands.firstFailure == nil,
+          view.boundedStorage.mutationFailure == nil, window.firstResponder === view else {
+          throw BoomError.invalid("The first-key focus control left a refusal or lost its actual responder.")
+        }
+      } catch { let failure = await joinedDocumentInputFailure(error); throw failure }
     }
 
     private func applicationState(_ window: NSWindow) -> [String: Any] {
@@ -2178,6 +2264,8 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
         "actual_adopting_final_control_passed": adoptingFinalVerified,
         "adopting_final_queued_at_focus_move": adoptingFinalQueuedAtFocus.map { $0 as Any } ?? NSNull(),
         "actual_tab_pointer_control_passed": tabPointerVerified,
+        "actual_first_key_focus_custody_passed": firstKeyFocusVerified,
+        "first_key_focus_custody_scope": "Actual native event and responder move in one App.run turn before async preparation; exact source/one Undo group. No entered-backend hold, hardware input or input-method-service acceptance.",
         "native_tab_oracles": nativeTabObservations,
         "document_input_control_scope": "Public72K App-run preparation only; actual Session/context/adoption/SDK Undo and programmatic native events. No hardware keyboard or input-method-service acceptance.",
         "actual_live_backup_control_passed": liveBackupVerified,
