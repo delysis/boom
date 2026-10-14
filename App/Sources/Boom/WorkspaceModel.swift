@@ -4025,7 +4025,13 @@ extension WorkspaceModel {
     var ordered: [BoundedDocumentCapture] = [], active = Set<UUID>(), followed = Set<UUID>()
     var omitted = Set<UUID>(), charged = 0
     func resolve(_ title: String, id: UUID?) throws -> UUID {
-      if let id { return id }
+      if let id {
+        guard documentIndices.contains(where: { $0.id == id })
+          || state.archivedDocuments?.contains(where: { $0.id == id }) == true else {
+          throw BoomError.stale("The referenced document was removed.")
+        }
+        return id
+      }
       let matches = documentIndices.filter { $0.title.compare(title, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame }
       guard matches.count == 1, let match = matches.first else {
         throw BoomError.invalid("Missing or ambiguous document: \(title). Insert its stable reference from the library.")
