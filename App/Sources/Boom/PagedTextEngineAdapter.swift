@@ -892,6 +892,37 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
   func makeWorkspacePublisher() async throws -> PagedWorkspacePublisher {
     try await onQueue { PagedWorkspacePublisher(store: try self.router.files()) }
   }
+  /// Capture only: the live SDK/source/read lane stays open. The complete
+  /// physical document head is published within one writer job; ACK receiving
+  /// afterwards changes custody, not these files or the metadata index.
+  func captureWorkspaceBackup(vault: Vault, cancellation: CancellationFlag) async throws -> WorkspaceBackup.CapturedDirectory {
+    guard vault.root.deletingLastPathComponent().standardizedFileURL.path == sourceRoot.standardizedFileURL.path else {
+      throw BoomError.denied("Backup has another actual workspace namespace.")
+    }
+    let lease = try rootCustody.reserve(engine: self, purpose: .operation(UUID()), claims: [.workspace])
+    return try await withTaskCancellationHandler {
+      do {
+        return try await onQueue(custody: lease) {
+          try self.rootCustody.start(lease)
+          try cancellation.check(); try self.router.files().requireQueue()
+          // Fixed lock order: existing writer queue, then Vault's mutex.
+          // Vault's synchronous operations never call back into Engine.
+          let captured = try vault.captureBackupSource(cancellation: cancellation)
+          do { try self.rootCustody.finishRead(lease) }
+          catch {
+            try WorkspaceBackup.discard(captured, preserving: error)
+            throw error
+          }
+          return captured
+        }
+      } catch {
+        let original = error
+        do { _ = try self.rootCustody.joinedFailure(lease, error: original) }
+        catch { throw PagedTextCustodyHandoffFailure(original: original, handoff: error, lease: lease) }
+        throw original
+      }
+    } onCancel: { cancellation.cancel() }
+  }
   func currentDocumentRecordRetaining(_ publisher: PagedWorkspacePublisher, documentID: UUID)
     async throws -> PagedTextCustodiedValue<PagedDocumentRootRecord> {
     try await rootOutput(claims: [.workspace], outputClaims: { [.record($0)] }) {

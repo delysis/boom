@@ -111,6 +111,13 @@ final class Vault: @unchecked Sendable {
   static let workspaceID = UUID(uuidString: "726B3A82-2EB1-493B-9D8E-F17C7A6E4B8A")!
   let root: URL
   private let lock = NSLock()
+  /// Called only inside the existing Engine writer job. All category and
+  /// workspace JSON writers use this same lock; no await occurs while held.
+  func captureBackupSource(cancellation: CancellationFlag) throws -> WorkspaceBackup.CapturedDirectory {
+    precondition(!Thread.isMainThread)
+    lock.lock(); defer { lock.unlock() }
+    return try WorkspaceBackup.captureForExport(root: root.deletingLastPathComponent(), cancellation: cancellation)
+  }
   init(root: URL) throws {
     guard root.isFileURL else { throw BoomError.invalid("Workspace storage must be a local directory.") }
     let selected = root.standardizedFileURL

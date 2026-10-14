@@ -188,7 +188,7 @@ struct WritingExamplesView: View {
     }
   }
   private var canChange: Bool {
-    !model.isBusy && !model.editingLocked && model.state.selectedDocument == request.manuscriptID
+    !model.isBusy && model.state.selectedDocument == request.manuscriptID
       && model.documentIndices.contains { $0.id == request.manuscriptID }
   }
   private var canAdd: Bool {

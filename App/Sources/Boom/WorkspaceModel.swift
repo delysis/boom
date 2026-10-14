@@ -134,7 +134,6 @@ private struct BoundedConsultationContext: Sendable {
     if message.state == .complete { speechOutput.speak(message.text) }
   }
   @Published var editingWritingExamples: WritingExamplesRequest?
-  @Published var editingLocked = false
   var openRestoredWorkspace: ((URL) -> Void)?
   @Published var writingExampleIDs: [UUID] = [] {
     didSet {
@@ -643,6 +642,9 @@ private struct BoundedConsultationContext: Sendable {
       }
       _ = try await session.flush(through: session.generation)
     }
+    try await saveWorkspaceMetadata()
+  }
+  private func saveWorkspaceMetadata() async throws {
     retainComposerDraft(schedule: false)
     state.documents = documentIndices
     let snapshot = state
@@ -3272,53 +3274,85 @@ private struct BoundedConsultationContext: Sendable {
       let panel = NSSavePanel(); panel.nameFieldStringValue = "Bloom-backup"
       panel.canCreateDirectories = true
       guard panel.runModal() == .OK, let target = panel.url else { return }
-      work("Backing up workspace…") { [weak self] _ in
-        try await self?.exportWorkspaceBackup(to: target)
-      }
+      do { _ = try exportWorkspaceBackup(to: target) }
+      catch { status = error.localizedDescription }
     }
   }
-  private func exportWorkspaceBackup(to target: URL) async throws {
+  @discardableResult
+  func exportWorkspaceBackup(to url: URL) throws -> Task<URL, Error> {
     try requirePagedOperation()
-    guard recordingAttachmentTask == nil else { throw BoomError.unavailable("A recording is still being saved.") }
-    pagedTransition = true; editingLocked = true
-    finishComposition()
-    pagedInput?.activeView?.isEditable = false
-    defer {
-      pagedTransition = false
-      editingLocked = pagedSession == nil && selectedDocumentID != nil
-      pagedInput?.activeView?.isEditable = !editingLocked && pagedFirstFailure == nil
-      if pagedEngine != nil, pagedFirstFailure == nil {
-        scheduleSave(); refreshVisibleSearch()
+    guard canBackupWorkspace, recordingAttachmentTask == nil else {
+      throw BoomError.unavailable("Another workspace capture or recording is still being saved.")
+    }
+    let target = url.standardizedFileURL, id = UUID(), flag = CancellationFlag()
+    guard pagedExportTaskCount < Self.maximumPagedExportTasks,
+      exportTasks[target] != nil || exportTasks.count < Self.maximumPagedExportTasks else {
+      throw BoomError.budget("The existing export registry has eight pending or retained destinations.")
+    }
+    let (engine, _) = try pagedOwners(), vault = store.vault
+    // Retain the pre-existing handles before installing this export's entry;
+    // joining the new entry itself would wait on its own producer.
+    let priorExports = Array(exportTasks.values), previousExport = exportTasks[target], previousGhost = ghostTask
+    cancelInputCompletions(); invalidateGhost()
+    isBusy = true; activeID = id; activeFlag = flag
+    status = "Backing up workspace…"
+    pagedExportTaskCount += 1
+    let producer = Task<URL, Error> { [weak self] in
+      try await withTaskCancellationHandler {
+        guard let self else { throw CancellationError() }
+        var captured = false
+        defer { if !captured { self.finishWorkspaceBackupCapture(id) } }
+        if let previousGhost { await previousGhost.value }
+        for input in self.inputCompletions { await input.value?.join() }
+        for operation in priorExports {
+          await operation.task.value
+          // Terminal export failures remain in their existing entries; they
+          // do not poison a new backup of the live workspace.
+          if let result = operation.pagedResult { _ = await result.result }
+          if let result = operation.clipboardResult { _ = await result.result }
+        }
+        try flag.check()
+        if let failure = await self.joinWorkspaceSaveTasks() { throw failure }
+        guard self.pagedEngine === engine, self.pagedImported == nil, self.pagedInitialized == nil else {
+          throw BoomError.stale("The backup capture lost its existing workspace source.")
+        }
+        // A marked composition stays live. Its last completed file checkpoint
+        // is backed up; no forced unmark or synthetic native receiving occurs.
+        if self.pagedSession?.isPinned == true { try await self.saveWorkspaceMetadata() }
+        else { try await self.flush() }
+        try flag.check()
+        let snapshot = try await engine.captureWorkspaceBackup(vault: vault, cancellation: flag)
+        captured = true
+        self.finishWorkspaceBackupCapture(id)
+        // This Task/registry owns the clone until export AND disposal join.
+        // No live writer lock, editor retirement or busy UI spans this copy.
+        try await detachedWork { try WorkspaceBackup.export(snapshot, to: target, cancellation: flag) }
+        return target
+      } onCancel: {
+        flag.cancel()
+        previousExport?.pagedResult?.cancel(); previousExport?.clipboardResult?.cancel()
       }
     }
-    // The lock remains held. A directory copy is not a snapshot: all source,
-    // checkpoint and metadata writers stay joined/closed until the copy ends.
-    for input in inputCompletions { await input.value?.join() }
-    searchEpoch &+= 1; searchTask?.cancel()
-    if let searchTask { await searchTask.value }
-    for operation in Array(exportTasks.values) { await operation.task.value }
-    try await flush()
-    try await closePagedSelection()
-    guard pagedImported == nil, pagedInitialized == nil, let engine = pagedEngine else {
-      throw BoomError.stale("A document producer still owns the workspace.")
-    }
-    try await engine.close()
-    pagedEngine = nil; pagedPublisher = nil
-    var copyFailure: Error?
-    do { try await store.exportBackup(to: target) } catch { copyFailure = error }
-    // Cancellation stops the copy, not the mandatory reopening/join.
-    let reopening = Task { @MainActor in try await self.openPagedWorkspace() }
-    do { try await reopening.value }
-    catch {
-      failPagedSource(error)
-      if let copyFailure {
-        throw BoomError.unavailable("Backup failed: \(copyFailure.localizedDescription). Reopening also failed: \(error.localizedDescription)")
+    let observer = Task { [weak self] in
+      defer { self?.pagedExportTaskCount -= 1 }
+      do {
+        _ = try await producer.value
+        if self?.exportTasks[target]?.id == id { self?.exportTasks[target] = nil }
+        if self?.isBusy == false { self?.status = "Backup exported" }
+      } catch {
+        // The result and any refused cleanup path remain in the existing
+        // registry. Backup failure never retires or poisons the live editor.
+        self?.status = error is CancellationError ? "Stopped" : error.localizedDescription
+        PerformanceTrace.event("Workspace.BackupFailure")
       }
-      throw error
     }
-    if let id = selectedDocumentID { focusEditor(id) }
-    if let copyFailure { throw copyFailure }
-    status = "Backup exported"
+    exportTasks[target] = (id, observer, producer, nil)
+    return producer
+  }
+  private func finishWorkspaceBackupCapture(_ id: UUID) {
+    guard activeID == id else { return }
+    isBusy = false; activeID = nil; activeFlag = nil
+    scheduleSave(); refreshVisibleSearch(); scheduleCompletion()
   }
   func importModel() {
     guard !isBusy else { return }

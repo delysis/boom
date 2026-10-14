@@ -50,7 +50,6 @@ struct WorkspaceView: View {
         .onChange(of: geometry.size.width, initial: true) { _, width in model.fitPanes(to: width) }
     }
     .background(Color(nsColor: BoomChrome.sidebarBackground))
-    .disabled(model.editingLocked)
     .environment(\.openURL, OpenURLAction { _ in .discarded })
     .sheet(isPresented: $model.showingModels) { ModelPickerView(model: model) }
     .sheet(item: $model.editingWritingExamples) { WritingExamplesView(model: model, request: $0) }
@@ -69,7 +68,6 @@ struct ManuscriptPane: View {
         if let viewport = model.pagedViewport {
           PagedManuscriptView(viewport: viewport)
             .id(ObjectIdentifier(viewport))
-            .allowsHitTesting(!model.editingLocked)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
           Color.clear.accessibilityLabel("No document selected")
