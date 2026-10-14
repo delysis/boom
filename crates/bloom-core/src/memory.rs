@@ -108,7 +108,7 @@ impl CacheConfiguration {
         let positions = tokens.div_ceil(256) * 256;
         let sliding = positions.min(self.sliding_window + u64::from(prefill.token_ceiling));
         let concrete = self.num_hidden_layers - self.num_kv_shared_layers;
-        let per_row = self.layer_types[..concrete as usize]
+        self.layer_types[..concrete as usize]
             .iter()
             .map(|kind| {
                 if kind == "full_attention" {
@@ -123,8 +123,7 @@ impl CacheConfiguration {
                     sliding * self.num_key_value_heads * self.head_dim * 4
                 }
             })
-            .sum::<u64>();
-        per_row
+            .sum::<u64>()
     }
     fn bytes(&self, tokens: u64, width: u64, prefill: Prefill) -> u64 {
         self.row_bytes(tokens, prefill) * (2 * width + u64::from(width > 1))

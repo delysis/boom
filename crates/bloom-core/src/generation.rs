@@ -701,10 +701,10 @@ mod tests {
             .progress
             .execution_origin
             .as_mut()
-            .unwrap()
+            .expect("Checkpoint fixture has an execution origin")
             .independent_cohort
             .as_mut()
-            .unwrap()
+            .expect("Checkpoint fixture has its admitted independent cohort")
             .row = 1;
         assert!(validate(&next.identity, None, changed).is_err());
         // Subsequent checkpoints cannot silently erase a heterogeneous cohort
@@ -714,7 +714,7 @@ mod tests {
             .progress
             .execution_origin
             .as_mut()
-            .unwrap()
+            .expect("Checkpoint fixture has an execution origin")
             .independent_cohort = None;
         assert!(validate(&next.identity, Some(&next), scalar).is_err());
         Ok(())
