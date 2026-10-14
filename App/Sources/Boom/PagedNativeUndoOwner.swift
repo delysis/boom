@@ -85,7 +85,7 @@ import Foundation
       installed: @escaping @MainActor (UUID) -> Void) {
       original = source; self.source = source; self.selection = selection; self.extending = extending; terminal = installed
     }
-    func settle() {
+    @MainActor func settle() {
       let delivered = terminal; terminal = nil
       delivered?(id)
     }
