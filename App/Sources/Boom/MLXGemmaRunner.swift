@@ -824,29 +824,73 @@ actor MLXGemmaRunner {
     pairedAdmission: PairedContextAdmission? = nil,
     promptContract: ConsultationPromptContract = .referenceHistoryV2,
     renderedContext: RenderedReferenceContext? = nil, capturedSources: [SourceReference] = []
-  ) async throws -> (plans: [ConsultationPlan], history: [ChatMessage], omittedHistory: Int) {
+  ) async throws -> (plans: [ConsultationPlan], history: [ChatMessage], omittedHistory: Int,
+    context: String, renderedContext: RenderedReferenceContext?, capturedSources: [SourceReference], workingTextBytes: Int?) {
     let trace = PerformanceTrace.begin("Request.ContextFit")
     defer { PerformanceTrace.end("Request.ContextFit", trace) }
     guard voices.count == reserves.count else { throw BoomError.invalid("Every participant needs an output reservation.") }
-    var retained = history.filter { $0.state == .complete }
-    let originalCount = retained.count
-    while true {
+    let complete = history.filter { $0.state == .complete }
+    var recent: [ChatMessage] = [], historyBytes = 0
+    for turn in complete.suffix(4096).reversed() {
+      let bytes = turn.text.utf8.count.addingReportingOverflow(turn.context.utf8.count)
+      guard !bytes.overflow, bytes.partialValue <= 4_194_304 - historyBytes else { break }
+      historyBytes += bytes.partialValue; recent.append(turn)
+    }
+    recent.reverse()
+    var workingContext = context, workingRendered = renderedContext, workingSources = capturedSources
+    var workingBytes: Int?, maximumSources = 32
+    func compile(_ turns: [ChatMessage]) async throws -> [ConsultationPlan] {
       try flag.check()
-      do {
-        let plans = try ProductCore.consultationRound(voices: voices, history: retained,
-          instructions: instructions, context: context, request: request, routing: routing,
-          authority: authority, promptContract: promptContract,
-          renderedContext: renderedContext, capturedSources: capturedSources)
-        for (plan, reserve) in zip(plans, reserves) {
-          _ = try await preflight(plan, images: images, media: media, maxTokens: reserve, flag: flag, cacheOwner: cacheOwner, pairedAdmission: pairedAdmission)
+      let plans = try ProductCore.consultationRound(voices: voices, history: turns,
+        instructions: instructions, context: workingContext, request: request, routing: routing,
+        authority: authority, promptContract: promptContract,
+        renderedContext: workingRendered, capturedSources: workingSources, workingTextBytes: workingBytes)
+      for (plan, reserve) in zip(plans, reserves) {
+        _ = try await preflight(plan, images: images, media: media, maxTokens: reserve,
+          flag: flag, cacheOwner: cacheOwner, pairedAdmission: pairedAdmission)
+      }
+      return plans
+    }
+    do {
+      let plans = try await compile(recent)
+      return (plans, recent, complete.count - recent.count, workingContext, workingRendered, workingSources, workingBytes)
+    } catch BoomError.budget { /* Slide whole older turns before reducing current text. */ }
+
+    var best: [ConsultationPlan]
+    while true {
+      do { best = try await compile([]); break }
+      catch BoomError.budget(let reason) {
+        if let bytes = workingBytes {
+          if bytes > 0 { workingBytes = bytes / 2 }
+          else if maximumSources > 0 { maximumSources /= 2 }
+          else {
+            // Text and optional source metadata are already absent. This is a
+            // real model/media/output reservation failure, not a text limit.
+            throw BoomError.unavailable("The model cannot reserve this output and media on this Mac. \(reason)")
+          }
+        } else { workingBytes = 32_768 }
+        if let original = renderedContext {
+          let value = try DocumentTools.windowedContext(original, authority: authority,
+            capturedSources: capturedSources, bodyBytes: workingBytes ?? 0, maximumSources: maximumSources)
+          workingRendered = value; workingContext = value.prompt; workingSources = value.bindings.map(\.source)
+        } else {
+          // Legacy reference strings have no typed interior ranges. Omit their
+          // whole block rather than cutting structured data into false claims.
+          workingContext = context.isEmpty ? "" : "[Captured reference data outside the working window]"
         }
-        // Every participant receives this exact captured history suffix.
-        return (plans, retained, originalCount - retained.count)
-      } catch BoomError.budget {
-        guard !retained.isEmpty else { throw BoomError.budget("The current question, voice and explicit sources exceed available context. Nothing was sent.") }
-        retained.removeFirst()
       }
     }
+    // Every candidate is a whole recent suffix. Binary search avoids repeatedly
+    // tokenizing all but one of thousands of old turns.
+    var lower = 0, upper = recent.count
+    while lower < upper {
+      let count = lower + (upper - lower + 1) / 2
+      do {
+        best = try await compile(Array(recent.suffix(count))); lower = count
+      } catch BoomError.budget { upper = count - 1 }
+    }
+    let retained = Array(recent.suffix(lower))
+    return (best, retained, complete.count - retained.count, workingContext, workingRendered, workingSources, workingBytes)
   }
   func completionRecipe(document: DocumentSnapshot, caret: Int, sources: [SourceReference],
     examples: [String], profile: SamplingProfile, maxTokens: Int, flag: CancellationFlag,

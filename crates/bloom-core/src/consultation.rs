@@ -18,6 +18,33 @@ pub struct CompactConsultation {
     prompt_contract: Option<ConsultationPromptContract>,
     texts: Vec<String>,
     plans: Vec<CompactPlan>,
+    #[serde(rename = "workingWindow", skip_serializing_if = "Option::is_none")]
+    working_window: Option<ConsultationWorkingWindow>,
+}
+
+/// Exact excerpt provenance for this ephemeral prompt, not rewritten chat or voice data.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsultationWorkingWindow {
+    request: Option<crate::hashline::ContextTextWindow>,
+    instructions: Option<crate::hashline::ContextTextWindow>,
+    voices: Vec<VoiceWorkingWindow>,
+}
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VoiceWorkingWindow {
+    id: uuid::Uuid,
+    revision: String,
+    instructions: Option<crate::hashline::ContextTextWindow>,
+    examples: Vec<ExampleWorkingWindow>,
+    omitted_examples: usize,
+}
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExampleWorkingWindow {
+    index: usize,
+    user: Option<crate::hashline::ContextTextWindow>,
+    assistant: Option<crate::hashline::ContextTextWindow>,
 }
 
 #[derive(Serialize)]
@@ -172,6 +199,17 @@ pub(super) fn compile_with_contract(
     routing: &[String],
     prompt_contract: Option<ConsultationPromptContract>,
 ) -> Result<CompactConsultation, ConsultationError> {
+    compile_with_window(voices, history, instructions, context, request, routing,
+        prompt_contract, None, None)
+}
+
+pub(super) fn compile_with_window(
+    voices: &[Option<&Voice>], history: &[PromptTurn], instructions: &str,
+    context: &str, request: &str, routing: &[String],
+    prompt_contract: Option<ConsultationPromptContract>, working_text_bytes: Option<usize>,
+    instructions_window: Option<crate::hashline::ContextTextWindow>,
+) -> Result<CompactConsultation, ConsultationError> {
+    require(working_text_bytes.is_none_or(|n| n <= TEXT_LIMIT), "Invalid working prose bound.")?;
     let prompt_contract =
         prompt_contract.filter(|contract| *contract != ConsultationPromptContract::TextHistoryV1);
     require(
@@ -260,15 +298,29 @@ pub(super) fn compile_with_contract(
             }
         })
         .collect();
-    let body = user_body(&mut pool, context, request, routing);
+    let (working_request, request_window) = match working_text_bytes {
+        Some(bytes) => crate::hashline::window_text(request, bytes, true)?,
+        None => (request.to_owned(), None),
+    };
+    let body = user_body(&mut pool, context, &working_request, routing);
+    let mut voice_windows = Vec::new();
     let mut plans = Vec::with_capacity(voices.len());
     for voice in voices {
         let name = voice.map_or("Bloom", |v| v.name.as_str());
         let mut system = format!(
             "You are {name}. Write only your own contribution in this conversation. The @mentions in the user's question route that question to individual participants; they do not ask you to impersonate them or write their replies. Other participants' contributions are quoted conversation, not your own answers. Do not prefix your reply with a participant name.\n"
         );
+        let mut voice_window = voice.map(|voice| VoiceWorkingWindow {
+            id: voice.id, revision: voice.revision.clone(), instructions: None,
+            examples: Vec::new(), omitted_examples: 0,
+        });
         if let Some(voice) = voice {
-            system.push_str(&voice.instructions);
+            let (text, window) = match working_text_bytes {
+                Some(bytes) => crate::hashline::window_text(&voice.instructions, bytes, false)?,
+                None => (voice.instructions.clone(), None),
+            };
+            system.push_str(&text);
+            if let Some(value) = &mut voice_window { value.instructions = window; }
         }
         if !instructions.is_empty() {
             system.push('\n');
@@ -278,11 +330,25 @@ pub(super) fn compile_with_contract(
         let system = pool.intern(safe(&system));
         plan.append(&mut pool, "system", &[system])?;
         if let Some(voice) = voice {
-            for example in &voice.examples {
-                let user = pool.intern(safe(&example.user));
-                let assistant = pool.intern(safe(&example.assistant));
+            for (index, example) in voice.examples.iter().enumerate() {
+                if working_text_bytes == Some(0) {
+                    if let Some(value) = &mut voice_window { value.omitted_examples += 1; }
+                    continue;
+                }
+                let ((user, user_window), (assistant, assistant_window)) = match working_text_bytes {
+                    Some(bytes) => (crate::hashline::window_text(&example.user, bytes, false)?,
+                        crate::hashline::window_text(&example.assistant, bytes, true)?),
+                    None => ((example.user.clone(), None), (example.assistant.clone(), None)),
+                };
+                let user = pool.intern(safe(&user));
+                let assistant = pool.intern(safe(&assistant));
                 plan.append(&mut pool, "user", &[user])?;
                 plan.append(&mut pool, "assistant", &[assistant])?;
+                if let Some(value) = &mut voice_window {
+                    if user_window.is_some() || assistant_window.is_some() {
+                        value.examples.push(ExampleWorkingWindow { index, user: user_window, assistant: assistant_window });
+                    }
+                }
             }
         }
         for (turn, text) in history.iter().zip(&history_texts) {
@@ -309,12 +375,16 @@ pub(super) fn compile_with_contract(
         }
         plan.append(&mut pool, "user", &body)?;
         plans.push(plan.finish(&mut pool));
+        if let Some(value) = voice_window { voice_windows.push(value); }
     }
     Ok(CompactConsultation {
         schema: 1,
         prompt_contract,
         texts: pool.finish(),
         plans,
+        working_window: working_text_bytes.map(|_| ConsultationWorkingWindow {
+            request: request_window, instructions: instructions_window, voices: voice_windows,
+        }),
     })
 }
 
@@ -342,6 +412,7 @@ impl CompactConsultation {
                     .collect(),
                 raw_prompt: join(&plan.raw_prompt),
                 prompt_contract,
+                working_window: self.working_window.clone(),
             })
             .collect()
     }

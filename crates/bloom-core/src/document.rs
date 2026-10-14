@@ -27,9 +27,20 @@ pub struct Document {
 pub struct Authority {
     pub mode: Mode,
     pub target: Option<Document>,
+    #[serde(default, rename = "targetWindow", skip_serializing_if = "Option::is_none")]
+    pub target_window: Option<crate::hashline::ContextTextWindow>,
 }
 
 impl Authority {
+    pub(crate) fn admit_target_range(&self, start: usize, end: usize) -> Result<(), Error> {
+        if let Some(window) = &self.target_window {
+            let target = self.target.as_ref().ok_or_else(|| Error("Missing captured target.".into()))?;
+            window.validate(&target.text)?;
+            require(window.ranges.iter().any(|range| start >= range.start && end <= range.end),
+                "The edit addresses target text outside the supplied working window.")?;
+        }
+        Ok(())
+    }
     pub fn instructions_v3(&self) -> Result<String, Error> {
         if self.mode == Mode::Ask {
             return self.instructions();
@@ -248,6 +259,7 @@ fn validate<'a>(
             boundaries.binary_search(&start).is_ok() && boundaries.binary_search(&end).is_ok(),
             "An edit cannot split a Unicode character.",
         )?;
+        authority.admit_target_range(start, end)?;
         edits.push(ByteEdit {
             start,
             end,
@@ -356,6 +368,7 @@ mod tests {
         let authority = Authority {
             mode: Mode::Edit,
             target: Some(document.clone()),
+            target_window: None,
         };
         (document, authority, patch)
     }

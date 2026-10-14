@@ -17,6 +17,7 @@ struct StoredProposal: Codable, Identifiable, Sendable {
   let attachments: [SourceReference]
   var status: String
   var appliedRevision: String? = nil
+  var targetWindow: ContextTextWindow? = nil
 }
 
 enum DocumentMergeConflict: Error { case changed }
@@ -44,9 +45,10 @@ struct CompletionSegment {
 
 private struct BoundedConsultationContext: Sendable {
   let captures: [BoundedDocumentCapture]
+  var omittedSources: Int = 0
   let documents: [DocumentSnapshot]
-  init(captures: [BoundedDocumentCapture]) {
-    self.captures = captures
+  init(captures: [BoundedDocumentCapture], omittedSources: Int = 0) {
+    self.captures = captures; self.omittedSources = omittedSources
     documents = captures.map(\.modelSnapshot)
   }
   var sources: [SourceReference] { captures.map(\.source) }
@@ -1251,26 +1253,26 @@ private struct BoundedConsultationContext: Sendable {
         state.attachments[current].digest == captured.digest else { throw BoomError.stale("The attachment changed.") }
       state.attachments[current] = prepared; attachments[index] = prepared
     }
-    let attachmentSources = attachments.map(\.reference), sources = graph.sources + attachmentSources
+    let attachmentSources = attachments.map(\.reference), capturedSourceIdentities = graph.sources + attachmentSources
     let attachmentText = promptContract == .referenceBindingsV3 ? "" : attachments.filter { !$0.text.isEmpty }.map {
       "ATTACHMENT \($0.name)\nID \($0.id)\nDIGEST \($0.digest)\nCOVERAGE \($0.coverage)\n\($0.text)"
     }.joined(separator: "\n\n")
     let authority = CapturedDocumentAuthority(mode: interaction, target: document,
       capture: interaction == .ask ? nil : graph.captures.first { $0.documentID == document?.id })
-    let context: String, renderedContext: RenderedReferenceContext?, capturedContextSources: [SourceReference]
+    let capturedContext: String, capturedRenderedContext: RenderedReferenceContext?, capturedContextSources: [SourceReference]
     let capturedAttachments = attachments
     if promptContract == .referenceBindingsV3 {
       let rendered = try await detachedWork {
-        try DocumentTools.renderedContext(graph.documents, attachments: capturedAttachments, authority: authority)
+        try DocumentTools.renderedContext(graph.documents, attachments: capturedAttachments, authority: authority,
+          preferredDocumentID: chat.attachedDocumentID, omittedSources: graph.omittedSources)
       }
-      renderedContext = rendered; context = rendered.prompt
+      capturedRenderedContext = rendered; capturedContext = rendered.prompt
       capturedContextSources = graph.promptSources + attachments.filter { !$0.text.isEmpty }.map(\.reference)
     } else {
       let documentContext = try await detachedWork { try DocumentTools.context(graph.documents, authority: authority) }
-      context = [documentContext, attachmentText].filter { !$0.isEmpty }.joined(separator: "\n\n")
-      renderedContext = nil; capturedContextSources = []
+      capturedContext = [documentContext, attachmentText].filter { !$0.isEmpty }.joined(separator: "\n\n")
+      capturedRenderedContext = nil; capturedContextSources = []
     }
-    guard context.utf8.count <= 524_288 else { throw BoomError.budget("Combined reference context exceeds 512 KiB.") }
     let instructions = chat.instructions ?? ""
     let targets: [Voice?] = voices.isEmpty ? [nil] : voices.map(Optional.some)
     let outputLimit = interaction == .ask ? 512 : 4096
@@ -1301,10 +1303,17 @@ private struct BoundedConsultationContext: Sendable {
           independentHistory: interaction == .ask && style == .separate, ownedBy: ownerFlag)
       }
       let fitted = try await runner.fittedRound(voices: targets, history: chat.messages,
-        instructions: instructions, context: context, request: request, routing: slugs,
+        instructions: instructions, context: capturedContext, request: request, routing: slugs,
         images: images, media: media.media, reserves: reserves, flag: flag, authority: authority, cacheOwner: cacheOwner,
         pairedAdmission: fitPairedAdmission, promptContract: promptContract,
-        renderedContext: renderedContext, capturedSources: capturedContextSources)
+        renderedContext: capturedRenderedContext, capturedSources: capturedContextSources)
+      let context = fitted.context, renderedContext = fitted.renderedContext
+      let workingSources = fitted.capturedSources
+      let mediaIDs = Set(media.media.map { $0.reference.id })
+      let contextIDs = renderedContext.map { Set($0.bindings.map { $0.source.id }) }
+        ?? (context == capturedContext ? Set(graph.sources.map(\.id)) : [])
+      let suppliedIDs = contextIDs.union(mediaIDs)
+      let sources = capturedSourceIdentities.filter { suppliedIDs.contains($0.id) }
       let plans = fitted.plans
       try flag.check()
       try await self.revalidateResponseSources(graph.sources, attachments: attachmentSources, targetID: authority.target?.id)
@@ -1403,8 +1412,9 @@ private struct BoundedConsultationContext: Sendable {
           }
           let outputs = await runner.runIndependentText(requests)
           try await self.finishIndependentConsultationAnswers(Array(zip(receipts, outputs)),
-            chatID: chat.id, authority: authority, documentSources: try self.sourceReferences(for: graph.documents),
-            attachments: attachmentSources, flag: flag)
+            chatID: chat.id, authority: authority,
+            documentSources: try self.sourceReferences(for: graph.documents).filter { suppliedIDs.contains($0.id) },
+            attachments: attachmentSources.filter { suppliedIDs.contains($0.id) }, flag: flag)
           return
         }
         responses: for (offset, voice) in targets.enumerated() {
@@ -1416,16 +1426,25 @@ private struct BoundedConsultationContext: Sendable {
             plan = try ProductCore.prompt(voice: voice, history: fitted.history + round,
               instructions: instructions, context: context, request: request, routing: slugs,
               authority: authority, promptContract: promptContract,
-              renderedContext: renderedContext, capturedSources: capturedContextSources)
+              renderedContext: renderedContext, capturedSources: workingSources, workingTextBytes: fitted.workingTextBytes)
           } else { plan = plans[offset] }
           var responseAuthority = authority
+          responseAuthority.targetWindow = renderedContext?.bindings.first {
+            $0.source.id == authority.target?.id
+          }?.window
+          if renderedContext == nil, context != capturedContext, let target = authority.target {
+            responseAuthority.targetWindow = ContextTextWindow(digest: target.revision,
+              bytes: target.text.utf8.count, utf16: target.text.utf16.count, ranges: [])
+          }
           var sourceDocuments = graph.documents
+          var responseSourceIDs = suppliedIDs
           var previousAttemptID = replay?.previousAttemptID
           while true {
             try flag.check()
             try await self.revalidateResponseSources(try self.sourceReferences(for: sourceDocuments), attachments: attachmentSources, targetID: responseAuthority.target?.id)
             guard interaction == .ask || self.state.selectedDocument == document?.id else { throw BoomError.stale("Active document changed.") }
-            let attemptSources = try self.sourceReferences(for: sourceDocuments) + attachmentSources
+            let attemptSources = (try self.sourceReferences(for: sourceDocuments) + attachmentSources)
+              .filter { responseSourceIDs.contains($0.id) }
             let seed = UInt64.random(in: .min ... .max), vault = self.store.vault
             let attemptID = UUID()
             var receipt = ConsultationReceipt(operationID: flag.operationID, seed: seed, state: .pending,
@@ -1530,7 +1549,8 @@ private struct BoundedConsultationContext: Sendable {
               if issue == nil, let patch = parsed.edits.first, let base = responseAuthority.target,
                 let current = responseAuthority.capture?.modelSnapshot {
                 do { _ = try await detachedWork { try DocumentTools.validate(patch,
-                  grant: DocumentGrant(mode: interaction, snapshot: base), current: current) } }
+                  grant: DocumentGrant(mode: interaction, snapshot: base), current: current,
+                  targetWindow: capturedAuthority.targetWindow) } }
                 catch { issue = error.localizedDescription; refreshContext = current.revision != base.revision }
               }
             }
@@ -1542,8 +1562,8 @@ private struct BoundedConsultationContext: Sendable {
               do {
                 let completed = try await self.finishConsultationResponse(result.text, pending: pending,
                   chatID: chat.id, authority: responseAuthority,
-                  documentSources: try self.sourceReferences(for: sourceDocuments),
-                  attachments: attachmentSources, recovering: true)
+                  documentSources: try self.sourceReferences(for: sourceDocuments).filter { responseSourceIDs.contains($0.id) },
+                  attachments: attachmentSources.filter { responseSourceIDs.contains($0.id) }, recovering: true)
                 if completed.state == .failed {
                   issue = completed.failure
                   refreshContext = self.pagedSession?.generation != responseAuthority.capture?.generation
@@ -1578,7 +1598,8 @@ private struct BoundedConsultationContext: Sendable {
                 let refreshedDocuments = sourceDocuments, refreshedAuthority = responseAuthority
                 if promptContract == .referenceBindingsV3 {
                   let rendered = try await detachedWork {
-                    try DocumentTools.renderedContext(refreshedDocuments, attachments: capturedAttachments, authority: refreshedAuthority)
+                    try DocumentTools.renderedContext(refreshedDocuments, attachments: capturedAttachments, authority: refreshedAuthority,
+                      preferredDocumentID: chat.attachedDocumentID, omittedSources: refreshedGraph.omittedSources)
                   }
                   refreshedContext = rendered; fullContext = rendered.prompt
                   refreshedSources = refreshedGraph.promptSources
@@ -1608,6 +1629,16 @@ private struct BoundedConsultationContext: Sendable {
                   renderedContext: refreshedContext, capturedSources: refreshedSources)
                 guard let refreshedPlan = refreshed.plans.first else { throw BoomError.invalid("Missing captured response plan.") }
                 plan = refreshedPlan
+                let refreshedIDs = refreshed.renderedContext.map { Set($0.bindings.map { $0.source.id }) }
+                  ?? (refreshed.context == fullContext ? Set(refitSources.map(\.id)) : [])
+                responseSourceIDs = refreshedIDs.union(mediaIDs)
+                responseAuthority.targetWindow = refreshed.renderedContext?.bindings.first {
+                  $0.source.id == responseAuthority.target?.id
+                }?.window
+                if refreshed.renderedContext == nil, refreshed.context != fullContext, let target = responseAuthority.target {
+                  responseAuthority.targetWindow = ContextTextWindow(digest: target.revision,
+                    bytes: target.text.utf8.count, utf16: target.text.utf16.count, ranges: [])
+                }
               }
               continue
             }
@@ -1794,11 +1825,12 @@ private struct BoundedConsultationContext: Sendable {
         guard let document = authority.target, let capture = authority.capture, state.selectedDocument == capture.documentID else {
           throw BoomError.stale("The captured document is no longer open.")
         }
-        do { _ = try await detachedWork { try DocumentTools.validate(patch, grant: DocumentGrant(mode: authority.mode, snapshot: document), current: capture.modelSnapshot) } }
+        do { _ = try await detachedWork { try DocumentTools.validate(patch, grant: DocumentGrant(mode: authority.mode, snapshot: document), current: capture.modelSnapshot,
+          targetWindow: authority.targetWindow) } }
         catch { responseIssue = "No document changes: \(error.localizedDescription)"; answer = text }
         if responseIssue == nil {
           let proposal = StoredProposal(id: UUID(), chatID: chatID, messageID: pending.id,
-            patch: patch, document: document, capture: capture, documents: documentSources, attachments: attachments, status: "pending")
+            patch: patch, document: document, capture: capture, documents: documentSources, attachments: attachments, status: "pending", targetWindow: authority.targetWindow)
           state.proposals.append(proposal)
           try await flush()
           if authority.mode == .edit {
@@ -1855,7 +1887,8 @@ private struct BoundedConsultationContext: Sendable {
     }
     let document = capture.modelSnapshot
     let planned = try await detachedWork {
-      try DocumentTools.plan(proposal.patch, grant: DocumentGrant(mode: .propose, snapshot: document), current: document)
+      try DocumentTools.plan(proposal.patch, grant: DocumentGrant(mode: .propose, snapshot: document), current: document,
+        targetWindow: proposal.targetWindow)
     }
     if planned.1.isEmpty {
       if let index = state.proposals.firstIndex(where: { $0.id == proposal.id }) { state.proposals[index].status = "already present" }
@@ -3988,7 +4021,8 @@ extension WorkspaceModel {
   }
   private func captureChatContext(request: String, attachedDocumentID: UUID?,
     editingDocumentID: UUID?, flag: CancellationFlag) async throws -> BoundedConsultationContext {
-    var ordered: [BoundedDocumentCapture] = [], active = Set<UUID>(), complete = Set<UUID>(), charged = 0
+    var ordered: [BoundedDocumentCapture] = [], active = Set<UUID>(), followed = Set<UUID>()
+    var omitted = Set<UUID>(), charged = 0
     func resolve(_ title: String, id: UUID?) throws -> UUID {
       if let id { return id }
       let matches = documentIndices.filter { $0.title.compare(title, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame }
@@ -3997,27 +4031,38 @@ extension WorkspaceModel {
       }
       return match.id
     }
+    func capture(_ id: UUID, depth: Int) async throws -> BoundedDocumentCapture? {
+      try flag.check()
+      if let value = ordered.first(where: { $0.documentID == id }) { return value }
+      guard depth <= 8, ordered.count < 24, charged < 262_144 else {
+        omitted.insert(id); return nil
+      }
+      let start = id == editingDocumentID ? try pagedSession?.documentCoordinates().utf16Start : nil
+      let value = try await captureDocument(id, startingAtUTF16: start,
+        maximumBytes: min(PagedTextWindow.maximumBytes, 262_144 - charged))
+      charged += value.window.text.utf8.count
+      ordered.append(value); omitted.remove(id)
+      return value
+    }
     func visit(_ id: UUID, depth: Int) async throws {
       try flag.check()
       guard !active.contains(id) else { throw BoomError.invalid("Document-follow cycle.") }
-      if complete.contains(id) { return }
-      guard depth <= 8, complete.count + active.count < 24, charged < 262_144 else {
-        throw BoomError.budget("Linked context exceeds 24 sources / 256 KiB.")
-      }
+      if followed.contains(id) { return }
+      guard let value = try await capture(id, depth: depth) else { return }
       active.insert(id)
-      let start = id == editingDocumentID ? try pagedSession?.documentCoordinates().utf16Start : nil
-      let capture = try await captureDocument(id, startingAtUTF16: start,
-        maximumBytes: min(PagedTextWindow.maximumBytes, 262_144 - charged))
-      charged += capture.window.text.utf8.count
-      for link in try ReferenceParser.wiki(capture.window.text) {
+      for link in try ReferenceParser.wiki(value.window.text) {
         try await visit(resolve(link.title, id: link.documentID), depth: depth + 1)
       }
-      active.remove(id); complete.insert(id); ordered.append(capture)
+      active.remove(id); followed.insert(id)
     }
-    for id in [attachedDocumentID, editingDocumentID].compactMap({ $0 }) { try await visit(id, depth: 0) }
+    // The editing target and attached document precede optional link traversal.
+    let primary = [editingDocumentID, attachedDocumentID].compactMap { $0 }
+    for id in primary { _ = try await capture(id, depth: 0) }
+    for id in primary { try await visit(id, depth: 0) }
     for link in try ReferenceParser.wiki(request) { try await visit(resolve(link.title, id: link.documentID), depth: 0) }
-    return BoundedConsultationContext(captures: ordered)
+    return BoundedConsultationContext(captures: ordered, omittedSources: omitted.count)
   }
+
   func captureDocument(_ id: UUID, prefixAt caret: UInt64? = nil,
     startingAtUTF16 start: UInt64? = nil,
     maximumBytes: Int = PagedTextWindow.maximumBytes) async throws -> BoundedDocumentCapture {

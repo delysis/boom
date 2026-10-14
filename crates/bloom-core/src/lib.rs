@@ -356,6 +356,8 @@ pub struct ConsultationPlan {
     pub raw_prompt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_contract: Option<ConsultationPromptContract>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_window: Option<consultation::ConsultationWorkingWindow>,
 }
 #[derive(Serialize)]
 pub struct WireMessage {
@@ -701,6 +703,19 @@ pub enum Request {
         prompt_contract: Option<ConsultationPromptContract>,
         #[serde(default)]
         attachments: Vec<hashline::ReferenceAttachment>,
+        #[serde(default)]
+        body_bytes_limit: Option<usize>,
+        #[serde(default, rename = "preferredDocumentID")]
+        preferred_document_id: Option<Uuid>,
+        #[serde(default)]
+        omitted_sources: usize,
+    },
+    WindowReferenceContext {
+        rendered_context: hashline::RenderedReferenceContext,
+        authority: document::Authority,
+        captured_sources: Vec<hashline::ReferenceIdentity>,
+        body_bytes: usize,
+        maximum_sources: usize,
     },
     ValidateDocumentPatch {
         patch: document::Patch,
@@ -813,6 +828,8 @@ pub enum Request {
         rendered_context: Option<hashline::RenderedReferenceContext>,
         #[serde(default)]
         captured_sources: Vec<hashline::ReferenceIdentity>,
+        #[serde(default)]
+        working_text_bytes: Option<usize>,
     },
     CompileConsultationCompact {
         #[serde(default)]
@@ -829,6 +846,8 @@ pub enum Request {
         rendered_context: Option<hashline::RenderedReferenceContext>,
         #[serde(default)]
         captured_sources: Vec<hashline::ReferenceIdentity>,
+        #[serde(default)]
+        working_text_bytes: Option<usize>,
     },
     AuthoredPrefix {
         text: String,
@@ -936,6 +955,7 @@ struct ConsultationInput<'a> {
     prompt_contract: Option<ConsultationPromptContract>,
     rendered_context: Option<&'a hashline::RenderedReferenceContext>,
     captured_sources: &'a [hashline::ReferenceIdentity],
+    working_text_bytes: Option<usize>,
 }
 
 fn compact_with_authority(
@@ -955,9 +975,14 @@ fn compact_with_authority(
         )?;
         authority.instructions()?
     };
-    let instructions = format!("{}\n\n{policy}", input.instructions);
+    // Only authored prose slides. The fixed source/permission policy is never clipped.
+    let (authored, instructions_window) = match input.working_text_bytes {
+        Some(bytes) => hashline::window_text(input.instructions, bytes, false)?,
+        None => (input.instructions.to_owned(), None),
+    };
+    let instructions = format!("{authored}\n\n{policy}");
     let voices: Vec<_> = input.voices.iter().map(Option::as_ref).collect();
-    consultation::compile_with_contract(
+    consultation::compile_with_window(
         &voices,
         input.history,
         &instructions,
@@ -965,6 +990,8 @@ fn compact_with_authority(
         input.request,
         input.routing,
         input.prompt_contract,
+        input.working_text_bytes,
+        instructions_window,
     )
 }
 
@@ -983,6 +1010,7 @@ pub fn execute_for_transport(request: Request) -> Result<Value, ConsultationErro
             prompt_contract,
             rendered_context,
             captured_sources,
+            working_text_bytes,
         } => {
             let round = compact_with_authority(
                 &authority,
@@ -996,6 +1024,7 @@ pub fn execute_for_transport(request: Request) -> Result<Value, ConsultationErro
                     prompt_contract,
                     rendered_context: rendered_context.as_ref(),
                     captured_sources: &captured_sources,
+                    working_text_bytes,
                 },
             )?;
             serde_json::to_value(round).map_err(|error| Error(error.to_string()).into())
@@ -1124,9 +1153,13 @@ pub fn execute(request: Request) -> Result<Value, Error> {
             authority,
             prompt_contract,
             attachments,
+            body_bytes_limit,
+            preferred_document_id,
+            omitted_sources,
         } => {
             if prompt_contract == Some(ConsultationPromptContract::ReferenceBindingsV3) {
-                serde_json::to_value(hashline::context_v3(&documents, &attachments, &authority)?)
+                serde_json::to_value(hashline::context_v3_window(&documents, &attachments, &authority, body_bytes_limit, 32,
+                    preferred_document_id, omitted_sources)?)
             } else {
                 require(
                     attachments.is_empty(),
@@ -1134,6 +1167,9 @@ pub fn execute(request: Request) -> Result<Value, Error> {
                 )?;
                 serde_json::to_value(hashline::context(&documents, &authority)?)
             }
+        }
+        Request::WindowReferenceContext { rendered_context, authority, captured_sources, body_bytes, maximum_sources } => {
+            serde_json::to_value(rendered_context.windowed(&authority, &captured_sources, body_bytes, maximum_sources)?)
         }
         Request::PlanDocumentPatch {
             patch,
@@ -1227,6 +1263,7 @@ pub fn execute(request: Request) -> Result<Value, Error> {
             prompt_contract,
             rendered_context,
             captured_sources,
+            working_text_bytes,
         } => serde_json::to_value(
             compact_with_authority(
                 &authority,
@@ -1240,6 +1277,7 @@ pub fn execute(request: Request) -> Result<Value, Error> {
                     prompt_contract,
                     rendered_context: rendered_context.as_ref(),
                     captured_sources: &captured_sources,
+                    working_text_bytes,
                 },
             )
             .map_err(ConsultationError::into_legacy)?
@@ -1256,6 +1294,7 @@ pub fn execute(request: Request) -> Result<Value, Error> {
             prompt_contract,
             rendered_context,
             captured_sources,
+            working_text_bytes,
         } => serde_json::to_value(
             compact_with_authority(
                 &authority,
@@ -1269,6 +1308,7 @@ pub fn execute(request: Request) -> Result<Value, Error> {
                     prompt_contract,
                     rendered_context: rendered_context.as_ref(),
                     captured_sources: &captured_sources,
+                    working_text_bytes,
                 },
             )
             .map_err(ConsultationError::into_legacy)?,
@@ -1805,4 +1845,37 @@ mod tests {
         );
         Ok(())
     }
+    #[test]
+    fn working_prose_window_preserves_policy_and_original_request_and_voice() -> Result<(), Error> {
+        let voice = validate_voice(VoiceDraft { id: Uuid::new_v4(), slug: "reader".into(), name: "Reader".into(),
+            instructions: "Voice direction e\u{301}👩‍💻 ".repeat(2_000),
+            examples: vec![Exchange { user: "Earlier question ".repeat(2_000), assistant: "Earlier answer ".repeat(2_000) }] }, &[])?;
+        let request = format!("{}What about the harbor?", "Old question e\u{301}👩‍💻 ".repeat(2_000));
+        let instructions = "Authored instructions ".repeat(3_000);
+        let voice_before = serde_json::to_value(&voice).map_err(|e| Error(e.to_string()))?;
+        let compile = |bytes| {
+            let value = serde_json::json!({"op":"compile_consultation_compact", "authority":{"mode":"Ask","target":null},
+                "voices":[voice.clone()], "history":[], "instructions":instructions, "context":"", "request":request,
+                "routing":[], "workingTextBytes":bytes});
+            let request = serde_json::from_value(value).map_err(|e| Error(e.to_string()))?;
+            execute_for_transport(request).map_err(ConsultationError::into_legacy)
+        };
+        let value = compile(96)?;
+        let texts = value["texts"].as_array().ok_or_else(|| Error("Missing prompt pool.".into()))?;
+        let joined = texts.iter().filter_map(Value::as_str).collect::<String>();
+        assert!(joined.contains("What about the harbor?"));
+        assert!(joined.contains("Document permission: Ask (read only)"));
+        assert!(joined.len() < 4_096);
+        assert_eq!(value["workingWindow"]["request"]["digest"], digest(request.as_bytes()));
+        assert_eq!(value["workingWindow"]["request"]["bytes"], request.len());
+        assert_eq!(value["workingWindow"]["instructions"]["digest"], digest(instructions.as_bytes()));
+        assert_eq!(value["workingWindow"]["voices"][0]["revision"], voice.revision);
+        let zero = compile(0)?;
+        assert_eq!(zero["workingWindow"]["voices"][0]["omittedExamples"], 1);
+        assert_eq!(serde_json::to_value(&voice).map_err(|e| Error(e.to_string()))?, voice_before);
+        assert!(request.ends_with("What about the harbor?"));
+        assert_eq!(instructions.len(), "Authored instructions ".len() * 3_000);
+        Ok(())
+    }
+
 }
