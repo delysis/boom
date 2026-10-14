@@ -214,7 +214,7 @@ extension MLXGemmaRunner {
       if let failure = failures[row] { return .failure(failure) }
       return .success(Output(text: texts[row], tokenIDs: tokens[row],
         promptDigest: progress(row).promptDigest, promptTokens: cohort.rows[row].fullPromptTokenCount,
-        outputTokens: tokens[row].count, endedByEOS: stops[row].map(ends.contains) ?? false,
+        outputTokens: tokens[row].count, endedByEOS: stops[row] != nil,
         stopReason: reasons[row]!, stopTokenID: stops[row], firstTokenSeconds: first[row],
         elapsedSeconds: elapsed[row], executionPriority: Task.currentPriority.rawValue,
         executionOrigin: origins[row]))

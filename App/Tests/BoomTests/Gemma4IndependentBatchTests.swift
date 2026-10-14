@@ -278,8 +278,9 @@ struct Gemma4IndependentBatchTests {
                 suppressedTokenIDs: [], controlTokenIDs: [31], textDecoding: "checkpoint_raw_v1",
                 prefill: .init(chunking: "fixed_v1", tokenCeiling: 512))
             let seeds: [UInt64] = [7, 41, 151], journals = Journals()
-            func run(faults: Bool) async throws -> (MLXGemmaRunner.IndependentTextDecoded,
+            func run(faults: Bool, controlPolicy: ModelGenerationPolicy? = nil) async throws -> (MLXGemmaRunner.IndependentTextDecoded,
                 [MLXGemmaRunner.IndependentTextRequest], [GenerationExecutionOrigin]) {
+                let runPolicy = controlPolicy ?? policy
                 let parent = ProcessInfo.processInfo.environment["TMPDIR"].flatMap {
                     $0.hasPrefix("/") ? URL(fileURLWithPath: $0, isDirectory: true) : nil
                 }
@@ -288,11 +289,11 @@ struct Gemma4IndependentBatchTests {
                 let requests = prompts.indices.map { row in
                     let identity = GenerationIdentity(kind: .consultation, operationID: flags[row].operationID,
                         recordID: UUID(), attemptID: UUID(), model: "tiny-local-gemma4", seed: seeds[row],
-                        requestDigest: Digest.sha256("independent-question-\(row)"), maxTokens: 4, generationPolicy: policy)
+                        requestDigest: Digest.sha256("independent-question-\(row)"), maxTokens: 4, generationPolicy: runPolicy)
                     let owner = PromptCacheOwner(namespace: UUID(), entity: identity.recordID, route: .consultation)
                     return MLXGemmaRunner.IndependentTextRequest(identity: identity, owner: owner,
                         input: .raw("independent-question-\(row)"),
-                        settings: .init(temperature: 0.7, topP: 1, topK: 4, minP: 0), flag: flags[row], policy: policy,
+                        settings: .init(temperature: 0.7, topP: 1, topK: 4, minP: 0), flag: flags[row], policy: runPolicy,
                         onPrefill: { progress in
                             if faults && row == 0 && progress.processedPositions > 0 { flags[row].cancel() }
                         }, onCheckpoint: { progress, stop, token in
@@ -306,10 +307,10 @@ struct Gemma4IndependentBatchTests {
                     outputLimits: requests.map { $0.identity.maxTokens }, makeCache: { try model.newCache(parameters: nil) })
                 defer { cohort.discard() }
                 let origins = try MLXGemmaRunner.independentOrigins(requests: requests, preparedIDs: prompts,
-                    cohort: cohort, policy: policy)
+                    cohort: cohort, policy: runPolicy)
                 do {
                     let decoded = try await MLXGemmaRunner.decodeIndependentText(requests: requests, model: model,
-                        tokenizer: IDTokenizer(), cohort: cohort, origins: origins, policy: policy, flag: CancellationFlag())
+                        tokenizer: IDTokenizer(), cohort: cohort, origins: origins, policy: runPolicy, flag: CancellationFlag())
                     // The exact local CPU producer has returned. Join submitted
                     // arrays and real spill work before destroying their owner.
                     Stream.defaultStream.synchronize()
@@ -347,6 +348,24 @@ struct Gemma4IndependentBatchTests {
             let (baseline, _, _) = try await run(faults: false)
             let (faulted, requests, origins) = try await run(faults: true)
             #expect(try baseline.outputs[2].get().outputTokens > 0)
+            // Turn an actual first sampled peer token into a non-EOS control.
+            // The same real model, sampler and row seed must now stop before
+            // delivering it; the journal and returned Output must agree.
+            let control = try #require(try baseline.outputs[2].get().tokenIDs.first)
+            #expect(!policy.eosTokenIDs.contains(control))
+            let controlPolicy = ModelGenerationPolicy(schema: policy.schema,
+                vocabularySize: policy.vocabularySize, eosTokenIDs: policy.eosTokenIDs,
+                suppressedTokenIDs: policy.suppressedTokenIDs,
+                controlTokenIDs: (policy.controlTokenIDs + [control]).sorted(),
+                textDecoding: policy.textDecoding, prefill: policy.prefill)
+            let (controlled, controlledRequests, _) = try await run(faults: false, controlPolicy: controlPolicy)
+            let stopped = try controlled.outputs[2].get()
+            #expect(stopped.tokenIDs.isEmpty && stopped.outputTokens == 0 && stopped.text.isEmpty)
+            #expect(stopped.stopReason == "model_control" && stopped.stopTokenID == control)
+            #expect(stopped.endedByEOS) // Existing Output field covers all model stop controls.
+            let controlledJournal = try #require(await journals.value(controlledRequests[2].identity.attemptID))
+            #expect(controlledJournal.stopReason == stopped.stopReason && controlledJournal.stopTokenID == stopped.stopTokenID)
+            #expect(controlledJournal.progress.tokenIDs == stopped.tokenIDs)
             #expect(faulted.cancelled == [true, false, false])
             #expect(faulted.checkpointUncertain == [false, true, false])
             if case .failure(let error) = faulted.outputs[0] { #expect(error is CancellationError) }
