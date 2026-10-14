@@ -745,13 +745,18 @@ struct ChatPane: View {
         }
         if let role = model.authoredChatRole {
           HStack {
-            Text(role == .user ? "Writing a question" : "Writing an answer").font(.caption).foregroundStyle(.secondary)
+            Image(systemName: role == .user ? "bubble.left" : "bubble.left.fill")
+              .font(.caption).foregroundStyle(.secondary)
+              .help(role == .user ? "Writing a question" : "Writing an answer")
+              .accessibilityLabel(role == .user ? "Writing a question" : "Writing an answer")
             Spacer()
-            Button("Return to chat") { model.authoredChatRole = nil }.buttonStyle(.plain).font(.caption)
+            Button { model.authoredChatRole = nil } label: { Image(systemName: "arrow.uturn.backward") }
+              .buttonStyle(.plain).font(.caption).help("Return to chat").accessibilityLabel("Return to chat")
           }
         }
         if let issue = model.composerIssue {
-          Text(issue).font(.caption).foregroundStyle(.orange)
+          Image(systemName: "exclamationmark.circle").font(.caption).foregroundStyle(.orange)
+            .help(issue).accessibilityLabel("Composer issue").accessibilityValue(issue)
         }
         if model.settingUpModels {
           HStack(spacing: 8) { ProgressView().controlSize(.small).help(model.status); Spacer() }
