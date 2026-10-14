@@ -1676,6 +1676,115 @@ private final class LiveBackupCopyHold: @unchecked Sendable {
   }
 
 
+  /// Consumer component control: these supplied generation DTOs are not a
+  /// Runner/GPU claim. Actual Core-admitted journals, receipt IO, Model response
+  /// installation, shutdown and cold workspace reopen are exercised below.
+  func testIndependentEmptyEOSDeliveryFailsOnlyItsReplyAndColdReopenKeepsCompletedPeer() async throws {
+    let failures = testRun?.failureCount ?? 0
+    let url = try diagnosticRoot(), store = try WorkspaceStore(rootOverride: url)
+    let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    Self.failedModel = model
+    if model.selectedChat == nil { try model.newChat() }
+    let chat = try XCTUnwrap(model.selectedChat)
+    let policy = try ProductCore.generationPolicy(vocabularySize: 16,
+      configuration: Data(#"{"eos_token_id":1}"#.utf8), controls: [1], tokenizerEOS: 1)
+    let plans = try ["Empty fixture answer", "Unicode peer answer"].map {
+      try ProductCore.prompt(voice: nil, history: [], instructions: "", context: "", request: $0, routing: [])
+    }
+    let identities = plans.enumerated().map { row, plan in
+      GenerationIdentity(kind: .consultation, operationID: UUID(), recordID: UUID(), attemptID: UUID(),
+        model: "public-consumer-dto", seed: UInt64(17 + row), requestDigest: Digest.sha256(plan.rawPrompt),
+        maxTokens: 4, generationPolicy: policy)
+    }
+    let prompts = [Array(repeating: 2, count: 12), Array(repeating: 3, count: 10)]
+    let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
+    let geometry = try JSONDecoder().decode(PromptCacheGeometry.self,
+      from: Data(#"{"chunking":"remainder","tokenCeiling":512,"chunkStride":11}"#.utf8))
+    let rows = try identities.indices.map { row in
+      IndependentTextCohortOrigin.Row(operationID: identities[row].operationID,
+        attemptID: identities[row].attemptID, namespace: UUID(), recordID: identities[row].recordID,
+        requestDigest: identities[row].requestDigest, preparedTokenDigest: Digest.sha256(try encoder.encode(prompts[row])),
+        promptTokens: prompts[row].count, cachedTokens: 0, seed: identities[row].seed, outputLimit: 4,
+        samplingDigest: Digest.sha256("consumer-fixture-sampling"), cacheParentID: nil,
+        cacheHistoryDigest: Digest.sha256("[]"), cacheLengths: [0], cachePadding: [0])
+    }
+    let cohortID = UUID()
+    let origins = identities.indices.map { row in
+      GenerationExecutionOrigin(schema: 1, cacheAlgorithm: "independent-text-cohort-v1",
+        cachedPromptTokens: 0, cacheMissReason: "public_consumer_dto",
+        independentCohort: .init(schema: 1, cohortID: cohortID, row: row, rows: rows,
+          policyDigest: Digest.sha256("consumer-fixture-policy"), promptWidth: 12,
+          maskDigest: Digest.sha256("consumer-fixture-mask"), cacheWidths: [0], prefill: geometry))
+    }
+    let texts = ["", "Café 👩🏽‍💻 peer remains complete"], tokens = [[], [4, 5]]
+    let outputs = identities.indices.map { row in
+      MLXGemmaRunner.Output(text: texts[row], tokenIDs: tokens[row], promptDigest: rows[row].preparedTokenDigest,
+        promptTokens: prompts[row].count, outputTokens: tokens[row].count, endedByEOS: true,
+        stopReason: "eos", stopTokenID: 1, firstTokenSeconds: row == 0 ? nil : 0.01,
+        elapsedSeconds: 0.02, executionPriority: Task.currentPriority.rawValue, executionOrigin: origins[row])
+    }
+    var prepared: [(ConsultationReceipt, Result<MLXGemmaRunner.Output, Error>)] = []
+    var originalJournals: [Data] = []
+    for row in identities.indices {
+      let identity = identities[row], output = outputs[row]
+      var receipt = ConsultationReceipt(operationID: identity.operationID, seed: identity.seed, state: .pending,
+        failure: nil, model: identity.model, voice: nil, plan: plans[row], sources: [],
+        promptDigest: identity.requestDigest, tokenIDs: [], stopReason: "pending",
+        firstTokenSeconds: nil, elapsedSeconds: 0, generationPolicy: policy)
+      receipt.attemptID = identity.attemptID; receipt.responseID = identity.recordID
+      try store.vault.encode(receipt, kind: .receipt, id: identity.attemptID)
+      try store.vault.encode(receipt, kind: .receipt, id: identity.recordID)
+      try await store.checkpoint(.init(text: output.text, tokenIDs: output.tokenIDs,
+        promptDigest: output.promptDigest, promptTokens: output.promptTokens,
+        firstTokenSeconds: output.firstTokenSeconds, elapsedSeconds: output.elapsedSeconds,
+        executionOrigin: output.executionOrigin), identity: identity, stopReason: output.stopReason,
+        stopTokenID: output.stopTokenID)
+      originalJournals.append(try store.vault.get(.generationJournal, id: identity.attemptID))
+      let index = try XCTUnwrap(model.state.chats.firstIndex(where: { $0.id == chat.id }))
+      model.state.chats[index].messages.append(ChatMessage(id: identity.recordID, role: .assistant,
+        text: "", sources: [], state: .pending, provider: identity.model, speaker: Speaker(name: "Bloom")))
+      prepared.append((receipt, .success(output)))
+    }
+    let cancelled = CancellationFlag(); cancelled.cancel()
+    do {
+      try await model.finishIndependentConsultationAnswers(prepared, chatID: chat.id, authority: .readOnly,
+        documentSources: [], attachments: [], flag: cancelled)
+      XCTFail("Canceled shared delivery entered the consumer")
+    } catch is CancellationError {}
+    XCTAssertEqual(model.state.chats.first(where: { $0.id == chat.id })?.messages.suffix(2).map(\.state), [.pending, .pending])
+    try await model.finishIndependentConsultationAnswers(prepared, chatID: chat.id, authority: .readOnly,
+      documentSources: [], attachments: [], flag: CancellationFlag())
+    let received = try XCTUnwrap(model.state.chats.first(where: { $0.id == chat.id })).messages.suffix(2)
+    XCTAssertEqual(received.map(\.state), [.failed, .complete]); XCTAssertEqual(received.map(\.text), texts)
+    for row in identities.indices {
+      let identity = identities[row]
+      let receipt = try store.vault.decode(ConsultationReceipt.self, kind: .receipt, id: identity.recordID)
+      XCTAssertEqual(receipt.state, row == 0 ? .failed : .complete)
+      XCTAssertEqual(receipt.stopReason, "eos"); XCTAssertEqual(receipt.stopTokenID, 1)
+      XCTAssertEqual(receipt.tokenIDs, tokens[row]); XCTAssertEqual(receipt.executionOrigin, origins[row])
+      XCTAssertEqual(try store.vault.get(.generationJournal, id: identity.attemptID), originalJournals[row])
+    }
+    XCTAssertNil(model.selectedMLXRunner)
+    guard (testRun?.failureCount ?? 0) == failures else {
+      throw BoomError.invalid("Independent consumer assertions failed; original journals and live Model retained.")
+    }
+    try await joinedClose(model)
+    let reopened = try WorkspaceStore(rootOverride: url), persisted = try await reopened.loadState()
+    let restored = try XCTUnwrap(persisted.chats.first(where: { $0.id == chat.id })).messages.suffix(2)
+    XCTAssertEqual(restored.map(\.state), [.failed, .complete]); XCTAssertEqual(restored.map(\.text), texts)
+    for row in identities.indices {
+      let stored = try await reopened.generationCheckpoint(identity: identities[row])
+      let journal = try XCTUnwrap(stored)
+      XCTAssertEqual(journal.stopReason, "eos"); XCTAssertEqual(journal.stopTokenID, 1)
+      XCTAssertEqual(journal.progress.executionOrigin, origins[row])
+    }
+    try await reopened.releaseExclusiveWorkspace()
+    guard (testRun?.failureCount ?? 0) == failures else {
+      throw BoomError.invalid("Cold independent consumer assertions failed; files retained.")
+    }
+    try await removeJoinedScratch(url)
+  }
+
   func testStopDispositionsAcceptedIndependentQuestionsWithoutStartingQueuedGeneration() async throws {
     let failures = testRun?.failureCount ?? 0
     let url = try diagnosticRoot(), store = try WorkspaceStore(rootOverride: url)

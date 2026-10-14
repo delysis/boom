@@ -1334,7 +1334,6 @@ private struct BoundedConsultationContext: Sendable {
         try await self.flush()
         // Separate voices answer the same captured history independently.
         // Discussion rounds, document mutations, replay and media stay ordered.
-        var independent: [(ConsultationReceipt, Result<MLXGemmaRunner.Output, Error>)]?
         if interaction == .ask, style == .separate, replay == nil,
           images.isEmpty, media.media.isEmpty, targets.count > 1, let cacheOwner {
           let vault = self.store.vault, checkpointStore = self.store
@@ -1399,7 +1398,10 @@ private struct BoundedConsultationContext: Sendable {
               }))
           }
           let outputs = await runner.runIndependentText(requests)
-          independent = Array(zip(receipts, outputs))
+          try await self.finishIndependentConsultationAnswers(Array(zip(receipts, outputs)),
+            chatID: chat.id, authority: authority, documentSources: try self.sourceReferences(for: graph.documents),
+            attachments: attachmentSources, flag: flag)
+          return
         }
         responses: for (offset, voice) in targets.enumerated() {
           try flag.check()
@@ -1412,28 +1414,6 @@ private struct BoundedConsultationContext: Sendable {
               authority: authority, promptContract: promptContract,
               renderedContext: renderedContext, capturedSources: capturedContextSources)
           } else { plan = plans[offset] }
-          if let entry = independent?[offset], case .failure(let error) = entry.1 {
-            var receipt = entry.0
-            if let journal = try await self.store.consultationCheckpoint(id: replyIDs[offset], receipt: receipt) {
-              receipt.retain(journal)
-            }
-            receipt.state = error is CancellationError ? .cancelled : .failed
-            receipt.failure = error.localizedDescription; receipt.stopReason = receipt.state.rawValue
-            let failed = receipt, vault = self.store.vault
-            try await detachedWork {
-              if let attempt = failed.attemptID { try vault.encode(failed, kind: .receipt, id: attempt) }
-              try vault.encode(failed, kind: .receipt, id: replyIDs[offset])
-            }
-            if let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
-              let m = self.state.chats[c].messages.firstIndex(where: { $0.id == replyIDs[offset] }) {
-              self.state.chats[c].messages[m].state = receipt.state
-              self.state.chats[c].messages[m].failure = receipt.failure
-              if let journal = try await self.store.consultationCheckpoint(id: replyIDs[offset], receipt: receipt) {
-                self.state.chats[c].messages[m].text = journal.progress.text
-              }
-            }
-            continue responses
-          }
           var responseAuthority = authority
           var sourceDocuments = graph.documents
           var previousAttemptID = replay?.previousAttemptID
@@ -1442,14 +1422,13 @@ private struct BoundedConsultationContext: Sendable {
             try await self.revalidateResponseSources(try self.sourceReferences(for: sourceDocuments), attachments: attachmentSources, targetID: responseAuthority.target?.id)
             guard interaction == .ask || self.state.selectedDocument == document?.id else { throw BoomError.stale("Active document changed.") }
             let attemptSources = try self.sourceReferences(for: sourceDocuments) + attachmentSources
-            let seed = independent?[offset].0.seed ?? UInt64.random(in: .min ... .max), vault = self.store.vault
-            let attemptID = independent?[offset].0.attemptID ?? UUID()
+            let seed = UInt64.random(in: .min ... .max), vault = self.store.vault
+            let attemptID = UUID()
             var receipt = ConsultationReceipt(operationID: flag.operationID, seed: seed, state: .pending,
               failure: nil, model: provider, voice: voice, plan: plan, sources: attemptSources,
               promptDigest: Digest.sha256(plan.rawPrompt), tokenIDs: [], stopReason: "pending",
               firstTokenSeconds: nil, elapsedSeconds: 0, generationPolicy: executionPolicy)
             let replyID = replyIDs[offset]
-            if let prepared = independent?[offset].0 { receipt = prepared }
             receipt.media = media.media.isEmpty ? nil : media.media.map(\.reference)
             receipt.attemptID = attemptID; receipt.previousAttemptID = previousAttemptID; receipt.responseID = replyID
             let pendingReceipt = receipt
@@ -1480,8 +1459,7 @@ private struct BoundedConsultationContext: Sendable {
               runner: runner, policy: executionPolicy, operationID: flag.operationID)
             defer { self.finishJoinedRetentionRequest(joinedRetention) }
             let result: MLXGemmaRunner.Output
-            if let prepared = independent?[offset] { result = try prepared.1.get() }
-            else { result = try await runner.run(plan: plan, images: images, media: media.media, maxTokens: outputLimit,
+            result = try await runner.run(plan: plan, images: images, media: media.media, maxTokens: outputLimit,
               seed: seed, flag: flag, independentIdentity: generation, cacheOwner: cacheOwner, executionPolicy: executionPolicy,
               joinedRetention: joinedRetention,
               beforeCachePublication: { [weak self] in
@@ -1514,7 +1492,6 @@ private struct BoundedConsultationContext: Sendable {
                   }
                 }
               }
-            }
             receipt.promptDigest = result.promptDigest; receipt.tokenIDs = result.tokenIDs
             receipt.stopReason = result.stopReason; receipt.firstTokenSeconds = result.firstTokenSeconds
             receipt.stopTokenID = result.stopTokenID
@@ -1678,6 +1655,78 @@ private struct BoundedConsultationContext: Sendable {
         self.composerIssue = flag.isCancelled ? nil : "Bloom couldn't finish this answer. You can try again."
         self.status = flag.isCancelled ? "Cancelled" : "Answer interrupted"
       }
+  }
+  /// Receive already joined separate-answer rows without letting one empty
+  /// delivery rewrite another row's actual completed journal or response.
+  func finishIndependentConsultationAnswers(
+    _ prepared: [(ConsultationReceipt, Result<MLXGemmaRunner.Output, Error>)],
+    chatID: UUID, authority: CapturedDocumentAuthority,
+    documentSources: [SourceReference], attachments: [SourceReference], flag: CancellationFlag
+  ) async throws {
+    guard authority.mode == .ask else { throw BoomError.invalid("Independent answers require read-only authority.") }
+    for (original, result) in prepared {
+      try flag.check()
+      try await revalidateResponseSources(documentSources, attachments: attachments, targetID: authority.target?.id)
+      guard let replyID = original.responseID, let attemptID = original.attemptID else {
+        throw BoomError.stale("The independent answer lost its original attempt.")
+      }
+      func pendingPosition() throws -> (Int, Int) {
+        guard let chat = state.chats.firstIndex(where: { $0.id == chatID }),
+          let index = state.chats[chat].messages.firstIndex(where: { $0.id == replyID && $0.state == .pending }) else {
+          throw BoomError.stale("The pending independent response disappeared.")
+        }
+        return (chat, index)
+      }
+      _ = try pendingPosition()
+      var receipt = original
+      var failure: Error?
+      switch result {
+      case .failure(let error):
+        failure = error
+        if let journal = try await store.consultationCheckpoint(id: replyID, receipt: receipt) {
+          receipt.retain(journal)
+          receipt.stopReason = journal.stopReason ?? (error is CancellationError ? "cancelled" : "failed")
+        } else { receipt.stopReason = error is CancellationError ? "cancelled" : "failed" }
+      case .success(let output):
+        receipt.promptDigest = output.promptDigest; receipt.tokenIDs = output.tokenIDs
+        receipt.stopReason = output.stopReason; receipt.stopTokenID = output.stopTokenID
+        receipt.firstTokenSeconds = output.firstTokenSeconds; receipt.elapsedSeconds = output.elapsedSeconds
+        receipt.executionOrigin = output.executionOrigin
+        if output.text.isEmpty { failure = BoomError.unavailable("The model ended before producing an answer.") }
+        else {
+          let emitted = receipt, vault = store.vault
+          try await detachedWork {
+            try vault.encode(emitted, kind: .receipt, id: attemptID)
+            try vault.encode(emitted, kind: .receipt, id: replyID)
+          }
+          let (chat, index) = try pendingPosition()
+          state.chats[chat].messages[index].text = output.text
+          let pending = state.chats[chat].messages[index]
+          try flag.check()
+          try await revalidateResponseSources(documentSources, attachments: attachments, targetID: authority.target?.id)
+          let message = try await finishConsultationResponse(output.text,
+            pending: pending, chatID: chatID, authority: authority,
+            documentSources: documentSources, attachments: attachments)
+          receipt.state = message.state; receipt.failure = message.failure
+          status = "Local answer · \(output.promptTokens) prompt tokens"
+        }
+      }
+      if let failure {
+        receipt.state = failure is CancellationError ? .cancelled : .failed
+        receipt.failure = failure.localizedDescription
+        let journal = try await store.consultationCheckpoint(id: replyID, receipt: receipt)
+        let (chat, index) = try pendingPosition()
+        state.chats[chat].messages[index].state = receipt.state
+        state.chats[chat].messages[index].failure = receipt.failure
+        if let journal { state.chats[chat].messages[index].text = journal.progress.text }
+      }
+      let finished = receipt, vault = store.vault
+      try await detachedWork {
+        try vault.encode(finished, kind: .receipt, id: attemptID)
+        try vault.encode(finished, kind: .receipt, id: replyID)
+      }
+      try await flush()
+    }
   }
   private func startPendingConsultations() {
     guard !isBusy, !pagedShutdownRequested, !pendingConsultations.isEmpty else { return }
