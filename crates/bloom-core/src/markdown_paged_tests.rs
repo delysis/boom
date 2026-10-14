@@ -3982,7 +3982,10 @@ fn actual_reference_subtree_choices_use_pinned_first_definitions_and_image_excep
             "node={node:?}: exact consumed source"
         );
         assert_eq!(actual.is_image(), image, "node={node:?}: accepted kind");
-        assert!(actual.referenced(), "node={node:?}: actual reference access");
+        assert!(
+            actual.referenced(),
+            "node={node:?}: actual reference access"
+        );
         assert_eq!(
             actual.ending(),
             if node.ends_with(')') { ')' } else { ']' },
@@ -4074,7 +4077,8 @@ fn actual_reference_subtree_choices_use_pinned_first_definitions_and_image_excep
         "plain ".repeat(7000)
     );
     assert!(
-        text.find(body).expect("actual collapsed continuation") > pulldown_cmark::paged::PROBE_BYTES
+        text.find(body).expect("actual collapsed continuation")
+            > pulldown_cmark::paged::PROBE_BYTES
     );
     let anchor = text[..text.find(body).expect("actual collapsed continuation")]
         .encode_utf16()
@@ -4146,7 +4150,8 @@ fn actual_same_builder_indexes_later_definitions_before_resolving_long_paragraph
             let body_start = text.find(body).expect("actual dependent source") as u64;
             let paragraph_end = text.find("\n\n# Outside").expect("actual paragraph end") as u64;
             assert!(
-                view.window.start <= body_start && body_start < view.window.end
+                view.window.start <= body_start
+                    && body_start < view.window.end
                     && view.window.end <= paragraph_end,
                 "pending-only window {:?} must contain body {body_start} and stop within paragraph {paragraph_end}",
                 view.window

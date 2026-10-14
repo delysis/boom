@@ -558,9 +558,9 @@ impl LogicalSnapshot {
         if let Some(index) = self.markup_index(mode) {
             return Ok(Some(index));
         }
-        Ok(self.previous_markup(mode)?.filter(|index| {
-            index.source.id == self.id() && index.source.summary == self.summary()
-        }))
+        Ok(self
+            .previous_markup(mode)?
+            .filter(|index| index.source.id == self.id() && index.source.summary == self.summary()))
     }
     pub(super) fn previous_markup(
         &self,

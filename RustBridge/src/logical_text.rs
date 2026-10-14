@@ -1256,9 +1256,16 @@ pub unsafe extern "C" fn bloom_logical_markup_begin(
             if window.value.text().len() > bloom_text::NATIVE_WINDOW_BYTES {
                 return Err(Error::Invalid("markup window budget"));
             }
-            let end = window.value.start().bytes.checked_add(window.value.local_summary().bytes)
+            let end = window
+                .value
+                .start()
+                .bytes
+                .checked_add(window.value.local_summary().bytes)
                 .ok_or(Error::Invalid("markup window endpoint"))?;
-            let indexed = window.value.snapshot().captured_markup_prefix(mode)?
+            let indexed = window
+                .value
+                .snapshot()
+                .captured_markup_prefix(mode)?
                 .filter(|index| index.indexed_summary().bytes >= end);
             let queried_prefix = indexed.as_ref().is_some_and(|index| !index.complete());
             let query = indexed
