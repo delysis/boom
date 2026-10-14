@@ -115,7 +115,7 @@ final class NativeTextScrollView: NSScrollView {
     if attachmentViewport {
       reader.isAttachmentViewport = true
       reader.isVerticallyResizable = true
-      reader.maxSize = NSSize(width: .greatestFiniteMagnitude, height: .greatestFiniteMagnitude)
+      reader.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
       reader.autoresizingMask = [.width]
       reader.textContainer?.widthTracksTextView = true
       reader.layoutManager?.allowsNonContiguousLayout = true
@@ -226,7 +226,7 @@ final class NativeReadingTextView: NativeMediaTextView {
     setFrameSize(NSSize(width: width, height: max(frame.height, maximum)))
     let viewport = NSRect(x: 0, y: 0, width: width, height: maximum)
     layout.ensureLayout(forBoundingRect: viewport, in: container)
-    guard layout.firstUnlaidCharacterIndex >= storage.length else { return maximum }
+    guard layout.firstUnlaidCharacterIndex() >= storage.length else { return maximum }
     // All source is already laid. Read ALL laid glyph geometry, not just
     // glyphs intersecting the top rectangle: a previously scrolled long
     // document without a final newline must still retain its capped card.

@@ -617,7 +617,7 @@ final class InlineMediaTests: XCTestCase {
       // the already-complete branch, not merely a still-unlaid suffix. Call
       // the real helper directly so the item's width cache cannot mask it.
       readingLayout.ensureLayout(for: readingContainer)
-      XCTAssertGreaterThanOrEqual(readingLayout.firstUnlaidCharacterIndex, longScroll.reader.string.utf16.count)
+      XCTAssertGreaterThanOrEqual(readingLayout.firstUnlaidCharacterIndex(), longScroll.reader.string.utf16.count)
       XCTAssertGreaterThan(readingLayout.usedRect(for: readingContainer).maxY, 480)
       let revisitedHeight = longScroll.reader.boundedAttachmentHeight(at: longScroll.reader.frame.width, maximum: 480)
       XCTAssertEqual(revisitedHeight, 480,
