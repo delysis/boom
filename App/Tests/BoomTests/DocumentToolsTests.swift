@@ -346,4 +346,79 @@ final class DocumentToolsTests: XCTestCase {
         patch, grant: DocumentGrant(mode: .edit, snapshot: original), current: original
       ).text, "<aside>New</aside>")
   }
+  func testAutomaticReferenceWindowKeepsOriginalSourceAndPlanProvenance() throws {
+    let original = String(String(repeating: "Public harbor line.\n", count: 5_000).prefix(82_600))
+    let document = DocumentSnapshot(title: "Public 82K", text: original)
+    let captured = try DocumentTools.renderedContext([document], attachments: [], authority: .readOnly,
+      preferredDocumentID: document.id, omittedSources: 7)
+    let windowed = try DocumentTools.windowedContext(captured, authority: .readOnly,
+      capturedSources: captured.bindings.map(\.source), bodyBytes: 4_096, maximumSources: 1)
+    let binding = try XCTUnwrap(windowed.bindings.first)
+    let window = try XCTUnwrap(binding.window)
+    XCTAssertEqual(binding.source.id, document.id)
+    XCTAssertEqual(binding.source.digest, document.revision)
+    XCTAssertEqual(window.digest, document.revision)
+    XCTAssertEqual(window.bytes, 82_600)
+    XCTAssertLessThanOrEqual(window.ranges.reduce(0) { $0 + $1.end - $1.start }, 4_096)
+    XCTAssertEqual(windowed.omittedSources, 7)
+    XCTAssertNotNil(binding.originalUTF8Hex)
+    let question = String(repeating: "Earlier question e\u{301}👩‍💻 ", count: 2_000) + "Which line mentions the harbor?"
+    let plan = try ProductCore.prompt(voice: nil, history: [],
+      instructions: String(repeating: "Authored guidance. ", count: 2_000), context: windowed.prompt,
+      request: question, routing: [], promptContract: .referenceBindingsV3,
+      renderedContext: windowed, capturedSources: windowed.bindings.map(\.source), workingTextBytes: 96)
+    let requestWindow = try XCTUnwrap(plan.workingWindow?.request)
+    XCTAssertEqual(requestWindow.digest, Digest.sha256(question))
+    XCTAssertEqual(requestWindow.bytes, question.utf8.count)
+    XCTAssertEqual(requestWindow.ranges.last?.end, question.utf8.count)
+    XCTAssertTrue(plan.rawPrompt.contains("Which line mentions the harbor?"))
+    XCTAssertTrue(plan.rawPrompt.contains("Document permission: Ask (read only)"))
+    XCTAssertFalse(plan.rawPrompt.contains(question))
+    let reopened = try JSONDecoder().decode(ConsultationPlan.self, from: JSONEncoder().encode(plan))
+    XCTAssertEqual(reopened.workingWindow?.request?.digest, requestWindow.digest)
+    XCTAssertEqual(reopened.rawPrompt, plan.rawPrompt)
+    XCTAssertEqual(document.text, original)
+    XCTAssertEqual(original.utf8.count, 82_600)
+  }
+
+  func testFittedTargetScopeSurvivesProposalCodingAndApplication() throws {
+    let empty = DocumentSnapshot(title: "Empty", text: "")
+    let emptyAuthority = CapturedDocumentAuthority(mode: .edit, target: empty)
+    let renderedEmpty = try DocumentTools.renderedContext([empty], attachments: [], authority: emptyAuthority)
+    XCTAssertNil(try XCTUnwrap(renderedEmpty.bindings.first).window)
+    let tag = try XCTUnwrap(renderedEmpty.target?.tag)
+    let append = try DocumentTools.response("```hashline\n\(tag)\nPUT >$:\n+First line\n```", authority: emptyAuthority)
+    XCTAssertNil(append.issue)
+    let appendPatch = try XCTUnwrap(append.edits.first)
+    XCTAssertEqual(try DocumentTools.apply(appendPatch,
+      grant: DocumentGrant(mode: .edit, snapshot: empty), current: empty).text, "First line")
+
+    let text = (1...10).map { String(format: "Line%02d ", $0) + String(repeating: "x", count: 44) + "\n" }.joined()
+    let document = DocumentSnapshot(title: "Windowed target", text: text)
+    var authority = CapturedDocumentAuthority(mode: .propose, target: document)
+    let captured = try DocumentTools.renderedContext([document], attachments: [], authority: authority)
+    let rendered = try DocumentTools.windowedContext(captured, authority: authority,
+      capturedSources: captured.bindings.map(\.source), bodyBytes: 160, maximumSources: 1)
+    let scope = try XCTUnwrap(rendered.bindings.first?.window)
+    authority.targetWindow = scope
+    let currentTag = try XCTUnwrap(rendered.target?.tag)
+    let response = try DocumentTools.response("```hashline\n\(currentTag)\nCUT 5\n```", authority: authority)
+    XCTAssertNotNil(response.issue)
+    XCTAssertTrue(response.edits.isEmpty)
+    let forbidden = patch(document, [Replacement(old: "Line05", new: "Hidden edit")])
+    let proposal = StoredProposal(id: UUID(), chatID: UUID(), messageID: UUID(), patch: forbidden,
+      document: document, documents: [], attachments: [], status: "pending", targetWindow: scope)
+    let restored = try JSONDecoder().decode(StoredProposal.self, from: JSONEncoder().encode(proposal))
+    XCTAssertEqual(restored.targetWindow?.digest, document.revision)
+    XCTAssertThrowsError(try DocumentTools.plan(restored.patch,
+      grant: DocumentGrant(mode: .propose, snapshot: document), current: document,
+      targetWindow: restored.targetWindow))
+    let visible = patch(document, [Replacement(old: "Line01", new: "Visible edit")])
+    let changed = try DocumentTools.apply(visible, grant: DocumentGrant(mode: .edit, snapshot: document),
+      current: document, targetWindow: scope)
+    XCTAssertTrue(changed.text.hasPrefix("Visible edit "))
+    XCTAssertTrue(changed.text.contains("Line05"))
+    XCTAssertEqual(document.text, text)
+  }
+
 }
