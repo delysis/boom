@@ -433,7 +433,7 @@ import Foundation
     guard observed.inputLease.isFirstResponder, observed.inputLease.isKeyWindow else {
       throw BoomError.stale("Undo requires its actual focused document client.")
     }
-    let ticket = try input.session.prepareLogicalRestore(entry.snapshot,
+    let ticket = try input.session.prepareResidentLogicalRestore(entry.snapshot,
       seed: seed, selection: entry.cursor, owner: input)
     do { try advance(entry, ticket: ticket, observed: observed) }
     catch {
@@ -510,7 +510,7 @@ import Foundation
         throw BoomError.stale("Undo requires its actual focused document client.")
       }
       if let seed = entry.seed, seed.containsFocusUTF16(entry.cursor.selection.focusUTF16) {
-        let ticket = try input.session.prepareLogicalRestore(entry.snapshot,
+        let ticket = try input.session.prepareResidentLogicalRestore(entry.snapshot,
           seed: seed, selection: entry.cursor, owner: input)
         do { try advance(entry, ticket: ticket, observed: observed) }
         catch {
@@ -694,7 +694,7 @@ import Foundation
 
   private func preserveUnreplayableInput(_ error: Error) {
     guard !queue.isEmpty else { return }
-    precondition(queue.count + refusedInput.count <= Self.maximumQueuedEntries,
+    precondition(queue.count + refusedInput.count <= Self.maximumQueuedEntries &&
       retainedInputBytes <= Self.maximumRawKeyBytes)
     if refusedInputFailure == nil { refusedInputFailure = error }
     refusedInput.append(contentsOf: queue)

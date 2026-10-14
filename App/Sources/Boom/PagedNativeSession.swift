@@ -354,7 +354,7 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
     return try prepare(window: window, selection: working.currentCursor.selection, cursor: working.currentCursor,
       before: logicalWindow.snapshot, kind: .navigation, owner: owner)
   }
-  func prepareLogicalRestore(_ target: PagedNativeLogicalSnapshot, seed: PagedNativeLogicalWindowSeed,
+  func prepareResidentLogicalRestore(_ target: PagedNativeLogicalSnapshot, seed: PagedNativeLogicalWindowSeed,
     selection: PagedNativeLogicalCursor, owner: PagedNativeInputOwner) throws -> PagedNativeNavigationInstallationTicket {
     guard seed.snapshot.isSame(target), seed.containsFocusUTF16(selection.selection.focusUTF16), target.sessionID == sessionID,
       target.engineIncarnation == engineIncarnation else { throw BoomError.stale("Undo seed has another exact retained source.") }
@@ -365,7 +365,7 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
   func prepareLogicalRestore(_ target: PagedNativeLogicalSnapshot, seed: PagedNativeLogicalWindowSeed?,
     selection: PagedNativeLogicalCursor, owner: PagedNativeInputOwner) async throws -> PagedNativeNavigationInstallationTicket {
     if let seed, seed.containsFocusUTF16(selection.selection.focusUTF16) {
-      return try prepareLogicalRestore(target, seed: seed, selection: selection, owner: owner)
+      return try prepareResidentLogicalRestore(target, seed: seed, selection: selection, owner: owner)
     }
     let read = try captureLogicalRead()
     let operation = try beginNavigation(); defer { navigationOperations.remove(operation) }
@@ -454,15 +454,17 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
     adopting = true
     defer { adopting = false }
     var consumed = false
-    consuming {
-      precondition(!consumed)
-      consumed = true
-      if !window.snapshot.isSame(ticket.before) { source.installPrepared(window.snapshot) }
-      working.installPrepared(window: window, arenaID: ticket.provisionalArenaID,
-        generation: next, cursor: ticket.cursor)
-      ticket.state = .consumed; stage = nil
-      ticket.sourceTransfer?(); ticket.sourceTransfer = nil
-      installing(window, ticket.provisionalArenaID, ticket.localSelection)
+    withoutActuallyEscaping(installing) { temporaryInstalling in
+      consuming {
+        precondition(!consumed)
+        consumed = true
+        if !window.snapshot.isSame(ticket.before) { source.installPrepared(window.snapshot) }
+        working.installPrepared(window: window, arenaID: ticket.provisionalArenaID,
+          generation: next, cursor: ticket.cursor)
+        ticket.state = .consumed; stage = nil
+        ticket.sourceTransfer?(); ticket.sourceTransfer = nil
+        temporaryInstalling(window, ticket.provisionalArenaID, ticket.localSelection)
+      }
     }
     precondition(consumed, "Actual Foundation target must consume its prepared source")
     ticket.releaseBacking()
@@ -665,7 +667,7 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
       do {
         if generation > sealedGeneration {
           if !expeditingSave {
-            let delay = Task { try? await Task.sleep(nanoseconds: 75_000_000) }
+            let delay = Task<Void, Never> { _ = try? await Task.sleep(nanoseconds: 75_000_000) }
             saveDelay = delay; await delay.value; saveDelay = nil
           }
           guard characterDepth == 0, !isPinned, !adopting, !notifyingGroup, !hookTransition else { return latest }

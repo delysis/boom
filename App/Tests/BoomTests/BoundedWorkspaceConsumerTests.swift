@@ -343,7 +343,9 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
     try viewport.requestScroll(toUTF16: imported.document.revision.summary.utf16 - 16)
     try await viewport.joinPresentation()
     let tail = try XCTUnwrap(viewport.visibleScrollWindow)
-    XCTAssertEqual(tail.revision, imported.document.revision)
+    XCTAssertEqual(tail.snapshot.sourceRevision, imported.document.revision)
+    let logicalSource = try XCTUnwrap(model.pagedSession).captureLogicalRead().source
+    XCTAssertTrue(tail.snapshot.isSame(logicalSource))
     XCTAssertLessThanOrEqual(tail.text.utf8.count, 16_384)
     try viewport.selectVisibleUTF16(0)
     let commands = try XCTUnwrap(model.pagedCommands)
@@ -352,7 +354,7 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
     try viewport.requestScroll(toUTF16: imported.document.revision.summary.utf16 - 16)
     try await viewport.joinPresentation()
     let extensionWindow = try XCTUnwrap(viewport.visibleScrollWindow)
-    XCTAssertEqual(extensionWindow.utf16Start, clicked.utf16Offset)
+    XCTAssertEqual(extensionWindow.start.utf16, clicked.utf16Offset)
     try viewport.selectVisibleUTF16(3, extending: true)
     try await commands.joinPendingCommand()
     let extended = try XCTUnwrap(model.pagedInput).currentDocumentSelection()
@@ -635,11 +637,11 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
     // converting that cluster, paragraph or document into a larger String.
     let nfdStart = edgeStart + 4, nfdEnd = nfdStart + 2, zwjEnd = nfdEnd + UInt64("👩🏽‍💻".utf16.count)
     let session = try XCTUnwrap(model.pagedSession)
-    let logical = try session.captureLogicalRead()
-    let fullNFD = try await session.logicalGraphemeBoundary(logical, atNativeUTF16: nfdStart + 1, forward: true).utf16
-    let fullZWJ = try await session.logicalGraphemeBoundary(logical, atNativeUTF16: nfdEnd + 2, forward: true).utf16
-    let fullNFDStart = try await session.logicalGraphemeBoundary(logical, atNativeUTF16: nfdStart + 1, forward: false).utf16
-    let fullZWJStart = try await session.logicalGraphemeBoundary(logical, atNativeUTF16: nfdEnd + 2, forward: false).utf16
+    let logicalRead = try session.captureLogicalRead()
+    let fullNFD = try await session.logicalGraphemeBoundary(logicalRead, atNativeUTF16: nfdStart + 1, forward: true).utf16
+    let fullZWJ = try await session.logicalGraphemeBoundary(logicalRead, atNativeUTF16: nfdEnd + 2, forward: true).utf16
+    let fullNFDStart = try await session.logicalGraphemeBoundary(logicalRead, atNativeUTF16: nfdStart + 1, forward: false).utf16
+    let fullZWJStart = try await session.logicalGraphemeBoundary(logicalRead, atNativeUTF16: nfdEnd + 2, forward: false).utf16
     XCTAssertEqual(fullNFD, nfdEnd); XCTAssertEqual(fullZWJ, zwjEnd)
     XCTAssertEqual(fullNFDStart, nfdStart); XCTAssertEqual(fullZWJStart, nfdEnd)
     XCTAssertEqual(model.pagedSelectedRecord, record)
@@ -874,7 +876,7 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
       let opened = try await Task.detached { try PagedClipboardTextFile.Opened(url: source) }.value
       let output: PagedTextCustodiedValue<PagedTextImportedRevision>
       do {
-        output = try await engine.importUTF8Retaining(documentID: record.document.id, from: opened.file,
+        output = try await engine.importUTF8Retaining(documentID: record.source.sourceRevision.documentID, from: opened.file,
           expectedBytes: opened.expectedBytes, priority: .foreground)
       } catch {
         let original = error

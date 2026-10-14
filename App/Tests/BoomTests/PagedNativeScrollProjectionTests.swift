@@ -317,9 +317,10 @@ private struct ScrollClickJoinFailure: Error, LocalizedError {
           throw BoomError.unavailable("The actual public writer body did not enter.")
         }
         view.setSelectedRange(NSRange(location: 4, length: 0))
+        let beforeGeneration = session.generation
         view.insertText("X", replacementRange: view.selectedRange())
         let accepted = session.generation, arena = session.arenaID
-        XCTAssertGreaterThan(accepted, opening.history.scope.coveredSequence)
+        XCTAssertEqual(accepted, beforeGeneration + 1)
         XCTAssertLessThan(session.localUTF16Count, 30_000)
         XCTAssertEqual(session.sealedRevision, original.document.revision)
         // Actual global anchor lies beyond the native island; focus is local.

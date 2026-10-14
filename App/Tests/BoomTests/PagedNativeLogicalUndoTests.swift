@@ -9,6 +9,12 @@ private struct LogicalUndoCleanupFailure: Error {
   let cleanup: Error
 }
 
+/// A deliberately failed forwarding reply AFTER the real file backend has
+/// committed and installed its original output. This is not an IO fault.
+private struct LogicalSaveDeliveryFailure: Error, Equatable {
+  let publicationID: UUID
+}
+
 @MainActor private final class LogicalUndoDuringCharacters: NSObject, NSTextStorageDelegate {
   weak var view: PagedNativeTextView?
   private(set) var delivered = false
@@ -32,8 +38,10 @@ private actor LogicalUndoDelivery: PagedNativeLogicalSessionStorage {
   private var publicationWaiter: CheckedContinuation<Void, Never>?
   private var readReleased = false
   private var publicationReleased = false
+  private var failingNextPublicationReply = false
   private(set) var readReturns = 0
   private(set) var publicationReturns = 0
+  private(set) var resumeCalls = 0
   init(_ backend: PagedNativeStorageBackend) {
     self.backend = backend; engineIncarnation = backend.engineIncarnation
   }
@@ -44,6 +52,10 @@ private actor LogicalUndoDelivery: PagedNativeLogicalSessionStorage {
   func holdPublication(_ signal: @escaping @MainActor @Sendable () -> Void) {
     precondition(publicationSignal == nil && publicationWaiter == nil)
     publicationReleased = false; publicationSignal = signal
+  }
+  func failNextPublicationReply() throws {
+    guard !failingNextPublicationReply else { throw BoomError.invalid("An actual publication reply already has its one-shot failure.") }
+    failingNextPublicationReply = true
   }
   func release() {
     readReleased = true; publicationReleased = true
@@ -81,19 +93,23 @@ private actor LogicalUndoDelivery: PagedNativeLogicalSessionStorage {
     try backend.prepareImportedSourceTransfer(imported, sessionID: sessionID)
   }
   func publishLogical(_ publication: PagedNativeLogicalPublication) async throws -> PagedNativeCommitAcknowledgement {
+    let failReply = failingNextPublicationReply
+    failingNextPublicationReply = false
     let result = try await backend.publishLogical(publication)
     publicationReturns += 1
     if let signal = publicationSignal {
       publicationSignal = nil; await signal()
       if !publicationReleased { await withCheckedContinuation { publicationWaiter = $0 } }
     }
+    if failReply { throw LogicalSaveDeliveryFailure(publicationID: publication.publicationID) }
     return result
   }
   func finishLogicalPublication(_ acknowledgement: PagedNativeCommitAcknowledgement) async throws {
     try await backend.finishLogicalPublication(acknowledgement)
   }
   func resumeLogicalPublication(_ publication: PagedNativeLogicalPublication) async throws -> PagedNativeCommitAcknowledgement {
-    try await backend.resumeLogicalPublication(publication)
+    resumeCalls += 1
+    return try await backend.resumeLogicalPublication(publication)
   }
 }
 
@@ -256,6 +272,107 @@ private actor LogicalUndoDelivery: PagedNativeLogicalSessionStorage {
       XCTAssertEqual(session.arenaID, arena)
       XCTAssertTrue(try session.captureLogicalState().source.isSame(live.source))
       XCTAssertEqual(f.view.string, "aXbc")
+    }
+  }
+  /// Real Backend publications and receiving, with an injected forwarding
+  /// reply failure only. It exercises the explicit Session retry API; it does
+  /// not qualify disk IO failure recovery or the packaged Save menu action.
+  func testFailedActualPublicationReplyKeepsTypingAndResponderUndoLiveAndOnlyExactSaveIdentityCanRetry() async throws {
+    try await run { f in
+      let session = f.session!, input = f.input!, commands = f.commands!, route = f.route!
+      let engine = f.engine!, originalRecord = session.sealedRootRecord
+      try await route.failNextPublicationReply()
+      try input.setDocumentSelection(PagedNativeNavigationSelection(utf16Offset: 1, utf16Length: 0))
+      f.view.insertText("X", replacementRange: f.view.selectedRange())
+      let firstGeneration = session.generation
+      do {
+        _ = try await session.flushRecord(through: firstGeneration)
+        XCTFail("The actual saver must expose its injected failed forwarding reply.")
+      } catch { guard error is LogicalSaveDeliveryFailure else { throw error } }
+      await session.joinPendingSave()
+      let firstID = try XCTUnwrap(session.failedSaveIdentity)
+      XCTAssertEqual(session.persistenceFailure as? LogicalSaveDeliveryFailure,
+        LogicalSaveDeliveryFailure(publicationID: firstID))
+      XCTAssertEqual(session.sealedRootRecord, originalRecord)
+      XCTAssertEqual(session.sealedGeneration, 0)
+      let firstReturns = await route.publicationReturns
+      XCTAssertEqual(firstReturns, 1, "The failure is after an actual Backend publication, not a manufactured ACK")
+
+      // Real native primitives and responder actions remain synchronous even
+      // though the original save output has not reached Session receiving.
+      try input.setDocumentSelection(PagedNativeNavigationSelection(utf16Offset: 2, utf16Length: 0))
+      f.view.insertText("Y", replacementRange: f.view.selectedRange())
+      let typedGeneration = session.generation
+      XCTAssertEqual(f.view.string, "aXYbc")
+      XCTAssertTrue(NSApplication.shared.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+      XCTAssertEqual(session.generation, typedGeneration + 1); XCTAssertEqual(f.view.string, "aXbc")
+      XCTAssertTrue(NSApplication.shared.sendAction(NSSelectorFromString("redo:"), to: nil, from: nil))
+      XCTAssertEqual(session.generation, typedGeneration + 2); XCTAssertEqual(f.view.string, "aXYbc")
+      XCTAssertNil(commands.firstFailure); XCTAssertNil(input.firstRefusal)
+      XCTAssertNil(f.view.boundedStorage.mutationFailure)
+      let later = try session.captureLogicalState(), arena = session.arenaID
+
+      do {
+        _ = try await session.retryFailedSave(expectedIdentity: UUID())
+        XCTFail("An unrelated identity cannot receive or retry the original save.")
+      } catch { guard case BoomError.stale = error else { throw error } }
+      let unrelatedResumeCalls = await route.resumeCalls
+      XCTAssertEqual(unrelatedResumeCalls, 0)
+      XCTAssertEqual(session.failedSaveIdentity, firstID)
+      XCTAssertEqual(session.persistenceFailure as? LogicalSaveDeliveryFailure,
+        LogicalSaveDeliveryFailure(publicationID: firstID))
+
+      // The next distinct publication is held only after its genuine file
+      // output returns, then fails its reply. No timing sleep chooses a race.
+      let nextReturned = expectation(description: "next actual captured publication returned")
+      await route.holdPublication { nextReturned.fulfill() }
+      try await route.failNextPublicationReply()
+      let firstCheckpoint = try await session.retryFailedSave(expectedIdentity: firstID)
+      XCTAssertEqual(session.sealedGeneration, firstGeneration)
+      XCTAssertEqual(session.arenaID, arena)
+      XCTAssertTrue(try session.captureLogicalState().source.isSame(later.source))
+      XCTAssertEqual(f.view.string, "aXYbc"); XCTAssertNil(session.persistenceFailure)
+      let firstDigest = try await engine.wholeTextSha256(firstCheckpoint.document.revision)
+      XCTAssertEqual(firstDigest, Digest.sha256(Data("aXbc".utf8)))
+      guard await XCTWaiter.fulfillment(of: [nextReturned], timeout: 10) == .completed else {
+        throw BoomError.unavailable("The newer actual publication did not reach its controlled reply boundary.")
+      }
+      let heldGeneration = session.generation
+      try input.setDocumentSelection(PagedNativeNavigationSelection(utf16Offset: 3, utf16Length: 0))
+      f.view.insertText("Z", replacementRange: f.view.selectedRange())
+      let newest = try session.captureLogicalState(), newestArena = session.arenaID
+      XCTAssertEqual(f.view.string, "aXYZbc"); XCTAssertEqual(newest.generation, heldGeneration + 1)
+      await route.release()
+      await session.joinPendingSave()
+      let secondID = try XCTUnwrap(session.failedSaveIdentity)
+      XCTAssertNotEqual(secondID, firstID)
+      XCTAssertEqual(session.persistenceFailure as? LogicalSaveDeliveryFailure,
+        LogicalSaveDeliveryFailure(publicationID: secondID))
+      let resumesBeforeStaleRetry = await route.resumeCalls
+      do {
+        _ = try await session.retryFailedSave(expectedIdentity: firstID)
+        XCTFail("A prior failed operation cannot authorize this newer failure's retry.")
+      } catch { guard case BoomError.stale = error else { throw error } }
+      let resumesAfterStaleRetry = await route.resumeCalls
+      XCTAssertEqual(resumesAfterStaleRetry, resumesBeforeStaleRetry)
+      XCTAssertEqual(session.failedSaveIdentity, secondID)
+      XCTAssertEqual(session.persistenceFailure as? LogicalSaveDeliveryFailure,
+        LogicalSaveDeliveryFailure(publicationID: secondID))
+
+      let secondCheckpoint = try await session.retryFailedSave(expectedIdentity: secondID)
+      XCTAssertEqual(session.arenaID, newestArena)
+      XCTAssertTrue(try session.captureLogicalState().source.isSame(newest.source))
+      XCTAssertEqual(session.generation, newest.generation); XCTAssertEqual(f.view.string, "aXYZbc")
+      let secondDigest = try await engine.wholeTextSha256(secondCheckpoint.document.revision)
+      XCTAssertEqual(secondDigest, Digest.sha256(Data("aXYbc".utf8)))
+      let finalRecord = try await session.flushRecord(through: newest.generation)
+      let finalDigest = try await engine.wholeTextSha256(finalRecord.document.revision)
+      XCTAssertEqual(finalDigest, Digest.sha256(Data("aXYZbc".utf8)))
+      XCTAssertNil(session.failedSaveIdentity); XCTAssertNil(session.persistenceFailure)
+      XCTAssertNil(commands.firstFailure); XCTAssertNil(input.firstRefusal)
+      XCTAssertNil(f.view.boundedStorage.mutationFailure)
+      let finalResumeCalls = await route.resumeCalls
+      XCTAssertEqual(finalResumeCalls, 2)
     }
   }
   func testSelectionSupersedesColdUndoRetainsOriginalKeysAndLaterNativeTypingStaysLive() async throws {

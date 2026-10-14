@@ -807,7 +807,7 @@ private final class PagedNativeInputObservers {
 
 /// Preserve the original construction/stale refusal if explicit stage cleanup
 /// also refuses. Neither error clears source intent, physical input or custody.
-private struct PagedNativeNavigationCleanupFailure: Error {
+struct PagedNativeNavigationCleanupFailure: Error {
   let original: Error
   let cleanup: Error
 }

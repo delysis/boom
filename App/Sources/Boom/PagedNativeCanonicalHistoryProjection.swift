@@ -1,7 +1,7 @@
 import BoomCore
 import Foundation
 
-private let pagedCanonicalZero = UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+private let pagedCanonicalZero = UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
 
 /// Immutable metadata read from the actual complete file history. Foundation
 /// owns live Undo/Redo; the worker never advances a parallel native timeline.
