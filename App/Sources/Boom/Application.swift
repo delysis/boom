@@ -30,8 +30,9 @@ import SwiftUI
       catch { fputs("Public editor lifetime admission refused.\n", stderr); exit(1) }
       let recipe = URL(fileURLWithPath: CommandLine.arguments[3])
       let app = NSApplication.shared
-      guard app.setActivationPolicy(.regular) else {
-        fputs("Public editor activation policy refused.\n", stderr); exit(1)
+      if app.activationPolicy() != .regular { _ = app.setActivationPolicy(.regular) }
+      guard app.activationPolicy() == .regular else {
+        fputs("Public editor activation policy refused: \(app.activationPolicy().rawValue).\n", stderr); exit(1)
       }
       Task {
         do { try await DeveloperEditorFixture.run(recipe: recipe); exit(0) }
