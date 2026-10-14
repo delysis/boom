@@ -91,7 +91,10 @@ final class NativePrefixParityProbeTests: XCTestCase {
       let oracle = try native.oracle(prefix: 8)
       let restored = try NativePrefixParityProbe.compareState(oracle: oracle,
         hydrated: NeuralPrefixParitySmoke.nativeBases(reuse.cache), suffixLength: 2, maskWindows: [nil, 4])
-      XCTAssertTrue(restored.allKVBitsEqual); XCTAssertTrue(restored.allMasksEqual)
+      let failureDetail = restored.allKVBitsEqual && restored.allMasksEqual ? ""
+        : String(decoding: try JSONEncoder().encode(restored), as: UTF8.self)
+      XCTAssertTrue(restored.allKVBitsEqual, failureDetail)
+      XCTAssertTrue(restored.allMasksEqual, failureDetail)
       XCTAssertEqual(oracle[1].state[0].asArray(Float.self), [4, 5, 6, 7])
       XCTAssertEqual(restored.layers.map { $0.keys.differingElementCount }, [0, 0])
     }
