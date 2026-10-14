@@ -7,10 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
-fn destination_in_pieces(
-    text: &str,
-    quantum: usize,
-) -> Result<Option<(usize, std::ops::Range<u64>)>, Box<dyn std::error::Error>> {
+type DestinationResult = Result<Option<(usize, std::ops::Range<u64>)>, Box<dyn std::error::Error>>;
+fn destination_in_pieces(text: &str, quantum: usize) -> DestinationResult {
     use pulldown_cmark::paged::{DestinationStatus, LinkDestinationStream, PROBE_BYTES};
     assert!((4..=PROBE_BYTES).contains(&quantum));
     let mut scanner = LinkDestinationStream::new(32);
@@ -269,17 +267,17 @@ impl PageProvider for Pages {
             rows.text_reads += 1;
             rows.text_read_pages.insert(page.locator.offset);
         }
-        if kind == PageKind::Index {
-            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                if value["node"]["kind"].as_str() == Some("inline_openers") {
-                    rows.inline_reads += 1;
-                }
-                if matches!(
-                    value["node"]["kind"].as_str(),
-                    Some("code_runs" | "code_branch")
-                ) {
-                    rows.code_reads += 1;
-                }
+        if kind == PageKind::Index
+            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        {
+            if value["node"]["kind"].as_str() == Some("inline_openers") {
+                rows.inline_reads += 1;
+            }
+            if matches!(
+                value["node"]["kind"].as_str(),
+                Some("code_runs" | "code_branch")
+            ) {
+                rows.code_reads += 1;
             }
         }
         Ok(bytes)
@@ -1701,7 +1699,7 @@ fn actual_unicode_reference_membership_and_per_block_definitions_match_pinned_pa
         "pinned Unicode folding and whitespace-normalized parser labels, not raw string equality"
     );
     assert!(progress.max_reference_probes <= 64);
-    assert!(retained_peak >= 2048 * 2 && retained_peak < 32 * 1024);
+    assert!((2048 * 2..32 * 1024).contains(&retained_peak));
     for fragment in view
         .fragments
         .iter()
