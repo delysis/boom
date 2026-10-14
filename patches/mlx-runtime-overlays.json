@@ -27,7 +27,7 @@
     "directory": "App/.build/checkouts/mlx-swift",
     "revision": "19601207e9a0de51e03ee6ec0c3c5f3784275075",
     "patch": "patches/mlx-swift-ready-buffer.patch",
-    "patchSHA256": "af5b0f4789950fcf67597c626a202fb23436cf2ee05e7e470253b2e2540d72ee",
+    "patchSHA256": "8315b1486c232fdc94224f1d5d1f6e510ba350187b0755996cc877f61a6f35b2",
     "submodules": [
       "Source/Cmlx/mlx-c"
     ],
@@ -35,6 +35,10 @@
       {
         "path": "Source/MLX/MLXArray+Bytes.swift",
         "sha256": "731f4500bbb125720660dca4dbcdecce492250a2d551cc0a754d0e093e87fa9e"
+      },
+      {
+        "path": "Source/Cmlx/include/mlx/c/array.h",
+        "sha256": "aeb01e844c5b33a6b16e6de2f241fb30cf8d666195f746576c1cd3a448fffbdc"
       }
     ]
   },

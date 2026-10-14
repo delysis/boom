@@ -74,3 +74,30 @@
  
  // MARK: - Backing / Bytes
  
+--- a/Source/Cmlx/include/mlx/c/array.h
++++ b/Source/Cmlx/include/mlx/c/array.h
+@@ -38,6 +38,24 @@
+ typedef struct mlx_array_ {
+   void* ctx;
+ } mlx_array;
++
++/** Immutable completed storage, independent of the array graph. Acquire on the
++ * evaluation owner before its next mutation/submission. Retention prevents
++ * MLX's functional buffer donation until last release.
++ */
++typedef struct mlx_ready_buffer_ {
++  void* ctx;
++} mlx_ready_buffer;
++
++/** Return 0 only for completed, error-free shared Metal storage. NEVER schedules,
++ * evaluates, waits or numerically converts. Unscheduled and evaluated/no-event
++ * arrays, empty layouts and unsupported backends return 1.
++ */
++int mlx_array_try_ready_buffer(mlx_ready_buffer* result, const mlx_array arr);
++void mlx_ready_buffer_free(mlx_ready_buffer buffer);
++const void* mlx_ready_buffer_data(mlx_ready_buffer buffer);
++size_t mlx_ready_buffer_size(mlx_ready_buffer buffer);
++size_t mlx_ready_buffer_offset(mlx_ready_buffer buffer);
+ 
+ static mlx_array mlx_array_empty;
+ 
