@@ -299,7 +299,15 @@ actor WorkspaceStore {
     }
   }
   func storageIdentity() throws -> (ownerID: UUID, storeID: UUID) {
-    let value = try WorkspaceStorageIdentity.loadOrCreate(at: root.appendingPathComponent("identity.json"))
+    let value: WorkspaceStorageIdentity
+    if vault.exists(.workspaceIdentity, Vault.workspaceID) {
+      value = try vault.decode(WorkspaceStorageIdentity.self, kind: .workspaceIdentity,
+        id: Vault.workspaceID, limit: 512)
+      try value.admit()
+    } else {
+      value = WorkspaceStorageIdentity(schema: 1, ownerID: UUID(), storeID: UUID())
+      try vault.encode(value, kind: .workspaceIdentity, id: Vault.workspaceID)
+    }
     return (value.ownerID, value.storeID)
   }
   func loadState() throws -> WorkspaceState {

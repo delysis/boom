@@ -32,4 +32,23 @@ final class WorkspaceStorageIdentityTests: XCTestCase {
       catch { XCTAssertEqual(try Data(contentsOf: path), bytes) }
     }
   }
+
+  func testOversizedOrLinkedIdentityIsRefusedWithoutReplacingEitherFile() async throws {
+    let root = try root(), store = try WorkspaceStore(rootOverride: root)
+    let path = store.root.appendingPathComponent("identity.json")
+    let oversized = Data(repeating: 0x20, count: 513)
+    try oversized.write(to: path)
+    do { _ = try await store.storageIdentity(); XCTFail("Oversized identity was admitted") }
+    catch { XCTAssertEqual(try Data(contentsOf: path), oversized) }
+    try FileManager.default.removeItem(at: path)
+    let target = root.appendingPathComponent("original.json")
+    let original = try JSONEncoder().encode(WorkspaceStorageIdentity(schema: 1, ownerID: UUID(), storeID: UUID()))
+    try original.write(to: target)
+    try FileManager.default.createSymbolicLink(at: path, withDestinationURL: target)
+    do { _ = try await store.storageIdentity(); XCTFail("Linked identity was admitted") }
+    catch {
+      XCTAssertEqual(try Data(contentsOf: target), original)
+      XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: path.path), target.path)
+    }
+  }
 }
