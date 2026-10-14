@@ -13,13 +13,18 @@ final class ProductTransportTests: XCTestCase {
       try bytes.write(to: url)
       return url
     }
-    let documents = try DocumentImport.read(urls, flag: CancellationFlag())
-    XCTAssertEqual(documents.count, 4)
-    XCTAssertTrue(documents.allSatisfy { $0.original == bytes && Data($0.text.utf8) == bytes })
-    let folder = try FolderImport.read(root, flag: CancellationFlag())
-    XCTAssertEqual(folder.map(\.path), urls.map(\.lastPathComponent))
-    XCTAssertTrue(folder.allSatisfy { $0.original == bytes })
-    let files = documents.map { ImportedText(path: $0.path, text: $0.text) }
+    let files = try urls.map { url -> ImportedText in
+      let original = try AttachmentProcessor.readGranted(url, limit: 2_097_152, allowEmpty: true)
+      XCTAssertEqual(original, bytes)
+      let text = try XCTUnwrap(String(data: original, encoding: .utf8))
+      XCTAssertEqual(Data(text.utf8), bytes)
+      return ImportedText(path: url.lastPathComponent, text: text)
+    }
+    try ProductCore.admitImportedTexts(files, documents: true)
+    let chosen = try FolderImport.chosenFiles(root, flag: CancellationFlag())
+    XCTAssertEqual(chosen.map(\.path), urls.map(\.lastPathComponent))
+    for file in chosen { XCTAssertEqual(try Data(contentsOf: file.url), bytes) }
+    try ProductCore.admitImportedTexts(files)
     XCTAssertThrowsError(try ProductCore.importedDocuments(files)) { error in
       guard case BoomError.budget = error else { return XCTFail("Capacity lost its type: \(error)") }
     }

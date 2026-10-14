@@ -97,9 +97,7 @@ final class FolderImportTests: XCTestCase {
     let chosen = try FolderImport.chosenFiles(source, flag: CancellationFlag())
     XCTAssertEqual(chosen.map(\.path), ["Drafts/章.md", "empty.txt"])
     XCTAssertEqual(chosen.first?.url, file.standardizedFileURL.resolvingSymlinksInPath())
-    let imported = try FolderImport.read(source, flag: CancellationFlag())
-    XCTAssertEqual(imported.map(\.path), ["Drafts/章.md", "empty.txt"])
-    XCTAssertEqual(try XCTUnwrap(imported.first).original, bytes)
+    XCTAssertEqual(try Data(contentsOf: XCTUnwrap(chosen.first).url), bytes)
     XCTAssertEqual(try Data(contentsOf: file), bytes)
   }
 
