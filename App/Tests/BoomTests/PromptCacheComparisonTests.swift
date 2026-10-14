@@ -69,20 +69,21 @@ final class PromptCacheComparisonTests: XCTestCase {
   }
 
   func testLiveAdapterUsesShiftedCallbacksAndRequiresExplicitOrigin() {
-    func output(cached: Int = 0, originPresent: Bool = true) -> MLXGemmaRunner.Output {
+    func output(cached: Int = 0, originPresent: Bool = true,
+      algorithm: String = PromptPrefixCache.activeAlgorithm) -> MLXGemmaRunner.Output {
       var value = MLXGemmaRunner.Output(text: "Public", tokenIDs: [10], promptDigest: String(repeating: "c", count: 64),
         promptTokens: 8, outputTokens: 1, endedByEOS: false, stopReason: "output_limit", stopTokenID: nil,
         firstTokenSeconds: 1, elapsedSeconds: 1)
       value.setupMetrics = .init(path: "token-iterator-constructor", returnedSeconds: 0,
         threadQoSBefore: 0, threadQoSAfter: 0, firstDeliveryThreadQoS: 0, tokenShape: [8 - cached], maskShape: nil)
       if originPresent {
-        value.executionOrigin = .init(schema: 1, cacheAlgorithm: PromptPrefixCache.algorithm,
+        value.executionOrigin = .init(schema: 1, cacheAlgorithm: algorithm,
           cachedPromptTokens: cached, cacheMissReason: cached == 0 ? "owner_disabled" : nil)
       }
       if cached > 0 {
         let geometry = PromptCacheGeometry(promptTokens: 8, prefill: PrefillParameters(stepSize: 4, chunking: .remainder))
         let suffix = PromptCacheGeometry(promptTokens: 8 - cached, prefill: PrefillParameters(stepSize: 4, chunking: .remainder))
-        value.prefillCacheMetrics = .init(algorithm: PromptPrefixCache.algorithm, cachedPromptTokens: cached,
+        value.prefillCacheMetrics = .init(algorithm: algorithm, cachedPromptTokens: cached,
           prefilledPromptTokens: 8 - cached, fullPromptTokens: 8, preservesChunkBoundaries: true,
           originalGeometry: geometry, suffixGeometry: suffix, missReason: nil, contextReclamation: nil,
           cachedOrigin: .prefill, cachedBatchWidth: 1, cachedRow: nil,
@@ -99,6 +100,9 @@ final class PromptCacheComparisonTests: XCTestCase {
     let warm = history(output(cached: 4), [7, 8])
     XCTAssertEqual(PromptCacheReuseSmoke.classifyOutputHistories(cold, warm).relation, .sameObservedPartitions)
     XCTAssertEqual(warm[0].forwards, cold[0].forwards)
+    let obsolete = history(output(algorithm: PromptPrefixCache.algorithm), [4, 7, 8])
+    XCTAssertTrue(obsolete[0].blockers.contains("cache_algorithm_not_current"))
+    XCTAssertEqual(PromptCacheReuseSmoke.classifyOutputHistories(obsolete, cold).relation, .unknown)
     let missingOrigin = history(output(originPresent: false), [4, 7, 8])
     XCTAssertEqual(PromptCacheReuseSmoke.classifyOutputHistories(missingOrigin, cold).relation, .unknown)
     XCTAssertEqual(PromptCacheReuseSmoke.classifyOutputHistories(history(output(cached: 4), [3, 7, 8]), cold).relation, .unknown)

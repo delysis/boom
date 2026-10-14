@@ -155,6 +155,43 @@ final class PromptPrefixCacheTests: XCTestCase {
       XCTAssertEqual(request.cachedTokenCount, 5)
     }
   }
+  func testLookupInventoryKeepsPublishedDiskNamespaceBesideDifferentHotOwner() async throws {
+    try await Device.withDefaultDevice(.cpu) {
+      let store = PromptPrefixCache(), first = owner(), second = owner(namespace: UUID())
+      let original = Array(0..<9), other = Array(40..<49)
+      try await publishPrompt(store, original, owner: first)
+      try await publishPrompt(store, other, owner: second)
+      XCTAssertTrue(store.retainedSnapshotObservations.allSatisfy { $0.namespace == second.namespace })
+      let beforeRaw = store.retainedBytesUpperBound, beforeNative = store.retainedNativeBytesUpperBound
+      let beforeAnchors = store.retainedAnchorTokenCounts, beforeLeases = store.activeCaptureLeaseCount
+      let observations = store.retainedLookupSnapshotObservations
+      XCTAssertEqual(store.retainedBytesUpperBound, beforeRaw)
+      XCTAssertEqual(store.retainedNativeBytesUpperBound, beforeNative)
+      XCTAssertEqual(store.retainedAnchorTokenCounts, beforeAnchors)
+      XCTAssertEqual(store.activeCaptureLeaseCount, beforeLeases)
+      let previous = try XCTUnwrap(observations.first {
+        $0.namespace == first.namespace && $0.tokenIDs == original
+      })
+      XCTAssertEqual(previous.origin, .prefill); XCTAssertEqual(previous.batchWidth, 1)
+      XCTAssertNil(previous.row); XCTAssertEqual(previous.nativePhysicalWidth, 1)
+      XCTAssertEqual(previous.forwardHistory.last?.endTokenCount, original.count)
+      XCTAssertEqual(previous.nativeRowReceipt?.processedTokenCount, original.count)
+      let coverage = try XCTUnwrap(previous.residentLocalCoverage)
+      XCTAssertEqual(coverage.count, 1); XCTAssertEqual(coverage[0].layer, 1)
+      XCTAssertEqual(coverage[0].window, 4); XCTAssertEqual(coverage[0].keep, 0)
+      XCTAssertTrue(observations.contains { $0.namespace == second.namespace && $0.tokenIDs == other })
+      let query = original + [999]
+      let expected = observations.filter { $0.namespace == first.namespace }.map {
+        PromptCacheReuseSmoke.residentPrefixCount(snapshot: $0, current: query, localLayerCount: 1)
+      }.max() ?? 0
+      XCTAssertEqual(expected, original.count)
+      let returning = try session(store, query, owner: first)
+      XCTAssertEqual(returning.cachedTokenCount, expected)
+      XCTAssertEqual(returning.observation.cachedNativePhysicalWidth, previous.nativePhysicalWidth)
+      XCTAssertEqual(returning.cache[0].state[0].asArray(Float.self), original.map(Float.init))
+      XCTAssertEqual(returning.cache[1].state[0].asArray(Float.self), [5, 6, 7, 8])
+    }
+  }
   func testChangingForwardGeometryDoesNotPreventValidResidentReuse() async throws {
     try await Device.withDefaultDevice(.cpu) {
       let store = PromptPrefixCache(), scope = owner(), ids = Array(0..<9)

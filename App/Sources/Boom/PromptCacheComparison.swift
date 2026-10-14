@@ -124,7 +124,7 @@ extension PromptCacheReuseSmoke {
       var cached = 0
       if let origin = output.executionOrigin, origin.isValid(promptTokens: output.promptTokens) {
         cached = origin.cachedPromptTokens
-        if origin.cacheAlgorithm != PromptPrefixCache.algorithm {
+        if origin.cacheAlgorithm != PromptPrefixCache.activeAlgorithm {
           blockers.append("cache_algorithm_not_current")
         }
         if let metrics = output.prefillCacheMetrics,

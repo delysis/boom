@@ -186,7 +186,7 @@ enum JoinedPrefixCancellationSmoke {
     var receipt: [String: Any] = ["schema": 1, "status": "running",
       "protocol": "joined_prefix_constructor_public_v1", "scope": "exactly four public constructor operations",
       "source_inventory_sha256": Bundle.main.object(forInfoDictionaryKey: "BoomSourceSHA256") ?? "unavailable",
-      "runtime_revision": ModelPacks.runtimeRevision, "cache_algorithm": PromptPrefixCache.algorithm,
+      "runtime_revision": ModelPacks.runtimeRevision, "cache_algorithm": PromptPrefixCache.activeAlgorithm,
       "fixture_sha256": fixtureSHA256, "application_byte_limit": applicationBudget,
       "retained_byte_limit": retainedBudget,
       "automatic_retries": false, "fifth_decode_case": "not_run",
@@ -281,7 +281,12 @@ enum JoinedPrefixCancellationSmoke {
         } catch { caught = error }
         await runner.join()
         let observation = probe.observation()
-        let snapshots = await runner.diagnosticCacheSnapshots()
+        let snapshots: [PromptPrefixCache.SnapshotObservation]
+        if denied {
+          snapshots = await runner.diagnosticCacheSnapshots()
+        } else {
+          snapshots = await runner.diagnosticActiveCacheSnapshots()
+        }
         let cancellationError = caught.map { $0 is CancellationError } ?? false
         var differences = constructorDifferences(observation, cancellationError: cancellationError,
           flagCancelled: flag.isCancelled, denied: denied)
@@ -351,12 +356,12 @@ enum JoinedPrefixCancellationSmoke {
             differences.append("successor_input_output_status")
           }
           if let origin = output.executionOrigin {
-            if !origin.isValid(promptTokens: output.promptTokens) || origin.cacheAlgorithm != PromptPrefixCache.algorithm
+            if !origin.isValid(promptTokens: output.promptTokens) || origin.cacheAlgorithm != PromptPrefixCache.activeAlgorithm
               || origin.cachedPromptTokens != expected || origin.cacheMissReason != metrics.missReason {
               differences.append("actual_execution_origin")
             }
           } else { differences.append("execution_origin_missing") }
-          if metrics.algorithm != PromptPrefixCache.algorithm || metrics.cachedPromptTokens != expected
+          if metrics.algorithm != PromptPrefixCache.activeAlgorithm || metrics.cachedPromptTokens != expected
             || metrics.fullPromptTokens != successorIDs.count || metrics.prefilledPromptTokens != successorIDs.count - expected {
             differences.append("actual_hydrated_prefix_and_suffix_counts")
           }

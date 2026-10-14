@@ -325,7 +325,7 @@ enum PromptCacheReuseSmoke {
         guard let metrics = output.prefillCacheMetrics else {
           differences.append("cache_metrics_missing"); continue
         }
-        if !(metrics.algorithm == PromptPrefixCache.algorithm && metrics.fullPromptTokens == tokens
+        if !(metrics.algorithm == PromptPrefixCache.activeAlgorithm && metrics.fullPromptTokens == tokens
           && metrics.cachedPromptTokens >= 0 && metrics.cachedPromptTokens < tokens
           && metrics.prefilledPromptTokens == tokens - metrics.cachedPromptTokens
           && trial.events.allSatisfy({ $0.processedPositions > metrics.cachedPromptTokens })) {

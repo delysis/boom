@@ -1108,6 +1108,21 @@ final class PromptPrefixCache: @unchecked Sendable {
     }
     return entries.values.sorted { $0.touched > $1.touched }.map { $0.entry.observation }
   }
+  /// Metadata for the same hot and published-disk candidate sources searched
+  /// by activeChoice. This never hydrates, reads files or evaluates tensors.
+  /// Hot-owner observations above keep their separate retention contract.
+  var retainedLookupSnapshotObservations: [SnapshotObservation] {
+    lock.lock(); defer { lock.unlock() }
+    let hot = activeNative?.rows.map { row in
+      var observation = row.observation
+      observation.nativePhysicalWidth = row.nativePhysicalWidth
+      return observation
+    } ?? []
+    let published = entries.values.sorted { $0.touched > $1.touched }
+      .filter { $0.entry.spans.flatMap { $0 }.allSatisfy { $0.diskFileID != nil } }
+      .map { $0.entry.observation }
+    return hot + published
+  }
   /// All optimization backings in entries and live leases, including source
   /// buffers still reachable through hydrated working caches. Native working KV
   /// allocations and actual OS/MLX admission remain separately accounted.

@@ -589,6 +589,11 @@ actor MLXGemmaRunner {
     await promptCache.joinPendingDiskCleanup()
   }
   func diagnosticCacheSnapshots() -> [PromptPrefixCache.SnapshotObservation] {
+    promptCache.retainedLookupSnapshotObservations
+  }
+  /// Preserve the active-owner observation contract for constructor controls
+  /// that require one physically retained native row after joined cancellation.
+  func diagnosticActiveCacheSnapshots() -> [PromptPrefixCache.SnapshotObservation] {
     promptCache.retainedSnapshotObservations
   }
   /// Resolve the policy once; the update tap reads only measured accounting.
