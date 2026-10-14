@@ -1942,24 +1942,42 @@ mod tests {
             "history":[], "instructions":instructions, "context":"", "request":question,
             "routing":[], "workingTextBytes":0});
         let compile = |request: Value| {
-            execute_for_transport(serde_json::from_value(request).map_err(|e| Error(e.to_string()))?)
-                .map_err(ConsultationError::into_legacy)
+            execute_for_transport(
+                serde_json::from_value(request).map_err(|e| Error(e.to_string()))?,
+            )
+            .map_err(ConsultationError::into_legacy)
         };
         let full = compile(request.clone())?;
-        let joined = full["texts"].as_array().ok_or_else(|| Error("Missing prompt text.".into()))?
-            .iter().filter_map(Value::as_str).collect::<String>();
+        let joined = full["texts"]
+            .as_array()
+            .ok_or_else(|| Error("Missing prompt text.".into()))?
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<String>();
         assert!(joined.contains(question));
         assert!(full["workingWindow"]["request"].is_null());
-        assert_eq!(full["workingWindow"]["instructions"]["bytes"], instructions.len());
+        assert_eq!(
+            full["workingWindow"]["instructions"]["bytes"],
+            instructions.len()
+        );
         request["workingRequestBytes"] = serde_json::json!(24);
         let clipped = compile(request)?;
-        let joined = clipped["texts"].as_array().ok_or_else(|| Error("Missing prompt text.".into()))?
-            .iter().filter_map(Value::as_str).collect::<String>();
+        let joined = clipped["texts"]
+            .as_array()
+            .ok_or_else(|| Error("Missing prompt text.".into()))?
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<String>();
         assert!(!joined.contains(question));
         assert!(joined.contains("about the harbor."));
-        assert_eq!(clipped["workingWindow"]["request"]["digest"], digest(question.as_bytes()));
-        assert_eq!(clipped["workingWindow"]["request"]["ranges"][0]["end"], question.len());
+        assert_eq!(
+            clipped["workingWindow"]["request"]["digest"],
+            digest(question.as_bytes())
+        );
+        assert_eq!(
+            clipped["workingWindow"]["request"]["ranges"][0]["end"],
+            question.len()
+        );
         Ok(())
     }
-
 }

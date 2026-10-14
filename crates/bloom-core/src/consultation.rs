@@ -214,7 +214,10 @@ pub(super) fn compile_with_contract(
         context,
         request,
         routing,
-        CompileOptions { prompt_contract, ..CompileOptions::default() },
+        CompileOptions {
+            prompt_contract,
+            ..CompileOptions::default()
+        },
     )
 }
 
@@ -227,7 +230,12 @@ pub(super) fn compile_with_window(
     routing: &[String],
     options: CompileOptions,
 ) -> Result<CompactConsultation, ConsultationError> {
-    let CompileOptions { prompt_contract, working_text_bytes, working_request_bytes, instructions_window } = options;
+    let CompileOptions {
+        prompt_contract,
+        working_text_bytes,
+        working_request_bytes,
+        instructions_window,
+    } = options;
     require(
         working_text_bytes.is_none_or(|n| n <= TEXT_LIMIT)
             && working_request_bytes.is_none_or(|n| n <= TEXT_LIMIT),
@@ -424,11 +432,12 @@ pub(super) fn compile_with_window(
         prompt_contract,
         texts: pool.finish(),
         plans,
-        working_window: (working_text_bytes.is_some() || working_request_bytes.is_some()).then_some(ConsultationWorkingWindow {
-            request: request_window,
-            instructions: instructions_window,
-            voices: voice_windows,
-        }),
+        working_window: (working_text_bytes.is_some() || working_request_bytes.is_some())
+            .then_some(ConsultationWorkingWindow {
+                request: request_window,
+                instructions: instructions_window,
+                voices: voice_windows,
+            }),
     })
 }
 

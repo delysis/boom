@@ -343,6 +343,9 @@ fn explicitly_windowed_original_prose_can_cross_the_old_wire_limit() {
     );
     assert!(serde_json::to_vec(&value).unwrap().len() < 4_096);
     request.as_object_mut().unwrap().remove("workingTextBytes");
-    request.as_object_mut().unwrap().remove("workingRequestBytes");
+    request
+        .as_object_mut()
+        .unwrap()
+        .remove("workingRequestBytes");
     assert_eq!(call(&request)["error"]["code"], "input_limit");
 }

@@ -1308,7 +1308,7 @@ mod tests {
                     rendered_context: Some(&rendered),
                     captured_sources: &sources,
                     working_text_bytes: None,
-                working_request_bytes: None,
+                    working_request_bytes: None,
                 },
             )
             .is_err()
@@ -1327,7 +1327,7 @@ mod tests {
                     rendered_context: None,
                     captured_sources: &sources,
                     working_text_bytes: None,
-                working_request_bytes: None,
+                    working_request_bytes: None,
                 },
             )
             .is_err()
