@@ -64,7 +64,13 @@ private final class DeveloperBackupCopyHold: @unchecked Sendable {
       connected = true
       guard let fixture else { throw BoomError.invalid("Public editor preparation was absent.") }
       try await fixture.observe(plan)
-    } catch { failures.append(error.localizedDescription) }
+    } catch {
+      failures.append(error.localizedDescription)
+      // Preserve the original failure before the capture handshake can fail or
+      // its owner terminate this process. This is outside measured input work.
+      let description = String(decoding: error.localizedDescription.utf8.prefix(512), as: UTF8.self)
+      FileHandle.standardError.write(Data(("Public editor failure before capture finish: " + description + "\n").utf8))
+    }
     // Finish the single main producer before shutdown can lazily load modules
     // or invoke other subsystem cleanup. The lifetime guardian remains active.
     if connected {

@@ -74,14 +74,23 @@ struct InlineMediaSpan: Decodable {
     let trace = PerformanceTrace.begin("Editor.MediaLayout", event: event)
     defer { PerformanceTrace.end("Editor.MediaLayout", trace) }
     guard hasMedia, let storage = manager.textStorage else { return 0 }
-    guard let first = (0..<range.length).first(where: { index in
-      indexes[index] >= 0 && indexes[index] < storage.length
-        && storage.attribute(.mediaItem, at: indexes[index], effectiveRange: nil) != nil
-    }) else { return 0 }
+    // Glyph batches usually share one attribute run. Reuse that run for both
+    // directions of character indexes, including reordered/bidirectional glyphs.
+    // Unknown media presence remains conservative without a lookup per glyph.
+    var mediaRange = NSRange(location: NSNotFound, length: 0)
+    var mediaPresent = false
+    func hasMediaAttribute(at character: Int) -> Bool {
+      guard character >= 0, character < storage.length else { return false }
+      if !NSLocationInRange(character, mediaRange) {
+        mediaPresent = storage.attribute(.mediaItem, at: character, effectiveRange: &mediaRange) != nil
+      }
+      return mediaPresent
+    }
+    guard let first = (0..<range.length).first(where: { hasMediaAttribute(at: indexes[$0]) }) else { return 0 }
     var generated = Array(UnsafeBufferPointer(start: glyphs, count: range.length))
     var properties = Array(UnsafeBufferPointer(start: props, count: range.length))
     for i in first..<range.length where indexes[i] >= 0 && indexes[i] < storage.length {
-      if storage.attribute(.mediaItem, at: indexes[i], effectiveRange: nil) != nil {
+      if hasMediaAttribute(at: indexes[i]) {
         generated[i] = 0
         properties[i] = storage.attribute(.mediaStart, at: indexes[i], effectiveRange: nil) != nil ? .controlCharacter : .null
       }
@@ -219,6 +228,7 @@ struct InlineMediaSpan: Decodable {
     if container.layoutManager == nil { manager.addTextContainer(container) }
     if manager.textStorage == nil { storage.addLayoutManager(manager) }
     super.init(frame: frame, textContainer: container)
+    inlineMedia.layout.reconcileMediaPresence(in: storage)
     inlineMedia.view = self; layoutManager?.delegate = inlineMedia.layout
   }
   required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
