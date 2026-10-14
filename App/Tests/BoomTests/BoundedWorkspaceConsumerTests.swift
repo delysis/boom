@@ -1917,4 +1917,55 @@ private final class LiveBackupCopyHold: @unchecked Sendable {
     }
     try await removeJoinedScratch(url)
   }
+  func testOwnedDocumentTemporaryFileDisposalJoinsSuccessFailureAndCancellation() async throws {
+    let url = try root(), model = try await open(url, requiresActualKeyWindow: false)
+    for outcome in 0..<2 {
+      var staged: URL?
+      do {
+        try await model.withTemporaryDocumentFile { path in
+          staged = path
+          try await detachedWork { try Data("public temporary document".utf8).write(to: path, options: .withoutOverwriting) }
+          XCTAssertTrue(FileManager.default.fileExists(atPath: path.path))
+          if outcome == 1 { throw BoomError.invalid("Public temporary import failure") }
+        }
+        XCTAssertEqual(outcome, 0)
+      } catch {
+        XCTAssertNotEqual(outcome, 0)
+      }
+      let path = try XCTUnwrap(staged)
+      XCTAssertFalse(FileManager.default.fileExists(atPath: path.path))
+      XCTAssertFalse(FileManager.default.fileExists(atPath: path.deletingLastPathComponent().path))
+    }
+    var cancelledPath: URL?
+    let entered = expectation(description: "Actual owned temporary file created")
+    let task = Task { @MainActor in
+      try await model.withTemporaryDocumentFile { path in
+        cancelledPath = path
+        try await detachedWork { try Data("public cancelled document".utf8).write(to: path, options: .withoutOverwriting) }
+        entered.fulfill()
+        try await Task.sleep(for: .seconds(10))
+      }
+    }
+    await fulfillment(of: [entered], timeout: 5)
+    task.cancel()
+    do { try await task.value; XCTFail("Cancelled temporary operation completed") }
+    catch { XCTAssertTrue(error is CancellationError) }
+    let path = try XCTUnwrap(cancelledPath)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: path.path))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: path.deletingLastPathComponent().path))
+    try await joinedClose(model); try await removeJoinedScratch(url)
+  }
+  func testAuthoredDocumentDoesNotRetainTemporaryImportProvenance() async throws {
+    let url = try root(), model = try await open(url, requiresActualKeyWindow: false)
+    let document = DocumentSnapshot(title: "Authored", text: "Public authored text é🙂")
+    try await model.importAuthoredDocument(document, selecting: false, flag: CancellationFlag())
+    XCTAssertNil(model.state.importedFiles?[document.id])
+    let captured = try await model.captureDocument(document.id)
+    XCTAssertEqual(captured.completeSnapshot?.text, document.text)
+    try await joinedClose(model)
+    let fresh = try WorkspaceStore(rootOverride: url), state = try await fresh.loadState()
+    XCTAssertNil(state.importedFiles?[document.id])
+    XCTAssertTrue(state.documents.contains { $0.id == document.id })
+    try await removeJoinedScratch(url)
+  }
 }

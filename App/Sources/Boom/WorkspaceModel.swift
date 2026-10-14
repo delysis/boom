@@ -2475,41 +2475,42 @@ private struct BoundedConsultationContext: Sendable {
       guard let self else { return }
       let (engine, _) = try self.pagedOwners()
       let id = UUID()
-      let url = try await detachedWork {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-branch-\(UUID().uuidString).md")
-        guard FileManager.default.createFile(atPath: url.path, contents: nil) else { throw BoomError.unavailable("Could not create a branch stream.") }
-        return url
-      }
-      let file = try await detachedWork { try FileHandle(forWritingTo: url) }
-      var closeAttempted = false
-      do {
-        try await engine.export(capture.record.document.revision, to: file)
-        closeAttempted = true
-        try await detachedWork { try file.close() }
-      } catch {
-        let original = error
-        if !closeAttempted {
-          do { try await detachedWork { try file.close() } }
-          catch { throw WorkspacePagedImportFailure(original: original, cleanup: error, url: url) }
+      try await self.withTemporaryDocumentFile { url in
+        try await detachedWork {
+          guard FileManager.default.createFile(atPath: url.path, contents: nil,
+            attributes: [.posixPermissions: 0o600]) else { throw BoomError.unavailable("Could not create a branch stream.") }
         }
-        throw original
+        let file = try await detachedWork { try FileHandle(forWritingTo: url) }
+        var closeAttempted = false
+        do {
+          try await engine.export(capture.record.document.revision, to: file)
+          closeAttempted = true
+          do { try await detachedWork { try file.close() } }
+          catch { throw WorkspacePagedImportFailure(original: BoomError.unavailable("Branch stream did not close."), cleanup: error, url: url) }
+        } catch {
+          let original = error
+          if !closeAttempted {
+            do { try await detachedWork { try file.close() } }
+            catch { throw WorkspacePagedImportFailure(original: original, cleanup: error, url: url) }
+          }
+          throw original
+        }
+        try await self.importPagedDocument(url, title: capture.title + " · branch", documentID: id, recordImportedSource: false, flag: flag)
+        let position = capture.window.utf16Start + UInt64(bundle.recipe.caretUTF16)
+        guard let commands = self.pagedCommands else { throw BoomError.stale("The branch lost its native command owner.") }
+        await Task.yield()
+        guard let mounted = self.pagedInput?.activeView, let window = mounted.window,
+          window.isKeyWindow, window.makeFirstResponder(mounted), window.firstResponder === mounted else {
+          throw BoomError.stale("The branch has not received its native editor focus.")
+        }
+        try await commands.navigate(toUTF16: position, selectingUTF16: PagedNativeNavigationSelection(utf16Offset: position, utf16Length: 0))
+        guard let view = self.pagedInput?.activeView else { throw BoomError.stale("The branch lost its editor.") }
+        view.insertText(continuation, replacementRange: view.selectedRange())
+        if let error = view.boundedStorage.mutationFailure { throw error }
+        self.state.manuscriptOrigins[id] = ManuscriptOrigin(documentID: capture.documentID, revision: capture.revisionDigest,
+          bundleID: bundle.id, candidateID: bundle.candidates[index].id)
+        try await self.flush()
       }
-      try await self.importPagedDocument(url, title: capture.title + " · branch", documentID: id, flag: flag)
-      let position = capture.window.utf16Start + UInt64(bundle.recipe.caretUTF16)
-      guard let commands = self.pagedCommands else { throw BoomError.stale("The branch lost its native command owner.") }
-      await Task.yield()
-      guard let mounted = self.pagedInput?.activeView, let window = mounted.window,
-        window.isKeyWindow, window.makeFirstResponder(mounted), window.firstResponder === mounted else {
-        throw BoomError.stale("The branch has not received its native editor focus.")
-      }
-      try await commands.navigate(toUTF16: position, selectingUTF16: PagedNativeNavigationSelection(utf16Offset: position, utf16Length: 0))
-      guard let view = self.pagedInput?.activeView else { throw BoomError.stale("The branch lost its editor.") }
-      view.insertText(continuation, replacementRange: view.selectedRange())
-      if let error = view.boundedStorage.mutationFailure { throw error }
-      self.state.manuscriptOrigins[id] = ManuscriptOrigin(documentID: capture.documentID, revision: capture.revisionDigest,
-        bundleID: bundle.id, candidateID: bundle.candidates[index].id)
-      try await self.flush()
-      try await detachedWork { try FileManager.default.removeItem(at: url) }
       self.showingCandidates = false
     }
   }
@@ -3869,19 +3870,45 @@ extension WorkspaceModel {
   private func createPagedDocument(flag: CancellationFlag) async throws {
     try await importAuthoredDocument(DocumentSnapshot(title: "Untitled", text: ""), selecting: true, flag: flag)
   }
+  /// One platform-owned directory scopes transient authored/branch input.
+  /// Normal success, failure and cancellation join disposal off the UI thread;
+  /// an uncertain handle cleanup keeps its original file and error together.
+  func withTemporaryDocumentFile(_ body: @MainActor (URL) async throws -> Void) async throws {
+    let root = store.root
+    let directory = try await detachedWork {
+      try FileManager.default.url(for: .itemReplacementDirectory, in: .userDomainMask,
+        appropriateFor: root, create: true)
+    }
+    let result: Result<Void, Error>
+    do {
+      try await detachedWork {
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+      }
+      try await body(directory.appendingPathComponent("Document.md"))
+      result = .success(())
+    } catch { result = .failure(error) }
+    if case .failure(let failure as WorkspacePagedImportFailure) = result { throw failure }
+    do { try await detachedWork { try FileManager.default.removeItem(at: directory) } }
+    catch {
+      if case .failure(let original) = result {
+        throw WorkspacePagedImportFailure(original: original, cleanup: error, url: directory)
+      }
+      throw error
+    }
+    try result.get()
+  }
   func importAuthoredDocument(_ document: DocumentSnapshot, selecting: Bool,
     flag: CancellationFlag) async throws {
+    try flag.check()
     guard document.text.utf8.count <= 2_097_152 else { throw BoomError.budget("Authored input exceeds the bounded import size.") }
-    let url = try await detachedWork {
-      let url = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-authored-\(UUID().uuidString).md")
-      try Data(document.text.utf8).write(to: url, options: .withoutOverwriting)
-      return url
+    try await withTemporaryDocumentFile { url in
+      try await detachedWork { try Data(document.text.utf8).write(to: url, options: .withoutOverwriting) }
+      try await importPagedDocument(url, title: document.title, documentID: document.id,
+        selecting: selecting, recordImportedSource: false, flag: flag)
     }
-    try await importPagedDocument(url, title: document.title, documentID: document.id, selecting: selecting, flag: flag)
-    try await detachedWork { try FileManager.default.removeItem(at: url) }
   }
   private func importPagedDocument(_ url: URL, title: String, documentID: UUID = UUID(),
-    selecting: Bool = true, flag: CancellationFlag) async throws {
+    selecting: Bool = true, recordImportedSource: Bool = true, flag: CancellationFlag) async throws {
     try requirePagedOperation(); try flag.check()
     pagedTransition = true
     defer { pagedTransition = false }
@@ -3898,15 +3925,19 @@ extension WorkspaceModel {
       } onCancel: { cancellation.cancel() }
       pagedImported = imported
       closeAttempted = true
-      try await detachedWork { try file.close() }
+      do { try await detachedWork { try file.close() } }
+      catch { throw WorkspacePagedImportFailure(original: BoomError.unavailable("Import stream did not close."), cleanup: error, url: url) }
       let descriptor = PagedDocumentDescriptor(id: documentID, title: title, revision: imported.value.revision)
       let initialized = try await engine.initialNativeRecordRetaining(descriptor)
       pagedInitialized = initialized
       let record = try await engine.publishInitialDocumentRetaining(publisher, imported: imported, initialized: initialized)
       pagedImported = nil; pagedInitialized = nil
       documentIndices.append(DocumentIndex(id: documentID, title: title)); state.documents = documentIndices
-      if state.importedFiles == nil { state.importedFiles = [:] }
-      state.importedFiles?[documentID] = ImportedFile(folderID: nil, path: url.path, originalDigest: imported.value.wholeTextSha256, originalRevision: imported.value.revision)
+      if recordImportedSource {
+        if state.importedFiles == nil { state.importedFiles = [:] }
+        state.importedFiles?[documentID] = ImportedFile(folderID: nil, path: url.path,
+          originalDigest: imported.value.wholeTextSha256, originalRevision: imported.value.revision)
+      }
       if selecting {
         retainComposerDraft(schedule: false)
         try await closePagedSelection(); try flag.check()
@@ -4033,5 +4064,5 @@ private struct WorkspacePagedImportFailure: Error, LocalizedError {
   let original: Error
   let cleanup: Error
   let url: URL
-  var errorDescription: String? { "\(original.localizedDescription) Import handle cleanup: \(cleanup.localizedDescription). Original source retained at \(url.path)." }
+  var errorDescription: String? { "\(original.localizedDescription) Import cleanup: \(cleanup.localizedDescription). Original source retained at \(url.path)." }
 }
