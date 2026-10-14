@@ -1444,11 +1444,11 @@ private final class LiveBackupCopyHold: @unchecked Sendable {
   func testActualLiveCloneBackupKeepsNativeUndoScrollAndLaterSaveWhileCopyHeldThenColdRestoresSnapshot() async throws {
     let failures = testRun?.failureCount ?? 0
     let parent = try diagnosticRoot(), scratch = parent.appendingPathComponent("workspace")
-    let model = try await open(scratch, requiresActualKeyWindow: false)
+    let model = try await open(scratch)
     let source = try await writeSource(parent)
     let originalHash = try await Task.detached { try ModelInstaller.hashFile(source, maxBytes: 3_145_728) }.value
     try await model.importDocuments([source], flag: CancellationFlag())
-    try await focusCurrentEditor(model, requiresActualKeyWindow: false)
+    try await focusCurrentEditor(model)
     let imported = try XCTUnwrap(model.pagedSelectedRecord)
     XCTAssertEqual(imported.document.revision.summary.bytes, 3_145_728)
     let engine = try XCTUnwrap(model.pagedEngine), session = try XCTUnwrap(model.pagedSession)
@@ -1550,7 +1550,7 @@ private final class LiveBackupCopyHold: @unchecked Sendable {
     try await Task.detached { try FileManager.default.removeItem(at: source) }.value
     let restoredStore = try await Task.detached { try WorkspaceStore(rootOverride: restoredRoot) }.value
     try await restoredStore.restoreBackup(from: backup)
-    let restored = try await open(restoredRoot, requiresActualKeyWindow: false)
+    let restored = try await open(restoredRoot)
     let restoredEngine = try XCTUnwrap(restored.pagedEngine), restoredSession = try XCTUnwrap(restored.pagedSession)
     XCTAssertFalse(restoredEngine === engine); XCTAssertNotEqual(restoredSession.sessionID, session.sessionID)
     let restoredRecord = try XCTUnwrap(restored.pagedSelectedRecord)
