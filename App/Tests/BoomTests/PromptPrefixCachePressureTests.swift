@@ -139,7 +139,15 @@ final class PromptPrefixCachePressureTests: XCTestCase {
         .init(row: 0, emittedTokenIDs: [], stopTokenID: 999), .init(row: 1, emittedTokenIDs: first),
         .init(row: 2, emittedTokenIDs: second)]))
       XCTAssertLessThanOrEqual(store.retainedBytesUpperBound, 8192)
-      XCTAssertEqual(store.retainedSnapshotObservations.first(where: { $0.row == 0 })?.tokenIDs, ids)
+      // A prompt-only EOS keeps prefill provenance (row == nil). Identify
+      // its actual stopped lane by the receipt rather than a decode-origin row.
+      let earlyEOS = store.retainedSnapshotObservations.first {
+        $0.nativeRowReceipt?.observedStopTokenID == 999
+      }
+      XCTAssertEqual(earlyEOS?.tokenIDs, ids)
+      XCTAssertEqual(earlyEOS?.origin, .prefill)
+      XCTAssertNil(earlyEOS?.row)
+      XCTAssertEqual(earlyEOS?.nativeRowReceipt?.deliveredGeneratedTokenCount, 0)
       let identical = try request(store, ids, owner: scope)
       XCTAssertEqual(identical.cachedTokenCount, 62, "EOS requires coverage one boundary before the saved endpoint.")
       XCTAssertEqual(identical.cache[0].state[0].asArray(Float.self),
@@ -258,36 +266,122 @@ final class PromptPrefixCachePressureTests: XCTestCase {
     }
   }
 
-  func testPressureCannotCreditSourceStillNeededByHydratedWorkingCache() async throws {
+  /// Test-side ready observation only. The scoped C pins close on return;
+  /// neither this helper nor the production hook evaluates an unready graph.
+  private func readyParentBytes(_ arrays: [MLXArray], phase: String) throws -> UInt64 {
+    let pair = try XCTUnwrap(arrays.count == 2 ? arrays : nil)
+    let keys = try XCTUnwrap(pair[0].readyBuffer(), "Missing completed K parent at \(phase).")
+    let values = try XCTUnwrap(pair[1].readyBuffer(), "Missing completed V parent at \(phase).")
+    XCTAssertGreaterThanOrEqual(keys.allocationBytes, pair[0].nbytes)
+    XCTAssertGreaterThanOrEqual(values.allocationBytes, pair[1].nbytes)
+    let keyBytes = try XCTUnwrap(UInt64(exactly: keys.allocationBytes))
+    let valueBytes = try XCTUnwrap(UInt64(exactly: values.allocationBytes))
+    let (sum, overflow) = keyBytes.addingReportingOverflow(valueBytes)
+    let total = try XCTUnwrap(overflow ? nil : sum, "Physical parent byte sum overflowed.")
+    print("KVPressureReady phase=\(phase) keyParent=\(keyBytes) valueParent=\(valueBytes) keyLogical=\(pair[0].nbytes) valueLogical=\(pair[1].nbytes) total=\(total)")
+    return total
+  }
+
+  func testReadyParentBudgetOneByteShortRefusesSpillWithoutChangingNativeKV() async throws {
     try await Device.withDefaultDevice(.cpu) {
-      let store = PromptPrefixCache(byteLimit: 56), scope = owner(), ids = Array(0..<6)
+      let scope = owner(), ids = Array(0..<6)
+      let keys = MLXArray(ids.map(Float.init), [1, 1, 6, 1]), values = keys + 100
+      asyncEval([keys, values]); eval([keys, values])
+      let required = try readyParentBytes([keys, values], phase: "under-budget-source")
+      let (limit, overflow) = required.subtractingReportingOverflow(1)
+      let rawLimit = try XCTUnwrap(overflow ? nil : limit)
+      let store = PromptPrefixCache(byteLimit: rawLimit)
       let cold = try store.makeSession(owner: scope, input: LMInput(tokens: MLXArray(ids)),
         promptTokenIDs: ids, prefill: PrefillParameters(stepSize: 6),
         useActiveNative: true, makeCache: { [RotatingKVCache(maxSize: 4)] })
-      let source = MLXArray(ids.map(Float.init), [1, 1, 6, 1])
-      _ = cold.cache[0].update(keys: source, values: source + 100)
+      _ = cold.cache[0].update(keys: keys, values: values)
       cold.prefill.progress?(6, 6)
       asyncEval(cold.cache.flatMap { $0.innerState() }); eval(cold.cache); cold.markCacheSubmitted()
-      await cold.joinPendingSpill(cancelled: false); XCTAssertTrue(store.publish(cold))
+      XCTAssertEqual(try readyParentBytes(cold.cache[0].innerState(), phase: "under-budget-native"), required)
+      await cold.joinPendingSpill(cancelled: false)
+      XCTAssertEqual(cold.retentionObservation?.refusalReason, "pool_limit")
+      XCTAssertEqual(cold.retentionObservation?.diskSubmittedJobs, 0)
+      XCTAssertEqual(cold.retentionObservation?.diskBytes, 0)
+      XCTAssertEqual(store.retainedBytesUpperBound, 0); XCTAssertEqual(store.activeCaptureLeaseCount, 0)
+      XCTAssertEqual(cold.cache[0].offset, 6)
+      XCTAssertEqual(cold.cache[0].state[0].asArray(Float.self), ids.map(Float.init))
+      XCTAssertEqual(cold.cache[0].state[1].asArray(Float.self), ids.map { Float($0 + 100) })
+      XCTAssertTrue(store.publish(cold), "A real joined hot cache remains valid even when its disk spill cannot fit.")
+      let next = try store.makeSession(owner: scope, input: LMInput(tokens: MLXArray(ids)),
+        promptTokenIDs: ids, prefill: PrefillParameters(stepSize: 6),
+        useActiveNative: true, makeCache: { [RotatingKVCache(maxSize: 4)] })
+      XCTAssertEqual(next.cachedTokenCount, 5,
+        "The sole hot ring still physically covers this prefix even though its disk spill was refused.")
+      XCTAssertEqual(next.cache[0].offset, 5)
+      XCTAssertEqual(next.cache[0].state[0].asArray(Float.self), [1, 2, 3, 4])
+      XCTAssertEqual(next.cache[0].state[1].asArray(Float.self), [101, 102, 103, 104])
+      XCTAssertEqual(cold.cache[0].offset, 6)
+      XCTAssertEqual(cold.cache[0].state[0].asArray(Float.self), ids.map(Float.init))
+      XCTAssertGreaterThanOrEqual(store.retainedNativeBytesUpperBound, 48)
+      store.clear(); next.discardStagedAnchors(); cold.discardStagedAnchors()
+      XCTAssertEqual(store.retainedBytesUpperBound, 0); XCTAssertEqual(store.activeCaptureLeaseCount, 0)
+      XCTAssertGreaterThanOrEqual(store.retainedNativeBytesUpperBound, 48,
+        "A declined raw pin cannot credit the explicitly held native source.")
+    }
+  }
+
+  func testPressureCannotCreditSourceStillNeededByHydratedWorkingCache() async throws {
+    try await Device.withDefaultDevice(.cpu) {
+      let scope = owner(), ids = Array(0..<6)
+      let source = MLXArray(ids.map(Float.init), [1, 1, 6, 1]), values = source + 100
+      asyncEval([source, values]); eval([source, values])
+      let parents = try readyParentBytes([source, values], phase: "positive-source")
+      // The pinned allocator declines cache rentals >=2x the requested extent.
+      // Derive fixture headroom from ACTUAL parents, not the former56-byte
+      // logical archive. The later four-position ring is measured again below.
+      let (doubled, overflow) = parents.multipliedReportingOverflow(by: 2)
+      let rawLimit = try XCTUnwrap(overflow ? nil : doubled)
+      XCTAssertLessThanOrEqual(rawLimit, PromptPrefixCache.defaultByteLimit)
+      print("KVPressureQuota rawLimit=\(rawLimit) measuredParents=\(parents)")
+      let store = PromptPrefixCache(byteLimit: rawLimit)
+      let cold = try store.makeSession(owner: scope, input: LMInput(tokens: MLXArray(ids)),
+        promptTokenIDs: ids, prefill: PrefillParameters(stepSize: 6),
+        useActiveNative: true, makeCache: { [RotatingKVCache(maxSize: 4)] })
+      _ = cold.cache[0].update(keys: source, values: values)
+      cold.prefill.progress?(6, 6)
+      asyncEval(cold.cache.flatMap { $0.innerState() }); eval(cold.cache); cold.markCacheSubmitted()
+      XCTAssertEqual(try readyParentBytes(cold.cache[0].innerState(), phase: "positive-cold"), parents)
+      await cold.joinPendingSpill(cancelled: false)
+      XCTAssertGreaterThan(cold.retentionObservation?.diskSubmittedJobs ?? 0, 0)
+      XCTAssertTrue(store.publish(cold))
       var warm: PromptPrefixCache.Session? = try store.makeSession(owner: scope,
         input: LMInput(tokens: MLXArray(ids)), promptTokenIDs: ids,
         prefill: PrefillParameters(stepSize: 6), useActiveNative: true, makeCache: { [RotatingKVCache(maxSize: 4)] })
       XCTAssertEqual(warm?.cachedTokenCount, 5)
+      do {
+        let working = try XCTUnwrap(warm).cache[0]
+        asyncEval(working.innerState()); eval(working.innerState())
+        XCTAssertLessThanOrEqual(try readyParentBytes(working.innerState(), phase: "positive-hydrated"), rawLimit)
+        XCTAssertEqual(working.state[0].asArray(Float.self), [1, 2, 3, 4])
+        XCTAssertEqual(working.state[1].asArray(Float.self), [101, 102, 103, 104])
+      }
       let final = MLXArray([Float(5)], [1, 1, 1, 1])
       _ = warm!.cache[0].update(keys: final, values: final + 100)
       warm!.prefill.progress?(1, 1)
       let next = MLXArray([Float(901)], [1, 1, 1, 1])
       _ = warm!.cache[0].update(keys: next, values: next + 100)
       XCTAssertEqual(warm!.cache[0].offset, 7, "The valid model forward still proceeds.")
-      eval(warm!.cache); warm!.markCacheSubmitted(); await warm!.joinPendingSpill(cancelled: false)
+      asyncEval(warm!.cache.flatMap { $0.innerState() }); eval(warm!.cache); warm!.markCacheSubmitted()
+      XCTAssertLessThanOrEqual(try readyParentBytes(warm!.cache[0].innerState(), phase: "positive-advanced"), rawLimit)
+      XCTAssertEqual(warm!.cache[0].state[0].asArray(Float.self), [5, 901, 3, 4])
+      XCTAssertEqual(warm!.cache[0].state[1].asArray(Float.self), [105, 1001, 103, 104])
+      await warm!.joinPendingSpill(cancelled: false)
       XCTAssertEqual(warm!.retentionObservation?.lastCompleteTokenCount, 7)
       XCTAssertNil(warm!.retentionObservation?.refusalReason,
-        "Eliminating the extra immutable RAM archive removes this former artificial pool refusal; actual native aliases still stay charged.")
+        "No extra immutable RAM archive is retained; every actual ready parent still fits the measured raw quota.")
       XCTAssertTrue(warm!.retentionObservation?.compactLocalCoverage == true)
-      XCTAssertLessThanOrEqual(store.retainedBytesUpperBound, 56)
+      XCTAssertLessThanOrEqual(store.retainedBytesUpperBound, rawLimit)
       store.clear(); warm!.discardStagedAnchors()
       XCTAssertGreaterThanOrEqual(store.retainedNativeBytesUpperBound, 48,
         "Optional descriptor release cannot erase the aliased full source backing.")
+      XCTAssertEqual(cold.cache[0].offset, 6)
+      XCTAssertEqual(cold.cache[0].state[0].asArray(Float.self), ids.map(Float.init))
+      XCTAssertEqual(cold.cache[0].state[1].asArray(Float.self), ids.map { Float($0 + 100) })
       warm = nil
       XCTAssertEqual(store.retainedBytesUpperBound, 0)
       XCTAssertGreaterThan(store.retainedNativeBytesUpperBound, 0, "The explicitly held cold session still owns its real native cache.")

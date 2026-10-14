@@ -586,6 +586,7 @@ actor MLXGemmaRunner {
   nonisolated func invalidatePromptCacheRetention(reason: String) { promptCache.clear(reason: reason) }
   func clearPromptCache() async {
     await InferenceExecutor.shared.perform { _ in self.promptCache.clear() }
+    await promptCache.joinPendingDiskCleanup()
   }
   func diagnosticCacheSnapshots() -> [PromptPrefixCache.SnapshotObservation] {
     promptCache.retainedSnapshotObservations

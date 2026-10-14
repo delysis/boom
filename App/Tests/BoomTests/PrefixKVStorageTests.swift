@@ -127,6 +127,8 @@ final class PrefixKVStorageTests: XCTestCase {
       let viewArrays = try view.materialize(row: 0, positions: 0..<2)
       XCTAssertEqual(originalArrays.0.asArray(Float.self), [0, 10, 20, 30])
       XCTAssertEqual(viewArrays.0.asArray(Float.self), [10, 20])
+      XCTAssertEqual(originalArrays.1.asArray(Float.self), [-1, -11, -21, -31])
+      XCTAssertEqual(viewArrays.1.asArray(Float.self), [-11, -21])
       XCTAssertEqual(view.id, original.id); XCTAssertEqual(view.backingBytesUpperBound, original.backingBytesUpperBound)
     }
   }

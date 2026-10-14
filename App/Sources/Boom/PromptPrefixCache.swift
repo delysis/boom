@@ -254,6 +254,7 @@ final class PromptPrefixCache: @unchecked Sendable {
       guard cap > 0 else { return nil }
       if supports(cap) { return cap }
       var ceilings: Set<Int> = []
+      if let nativeCurrentPrefix, nativeCurrentPrefix <= cap { ceilings.insert(nativeCurrentPrefix) }
       for values in spans {
         var upper: Int?
         for span in values {
@@ -1089,6 +1090,9 @@ final class PromptPrefixCache: @unchecked Sendable {
     publicationTicket = nil; pendingMissReason = reason
     lock.unlock(); withExtendedLifetime(retired) {}
   }
+  /// Explicit close/eviction joins producers first, then clears and awaits the
+  /// cleanup already queued by last file owners. Escaped spans remain owned.
+  func joinPendingDiskCleanup() async { await disk.joinPending() }
   var retainedAnchorTokenCounts: [Int] {
     lock.lock(); defer { lock.unlock() }; return (entries.values.map { $0.entry.tokens.count } + (activeNative?.rows.map { $0.tokens.count } ?? [])).sorted(by: >)
   }
@@ -1622,7 +1626,22 @@ final class PromptPrefixCache: @unchecked Sendable {
         } }
       }
       let lexical = zip(tokens, row.tokens).prefix(while: { $0.0 == $0.1 }).count
-      guard let count = row.maximumSupportedPrefix(upTo: min(lexical, tokens.count - 1)),
+      let cap = min(lexical, tokens.count - 1)
+      if let source, cap > 0 {
+        // Probe the sole joined hot owner's actual coverage. No resident view
+        // is archived; an earlier covered prefix is hydrated after admission.
+        row.nativeCurrentPrefix = cap
+        if !Self.hasCurrentHot(row, owners: source.owners) {
+          // Across an overwritten-tail gap, only the pinned prefix can remain.
+          let pinned = row.layouts.compactMap { layout -> Int? in
+            if case .rotating(_, let keep, _, _) = layout { return keep }
+            return nil
+          }.min() ?? 0
+          row.nativeCurrentPrefix = min(cap, pinned)
+          if !Self.hasCurrentHot(row, owners: source.owners) { row.nativeCurrentPrefix = nil }
+        }
+      }
+      guard let count = row.maximumSupportedPrefix(upTo: cap),
         count > longest else { continue }
       selected = row; selectedRecord = source; longest = count
     }
@@ -1630,7 +1649,7 @@ final class PromptPrefixCache: @unchecked Sendable {
     return (selectedRecord, selected, longest, storageEpoch)
   }
   private static func hasCurrentHot(_ row: Entry, owners: [PrefixKVNativeOwnership]) -> Bool {
-    guard let prefix = row.nativeCurrentPrefix, prefix == row.tokens.count,
+    guard let prefix = row.nativeCurrentPrefix, prefix > 0, prefix <= row.tokens.count,
       owners.count == row.layouts.count, let width = try? ActiveNativeKVStorage.rowWidth(owners) else { return false }
     let selected = row.nativeLedgerRow ?? row.row ?? 0
     guard selected >= 0, selected < width else { return false }
@@ -1639,7 +1658,7 @@ final class PromptPrefixCache: @unchecked Sendable {
       if let batch = native as? any BatchKVCacheProtocol {
         guard let positions = PrefixKVStorage.readyBatchPositions(batch), selected < positions.positions.count,
           positions.positions[selected] >= prefix else { return false }
-      } else if native.offset != prefix { return false }
+      } else if native.offset < prefix { return false }
       guard PrefixKVStorage.layout(of: native) == row.layouts[layer] else { return false }
       if case .rotating = row.layouts[layer] {
         return PrefixKVStorage.currentRingSupports(native, prefix: prefix, row: selected)

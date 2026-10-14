@@ -176,8 +176,17 @@ struct PrefixKVSpan {
     }
     try self.init(id: id, offset: offset, layer: layer,
       keyShape: keys.shape, valueShape: values.shape, keyType: keys.dtype, valueType: values.dtype,
-      storage: .resident(keys, values), rows: 0..<keys.dim(0), positions: 0..<keys.dim(2),
+      storage: .resident(Self.detachedDescriptor(keys), Self.detachedDescriptor(values)),
+      rows: 0..<keys.dim(0), positions: 0..<keys.dim(2),
       bound: backingBytesUpperBound ?? bytes)
+  }
+  /// Own an independent array context while sharing its existing backing.
+  /// Updating the caller's Swift wrapper must not change this immutable span.
+  /// MLX context assignment adds no primitive, evaluation or tensor copy.
+  private static func detachedDescriptor(_ array: MLXArray) -> MLXArray {
+    let snapshot = MLXArray.mlxNone
+    snapshot._updateInternal(array)
+    return snapshot
   }
   init(disk: PrefixKVDiskFile, offset: Int, layer: Int, keyShape: [Int], valueShape: [Int],
     keyType: DType, valueType: DType, keysOffset: UInt64, valuesOffset: UInt64) throws {
@@ -346,8 +355,8 @@ enum PrefixKVStorage {
   }
 
   /// Current-hot eligibility is metadata only. The actual joined native owner
-  /// must still hold this exact offset/row and every required ring interval.
-  /// Historical prefixes and ragged Batch caches cannot use this scalar path.
+  /// must still hold every required interval for this authorized prefix/row.
+  /// Earlier resident prefixes are hydrated; an overwritten tail is a miss.
   static func currentRingSupports(_ cache: any KVCache, prefix: Int, row: Int) -> Bool {
     let native = unwrap(cache)
     if let batch = native as? BatchRotatingKVCache {
@@ -364,7 +373,7 @@ enum PrefixKVStorage {
       }
       return false
     }
-    guard prefix > 0, native.offset == prefix,
+    guard prefix > 0, native.offset >= prefix,
       let layout = layout(of: native), case let .rotating(window, keep, _, _) = layout,
       let ranges = try? readyRingRanges(of: native, after: 0, needsPinned: true) else { return false }
     let arrays = native.innerState()

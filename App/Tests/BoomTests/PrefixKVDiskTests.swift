@@ -468,4 +468,41 @@ final class PrefixKVDiskTests: XCTestCase {
       }
     }
   }
+
+  func testJoinedManagerClearRetainsEscapedReaderThenJoinsLastFileOwnerCleanup() async throws {
+    try await InferenceExecutor.shared.perform { _ in
+      try await Device.withDefaultDevice(.cpu) {
+        let root = try Self.root()
+        let store = PromptPrefixCache(byteLimit: 4096, temporaryParent: root)
+        let owner = PromptCacheOwner(namespace: UUID(), entity: UUID(), route: .consultation)
+        let ids = Array(0..<6)
+        var source: PromptPrefixCache.Session? = try Self.session(store, ids, owner: owner)
+        try await Self.finishPrefill(XCTUnwrap(source))
+        XCTAssertTrue(store.publish(try XCTUnwrap(source)))
+        XCTAssertGreaterThan(source?.retentionObservation?.diskCreatedFiles ?? 0, 0)
+        source?.discardStagedAnchors(); source = nil
+        var escaped: PromptPrefixCache.Session? = try Self.session(store, ids + [9], owner: owner)
+        XCTAssertEqual(escaped?.cachedTokenCount, 6)
+        XCTAssertFalse(try Self.files(root).isEmpty, "Require actual completed private-file spills.")
+
+        store.clear()
+        await store.joinPendingDiskCleanup()
+        XCTAssertFalse(store.hasAnchors)
+        XCTAssertFalse(try Self.files(root).isEmpty,
+          "Joined clear must not unlink spans still owned by a genuine warm reader.")
+        if let reader = escaped {
+          XCTAssertGreaterThan(reader.retentionObservation?.diskBytes ?? 0, 0)
+          XCTAssertEqual(reader.cache[0].state[0].asArray(Float.self), ids.map(Float.init))
+          XCTAssertEqual(reader.cache[1].state[0].asArray(Float.self), [Float(2), 3, 4, 5])
+          reader.discardStagedAnchors()
+        }
+        escaped = nil // the last cache/capture file owners, not a forced purge
+        await store.joinPendingDiskCleanup()
+        XCTAssertTrue(try Self.files(root).isEmpty,
+          "The explicit join must complete the actual queued last-owner unlinks.")
+        XCTAssertEqual(store.activeCaptureLeaseCount, 0)
+        XCTAssertEqual(store.retainedBytesUpperBound, 0)
+      }
+    }
+  }
 }

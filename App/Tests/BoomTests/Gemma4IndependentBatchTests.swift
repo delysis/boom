@@ -275,7 +275,7 @@ struct Gemma4IndependentBatchTests {
             let model = try Self.model(perLayerInput: 4, kEqualsV: false)
             let prompts = [511, 512, 513].enumerated().map { Self.tokens($0.element, row: $0.offset).map(Int.init) }
             let policy = ModelGenerationPolicy(schema: 1, vocabularySize: 32, eosTokenIDs: [31],
-                suppressedTokenIDs: [], controlTokenIDs: [31], textDecoding: "checkpoint-no-cleanup-v1",
+                suppressedTokenIDs: [], controlTokenIDs: [31], textDecoding: "checkpoint_raw_v1",
                 prefill: .init(chunking: "fixed_v1", tokenCeiling: 512))
             let seeds: [UInt64] = [7, 41, 151], journals = Journals()
             func run(faults: Bool) async throws -> (MLXGemmaRunner.IndependentTextDecoded,
