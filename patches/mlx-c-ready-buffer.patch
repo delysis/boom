@@ -1,0 +1,107 @@
+--- a/mlx/c/array.cpp
++++ b/mlx/c/array.cpp
+@@ -6,6 +6,77 @@
+ #include "mlx/c/error.h"
+ #include "mlx/c/private/mlx.h"
+ #include "mlx/c/string.h"
++
++namespace {
++struct ReadyBuffer {
++  std::shared_ptr<mlx::core::array::Data> storage;
++  const void* bytes;
++  size_t size;
++  size_t offset;
++};
++} // namespace
++
++extern "C" int mlx_array_try_ready_buffer(
++    mlx_ready_buffer* result, const mlx_array arr) {
++  if (result == nullptr) {
++    return 1;
++  }
++  result->ctx = nullptr;
++#if defined(_METAL_)
++  try {
++    auto& value = mlx_array_get_(arr);
++    // is_available alone accepts evaluated intermediates without an event.
++    if (value.status() == mlx::core::array::Status::unscheduled) {
++      return 1;
++    }
++    if (value.event().valid()) {
++      if (!value.event().is_signaled()) {
++        return 1;
++      }
++      // Observe without consuming the original producer error.
++      if (value.event().load_error() != nullptr) {
++        return 1;
++      }
++    } else if (value.status() != mlx::core::array::Status::available) {
++      return 1;
++    }
++    // Do not detach the event or change producer status during handoff.
++    if (value.size() == 0 ||
++        !value.data_shared_ptr() || value.offset() < 0) {
++      return 1;
++    }
++    // Data only: no ArrayDesc, primitive, inputs, graph or event crosses threads.
++    auto storage = value.data_shared_ptr();
++    auto size = value.buffer_size();
++    auto offset = static_cast<size_t>(value.offset());
++    auto bytes = storage->buffer.raw_ptr();
++    if (bytes == nullptr || offset >= size) {
++      return 1;
++    }
++    result->ctx = new ReadyBuffer{std::move(storage), bytes, size, offset};
++    return 0;
++  } catch (...) {
++    // Optimization failure must not call the process-wide fatal error handler.
++    return 1;
++  }
++#else
++  // Other raw_ptr backends can perform synchronous device transfers.
++  return 1;
++#endif
++}
++
++extern "C" void mlx_ready_buffer_free(mlx_ready_buffer buffer) {
++  delete static_cast<ReadyBuffer*>(buffer.ctx);
++}
++extern "C" const void* mlx_ready_buffer_data(mlx_ready_buffer buffer) {
++  return buffer.ctx ? static_cast<ReadyBuffer*>(buffer.ctx)->bytes : nullptr;
++}
++extern "C" size_t mlx_ready_buffer_size(mlx_ready_buffer buffer) {
++  return buffer.ctx ? static_cast<ReadyBuffer*>(buffer.ctx)->size : 0;
++}
++extern "C" size_t mlx_ready_buffer_offset(mlx_ready_buffer buffer) {
++  return buffer.ctx ? static_cast<ReadyBuffer*>(buffer.ctx)->offset : 0;
++}
+ 
+ extern "C" size_t mlx_dtype_size(mlx_dtype dtype) {
+   return mlx_dtype_to_cpp(dtype).size();
+--- a/mlx/c/array.h
++++ b/mlx/c/array.h
+@@ -38,6 +38,24 @@
+ typedef struct mlx_array_ {
+   void* ctx;
+ } mlx_array;
++
++/** Immutable completed storage, independent of the array graph. Acquire on the
++ * evaluation owner before its next mutation/submission. Retention prevents
++ * MLX's functional buffer donation until last release.
++ */
++typedef struct mlx_ready_buffer_ {
++  void* ctx;
++} mlx_ready_buffer;
++
++/** Return 0 only for completed, error-free shared Metal storage. NEVER schedules,
++ * evaluates, waits or numerically converts. Unscheduled and evaluated/no-event
++ * arrays, empty layouts and unsupported backends return 1.
++ */
++int mlx_array_try_ready_buffer(mlx_ready_buffer* result, const mlx_array arr);
++void mlx_ready_buffer_free(mlx_ready_buffer buffer);
++const void* mlx_ready_buffer_data(mlx_ready_buffer buffer);
++size_t mlx_ready_buffer_size(mlx_ready_buffer buffer);
++size_t mlx_ready_buffer_offset(mlx_ready_buffer buffer);
+ 
+ static mlx_array mlx_array_empty;
+ 

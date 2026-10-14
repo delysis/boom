@@ -17,4 +17,5 @@ fi
 mkdir -p "$HERE/.build-support"
 (cd "$HERE" && cargo fmt --all -- --check && { [[ -f Cargo.lock ]] || cargo generate-lockfile; })
 (cd "$HERE/App" && swift package resolve)
+python3 "$HERE/scripts/prepare-mlx-runtime.py" --apply
 echo 'Source preparation complete. Review and retain the generated dependency locks before release.'

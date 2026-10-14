@@ -7,3 +7,6 @@ App/Tests/BoomTests/Fixtures/Attachments/*.bin binary
 
 App/Tests/BoomTests/Fixtures/Storyboard/*.mp4 binary
 App/Tests/BoomTests/Fixtures/Storyboard/*.wav binary
+
+# Unified diff context includes a single space on otherwise empty lines.
+patches/*.patch -whitespace

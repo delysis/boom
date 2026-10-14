@@ -59,6 +59,41 @@ struct SupplementalPackage: Decodable {
   let files: [SupplementalFile]
 }
 struct SupplementalInventory: Decodable { let schema: Int; let packages: [SupplementalPackage] }
+struct RuntimeOverlay: Decodable {
+  struct File: Decodable { let path: String; let sha256: String }
+  let directory: String
+  let revision: String
+  let patch: String
+  let patchSHA256: String
+  let files: [File]
+  var provenance: [String: Any] {
+    ["source_directory": directory, "upstream_revision": revision,
+      "compiled_source": "tracked_overlay", "patch": patch, "patch_sha256": patchSHA256,
+      "postimages": files.map { ["path": $0.path, "sha256": $0.sha256] }]
+  }
+}
+let overlaysURL = root.appendingPathComponent("patches/mlx-runtime-overlays.json")
+var runtimeOverlays: [RuntimeOverlay] = []
+if fm.fileExists(atPath: overlaysURL.path) {
+  let values = try overlaysURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+  guard values.isRegularFile == true, values.isSymbolicLink != true, (values.fileSize ?? Int.max) <= 65_536 else {
+    fatalError("Invalid tracked runtime overlay manifest")
+  }
+  runtimeOverlays = try JSONDecoder().decode([RuntimeOverlay].self, from: Data(contentsOf: overlaysURL))
+  // This is the same verifier used before compilation. It admits no arbitrary
+  // dirty checkout, and independently checks the nested C dependency.
+  let verifier = Process()
+  verifier.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+  verifier.arguments = ["python3", root.appendingPathComponent("scripts/prepare-mlx-runtime.py").path, "--verify"]
+  try verifier.run(); verifier.waitUntilExit()
+  guard verifier.terminationStatus == 0 else { fatalError("Runtime overlay verification failed") }
+}
+func overlayFor(_ source: Source) -> RuntimeOverlay? {
+  runtimeOverlays.first {
+    root.appendingPathComponent($0.directory).standardizedFileURL == source.directory.standardizedFileURL
+      && $0.revision == source.revision
+  }
+}
 let supplementalURL = root.appendingPathComponent("licenses/supplemental.json")
 var supplemental: [String: SupplementalPackage] = [:]
 var supplementalInvalid = false
@@ -160,10 +195,25 @@ for (index, entry) in pins.enumerated() {
     license: "inspect source notice", explicit: nil, revision: revision, workspaceMember: false, repository: nil))
 }
 try fm.createDirectory(at: destination, withIntermediateDirectories: true)
+if !runtimeOverlays.isEmpty {
+  try fm.copyItem(at: overlaysURL, to: destination.appendingPathComponent("mlx-runtime-overlays.json"))
+  for overlay in runtimeOverlays {
+    try fm.copyItem(at: root.appendingPathComponent(overlay.patch),
+      to: destination.appendingPathComponent(overlay.patchSHA256 + "-" + URL(fileURLWithPath: overlay.patch).lastPathComponent))
+    // A nested dependency is a separate pinned source, not a cleanliness waiver
+    // for its parent. Keep its own source notice and provenance in this inventory.
+    if !sources.contains(where: { root.appendingPathComponent(overlay.directory).standardizedFileURL == $0.directory.standardizedFileURL }) {
+      sources.append(Source(name: "swift:mlx-c", directory: root.appendingPathComponent(overlay.directory),
+        license: "inspect source notice", explicit: nil, revision: overlay.revision,
+        workspaceMember: false, repository: nil))
+    }
+  }
+}
 for source in sources.sorted(by: { $0.name < $1.name }) {
   if let revision = source.revision {
     let actual = git(source.directory, ["rev-parse", "HEAD"])
-    guard actual == revision, git(source.directory, ["diff", "--quiet", "HEAD", "--"]) != nil else {
+    guard actual == revision,
+      overlayFor(source) != nil || git(source.directory, ["diff", "--quiet", "HEAD", "--"]) != nil else {
       inventory.append(unresolved(source.name, actual == revision ? "modified_checkout" : "revision_mismatch", revision: revision, actual: actual))
       sourceInventoryComplete = false
       continue
@@ -241,12 +291,15 @@ for source in sources.sorted(by: { $0.name < $1.name }) {
     "status": retained.isEmpty ? "notices_missing" : (rejected.isEmpty ? "retained" : "notices_incomplete"),
     "retained_notices": retained.sorted(), "rejected_notices": rejected.sorted(), "requires_license_review": true]
   if let revision = source.revision { row["expected_revision"] = revision; row["actual_revision"] = revision }
+  if let overlay = overlayFor(source) { row["runtime_overlay"] = overlay.provenance }
   if let extra = supplemental[source.name] { row["supplemental_revision"] = extra.revision; row["supplemental_repository"] = extra.repository }
   inventory.append(row)
 }
 let record: [String: Any] = ["schema": 2,
   "scope": "expected resolved source packages; may include non-linked or build dependencies",
   "distribution_approved": false, "source_inventory_complete": sourceInventoryComplete,
+  "model_pack_conversion_upstream_revision": args[5],
+  "compiled_runtime_overlays": runtimeOverlays.map(\.provenance),
   "notices_complete": sourceInventoryComplete && inventory.allSatisfy { $0["status"] as? String == "retained" },
   "packages": inventory.sorted { ($0["package"] as? String ?? "") < ($1["package"] as? String ?? "") }]
 let bytes = try JSONSerialization.data(withJSONObject: record, options: [.prettyPrinted, .sortedKeys])

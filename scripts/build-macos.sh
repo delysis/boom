@@ -5,7 +5,7 @@ if [[ "$(uname -s)" != Darwin ]]; then echo 'macOS required.' >&2; exit 1; fi
 [[ -f "$HERE/Cargo.lock" && -f "$HERE/App/Package.resolved" ]] || { echo 'Run scripts/bootstrap.sh once and review the dependency locks.' >&2; exit 1; }
 MLX_RUNTIME=9afc3b55f75a0d41a3d0c11330b9df6a036d24e4
 [[ "$(git -C "$HERE/.deps/MLXSwiftLM" rev-parse HEAD)" == "$MLX_RUNTIME" ]] || { echo 'Unexpected MLX Swift LM revision.' >&2; exit 1; }
-git -C "$HERE/.deps/MLXSwiftLM" diff --quiet HEAD || { echo 'MLX Swift LM source has local changes.' >&2; exit 1; }
+python3 "$HERE/scripts/prepare-mlx-runtime.py" --verify
 EDITION="${2:-author}"
 SIGN_PROFILE="${3:-development}"
 case "$SIGN_PROFILE" in
@@ -34,7 +34,7 @@ exec > >(tee "$OUT/build.log") 2>&1
 source_inventory() {
   (
     cd "$HERE"
-    { find App/Sources App/Tests Core/Sources Core/Tests RustBridge/src RustBridge/tests crates scripts licenses -type f; printf '%s\n' App/Package.swift Core/Package.swift RustBridge/Cargo.toml Cargo.toml Info.plist Entitlements.plist LICENSE LICENSE-MIT LICENSE-APACHE NOTICE.md; } | LC_ALL=C sort | while IFS= read -r path; do shasum -a 256 "$path"; done
+    { find App/Sources App/Tests Core/Sources Core/Tests RustBridge/src RustBridge/tests crates scripts patches licenses -type f; printf '%s\n' App/Package.swift Core/Package.swift RustBridge/Cargo.toml Cargo.toml Info.plist Entitlements.plist LICENSE LICENSE-MIT LICENSE-APACHE NOTICE.md; } | LC_ALL=C sort | while IFS= read -r path; do shasum -a 256 "$path"; done
   )
 }
 source_inventory > "$OUT/source-files-before.sha256"
