@@ -51,9 +51,18 @@ fn media_from_parser_cancelled<'a, F: BrokenLinkCallback<'a>>(
             break;
         };
         let Event::Start(
-            Tag::Link { dest_url, link_type, .. }
-            | Tag::Image { dest_url, link_type, .. },
-        ) = event else {
+            Tag::Link {
+                dest_url,
+                link_type,
+                ..
+            }
+            | Tag::Image {
+                dest_url,
+                link_type,
+                ..
+            },
+        ) = event
+        else {
             continue;
         };
         let Some(identity) = dest_url.strip_prefix("boom-attachment:") else {
@@ -443,8 +452,18 @@ mod tests {
                 })
                 .expect("actual ordinary collapsed Link/Image");
             assert!(
-                matches!(event, Event::Start(Tag::Link { link_type: LinkType::Collapsed, .. }
-                    | Tag::Image { link_type: LinkType::Collapsed, .. })),
+                matches!(
+                    event,
+                    Event::Start(
+                        Tag::Link {
+                            link_type: LinkType::Collapsed,
+                            ..
+                        } | Tag::Image {
+                            link_type: LinkType::Collapsed,
+                            ..
+                        }
+                    )
+                ),
                 "marker={marker:?}"
             );
             assert_eq!(
@@ -470,7 +489,10 @@ mod tests {
             );
             if !marker.starts_with('!') {
                 let style = spans(&text)?;
-                let link = style.iter().find(|span| span.kind == "link").expect("ordinary Link style");
+                let link = style
+                    .iter()
+                    .find(|span| span.kind == "link")
+                    .expect("ordinary Link style");
                 assert_eq!(
                     link.length,
                     marker.encode_utf16().count() - 2,

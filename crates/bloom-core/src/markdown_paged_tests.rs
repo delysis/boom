@@ -4349,7 +4349,10 @@ fn actual_collapsed_media_full_marker_ranges_survive_paged_projection_deletion_a
         let (mut engine, mut source, _) = self::source(&text)?;
         let snapshot = source.capture_for_publication()?;
         let (media, progress) = index(&mut engine, &snapshot, MarkupMode::Media)?;
-        assert!(media.complete() && !progress.incomplete_block, "marker={marker:?}");
+        assert!(
+            media.complete() && !progress.incomplete_block,
+            "marker={marker:?}"
+        );
         let view = context(&mut engine, &snapshot, Arc::clone(&media), anchor, 256)?;
         let actual = paged_media_spans(&view)?;
         assert_eq!(actual.len(), 1, "marker={marker:?}");
@@ -4371,8 +4374,13 @@ fn actual_collapsed_media_full_marker_ranges_survive_paged_projection_deletion_a
         let deleted_text = format!("{prefix}{tail}");
         assert_logical_source_bytes(&mut engine, &deleted, &deleted_text)?;
         let (after, progress) = index(&mut engine, &deleted, MarkupMode::Media)?;
-        assert!(after.complete() && !progress.incomplete_block, "marker={marker:?}");
-        assert!(paged_media_spans(&context(&mut engine, &deleted, after, anchor, 256)?)?.is_empty());
+        assert!(
+            after.complete() && !progress.incomplete_block,
+            "marker={marker:?}"
+        );
+        assert!(
+            paged_media_spans(&context(&mut engine, &deleted, after, anchor, 256)?)?.is_empty()
+        );
         source.restore(&snapshot)?;
         assert!(source.capture().same(&snapshot));
         let writes = engine.stats().page_writes;
