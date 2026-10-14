@@ -338,6 +338,7 @@ struct ChatComposer: NSViewRepresentable {
     var completionTarget: TextInputTarget?
     var currentTextVersion: (() -> UUID)?
     private var measuredHeight: CGFloat = -1
+    private var heightPublicationPending = false
     private var acknowledgedText: String?
     private var acknowledgedTextVersion: UUID?
     private var acknowledgedNativeVersion: UUID?
@@ -381,9 +382,12 @@ struct ChatComposer: NSViewRepresentable {
       measuredHeight = height
       // Layout can run during SwiftUI updates. Publish only the latest measured
       // height after that update, so typing and width changes remain native.
+      guard !heightPublicationPending else { return }
+      heightPublicationPending = true
       DispatchQueue.main.async { [weak self] in
-        guard let self, self.measuredHeight == height else { return }
-        self.onContentHeight?(height)
+        guard let self else { return }
+        self.heightPublicationPending = false
+        self.onContentHeight?(self.measuredHeight)
       }
     }
   }
