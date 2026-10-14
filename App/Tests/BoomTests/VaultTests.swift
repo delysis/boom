@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import BoomCore
 import XCTest
 @testable import Boom
 
@@ -123,4 +124,39 @@ final class VaultTests: XCTestCase {
     XCTAssertFalse(FileManager.default.fileExists(atPath: refused.path))
     XCTAssertEqual(try Data(contentsOf: foreign), retained)
   }
+  func testFailedAtomicReplacementRemovesOnlyItsTemporaryRecord() throws {
+    let root = try fixtureRoot(), vault = try Vault(root: root.appendingPathComponent("Objects"))
+    let id = UUID(), before = Data("Retained category bytes".utf8), after = Data("Replacement bytes".utf8)
+    try vault.put(before, kind: .receipt, id: id)
+    let target = vault.recordURL(.receipt, id)
+    let descriptor = Darwin.open(target.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+    guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+    defer { XCTAssertEqual(Darwin.close(descriptor), 0) }
+    var admitted = stat()
+    guard fstat(descriptor, &admitted) == 0, admitted.st_mode & S_IFMT == S_IFREG,
+      admitted.st_uid == getuid(), admitted.st_nlink == 1 else {
+      throw BoomError.invalid("The owned category fixture is not a regular file.")
+    }
+    guard fchflags(descriptor, admitted.st_flags | UInt32(UF_IMMUTABLE)) == 0 else {
+      throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    defer { XCTAssertEqual(fchflags(descriptor, admitted.st_flags), 0, "Restore exact flags on the same opened inode") }
+    do {
+      try vault.put(after, kind: .receipt, id: id)
+      XCTFail("An immutable destination allowed atomic replacement")
+    } catch {
+      let actual = error as NSError
+      XCTAssertEqual(actual.domain, NSPOSIXErrorDomain)
+      XCTAssertEqual(actual.code, Int(EPERM), "The real rename failure must remain the primary error")
+    }
+    XCTAssertEqual(try vault.get(.receipt, id: id), before)
+    XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: vault.root.path)
+      .allSatisfy { !$0.hasPrefix(".record-") }, "Failed publication must not leave its disposable stage")
+    guard fchflags(descriptor, admitted.st_flags) == 0 else {
+      throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    try vault.put(after, kind: .receipt, id: id)
+    XCTAssertEqual(try vault.get(.receipt, id: id), after)
+  }
+
 }

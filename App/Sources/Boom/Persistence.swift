@@ -103,6 +103,15 @@ struct WorkspaceState: Codable, Sendable {
   }
 }
 
+private struct WorkspaceRecordCleanupFailure: LocalizedError {
+  let original: Error
+  let cleanup: Error
+  let path: URL
+  var errorDescription: String? {
+    "\(original.localizedDescription) Record cleanup at \(path.path): \(cleanup.localizedDescription)"
+  }
+}
+
 /// Ordinary owner-only category files. Structured decode failure never becomes
 /// an empty workspace. Large document pages belong to the bounded source engine.
 final class Vault: @unchecked Sendable {
@@ -174,7 +183,7 @@ final class Vault: @unchecked Sendable {
     let descriptor = Darwin.open(stage.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
     guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
     let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
-    var closeAttempted = false
+    var closeAttempted = false, published = false
     let writeTrace = PerformanceTrace.begin("Storage.AtomicWrite")
     defer { PerformanceTrace.end("Storage.AtomicWrite", writeTrace) }
     do {
@@ -185,6 +194,7 @@ final class Vault: @unchecked Sendable {
       guard Darwin.rename(stage.path, target.path) == 0 else {
         throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
       }
+      published = true
       let parent = Darwin.open(target.deletingLastPathComponent().path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
       guard parent >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
       let synchronized = fsync(parent), syncError = errno
@@ -193,12 +203,18 @@ final class Vault: @unchecked Sendable {
         throw BoomError.unavailable("Workspace publication failed: sync \(synchronized)/\(syncError), close \(closed)/\(closeError).")
       }
     } catch {
-      let original = error
+      var failure = error
       if !closeAttempted {
         do { closeAttempted = true; try handle.close() }
-        catch { throw BoomError.unavailable("Workspace write failed: \(original.localizedDescription). Close also failed: \(error.localizedDescription)") }
+        catch { failure = WorkspaceRecordCleanupFailure(original: failure, cleanup: error, path: stage) }
       }
-      throw original
+      // Only this unpublished, exclusively created temporary record is disposable.
+      // A post-rename sync failure keeps the actual published target untouched.
+      if !published {
+        do { try FileManager.default.removeItem(at: stage) }
+        catch { failure = WorkspaceRecordCleanupFailure(original: failure, cleanup: error, path: stage) }
+      }
+      throw failure
     }
   }
   func get(_ kind: Kind, id: UUID, limit: Int = 16_777_216) throws -> Data {
