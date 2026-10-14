@@ -1549,7 +1549,7 @@ private final class LiveBackupCopyHold: @unchecked Sendable {
     try await joinedClose(model)
     try await Task.detached { try FileManager.default.removeItem(at: source) }.value
     let restoredStore = try await Task.detached { try WorkspaceStore(rootOverride: restoredRoot) }.value
-    try await Task.detached { try restoredStore.restoreBackup(from: backup) }.value
+    try await restoredStore.restoreBackup(from: backup)
     let restored = try await open(restoredRoot, requiresActualKeyWindow: false)
     let restoredEngine = try XCTUnwrap(restored.pagedEngine), restoredSession = try XCTUnwrap(restored.pagedSession)
     XCTAssertFalse(restoredEngine === engine); XCTAssertNotEqual(restoredSession.sessionID, session.sessionID)
