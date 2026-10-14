@@ -33,6 +33,16 @@ import Foundation
     var event: NSEvent
   }
   private var mouseSelectionGesture: MouseSelectionGesture?
+  private struct OrderedMousePointer {
+    let id: UUID
+    let source: PagedNativeLogicalSnapshot
+    let output: PagedNativeLogicalWindow
+    let anchor: UInt64
+    let affinity: PagedSelectionAffinity
+    var selection: PagedNativeNavigationSelection
+    var released = false
+  }
+  private var orderedMousePointer: OrderedMousePointer?
   private var mouseAutoscrollTimer: Timer?
   private var handedOffMouseDown: NSEvent?
   private(set) var presentationFailure: Error?
@@ -340,10 +350,14 @@ import Foundation
       view.writingToolsBehavior = .none
       view.clicked = { [weak self] event in self?.selectScrollPoint(event) }
       view.dragged = { [weak self] event in
-        self?.managedInput?.activeView?.mouseDragged(with: event)
+        guard let self else { return }
+        if orderedMousePointer != nil { updateOrderedMousePointer(event, released: false) }
+        else { managedInput?.activeView?.mouseDragged(with: event) }
       }
       view.lifted = { [weak self] event in
-        self?.managedInput?.activeView?.mouseUp(with: event)
+        guard let self else { return }
+        if orderedMousePointer != nil { updateOrderedMousePointer(event, released: true) }
+        else { managedInput?.activeView?.mouseUp(with: event) }
       }
       view.copied = { [weak self] sender in self?.managedInput?.activeView?.copy(sender) }
       let surface = PagedScrollSurface(frame: contentView.frame)
@@ -387,9 +401,12 @@ import Foundation
         let input = managedInput, let native = input.activeView, let window = self.window,
         event.type == .leftMouseDown, event.windowNumber == window.windowNumber,
         display.window === window, native.window === window,
-        input.commandOwner?.hasPendingCommand == false,
         display.layoutManager != nil, display.textContainer != nil else {
         throw BoomError.stale("The visible source window has no bounded native layout.")
+      }
+      if input.commandOwner?.hasPendingCommand == true {
+        try beginOrderedMousePointer(event, display: display, input: input, native: native)
+        return
       }
       let extending = event.modifierFlags.contains(.shift)
       let anchor: UInt64?
@@ -418,6 +435,76 @@ import Foundation
       } else { native.mouseDown(with: event) }
     } catch { failPresentation(error) }
   }
+  /// Paint the captured intent only on its immutable display while earlier
+  /// navigation/keys keep the actual Input selection and their exact leases.
+  private func beginOrderedMousePointer(_ event: NSEvent, display: NSTextView,
+    input: PagedNativeInputOwner, native: PagedNativeTextView) throws {
+    guard orderedMousePointer == nil, event.clickCount == 1,
+      event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+      let owner = input.commandOwner, owner.canOrderPointerAfterNavigation,
+      let read = scrollSnapshot, let output = scrollProjection, input.session.isCurrent(read),
+      output.snapshot.isSame(read.source), let window = native.window, window.isKeyWindow,
+      window.firstResponder === native else {
+      throw BoomError.stale("The pointer has no ordered source-neutral navigation consumer.")
+    }
+    let local = display.characterIndexForInsertion(at: display.convert(event.locationInWindow, from: nil))
+    let focus = try output.position(localUTF16: local).utf16
+    let original = try input.currentDocumentSelection()
+    let anchor = event.modifierFlags.contains(.shift) ? original.anchorUTF16 : focus
+    let selected = PagedNativeNavigationSelection(utf16Offset: min(anchor, focus),
+      utf16Length: max(anchor, focus) - min(anchor, focus), focusAtEnd: focus >= anchor,
+      affinity: original.affinity)
+    let id = try owner.beginOrderedDocumentPointer(read, selection: selected,
+      extending: event.modifierFlags.contains(.shift), from: native) { [weak self] id in
+      guard let self, orderedMousePointer?.id == id else { return }
+      orderedMousePointer = nil
+      revealEditableWindow()
+      if let selection = try? input.currentDocumentSelection(),
+        selection.focusUTF16 >= input.session.logicalWindow.start.utf16,
+        let local = Int(exactly: selection.focusUTF16 - input.session.logicalWindow.start.utf16),
+        local >= 0, local <= input.session.logicalWindow.text.utf16.count {
+        input.activeView?.scrollRangeToVisible(NSRange(location: local, length: 0))
+      }
+    }
+    orderedMousePointer = OrderedMousePointer(id: id, source: read.source, output: output,
+      anchor: anchor, affinity: selected.affinity, selection: selected)
+    paintOrderedMousePointer(selected, output: output, display: display)
+  }
+  private func paintOrderedMousePointer(_ selected: PagedNativeNavigationSelection,
+    output: PagedNativeLogicalWindow, display: NSTextView) {
+    let end = output.start.utf16 + output.summary.utf16
+    let lower = min(end, max(output.start.utf16, selected.utf16Offset))
+    let upper = min(end, max(lower, selected.utf16Offset + selected.utf16Length))
+    display.setSelectedRange(NSRange(location: Int(lower - output.start.utf16), length: Int(upper - lower)))
+  }
+  func continueOrderedDocumentMouseSelection(_ event: NSEvent, in view: PagedNativeTextView,
+    released: Bool) -> Bool {
+    guard orderedMousePointer?.released == false, managedInput?.activeView === view else { return false }
+    updateOrderedMousePointer(event, released: released); return true
+  }
+  private func updateOrderedMousePointer(_ event: NSEvent, released: Bool) {
+    do {
+      guard var pointer = orderedMousePointer, !pointer.released,
+        event.type == (released ? .leftMouseUp : .leftMouseDragged),
+        let display = scrollText, showingScroll, let input = managedInput,
+        let window = self.window, event.windowNumber == window.windowNumber,
+        window.isKeyWindow, window.firstResponder === input.activeView,
+        input.session.logicalWindow.snapshot.isSame(pointer.source) else {
+        throw BoomError.stale("The ordered pointer left its captured source or physical focus.")
+      }
+      let local = display.characterIndexForInsertion(at: display.convert(event.locationInWindow, from: nil))
+      let focus = try pointer.output.position(localUTF16: local).utf16
+      let selection = PagedNativeNavigationSelection(utf16Offset: min(pointer.anchor, focus),
+        utf16Length: max(pointer.anchor, focus) - min(pointer.anchor, focus), focusAtEnd: focus >= pointer.anchor,
+        affinity: pointer.affinity)
+      pointer.selection = selection; pointer.released = released; orderedMousePointer = pointer
+      paintOrderedMousePointer(selection, output: pointer.output, display: display)
+      guard let owner = input.commandOwner else { throw BoomError.stale("Ordered pointer lost its actual input owner.") }
+      try owner.updateOrderedDocumentPointer(pointer.id, source: pointer.source, selection: selection,
+        completing: released)
+    } catch { failPresentation(error) }
+  }
+
   /// The accessibility/mouse consumer names a real scalar in this currently
   /// displayed window. It cannot authorize an earlier root or a half surrogate.
   func selectVisibleUTF16(_ local: Int, extending: Bool = false) throws {
@@ -759,6 +846,10 @@ import Foundation
   }
   private func hideScrollSurface() { showingScroll = false; scrollSurface?.isHidden = true }
   private func revealEditableWindow() {
+    // A queued pointer is painted against its frozen source until its actual
+    // chronological selection/window is delivered. Earlier mounts do not
+    // erase that presentation or manufacture a newer source hit.
+    guard orderedMousePointer == nil else { return }
     displayRequest = UUID(); requestedScroll = nil
     hideScrollSurface()
     if scrollProjection != nil { startScrollTask() }
@@ -781,6 +872,11 @@ import Foundation
     if presentationClosed { return }
     closingPresentation = true
     defer { closingPresentation = false }
+    // The SAME owner settles its latest captured pointer and all original
+    // keyboard intent in order before the physical host can retire.
+    if orderedMousePointer != nil, let owner = managedInput?.commandOwner {
+      try await owner.joinPendingCommand()
+    }
     stopMouseSelection()
     displayRequest = UUID(); requestedScroll = nil; hideScrollSurface()
     if let task = scrollTask { await task.value }

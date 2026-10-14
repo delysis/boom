@@ -1163,4 +1163,172 @@ import XCTest
     }
   }
 
+
+  func testActualNavigationThenQueuedKeyPointerAndLaterKeyKeepChronologicalMappedSelectionAndUndo() async throws {
+    let line = "abcdefghijklmné🙂\n"
+    try await fixture(#function, text: String(repeating: line, count: 3_000)) { f in
+      let input = f.input!, source = f.session!, commands = f.commands!, window = f.window!, viewport = f.scroll!
+      try viewport.enableDocumentNavigation(engine: f.engine!, publisher: f.publisher!)
+      try viewport.requestScroll(toUTF16: 40_000); try await viewport.joinPresentation()
+      let projection = try XCTUnwrap(viewport.visibleScrollWindow)
+      let surface = try XCTUnwrap(viewport.subviews.compactMap { $0 as? NSScrollView }.first { !$0.isHidden })
+      let display = try XCTUnwrap(surface.documentView as? NSTextView)
+      let point = NSPoint(x: display.textContainerOrigin.x + 22, y: display.textContainerOrigin.y + 10)
+      let local = display.characterIndexForInsertion(at: point)
+      let capturedCaret = try projection.position(localUTF16: local).utf16
+      let originalArena = source.arenaID, generation = source.generation
+      let navigationCaret: UInt64 = 12_001
+      XCTAssertGreaterThan(capturedCaret, navigationCaret)
+      let hold = try await f.route!.holdNext(.windowAfter)
+      let loading = try f.startNavigation(anchor: 12_000, caret: navigationCaret)
+      try await f.route!.awaitHeld(hold)
+      window.sendEvent(try f.key()) // original z belongs to the preceding navigation target
+      XCTAssertEqual(commands.queuedRawKeyCount, 1)
+      XCTAssertTrue(commands.canOrderPointerAfterNavigation)
+      let location = display.convert(point, to: nil)
+      @MainActor func mouse(_ type: NSEvent.EventType) throws -> NSEvent {
+        try XCTUnwrap(NSEvent.mouseEvent(with: type, location: location, modifierFlags: [],
+          timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+          context: nil, eventNumber: type == .leftMouseDown ? 1 : 2, clickCount: 1,
+          pressure: type == .leftMouseUp ? 0 : 1))
+      }
+      window.sendEvent(try mouse(.leftMouseDown))
+      XCTAssertEqual(source.generation, generation)
+      XCTAssertEqual(source.arenaID, originalArena)
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, 0,
+        "The visible pointer paints its captured intent without canceling or retargeting preceding input.")
+      XCTAssertEqual(display.selectedRange(), NSRange(location: local, length: 0))
+      window.sendEvent(try mouse(.leftMouseUp))
+      let y = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+        timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+        context: nil, characters: "Y", charactersIgnoringModifiers: "Y", isARepeat: false, keyCode: 16))
+      window.sendEvent(y)
+      XCTAssertEqual(commands.queuedRawKeyCount, 2)
+      XCTAssertEqual(commands.retainedRefusedInputCount, 0)
+      XCTAssertLessThanOrEqual(commands.retainedInputBytes, PagedNativeUndoOwner.maximumRawKeyBytes)
+      XCTAssertEqual(source.activeNavigationOperationCount, 1)
+      XCTAssertNil(viewport.presentationFailure); XCTAssertNil(commands.firstFailure); XCTAssertNil(input.firstRefusal)
+      try await f.route!.release(hold); _ = try await loading.value
+      try await commands.joinPendingCommand()
+      XCTAssertEqual(source.activeNavigationOperationCount, 0)
+      XCTAssertEqual(commands.queuedRawKeyCount, 0); XCTAssertEqual(commands.retainedInputBytes, 0)
+      XCTAssertEqual(commands.retainedRefusedInputCount, 0)
+      let mappedCaret = capturedCaret + 1 // the actual preceding z splice is before this captured point
+      let selected = try input.currentDocumentSelection()
+      XCTAssertEqual(selected.utf16Offset, mappedCaret + 1); XCTAssertEqual(selected.utf16Length, 0)
+      let expected = NSMutableString(string: f.originalText)
+      expected.insert("z", at: Int(navigationCaret)); expected.insert("Y", at: Int(mappedCaret))
+      try await f.assertSource(expected as String)
+      XCTAssertTrue(NSApplication.shared.sendAction(NSSelectorFromString("undo:"), to: nil, from: window))
+      try await commands.joinPendingCommand()
+      let beforeY = NSMutableString(string: f.originalText); beforeY.insert("z", at: Int(navigationCaret))
+      try await f.assertSource(beforeY as String)
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, mappedCaret)
+      XCTAssertTrue(NSApplication.shared.sendAction(NSSelectorFromString("redo:"), to: nil, from: window))
+      try await commands.joinPendingCommand(); try await f.assertSource(expected as String)
+      XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+      XCTAssertNil(f.view.boundedStorage.mutationFailure); XCTAssertNil(viewport.presentationFailure)
+    }
+  }
+
+
+  func testActualCloseSettlesUnfinishedPointerAtLastDragPointWithoutLosingEarlierOrLaterKeys() async throws {
+    let line = "abcdefghijklmné🙂\n"
+    try await fixture(#function, text: String(repeating: line, count: 3_000)) { f in
+      let input = f.input!, source = f.session!, commands = f.commands!, window = f.window!, viewport = f.scroll!
+      try viewport.enableDocumentNavigation(engine: f.engine!, publisher: f.publisher!)
+      try viewport.requestScroll(toUTF16: 40_000); try await viewport.joinPresentation()
+      let projection = try XCTUnwrap(viewport.visibleScrollWindow)
+      let surface = try XCTUnwrap(viewport.subviews.compactMap { $0 as? NSScrollView }.first { !$0.isHidden })
+      let display = try XCTUnwrap(surface.documentView as? NSTextView)
+      let startPoint = NSPoint(x: display.textContainerOrigin.x + 22, y: display.textContainerOrigin.y + 10)
+      let dragPoint = NSPoint(x: display.textContainerOrigin.x + 86, y: display.textContainerOrigin.y + 10)
+      let anchor = try projection.position(localUTF16: display.characterIndexForInsertion(at: startPoint)).utf16
+      let focus = try projection.position(localUTF16: display.characterIndexForInsertion(at: dragPoint)).utf16
+      XCTAssertGreaterThan(focus, anchor)
+      let navigationCaret: UInt64 = 12_001, generation = source.generation
+      XCTAssertGreaterThan(anchor, navigationCaret)
+      let hold = try await f.route!.holdNext(.windowAfter)
+      let loading = try f.startNavigation(anchor: 12_000, caret: navigationCaret)
+      try await f.route!.awaitHeld(hold)
+      window.sendEvent(try f.key())
+      @MainActor func mouse(_ type: NSEvent.EventType, point: NSPoint) throws -> NSEvent {
+        try XCTUnwrap(NSEvent.mouseEvent(with: type, location: display.convert(point, to: nil),
+          modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+          context: nil, eventNumber: type == .leftMouseDown ? 1 : 2, clickCount: 1, pressure: 1))
+      }
+      window.sendEvent(try mouse(.leftMouseDown, point: startPoint))
+      window.sendEvent(try mouse(.leftMouseDragged, point: dragPoint))
+      let y = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+        timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+        context: nil, characters: "Y", charactersIgnoringModifiers: "Y", isARepeat: false, keyCode: 16))
+      window.sendEvent(y)
+      XCTAssertEqual(commands.queuedRawKeyCount, 2); XCTAssertEqual(source.generation, generation)
+      let closeEntered = XCTestExpectation(description: "Actual viewport close entered its original owner join")
+      let closing = Task { @MainActor in closeEntered.fulfill(); try await viewport.closePresentation() }
+      let started = await XCTWaiter.fulfillment(of: [closeEntered], timeout: 10)
+      guard started == .completed else { throw BoomError.unavailable("Actual pointer close did not enter.") }
+      XCTAssertEqual(source.activeNavigationOperationCount, 1)
+      XCTAssertTrue(window.firstResponder === f.view)
+      // No mouseup is fabricated. Close completes the stored LAST real drag
+      // point, then owns the original read and both chronological native keys.
+      try await f.route!.release(hold); _ = try await loading.value; try await closing.value
+      XCTAssertEqual(commands.queuedRawKeyCount, 0); XCTAssertEqual(commands.retainedInputBytes, 0)
+      XCTAssertEqual(commands.retainedRefusedInputCount, 0)
+      XCTAssertEqual(source.activeNavigationOperationCount, 0)
+      XCTAssertNil(viewport.visibleScrollWindow); XCTAssertFalse(viewport.isMouseAutoscrolling)
+      XCTAssertFalse(viewport.hasPendingPresentationRead); XCTAssertNil(f.view.documentViewport)
+      let expected = NSMutableString(string: f.originalText); expected.insert("z", at: Int(navigationCaret))
+      expected.replaceCharacters(in: NSRange(location: Int(anchor + 1), length: Int(focus - anchor)), with: "Y")
+      try await f.assertSource(expected as String)
+      XCTAssertTrue(NSApplication.shared.sendAction(NSSelectorFromString("undo:"), to: nil, from: window))
+      try await commands.joinPendingCommand()
+      let beforeY = NSMutableString(string: f.originalText); beforeY.insert("z", at: Int(navigationCaret))
+      try await f.assertSource(beforeY as String)
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, anchor + 1)
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Length, focus - anchor)
+      XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure); XCTAssertNil(viewport.presentationFailure)
+    }
+  }
+
+  func testActualOrderedPointerFocusRefusalClearsItsDisplayAndAllowsLaterCurrentTyping() async throws {
+    let line = "abcdefghijklmné🙂\n"
+    try await fixture(#function, text: String(repeating: line, count: 3_000)) { f in
+      let input = f.input!, source = f.session!, commands = f.commands!, window = f.window!, viewport = f.scroll!
+      try viewport.enableDocumentNavigation(engine: f.engine!, publisher: f.publisher!)
+      try viewport.requestScroll(toUTF16: 40_000); try await viewport.joinPresentation()
+      let surface = try XCTUnwrap(viewport.subviews.compactMap { $0 as? NSScrollView }.first { !$0.isHidden })
+      let display = try XCTUnwrap(surface.documentView as? NSTextView)
+      let point = NSPoint(x: display.textContainerOrigin.x + 22, y: display.textContainerOrigin.y + 10)
+      let hold = try await f.route!.holdNext(.windowAfter)
+      let loading = try f.startNavigation(anchor: 12_000, caret: 12_001)
+      try await f.route!.awaitHeld(hold)
+      let down = try XCTUnwrap(NSEvent.mouseEvent(with: .leftMouseDown, location: display.convert(point, to: nil),
+        modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+        context: nil, eventNumber: 1, clickCount: 1, pressure: 1))
+      window.sendEvent(down)
+      let observed = try input.observeSelection(), generation = source.generation, arena = source.arenaID
+      // No earlier writing is queued in THIS refusal/cleanup control. Delivery
+      // of admitted writing across focus changes is a separate required case.
+      XCTAssertEqual(commands.queuedRawKeyCount, 0)
+      XCTAssertTrue(window.makeFirstResponder(nil)); XCTAssertTrue(window.makeFirstResponder(f.view))
+      XCTAssertNotEqual(try input.observeSelection().inputLease, observed.inputLease)
+      XCTAssertEqual(commands.retainedRefusedInputCount, 1)
+      XCTAssertNil(viewport.visibleScrollWindow)
+      try await viewport.joinPresentation()
+      XCTAssertFalse(viewport.hasPendingPresentationRead)
+      XCTAssertEqual(source.generation, generation); XCTAssertEqual(source.arenaID, arena)
+      let v = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+        timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+        context: nil, characters: "V", charactersIgnoringModifiers: "V", isARepeat: false, keyCode: 9))
+      window.sendEvent(v)
+      XCTAssertEqual(source.generation, generation + 1)
+      XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+      try await f.route!.release(hold); try await f.requireStale(loading)
+      try await f.assertSource("V" + f.originalText)
+      XCTAssertNil(viewport.presentationFailure); XCTAssertFalse(commands.hasPendingCommand)
+      XCTAssertNil(f.view.boundedStorage.mutationFailure)
+    }
+  }
+
 }

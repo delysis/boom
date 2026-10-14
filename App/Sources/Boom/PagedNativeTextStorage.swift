@@ -198,12 +198,14 @@ final class PagedNativeTextStorage: NSTextStorage {
     super.mouseDown(with: event)
   }
   override func mouseDragged(with event: NSEvent) {
+    if documentViewport?.continueOrderedDocumentMouseSelection(event, in: self, released: false) == true { return }
     if ownsDocumentMouseGesture {
       _ = documentViewport?.continueDocumentMouseSelection(event, in: self); return
     }
     super.mouseDragged(with: event)
   }
   override func mouseUp(with event: NSEvent) {
+    if documentViewport?.continueOrderedDocumentMouseSelection(event, in: self, released: true) == true { return }
     if ownsDocumentMouseGesture {
       ownsDocumentMouseGesture = false
       _ = documentViewport?.endDocumentMouseSelection(event, in: self); return

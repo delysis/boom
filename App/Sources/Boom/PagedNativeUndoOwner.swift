@@ -68,6 +68,27 @@ import Foundation
     case replacement(Data, String, UUID)
     case linePrefix(String)
     case wrapping(String, String, Bool, String)
+    case pointerSelection(PointerSelection)
+  }
+  /// One real pointer intent in the existing chronological input queue. The
+  /// display may paint it immediately; only its ordered delivery changes Input.
+  private final class PointerSelection {
+    let id = UUID()
+    let original: PagedNativeLogicalSnapshot
+    var source: PagedNativeLogicalSnapshot
+    var selection: PagedNativeNavigationSelection
+    let extending: Bool
+    var complete = false
+    var failure: Error?
+    private var terminal: (@MainActor (UUID) -> Void)?
+    init(source: PagedNativeLogicalSnapshot, selection: PagedNativeNavigationSelection, extending: Bool,
+      installed: @escaping @MainActor (UUID) -> Void) {
+      original = source; self.source = source; self.selection = selection; self.extending = extending; terminal = installed
+    }
+    func settle() {
+      let delivered = terminal; terminal = nil
+      delivered?(id)
+    }
   }
   private struct SourceCommand {
     let action: SourceAction
@@ -111,6 +132,7 @@ import Foundation
   private var replayObservation: PagedNativeSelectionObservation?
   private var capturedEditObservation: PagedNativeSelectionObservation?
   private var queuedDirections = 0
+  private var queuedPointerCount = 0
   private(set) var queuedRawKeyCount = 0
   private var rawKeyBytes = 0
   private var replayingRawKeys = false
@@ -159,6 +181,11 @@ import Foundation
       guard let self else { throw BoomError.stale("The native saver lost its actual Foundation owner.") }
       return try self.captureLogicalHistory()
     }
+    try input.session.setPointerSpliceObservation(subscription, ownerID: input.ownerID,
+      needed: { [weak self] in (self?.queuedPointerCount ?? 0) > 0 },
+      observe: { [weak self] before, after, start, removed, inserted in
+        self?.mapQueuedPointers(before: before, after: after, start: start, removed: removed, inserted: inserted)
+      })
   }
 
   private func validate(_ snapshot: PagedNativeLogicalSnapshot,
@@ -470,6 +497,11 @@ import Foundation
       let view = input.activeView, view.inputCommandIsClosed, !view.hasMarkedText() else { return }
     do {
       if queue.isEmpty { try finishOrderedInput(); return }
+      // Native mouse tracking also defers queued keys until the button is up.
+      // Keep this bounded display gesture responsive without changing the
+      // actual selection or canceling its preceding entered navigation read.
+      if queuedPointerCount > 0, queue.contains(where: { if case .sourceCommand(let command) = $0,
+        case .pointerSelection(let pointer) = command.action { return !pointer.complete }; return false }) { return }
       if case .rawKey? = queue.first {
         try replayOriginalKeys()
         if case .rawKey? = queue.first { resumeQueuedInput(); return }
@@ -494,8 +526,9 @@ import Foundation
         case .wrapping(let prefix, let suffix, let toggles, let name):
           try requestDocumentWrapping(input.currentDocumentSelection(), prefix: prefix,
             suffix: suffix, toggles: toggles, actionName: name)
+        case .pointerSelection(let pointer): try deliverPointer(pointer)
         }
-        queue.removeFirst(); rawKeyBytes -= command.chargedBytes
+        removeSourceCommandHead(command)
         if phase == .idle {
           try finishOrderedInput(after: command.replayLease)
           resumeQueuedInput()
@@ -601,7 +634,7 @@ import Foundation
       if phase != .closed { phase = .idle }
       if case .history(let request)? = queue.first { consumeHistoryHead(request) }
       else if case .sourceCommand(let command)? = queue.first {
-        queue.removeFirst(); rawKeyBytes -= command.chargedBytes
+        removeSourceCommandHead(command, refusing: true)
       }
       if firstFailure == nil { reportRefusal(original) }
       else { didFail?(original) }
@@ -723,10 +756,17 @@ import Foundation
     precondition(queue.count + refusedInput.count <= Self.maximumQueuedEntries &&
       retainedInputBytes <= Self.maximumRawKeyBytes)
     if refusedInputFailure == nil { refusedInputFailure = error }
+    if queuedPointerCount > 0 {
+      for item in queue {
+        if case .sourceCommand(let command) = item, case .pointerSelection(let pointer) = command.action {
+          pointer.settle()
+        }
+      }
+    }
     refusedInput.append(contentsOf: queue)
     refusedInputBytes += rawKeyBytes; refusedDirections += queuedDirections
     queue.removeAll(keepingCapacity: true)
-    rawKeyBytes = 0; queuedRawKeyCount = 0; queuedDirections = 0
+    rawKeyBytes = 0; queuedRawKeyCount = 0; queuedDirections = 0; queuedPointerCount = 0
     replayObservation = nil
     PerformanceTrace.event("Editor.ManagedAdmission")
   }
@@ -873,6 +913,8 @@ import Foundation
 
   private func beginNavigation(captured: PagedNativeLogicalReadSnapshot,
     observed: PagedNativeSelectionObservation,
+    installed onInstalled: (@MainActor (PagedNativeLogicalWindow) -> Void)? = nil,
+    settled onSettled: (@MainActor () -> Void)? = nil,
     preparing: @escaping @MainActor () async throws -> PagedNativeNavigationInstallationTicket) {
     precondition(navigationTask == nil, "An entered navigation task must be retained through its real join.")
     isNavigating = true; phase = .readingBoundary; relatedReadObservation = observed
@@ -881,12 +923,14 @@ import Foundation
         navigationTask = nil; isNavigating = false
         if relatedReadObservation == observed { relatedReadObservation = nil }
         if phase == .readingBoundary || phase == .preparing { phase = .idle }
+        onSettled?()
         pump()
       }
       do {
         let ticket = try await preparing()
         phase = .preparing
         let installed = try installPrepared(ticket, captured: captured, observed: observed)
+        onInstalled?(installed)
         relatedReadObservation = nil; phase = .idle
         try transferRawInputAfterMount()
         return installed
@@ -900,6 +944,124 @@ import Foundation
         if firstFailure == nil { reportRefusal(error) }
         throw error
       }
+    }
+  }
+
+  // First truthful chronology slice: source-neutral navigation followed by
+  // ordinary native text/selection keys. Formatting/history need their actual
+  // inverse/point transforms, and retain their existing pending behavior.
+  var canOrderPointerAfterNavigation: Bool {
+    guard phase == .readingBoundary, navigationTask != nil,
+      commandTask == nil, capturedEditTask == nil, queuedPointerCount == 0 else { return false }
+    return queue.allSatisfy {
+      guard case .rawKey(let key) = $0 else { return false }
+      // Shift-Tab may move physical focus; preserve the predecessor pending
+      // behavior until that chronological focus transition is explicitly owned.
+      return key.event.keyCode != 48 && key.event.modifierFlags.intersection([.command, .control, .option]).isEmpty
+    }
+  }
+  func beginOrderedDocumentPointer(_ read: PagedNativeLogicalReadSnapshot,
+    selection: PagedNativeNavigationSelection, extending: Bool, from view: PagedNativeTextView,
+    installed: @escaping @MainActor (UUID) -> Void) throws -> UUID {
+    guard canOrderPointerAfterNavigation, input.session.isCurrent(read),
+      selection.utf16Offset <= read.source.summary.utf16,
+      selection.utf16Length <= read.source.summary.utf16 - selection.utf16Offset else {
+      throw BoomError.stale("The pointer has no exact source-neutral chronological navigation.")
+    }
+    let pointer = PointerSelection(source: read.source, selection: selection, extending: extending, installed: installed)
+    try enqueueSourceCommand(.pointerSelection(pointer), from: view, chargedBytes: 512)
+    queuedPointerCount += 1
+    return pointer.id
+  }
+  func updateOrderedDocumentPointer(_ id: UUID, source: PagedNativeLogicalSnapshot,
+    selection: PagedNativeNavigationSelection, completing: Bool) throws {
+    guard let pointer = queue.compactMap({ item -> PointerSelection? in
+      if case .sourceCommand(let command) = item, case .pointerSelection(let pointer) = command.action,
+        pointer.id == id { return pointer }; return nil
+    }).first, !pointer.complete, pointer.original.isSame(source), pointer.source.isSame(source),
+      selection.utf16Offset <= source.summary.utf16,
+      selection.utf16Length <= source.summary.utf16 - selection.utf16Offset else {
+      throw BoomError.stale("The pointer release lost its exact captured source intent.")
+    }
+    pointer.selection = selection; pointer.complete = completing
+    if completing { pump() }
+  }
+  /// An explicit join/close ends tracking at its last admitted real point.
+  /// The original navigation, earlier keys, pointer and later keys then settle
+  /// in order; no missing mouseup or new source/focus authority is required.
+  private func completeOrderedPointerGestures() {
+    guard queuedPointerCount > 0 else { return }
+    for item in queue {
+      if case .sourceCommand(let command) = item, case .pointerSelection(let pointer) = command.action {
+        pointer.complete = true
+      }
+    }
+  }
+  private func removeSourceCommandHead(_ command: SourceCommand, refusing: Bool = false) {
+    if case .pointerSelection(let pointer) = command.action {
+      queuedPointerCount -= 1
+      if refusing { pointer.settle() }
+    }
+    queue.removeFirst(); rawKeyBytes -= command.chargedBytes
+  }
+  private func mapQueuedPointers(before: PagedNativeLogicalSnapshot, after: PagedNativeLogicalSnapshot,
+    start: UInt64, removed: UInt64, inserted: UInt64) {
+    guard queuedPointerCount > 0 else { return }
+    for item in queue {
+      guard case .sourceCommand(let command) = item, case .pointerSelection(let pointer) = command.action,
+        pointer.failure == nil else { continue }
+      do {
+        let retained = before.summary.utf16.subtractingReportingOverflow(removed)
+        let extent = retained.partialValue.addingReportingOverflow(inserted)
+        guard pointer.complete, pointer.source.isSame(before), start <= before.summary.utf16,
+          removed <= before.summary.utf16 - start, !retained.overflow, !extent.overflow,
+          after.summary.utf16 == extent.partialValue else {
+          throw BoomError.stale("A queued pointer has no exact accepted source splice.")
+        }
+        let old = pointer.selection, end = start + removed
+        func map(_ point: UInt64, afterInsertion: Bool) -> UInt64 {
+          if point < start { return point }
+          if point > end { return point - removed + inserted }
+          if removed > 0, point == end { return start + inserted }
+          return start + (afterInsertion ? inserted : 0)
+        }
+        // Endpoint insertion gravity is separate from visual affinity and
+        // actual focus direction. A collapsed clicked caret follows insertion.
+        let collapsed = old.utf16Length == 0
+        let anchor = map(old.anchorUTF16, afterInsertion: collapsed || old.focusAtEnd)
+        let focus = map(old.focusUTF16, afterInsertion: collapsed || !old.focusAtEnd)
+        pointer.selection = PagedNativeNavigationSelection(utf16Offset: min(anchor, focus),
+          utf16Length: max(anchor, focus) - min(anchor, focus), focusAtEnd: focus >= anchor,
+          affinity: old.affinity)
+        pointer.source = after
+      } catch { pointer.failure = error }
+    }
+  }
+  private func deliverPointer(_ pointer: PointerSelection) throws {
+    if let failure = pointer.failure { throw failure }
+    let read = try input.session.captureLogicalState(), observed = try input.observeSelection()
+    guard pointer.complete, pointer.source.isSame(read.source) else {
+      throw BoomError.stale("The ordered pointer lost its actual mapped logical source.")
+    }
+    let window = input.session.logicalWindow, focus = pointer.selection.focusUTF16
+    let selected: PagedNativeNavigationSelection
+    if pointer.extending {
+      // Shift uses the actual preceding chronological selection anchor, not
+      // the old caret still painted while that navigation was reading.
+      let anchor = try input.currentDocumentSelection().anchorUTF16
+      selected = PagedNativeNavigationSelection(utf16Offset: min(anchor, focus),
+        utf16Length: max(anchor, focus) - min(anchor, focus), focusAtEnd: focus >= anchor,
+        affinity: pointer.selection.affinity)
+    } else { selected = pointer.selection }
+    if focus >= window.start.utf16, focus - window.start.utf16 <= window.summary.utf16 {
+      _ = try window.position(localUTF16: Int(focus - window.start.utf16))
+      try input.setDocumentSelection(selected); pointer.settle()
+      return
+    }
+    beginNavigation(captured: read, observed: observed,
+      installed: { _ in pointer.settle() }, settled: { pointer.settle() }) { [self] in
+      try await input.session.prepareNavigationInstallation(owner: input,
+        toUTF16: focus > 4096 ? focus - 4096 : 0, selectingUTF16: selected)
     }
   }
 
@@ -1505,6 +1667,8 @@ import Foundation
   }
 
   func joinPendingCommand() async throws {
+    completeOrderedPointerGestures()
+    pump()
     var original: Error?
     for _ in 0..<(Self.maximumQueuedEntries + 2) {
       if commandTask == nil, navigationTask == nil, capturedEditTask == nil { break }

@@ -23,13 +23,17 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
   fileprivate weak var session: PagedNativeSession?
   fileprivate var receiver: ((PagedNativeGroupSubscription, PagedNativeGroupClosureReceipt) -> Void)?
   fileprivate var historyCapture: (() throws -> PagedNativeLogicalHistoryProjection)?
+  fileprivate var observesPointerSplices: (() -> Bool)?
+  fileprivate var pointerSplice: ((PagedNativeLogicalSnapshot, PagedNativeLogicalSnapshot, UInt64, UInt64, UInt64) -> Void)?
   fileprivate init(ownerID: UUID, session: PagedNativeSession,
     receiver: @escaping (PagedNativeGroupSubscription, PagedNativeGroupClosureReceipt) -> Void,
     historyCapture: (() throws -> PagedNativeLogicalHistoryProjection)?) {
     self.ownerID = ownerID; sessionID = session.sessionID; self.session = session
     self.receiver = receiver; self.historyCapture = historyCapture
   }
-  fileprivate func detach() { receiver = nil; historyCapture = nil; session = nil }
+  fileprivate func detach() {
+    receiver = nil; historyCapture = nil; observesPointerSplices = nil; pointerSplice = nil; session = nil
+  }
 }
 
 /// One resident candidate, completely prepared before Foundation may pop an
@@ -53,6 +57,7 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
   fileprivate let kind: Kind
   fileprivate var candidate: PagedNativeLogicalWindow?
   fileprivate var sourceTransfer: (() -> Void)?
+  fileprivate var pointerSplice: (start: UInt64, removed: UInt64, inserted: UInt64)?
   fileprivate var state = State.staged
   var isAwaitingAdoption: Bool { state == .staged }
   var wasConsumed: Bool { state == .consumed }
@@ -238,7 +243,16 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
     guard !adopting, characterDepth > 0 else { throw BoomError.invalid("Native source primitive has no character transaction.") }
     if working.requiresGroupClose(groupID) { emit(try working.closeNativeGroup(source: source)) }
     let cursor = try beforeSelection.map { try working.cursor(for: $0) } ?? working.currentCursor
-    return try working.replace(range, with: replacement, groupID: groupID, beforeCursor: cursor, source: source)
+    // Capture coordinate provenance only while the actual input queue holds a
+    // pointer. Ordinary typing has no snapshot allocation or queue scan here.
+    let observesPointer = subscription?.observesPointerSplices?() == true
+    let before = observesPointer ? logicalWindow : nil
+    let changed = try working.replace(range, with: replacement, groupID: groupID, beforeCursor: cursor, source: source)
+    if changed, let before {
+      subscription?.pointerSplice?(before.snapshot, logicalWindow.snapshot,
+        before.start.utf16 + UInt64(range.location), UInt64(range.length), UInt64(replacement.utf16.count))
+    }
+    return changed
   }
   @discardableResult func beginComposition(groupID: UUID? = nil) -> Bool {
     guard !adopting, !hookTransition else { return false }; working.beginComposition(groupID: groupID); return true
@@ -303,6 +317,15 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
     try requireToken(token, ownerID: ownerID)
     guard !hookTransition, !notifyingGroup else { throw BoomError.stale("Actual native history hook is being delivered.") }
     token.historyCapture = capture
+  }
+  /// The SAME Foundation owner observes actual accepted primitives only when
+  /// its chronological queue contains a captured pointer. No parallel edit log.
+  func setPointerSpliceObservation(_ token: PagedNativeGroupSubscription, ownerID: UUID,
+    needed: @escaping () -> Bool,
+    observe: @escaping (PagedNativeLogicalSnapshot, PagedNativeLogicalSnapshot, UInt64, UInt64, UInt64) -> Void) throws {
+    try requireToken(token, ownerID: ownerID)
+    guard !hookTransition, !notifyingGroup else { throw BoomError.stale("Native input observation is being delivered.") }
+    token.observesPointerSplices = needed; token.pointerSplice = observe
   }
   private func requireToken(_ token: PagedNativeGroupSubscription, ownerID: UUID) throws {
     guard subscription === token, token.session === self, token.ownerID == ownerID,
@@ -477,6 +500,10 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
       }
     }
     precondition(consumed, "Actual Foundation target must consume its prepared source")
+    if ticket.sourceChanged, let splice = ticket.pointerSplice,
+      subscription?.observesPointerSplices?() == true {
+      subscription?.pointerSplice?(ticket.before, window.snapshot, splice.start, splice.removed, splice.inserted)
+    }
     ticket.releaseBacking()
     if case .edit(let receipt) = ticket.kind { emit(receipt) }
     return window
@@ -505,8 +532,10 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
       beforeSnapshot: before.snapshot, snapshot: candidate.window.snapshot, beforeCursor: beforeCursor, cursor: afterCursor,
       beforeSeed: beforeSeed,
       seed: candidate.window.makeSeed(localFocusUTF16: Int(candidate.cursor.utf16 - candidate.window.start.utf16)))
-    return try prepare(window: candidate.window, selection: afterCursor.selection, cursor: afterCursor,
+    let ticket = try prepare(window: candidate.window, selection: afterCursor.selection, cursor: afterCursor,
       before: before.snapshot, kind: .edit(receipt), owner: owner, provisionalArenaID: installedArena)
+    ticket.pointerSplice = (selection.utf16Offset, selection.utf16Length, UInt64(text.utf16.count))
+    return ticket
   }
 
   private func prepareEdit(_ candidate: PagedNativeLogicalEdit, read: PagedNativeLogicalReadSnapshot,
@@ -550,7 +579,17 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
     let candidate = try await withTaskCancellationHandler {
       try await storage.logicalReplacement(read.source, selection: selection, replacement: replacement, cancellation: cancellation)
     } onCancel: { cancellation.cancel() }
-    return try prepareEdit(candidate, read: read, beforeCursor: beforeCursor, owner: owner, groupID: groupID)
+    let ticket = try prepareEdit(candidate, read: read, beforeCursor: beforeCursor, owner: owner, groupID: groupID)
+    // The candidate is the actual replacement result, not a guessed net map
+    // for formatting or history. Its summaries prove the inserted extent.
+    let retained = read.source.summary.utf16.subtractingReportingOverflow(selection.utf16Length)
+    let inserted = candidate.window.snapshot.summary.utf16.subtractingReportingOverflow(retained.partialValue)
+    guard !retained.overflow, !inserted.overflow else {
+      try cancelStagedNavigationInstallation(ticket)
+      throw BoomError.invalid("Logical replacement lost its actual UTF16 extent.")
+    }
+    ticket.pointerSplice = (selection.utf16Offset, selection.utf16Length, inserted.partialValue)
+    return ticket
   }
 
   func requireJoinedNativeClose() throws { try requirePhysicalQuiescence(requireSaved: true) }
