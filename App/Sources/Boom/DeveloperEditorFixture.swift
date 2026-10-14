@@ -272,6 +272,7 @@ private final class DeveloperBackupCopyHold: @unchecked Sendable {
       let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 1190, height: 846))
       self.window = window; window.isReleasedWhenClosed = false; window.contentView = host
       if plan.isMixed || normalMemory {
+        window.center()
         if NSApp.activationPolicy() != .regular {
           _ = NSApp.setActivationPolicy(.regular)
         }
@@ -662,6 +663,7 @@ private final class DeveloperBackupCopyHold: @unchecked Sendable {
       backupRestoredWindow = restoredWindow; restoredWindow.isReleasedWhenClosed = false
       let restoredHost = NSHostingView(rootView: WorkspaceView(model: restored))
       backupRestoredHost = restoredHost; restoredWindow.contentView = restoredHost
+      restoredWindow.center()
       for _ in 0..<10 { restoredHost.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(25)) }
       try await receiveActualKeyWindow(restoredWindow)
       guard let restoredInput = restored.pagedInput, let restoredView = restoredInput.activeView,
@@ -1545,7 +1547,7 @@ private final class DeveloperBackupCopyHold: @unchecked Sendable {
         "synchronous_cpu_stage": "Editor.PublicInputDispatch",
         "ready_wait_stage": "Editor.PublicReadyWait",
         "end_to_ready_stage": "Editor.PublicMixedOperation",
-        "offscreen_sdk_diagnostic": true, "normal_release_memory_observation": normalMemory,
+        "offscreen_sdk_diagnostic": !(plan.isMixed || normalMemory), "normal_release_memory_observation": normalMemory,
         "bitmap_raster_exercised": !normalMemory, "actual_held_writer_control_passed": heldWriterVerified,
         "held_writer_failure_state": heldWriterFailureState ?? ["available": false],
         "actual_live_backup_control_passed": liveBackupVerified,
@@ -1566,7 +1568,7 @@ private final class DeveloperBackupCopyHold: @unchecked Sendable {
         "process_footprint_before_bytes": footprintBefore, "process_footprint_after_bytes": footprintAfter,
         "process_peak_footprint_bytes": peakFootprint, "workspace_disk_bytes_before_receipt": extent,
         "workspace_disk_limit_bytes": plan.diskLimit, "target_lifetime_seconds": plan.lifetimeSeconds, "failures": failures,
-        "scope": normalMemory ? "Actual normal Release ordinary graph, physical streamed file and exact imports/exports, fixed paired native edits and synchronous layout with existing20ms memory Probe. No bitmap/Mach suspension/model/GPU or presentation latency claim." : plan.isMixed ? "Warmed actual ordinary graph with bounded head/middle/tail edits, NFD/ZWJ deletion, direct marked-text primitives, actual window-responder Undo/Redo, bounded and whole-source root edits, read-only scroll/click/recenter and interleaved contained input. Offscreen SDK raster; no hardware keyboard/input-method service/compositor, model or GPU-overlap acceptance. CPU dispatch spans contain no await; command/read/source joins have separate wait spans inside end-to-ready. All raw observations and failures retained." : "Warmed actual ordinary file WorkspaceModel/WorkspaceView/managed viewport; physical public ASCII imported/export-verified in <=64KiB chunks. Direct paired native edits, synchronous host layout and completed SDK cached-bitmap raster, closed-loop100ms pacing. No inference, IME, hardware input dispatch, deferred draw/compositor acceptance, or per-cycle whole-source copies/hash/files/Mach samples."
+        "scope": normalMemory ? "Actual normal Release ordinary graph, physical streamed file and exact imports/exports, fixed paired native edits and synchronous layout with existing20ms memory Probe. No bitmap/Mach suspension/model/GPU or presentation latency claim." : plan.isMixed ? "Warmed actual ordinary graph with bounded head/middle/tail edits, NFD/ZWJ deletion, direct marked-text primitives, actual window-responder Undo/Redo, bounded and whole-source root edits, read-only scroll/click/recenter and interleaved contained input. Visible actual App/key window with SDK raster; no hardware keyboard/input-method service/compositor, model or GPU-overlap acceptance. CPU dispatch spans contain no await; command/read/source joins have separate wait spans inside end-to-ready. All raw observations and failures retained." : "Warmed actual ordinary file WorkspaceModel/WorkspaceView/managed viewport; physical public ASCII imported/export-verified in <=64KiB chunks. Direct paired native edits, synchronous host layout and completed SDK cached-bitmap raster, closed-loop100ms pacing. No inference, IME, hardware input dispatch, deferred draw/compositor acceptance, or per-cycle whole-source copies/hash/files/Mach samples."
       ]
       let bytes = try JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys])
       guard bytes.count <= 16_384 else { throw BoomError.budget("Public fixture receipt exceeds its bound.") }
