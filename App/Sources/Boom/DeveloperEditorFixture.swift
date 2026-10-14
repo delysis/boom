@@ -170,7 +170,10 @@ import SwiftUI
       let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 1190, height: 846))
       self.window = window; window.isReleasedWhenClosed = false; window.contentView = host
       if plan.isMixed {
-        guard NSApp.setActivationPolicy(.regular) else {
+        if NSApp.activationPolicy() != .regular {
+          _ = NSApp.setActivationPolicy(.regular)
+        }
+        guard NSApp.activationPolicy() == .regular else {
           throw BoomError.unavailable("Mixed diagnostics cannot acquire their actual native action route.")
         }
         window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
