@@ -5,7 +5,11 @@ import XCTest
 final class RetainedInputTests: XCTestCase {
   private func store() throws -> WorkspaceStore {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-retained-input-" + UUID().uuidString)
-    addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+    let originalFailures = testRun?.failureCount ?? 0
+    addTeardownBlock { [weak self] in
+      guard self?.testRun?.failureCount == originalFailures else { return }
+      try FileManager.default.removeItem(at: root)
+    }
     return try WorkspaceStore(rootOverride: root)
   }
 
@@ -17,9 +21,11 @@ final class RetainedInputTests: XCTestCase {
       let first = try XCTUnwrap(chatOwner ? model.state.selectedChat : model.state.selectedDocument)
       let text = "An unsent request for its original owner."
       model.draft = text; model.mode = .edit
-      if chatOwner { try model.newChat() } else { try model.newDocument() }
+      if chatOwner { try model.newChat() }
+      else { try model.newDocument(); try await model.joinWorkspaceOperation() }
       XCTAssertEqual(model.mode, .ask)
-      if chatOwner { model.selectChat(first) } else { model.selectDocument(first) }
+      if chatOwner { model.selectChat(first) }
+      else { model.selectDocument(first); try await model.joinWorkspaceOperation() }
       XCTAssertEqual(model.draft, text)
       XCTAssertEqual(model.mode, .ask, "Switching restores input, not an earlier editing grant")
       model.mode = .edit
@@ -65,12 +71,15 @@ final class RetainedInputTests: XCTestCase {
     let first = try XCTUnwrap(model.state.selectedDocument)
     model.draft = "Question about the first manuscript."
     try model.newDocument()
+    try await model.joinWorkspaceOperation()
     let second = try XCTUnwrap(model.state.selectedDocument)
     XCTAssertEqual(model.draft, "")
     model.draft = "Question about the second manuscript."
     model.selectDocument(first)
+    try await model.joinWorkspaceOperation()
     XCTAssertEqual(model.draft, "Question about the first manuscript.")
     model.selectDocument(second)
+    try await model.joinWorkspaceOperation()
     XCTAssertEqual(model.draft, "Question about the second manuscript.")
     try await model.shutdown()
     let reopened = try await WorkspaceModel(storeOverride: store, loadModels: false)
@@ -82,7 +91,9 @@ final class RetainedInputTests: XCTestCase {
 
   @MainActor func testWritingExampleOrderSurvivesRestartWithoutStartingGeneration() async throws {
     let store = try store(), model = try await WorkspaceModel(storeOverride: store, loadModels: false)
-    if model.state.selectedDocument == nil { try model.newDocument() }
+    if model.state.selectedDocument == nil {
+      try model.newDocument(); try await model.joinWorkspaceOperation()
+    }
     let manuscript = try XCTUnwrap(model.state.selectedDocument)
     try await model.addWritingExample(title: "Lantern", prose: "The lantern crosses the harbor.", manuscriptID: manuscript)
     try await model.addWritingExample(title: "Window", prose: "The window holds a pale reflection.", manuscriptID: manuscript)
@@ -94,7 +105,16 @@ final class RetainedInputTests: XCTestCase {
     try await model.shutdown()
     let reopened = try await WorkspaceModel(storeOverride: store, loadModels: false)
     XCTAssertEqual(reopened.writingExampleIDs, ordered)
-    XCTAssertTrue(ordered.allSatisfy { id in reopened.documents.contains { $0.id == id } })
+    XCTAssertTrue(ordered.allSatisfy { id in reopened.documentIndices.contains { $0.id == id } })
+    let expected = Dictionary(uniqueKeysWithValues: zip(ids, [
+      "The lantern crosses the harbor.", "The window holds a pale reflection.", "A folded letter waits on the table."
+    ]))
+    for id in ordered {
+      let source = try await reopened.previewDocument(id)
+      XCTAssertEqual(source.documentID, id)
+      XCTAssertEqual(Data(source.window.text.utf8), Data(try XCTUnwrap(expected[id]).utf8),
+        "Each restored example must still resolve to its exact authored logical source, not only a catalog row.")
+    }
     XCTAssertNil(reopened.candidates); XCTAssertFalse(reopened.isBusy)
     XCTAssertFalse(reopened.showingCandidates)
     try await reopened.shutdown()
@@ -121,7 +141,9 @@ final class RetainedInputTests: XCTestCase {
 
   @MainActor func testFileBackupRestoresDraftAndOrderedExamples() async throws {
     let store = try store(), model = try await WorkspaceModel(storeOverride: store, loadModels: false)
-    if model.state.selectedDocument == nil { try model.newDocument() }
+    if model.state.selectedDocument == nil {
+      try model.newDocument(); try await model.joinWorkspaceOperation()
+    }
     let manuscript = try XCTUnwrap(model.state.selectedDocument)
     try await model.addWritingExample(title: "Public prose", prose: "Rain follows the ferry upstream.", manuscriptID: manuscript)
     let examples = model.writingExampleIDs

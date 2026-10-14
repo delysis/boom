@@ -344,6 +344,11 @@ final class NativeInputIdentityTests: XCTestCase {
       completion.refresh()
       XCTAssertNil(model.inputContextCache, "Busy construction and native updates must not serialize the conversation for an ineligible completion.")
       model.isBusy = false; completion.refresh()
+      XCTAssertNil(model.inputContextCache, "Idle native refresh must also leave encoding to the captured worker.")
+      let firstCapture = try XCTUnwrap(completion.completionDocument)
+      let first = try await model.prepareInputContext(target, document: firstCapture,
+        caret: input.selectedRange().location, flag: CancellationFlag())
+      XCTAssertNotNil(first)
       let prior = try XCTUnwrap(model.inputContextCache)
       completion.resumeGhost(" A lantern.", documentID: completion.id, caret: input.selectedRange().location, sources: [])
       XCTAssertNotNil(completion.ghostStamp)
@@ -360,8 +365,17 @@ final class NativeInputIdentityTests: XCTestCase {
       XCTAssertEqual(model.inputContextCache?.version, prior.version, "Streaming/native refreshes must leave the unused conversation digest alone.")
       XCTAssertEqual(completion.completionDocument?.text, input.string)
       model.isBusy = false; completion.refresh()
-      XCTAssertEqual(model.inputContextCache?.version, changed, "Idle refresh must reconcile the actual new conversation before completion becomes available.")
+      XCTAssertEqual(model.inputContextCache?.version, prior.version,
+        "Even after idle ownership reconciliation, native refresh must not encode the new conversation.")
       XCTAssertEqual(completion.completionDocument?.text, "Public draft. Typed")
+      let finalCapture = try XCTUnwrap(completion.completionDocument)
+      let prepared = try await model.prepareInputContext(target, document: finalCapture,
+        caret: input.selectedRange().location, flag: CancellationFlag())
+      XCTAssertEqual(prepared?.stamp.chatVersion, changed)
+      XCTAssertEqual(model.inputContextCache?.version, changed,
+        "The real worker must reconcile the exact captured conversation before generation.")
+      XCTAssertTrue(try XCTUnwrap(prepared).raw.contains("Streaming response."))
+      XCTAssertTrue(try XCTUnwrap(prepared).raw.hasSuffix("Public draft. Typed"))
     }
   }
 
