@@ -3947,6 +3947,7 @@ fn actual_reference_subtree_choices_use_pinned_first_definitions_and_image_excep
     for (node, image) in [
         ("[**é🙂**][r]", false),
         ("[r][]", false),
+        ("![r][]", true),
         ("[r]", false),
         ("![r]", true),
         ("![outer [*inner*][r]][r]", true),
@@ -3964,7 +3965,7 @@ fn actual_reference_subtree_choices_use_pinned_first_definitions_and_image_excep
                 &mut || false
             )?
             .is_none(),
-            "a supplied table alone is not completed search/fuel authority"
+            "node={node:?}: a supplied table alone is not completed search/fuel authority"
         );
         let actual = probe_inline_link_with_definitions(
             &input,
@@ -3975,11 +3976,43 @@ fn actual_reference_subtree_choices_use_pinned_first_definitions_and_image_excep
             &mut || false,
         )?
         .expect("actual source-complete pinned Link/Image");
-        assert_eq!(actual.end(), node.len());
-        assert_eq!(actual.is_image(), image);
-        assert!(actual.referenced());
-        assert_eq!(actual.ending(), if node.ends_with(')') { ')' } else { ']' });
+        assert_eq!(
+            actual.end(),
+            node.len(),
+            "node={node:?}: exact consumed source"
+        );
+        assert_eq!(actual.is_image(), image, "node={node:?}: accepted kind");
+        assert!(actual.referenced(), "node={node:?}: actual reference access");
+        assert_eq!(
+            actual.ending(),
+            if node.ends_with(')') { ')' } else { ']' },
+            "node={node:?}: actual closing source byte"
+        );
         let whole = format!("prefix {node} suffix\n\n{definitions_text}");
+        let ordinary = Parser::new_ext(&whole, MarkupMode::Style.options())
+            .into_offset_iter()
+            .find_map(|(event, range)| match event {
+                Event::Start(Tag::Link { .. }) if !image && range.start == "prefix ".len() => {
+                    Some(range)
+                }
+                Event::Start(Tag::Image { .. }) if image && range.start == "prefix ".len() => {
+                    Some(range)
+                }
+                _ => None,
+            })
+            .expect("actual ordinary root Link/Image event");
+        assert_eq!(
+            actual.event_end(),
+            ordinary.end - ordinary.start,
+            "node={node:?}: ordinary event range remains unchanged"
+        );
+        if matches!(node, "[r][]" | "![r][]") {
+            assert_eq!(
+                actual.event_end() + 2,
+                actual.end(),
+                "node={node:?}: actual collapsed [] is consumed outside the event range"
+            );
+        }
         let first = "prefix ".encode_utf16().count();
         let parser = Parser::new_inline_fragment(node, MarkupMode::Style.options())
             .expect("actual bounded inline contents")
@@ -3991,6 +4024,28 @@ fn actual_reference_subtree_choices_use_pinned_first_definitions_and_image_excep
                 first,
                 first + node.encode_utf16().count()
             ))
+        );
+    }
+    for suffix in [" [] after", "\n[] after", "  [] after"] {
+        let input = format!("[r]{suffix}");
+        let actual = probe_inline_link_with_definitions(
+            &input,
+            MarkupMode::Style.options(),
+            definitions.borrowed(),
+            true,
+            None,
+            &mut || false,
+        )?
+        .expect("the ordinary shortcut ends before the separate source");
+        assert_eq!(
+            actual.end(),
+            "[r]".len(),
+            "suffix={suffix:?}: no guessed collapsed consumption"
+        );
+        assert_eq!(
+            actual.event_end(),
+            actual.end(),
+            "suffix={suffix:?}: unchanged shortcut event"
         );
     }
     for input in [
@@ -4009,9 +4064,48 @@ fn actual_reference_subtree_choices_use_pinned_first_definitions_and_image_excep
                 &mut || false
             )?
             .is_none(),
-            "copied shortcut EOF/possible extension and real disabled outer Link remain unproved"
+            "input={input:?}: copied shortcut EOF/possible extension and real disabled outer Link remain unproved"
         );
     }
+    let attachment = "884646c1-14b4-490d-be8c-8953af793315";
+    let body = "[r][] **after é🙂** ![asset][] [r][] tail";
+    let text = format!(
+        "ordinary {} {body}\n\n{definitions_text}[asset]: boom-attachment:{attachment}\n",
+        "plain ".repeat(7000)
+    );
+    assert!(
+        text.find(body).expect("actual collapsed continuation") > pulldown_cmark::paged::PROBE_BYTES
+    );
+    let anchor = text[..text.find(body).expect("actual collapsed continuation")]
+        .encode_utf16()
+        .count() as u64;
+    let (mut engine, mut source, _) = self::source(&text)?;
+    let snapshot = source.capture_for_publication()?;
+    let (style, progress) = index(&mut engine, &snapshot, MarkupMode::Style)?;
+    assert!(
+        style.complete() && !progress.incomplete_block,
+        "collapsed Link/Image consumption must allow real following children to complete"
+    );
+    let rows = paged_spans(&context(&mut engine, &snapshot, style, anchor, 256)?)?;
+    assert!(
+        rows.iter().any(|span| span.kind == "strong"),
+        "real content after collapsed Link remains styled"
+    );
+    assert!(
+        rows.iter().any(|span| span.kind == "link"),
+        "actual reference Link remains styled"
+    );
+    let (media, progress) = index(&mut engine, &snapshot, MarkupMode::Media)?;
+    assert!(
+        media.complete() && !progress.incomplete_block,
+        "collapsed Image continuation completes"
+    );
+    let actual = paged_media_spans(&context(&mut engine, &snapshot, media, anchor, 256)?)?;
+    assert_eq!(actual.len(), 1, "one actual collapsed source Image");
+    assert_eq!(actual[0].id.to_string(), attachment);
+    assert_oracle(&text, &mut engine, &snapshot, anchor, 256)?;
+    assert_logical_source_bytes(&mut engine, &snapshot, &text)?;
+    assert!(source.capture().same(&snapshot));
     Ok(())
 }
 
@@ -4048,10 +4142,14 @@ fn actual_same_builder_indexes_later_definitions_before_resolving_long_paragraph
                 !pending.complete(),
                 "source block EOF cannot complete still-pending inline grammar"
             );
-            let view = context(&mut engine, &snapshot, pending, anchor, 128)?;
+            let view = context(&mut engine, &snapshot, pending, anchor, 32)?;
+            let body_start = text.find(body).expect("actual dependent source") as u64;
+            let paragraph_end = text.find("\n\n# Outside").expect("actual paragraph end") as u64;
             assert!(
-                view.window.end <= text.find("\n\n# Outside").expect("actual paragraph end") as u64,
-                "this negative observes only the pending paragraph, not the independently ready heading"
+                view.window.start <= body_start && body_start < view.window.end
+                    && view.window.end <= paragraph_end,
+                "pending-only window {:?} must contain body {body_start} and stop within paragraph {paragraph_end}",
+                view.window
             );
             assert!(!view.complete_blocks && !view.reference_budget_proven);
             assert!(paged_spans(&view)?.is_empty());

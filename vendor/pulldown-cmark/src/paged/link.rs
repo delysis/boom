@@ -12,9 +12,12 @@ use std::ops::Range;
 /// captured owner. Unfinished code/HTML dependencies remain unproved. Matched
 /// children use the actual pinned pass, rather than a second child grammar.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct InlineLinkFragment { end: usize, image: bool , referenced: bool, closing: u8 }
+pub struct InlineLinkFragment { end: usize, event_end: usize, image: bool , referenced: bool, closing: u8 }
 impl InlineLinkFragment {
+    /// Source consumed by the actual accepted LinkStack decision.
     pub fn end(&self) -> usize { self.end }
+    /// Original pinned event extent, excluding a collapsed reference's [].
+    pub fn event_end(&self) -> usize { self.event_end }
     pub fn is_image(&self) -> bool { self.image }
 pub fn referenced(&self) -> bool { self.referenced }
     pub fn ending(&self) -> char { char::from(self.closing) }
@@ -60,14 +63,26 @@ pub fn probe_inline_link_with_definitions<'a>(text: &'a str, options: crate::Opt
         };
         if range.start != 0 || range.end == 0 || range.end > text.len()
             { return Ok(None); }
-        match kind {
-            LinkType::Inline if text.as_bytes()[range.end - 1] == b')' => (),
-            LinkType::Reference | LinkType::Collapsed if absence_proven && text.as_bytes()[range.end - 1] == b']' => (),
+        let consumed_end = match kind {
+            LinkType::Inline if text.as_bytes()[range.end - 1] == b')' => range.end,
+            LinkType::Reference if absence_proven && text.as_bytes()[range.end - 1] == b']' => range.end,
+            LinkType::Collapsed if absence_proven && text.as_bytes()[range.end - 1] == b']' => {
+                // Pinned scan_reference chooses Collapsed only for literal
+                // adjacent []; LinkStack skips those nodes but keeps the
+                // event end at the first label. Require the SAME actual
+                // source suffix rather than widening the ordinary event.
+                let end = range.end.checked_add(2)
+                    .ok_or(InlineRunError::Invalid("collapsed reference source extent"))?;
+                if text.as_bytes().get(range.end..end) != Some(b"[]".as_slice()) {
+                    return Ok(None);
+                }
+                end
+            }
             LinkType::Shortcut if absence_proven && text.as_bytes()[range.end - 1] == b']'
-                && text.as_bytes().get(range.end).copied().or(following).is_some_and(|next| !matches!(next, b'(' | b'[')) => (),
+                && text.as_bytes().get(range.end).copied().or(following).is_some_and(|next| !matches!(next, b'(' | b'[')) => range.end,
             // A copied prefix ending exactly at [label] cannot exclude a
             // later inline/full-reference continuation. No fake EOF proof.
-            _ => return Ok(None), }
+            _ => return Ok(None), };
         let mut depth = 1usize;
         while depth != 0 {
             let Some((event, _)) = events.next_with_check(cancelled).map_err(|_| InlineRunError::Cancelled)? else { return Ok(None); };
@@ -81,8 +96,9 @@ pub fn probe_inline_link_with_definitions<'a>(text: &'a str, options: crate::Opt
         // up on MaybeCode/MaybeHtml. A copied edge cannot prove those failures
         // final; successful child spans and destination/title tokens skipped
         // by the actual LinkStack require no guessed absence proof.
-        if !events.inline_probe_stable_through(range.end) { return Ok(None); }
-        InlineLinkFragment { end: range.end, image , referenced: events.inline_probe_referenced_before(range.end), closing: text.as_bytes()[range.end - 1] }
+        if !events.inline_probe_stable_through(consumed_end) { return Ok(None); }
+        InlineLinkFragment { end: consumed_end, event_end: range.end, image ,
+            referenced: events.inline_probe_referenced_before(consumed_end), closing: text.as_bytes()[consumed_end - 1] }
     };
     if first_reference < found.end && !absence_proven { return Ok(None); }
     if cancelled() { return Err(InlineRunError::Cancelled); }
