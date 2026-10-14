@@ -106,24 +106,41 @@ struct NativeScrollableText: NSViewRepresentable {
 
 final class NativeTextScrollView: NSScrollView {
   let reader = NativeReadingTextView(frame: .zero)
-  init() {
+  private let attachmentViewport: Bool
+  init(attachmentViewport: Bool = false) {
+    self.attachmentViewport = attachmentViewport
     super.init(frame: .zero)
     drawsBackground = false; borderType = .noBorder
     hasVerticalScroller = true; autohidesScrollers = true
+    if attachmentViewport {
+      reader.isAttachmentViewport = true
+      reader.isVerticallyResizable = true
+      reader.maxSize = NSSize(width: .greatestFiniteMagnitude, height: .greatestFiniteMagnitude)
+      reader.autoresizingMask = [.width]
+      reader.textContainer?.widthTracksTextView = true
+      reader.layoutManager?.allowsNonContiguousLayout = true
+    }
     documentView = reader
   }
   required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
   override func layout() {
     super.layout()
     let width = max(1, contentView.bounds.width)
-    reader.setFrameSize(NSSize(width: width, height: reader.contentHeight(at: width)))
+    if attachmentViewport {
+      // NSTextView retains its complete source and native vertical resizing.
+      // A card resize must not call the isolated whole-document measurement.
+      reader.setFrameSize(NSSize(width: width, height: max(reader.frame.height, contentView.bounds.height)))
+    } else {
+      reader.setFrameSize(NSSize(width: width, height: reader.contentHeight(at: width)))
+    }
   }
 }
 
 final class NativeReadingTextView: NativeMediaTextView {
   private let displayStorage: NSTextStorage
   private let displayLayout: NSLayoutManager
-  private let measurement = NativeTextMeasurement()
+  private lazy var measurement = NativeTextMeasurement()
+  fileprivate var isAttachmentViewport = false
   private var presentation = NativeText.Presentation.markdown
   private var pointSize: CGFloat = 14
   private var acknowledgedSource: String?
@@ -200,8 +217,33 @@ final class NativeReadingTextView: NativeMediaTextView {
     return measurement.height(of: textStorage, width: width, insets: .zero, fragmentPadding: 0)
   }
 
+  /// The actual visible reader is also its geometry authority. Lay out only
+  /// the finite top rectangle; no attributed snapshot or second graph exists.
+  /// A still-unlaid suffix proves that this card needs its bounded scroller.
+  func boundedAttachmentHeight(at width: CGFloat, maximum: CGFloat) -> CGFloat {
+    guard width.isFinite, width > 0, maximum.isFinite, maximum > 0,
+      let storage = textStorage, let layout = layoutManager, let container = textContainer else { return 24 }
+    setFrameSize(NSSize(width: width, height: max(frame.height, maximum)))
+    let viewport = NSRect(x: 0, y: 0, width: width, height: maximum)
+    layout.ensureLayout(forBoundingRect: viewport, in: container)
+    guard layout.firstUnlaidCharacterIndex >= storage.length else { return maximum }
+    // All source is already laid. Read ALL laid glyph geometry, not just
+    // glyphs intersecting the top rectangle: a previously scrolled long
+    // document without a final newline must still retain its capped card.
+    // usedRect neither generates glyphs nor requests additional layout.
+    let used = layout.usedRect(for: container)
+    let extra = layout.extraLineFragmentTextContainer === container ? layout.extraLineFragmentRect.maxY : 0
+    let height = min(maximum, max(24, ceil(max(used.maxY, extra))))
+    // Short content has no extra scrollable blank reserve. Long native text
+    // may keep an already expanded frame; it is never truncated to this cap.
+    if height < maximum { setFrameSize(NSSize(width: width, height: height)) }
+    return height
+  }
   override var intrinsicContentSize: NSSize {
-    NSSize(width: NSView.noIntrinsicMetric, height: contentHeight(at: bounds.width))
+    if isAttachmentViewport {
+      return NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
+    }
+    return NSSize(width: NSView.noIntrinsicMetric, height: contentHeight(at: bounds.width))
   }
   override func setFrameSize(_ newSize: NSSize) {
     let changed = frame.width != newSize.width

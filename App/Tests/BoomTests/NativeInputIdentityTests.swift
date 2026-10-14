@@ -435,6 +435,9 @@ final class NativeInputIdentityTests: XCTestCase {
       view.isEditable = true; view.isSelectable = true; view.isRichText = false
       let history = UndoManager(); history.groupsByEvent = false
       view.documentUndo = history; view.allowsUndo = true
+      let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 600, height: 600))
+      window.isReleasedWhenClosed = false; window.contentView = view
+      defer { window.close() }
       view.string = original; view.setMedia(model: model); MarkdownStyle.apply(to: view)
       let itemKey = NSAttributedString.Key("BloomInlineMedia")
       let originalRange = (original as NSString).range(of: marker)
@@ -451,7 +454,8 @@ final class NativeInputIdentityTests: XCTestCase {
         XCTAssertEqual(view.inlineMedia.currentRanges, [originalRange])
         let initialItem = try XCTUnwrap(current.attribute(itemKey, at: originalRange.location,
           effectiveRange: nil) as? InlineMediaItem)
-        XCTAssertNil(initialItem.bytes, "The actual surface load has been scheduled but no async turn has run yet.")
+        XCTAssertNil(initialItem.image, "The actual visible load has been scheduled but no async turn has run yet.")
+        XCTAssertNil(initialItem.file)
         view.setSelectedRange(NSRange(location: 0, length: 0))
         // The second real Cocoa preview starts while the first is marked;
         // ordinary marked-text delegates deliberately leave parse spans alone.
@@ -495,14 +499,19 @@ final class NativeInputIdentityTests: XCTestCase {
       XCTAssertEqual(view.inlineMedia.currentRanges, [shiftedRange])
       let ready = try XCTUnwrap(try XCTUnwrap(storage).attribute(itemKey, at: shiftedRange.location,
         effectiveRange: nil) as? InlineMediaItem)
-      XCTAssertEqual(ready.bytes, bytes); XCTAssertNotNil(ready.image)
+      XCTAssertNotNil(ready.image); XCTAssertNil(ready.file, "Images retain a thumbnail and geometry, not an original file or Data.")
+      XCTAssertEqual(try model.store.vault.get(.attachment, id: record.id), bytes)
       XCTAssertTrue(history.canUndo)
       history.undo()
       XCTAssertEqual(Data(view.string.utf8), Data(original.utf8), "Attribute-only async media work cannot replace the native composition's actual Undo.")
       MarkdownStyle.apply(to: view)
       let range = (view.string as NSString).range(of: marker)
       view.setSelectedRange(range)
-      history.beginUndoGrouping(); view.cut(nil); history.endUndoGrouping()
+      history.beginUndoGrouping(); view.cut(nil)
+      XCTAssertEqual(view.string, original, "The actual native Cut waits only for its original clipboard publication.")
+      await view.inlineMedia.joinPendingLoads()
+      history.endUndoGrouping()
+      XCTAssertNil(view.inlineMedia.lastFailure)
       XCTAssertEqual(view.string, "Before\n\nAfter")
       guard case .bytes(let name, let copied)? = AttachmentInput.read(.general)?.first else {
         throw BoomError.invalid("The actual media Cut did not publish its original representation.")
@@ -511,6 +520,7 @@ final class NativeInputIdentityTests: XCTestCase {
       history.undo(); XCTAssertEqual(Data(view.string.utf8), Data(original.utf8))
       XCTAssertEqual(try model.store.vault.get(.attachment, id: record.id), bytes)
       view.inlineMedia.stop()
+      await view.inlineMedia.joinPendingLoads()
     }
   }
 }

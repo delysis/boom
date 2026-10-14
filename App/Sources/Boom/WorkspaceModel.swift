@@ -2133,8 +2133,6 @@ private struct BoundedConsultationContext: Sendable {
     }
   }
   var canExploreWriting: Bool {
-    let trace = PerformanceTrace.begin("Editor.WritingAvailability")
-    defer { PerformanceTrace.end("Editor.WritingAvailability", trace) }
     guard baseReady, !isBusy, hasSelectedDocument, caret > 0, let view = pagedInput?.activeView,
       (try? pagedInput?.currentDocumentSelection().utf16Length) == 0,
       view.selectedRange().length == 0, !view.hasMarkedText() else { return false }
@@ -3636,7 +3634,7 @@ private struct BoundedConsultationContext: Sendable {
         // The result and any refused cleanup path remain in the existing
         // registry. Backup failure never retires or poisons the live editor.
         self?.status = error is CancellationError ? "Stopped" : error.localizedDescription
-        PerformanceTrace.event("Workspace.BackupFailure")
+        PerformanceTrace.event("Workspace.Flush")
       }
     }
     exportTasks[target] = (id, observer, producer, nil)
@@ -3775,7 +3773,7 @@ extension WorkspaceModel {
       // Durability failure belongs to the retained saver; live source and
       // ordinary input remain usable. Explicit durable operations receive it.
       self?.status = error.localizedDescription
-      PerformanceTrace.event("Editor.ManagedSaveFailure")
+      PerformanceTrace.event("Storage.Save")
     }
     session.didSeal = { [weak self, weak session] _ in
       guard let self, let session, self.pagedSession === session else { return }
@@ -3792,7 +3790,7 @@ extension WorkspaceModel {
       // The existing status remains inspectable without a modal input fence.
       guard let self else { return }
       self.status = error.localizedDescription
-      PerformanceTrace.event("Editor.ManagedScrollRead")
+      PerformanceTrace.event("Editor.SourceRead")
     }
     try viewport.enableDocumentNavigation(engine: engine, publisher: publisher)
     refreshVisibleSearch()

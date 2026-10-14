@@ -83,22 +83,34 @@ enum AttachmentInput {
     return result.isEmpty ? nil : result
   }
 
-  @discardableResult static func write(_ input: AttachmentInput, to pasteboard: NSPasteboard) -> Bool {
+  struct PreparedClipboard: Sendable {
+    let encoded: Data
+    let original: Data
+    let originalType: String?
+  }
+  /// Original reads/encoding/header inspection can finish on the existing
+  /// media worker. Only the final pasteboard publication belongs to Main.
+  static func prepareWrite(_ input: AttachmentInput) -> PreparedClipboard? {
     guard case .bytes(let name, let data) = input,
-      let encoded = try? PropertyListEncoder().encode(ClipboardMedia(name: name, data: data)) else { return false }
-    pasteboard.clearContents()
-    guard pasteboard.setData(encoded, forType: .bloomMedia) else { return false }
-    // Advertise exact image bytes from their actual header, including a
-    // misleading filename. AppKit can synthesize TIFF when a consumer asks;
-    // Copy/Cut need no eager pixel decode or full TIFF re-encoding on Main.
+      let encoded = try? PropertyListEncoder().encode(ClipboardMedia(name: name, data: data)) else { return nil }
+    let type: String?
     if let source = CGImageSourceCreateWithData(data as CFData,
       [kCGImageSourceShouldCache: false] as CFDictionary),
       let identifier = CGImageSourceGetType(source) as String?,
-      let type = UTType(identifier), type.conforms(to: .image) {
-      return pasteboard.setData(data, forType: NSPasteboard.PasteboardType(type.identifier))
-    }
-    if let type = UTType(filenameExtension: (name as NSString).pathExtension) {
-      return pasteboard.setData(data, forType: NSPasteboard.PasteboardType(type.identifier))
+      let uniform = UTType(identifier), uniform.conforms(to: .image) {
+      type = uniform.identifier
+    } else { type = UTType(filenameExtension: (name as NSString).pathExtension)?.identifier }
+    return PreparedClipboard(encoded: encoded, original: data, originalType: type)
+  }
+  @discardableResult static func write(_ input: AttachmentInput, to pasteboard: NSPasteboard) -> Bool {
+    guard let prepared = prepareWrite(input) else { return false }
+    return write(prepared, to: pasteboard)
+  }
+  @discardableResult static func write(_ prepared: PreparedClipboard, to pasteboard: NSPasteboard) -> Bool {
+    pasteboard.clearContents()
+    guard pasteboard.setData(prepared.encoded, forType: .bloomMedia) else { return false }
+    if let type = prepared.originalType {
+      return pasteboard.setData(prepared.original, forType: NSPasteboard.PasteboardType(type))
     }
     return true
   }
@@ -228,9 +240,15 @@ enum NativePreparedMedia: @unchecked Sendable {
 }
 enum NativeMedia {
   static func thumbnail(_ data: Data, maximum: Int = 1600) -> CGImage? {
-    guard
-      let source = CGImageSourceCreateWithData(
-        data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
+    thumbnail(source: CGImageSourceCreateWithData(data as CFData,
+      [kCGImageSourceShouldCache: false] as CFDictionary), maximum: maximum)
+  }
+  static func thumbnail(_ url: URL, maximum: Int = 1600) -> CGImage? {
+    thumbnail(source: CGImageSourceCreateWithURL(url as CFURL,
+      [kCGImageSourceShouldCache: false] as CFDictionary), maximum: maximum)
+  }
+  private static func thumbnail(source: CGImageSource?, maximum: Int) -> CGImage? {
+    guard let source,
       let type = CGImageSourceGetType(source) as String?,
       [
         "public.jpeg", "public.png", "public.heic", "public.heif", "public.tiff",

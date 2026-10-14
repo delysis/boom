@@ -1,6 +1,7 @@
 import AppKit
+import AVKit
+import PDFKit
 import BoomCore
-import SwiftUI
 
 private extension NSAttributedString.Key {
   static let mediaItem = Self("BloomInlineMedia")
@@ -14,33 +15,51 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
   var range: NSRange { NSRange(location: location, length: length) }
 }
 
-/// Immutable display data. Original files stay in the workspace; thumbnails
-/// and playable bytes exist only while a surface owns their presentation.
+/// Lightweight source metadata plus a visible thumbnail/native file consumer.
+/// Originals are never resident Data in a display item.
 @MainActor final class InlineMediaItem: NSObject {
   let record: AttachmentRecord
-  let bytes: Data?
+  let file: NativeInlineMediaFile?
   let image: CGImage?
+  let pdf: PDFDocument?
+  let asset: AVURLAsset?
+  let imageGeometry: NSSize?
   let failure: String?
-  private lazy var prose = NativeReadingTextView(frame: .zero)
+  private var documentMeasurement: (width: CGFloat, height: CGFloat)?
+  fileprivate weak var documentReader: NativeReadingTextView?
   var kind: AttachmentKind { record.kind }
-  init(_ record: AttachmentRecord, bytes: Data? = nil, image: CGImage? = nil, failure: String? = nil) {
-    self.record = record; self.bytes = bytes; self.image = image; self.failure = failure
+  var isReady: Bool { image != nil || file != nil || kind == .document || kind == .unavailable }
+  var hasResidentPresentation: Bool { image != nil || file != nil }
+  init(_ record: AttachmentRecord, file: NativeInlineMediaFile? = nil,
+    image: CGImage? = nil, pdf: PDFDocument? = nil, asset: AVURLAsset? = nil,
+    imageGeometry: NSSize? = nil, failure: String? = nil) {
+    self.record = record; self.file = file; self.image = image; self.pdf = pdf; self.asset = asset
+    self.imageGeometry = imageGeometry; self.failure = failure
     super.init()
-    if kind == .document { prose.setSource(record.text) }
+  }
+  nonisolated static func imageSize(geometry: NSSize?, available: CGFloat) -> NSSize {
+    let width = max(1, available)
+    let ratio = geometry.map { $0.width / $0.height } ?? 1.5
+    let w = min(width, geometry?.width ?? width, 640 * ratio)
+    return NSSize(width: w, height: w / ratio)
   }
   func size(available: CGFloat) -> NSSize {
     let width = max(1, available)
     switch kind {
-    case .image:
-      let ratio = image.map { CGFloat($0.width) / CGFloat($0.height) } ?? 1.5
-      let w = min(width, image.map { CGFloat($0.width) } ?? width, 640 * ratio)
-      return NSSize(width: w, height: w / ratio)
+    case .image: return Self.imageSize(geometry: imageGeometry, available: width)
     case .audio: return NSSize(width: min(width, 560), height: 44)
     case .video: return NSSize(width: min(width, 680), height: min(width, 680) * 9 / 16)
     case .pdf: return NSSize(width: width, height: 360)
     case .document:
-      let height = prose.contentHeight(at: width)
-      return NSSize(width: width, height: min(480, max(24, height)))
+      if documentMeasurement?.width != width, let documentReader {
+        documentMeasurement = (width, documentReader.boundedAttachmentHeight(at: width, maximum: 480))
+      }
+      // An unseen document has no reader or parse/layout work. Its actual
+      // visible host resolves this placeholder, then invalidates its glyph.
+      if let measured = documentMeasurement, measured.width == width {
+        return NSSize(width: width, height: measured.height)
+      }
+      return NSSize(width: width, height: 24)
     case .unavailable: return NSSize(width: 24, height: 24)
     }
   }
@@ -136,6 +155,7 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
   var deferredLayoutObservation: ((ContinuousClock.Instant, ContinuousClock.Instant, ContinuousClock.Instant) -> Void)?
   var drawObservation: ((ContinuousClock.Instant, ContinuousClock.Instant) -> Void)?
   private weak var observedSource: NSTextStorage?
+  private weak var observedMediaClip: NSClipView?
   private var characterVersion = UUID()
   private var cachedMarkup: (version: UUID, value: ProductCore.MarkupProjection)?
   /// Partial source cannot establish remote Markdown fences or definitions.
@@ -258,22 +278,11 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
     }
   }
   override func copy(_ sender: Any?) {
-    if let payload = inlineMedia.selectedOriginal(selectedRange()) {
-      AttachmentInput.write(payload, to: .general); return
-    }
+    if inlineMedia.copyOriginal(selectedRange(), cutting: false) { return }
     super.copy(sender)
   }
   override func cut(_ sender: Any?) {
-    let selection = selectedRange()
-    if isEditable, let payload = inlineMedia.selectedOriginal(selection) {
-      let version = sourceVersion, storage = textStorage
-      // The actual original representation must reach the pasteboard before
-      // its source range can be removed. Clipboard IO grants no newer range.
-      guard AttachmentInput.write(payload, to: .general), textStorage === storage,
-        sourceVersion == version, selectedRange() == selection else { return }
-      insertText("", replacementRange: selection)
-      return
-    }
+    if isEditable, inlineMedia.copyOriginal(selectedRange(), cutting: true) { return }
     super.cut(sender)
   }
   override func layout() {
@@ -289,7 +298,29 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
     guard prepareTextLayout() else { return }
     inlineMedia.positionViews(); super.draw(dirtyRect)
   }
-  override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); if window == nil { inlineMedia.stop() } else { inlineMedia.refresh() } }
+  private func observeMediaClip() {
+    let clip = enclosingScrollView?.contentView
+    guard observedMediaClip !== clip else { return }
+    if let observedMediaClip {
+      NotificationCenter.default.removeObserver(self, name: NSView.boundsDidChangeNotification, object: observedMediaClip)
+    }
+    observedMediaClip = clip
+    if let clip {
+      clip.postsBoundsChangedNotifications = true
+      NotificationCenter.default.addObserver(self, selector: #selector(mediaClipDidScroll(_:)),
+        name: NSView.boundsDidChangeNotification, object: clip)
+    }
+  }
+  @objc private func mediaClipDidScroll(_ notification: Notification) {
+    guard let clip = notification.object as? NSClipView, clip === observedMediaClip else { return }
+    inlineMedia.viewportDidChange()
+  }
+  override func viewDidMoveToSuperview() { super.viewDidMoveToSuperview(); observeMediaClip() }
+  override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow(); observeMediaClip()
+    if window == nil { inlineMedia.stop() }
+    else { inlineMedia.configure(model: inlineMedia.model) }
+  }
   override func setSelectedRange(_ range: NSRange, affinity: NSSelectionAffinity, stillSelecting: Bool) {
     var selection = range
     for range in inlineMedia.currentRanges where range.location < NSMaxRange(selection) && NSMaxRange(range) > selection.location {
@@ -317,20 +348,44 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
   let layout = InlineMediaLayout()
   private(set) var spans: [InlineMediaSpan] = []
   private var items: [UUID: InlineMediaItem] = [:]
-  private var tasks: [UUID: Task<Void, Never>] = [:]
   private var hosts: [String: InlineMediaHost] = [:]
+  let disposal = NativeInlineMediaDisposal()
+  private var loadTask: Task<Void, Never>?
+  private var loadID: UUID?
+  private var loadingPreviewID: UUID?
+  private var pendingCopy: OriginalCopy?
+  private var visibleIDs = Set<UUID>()
+  private var visibleOrder: [UUID] = []
+  private var positioning = false
+  private var covered = false
+  private var stopped = false
   private var parsedSourceVersion: UUID?
+  private(set) var lastFailure: Error?
+  private(set) var cleanupFailure: NativeInlineMediaFileCleanupFailure?
   fileprivate var deferredRefresh = false
+
+  private struct OriginalCopy {
+    let intent: ClipboardIntent
+    let record: AttachmentRecord
+    let file: NativeInlineMediaFile?
+    let storage: NSTextStorage
+    let version: UUID
+    let selection: NSRange
+    let cutting: Bool
+  }
+  private enum Work {
+    case preview(AttachmentRecord, CGFloat, CGFloat)
+    case original(OriginalCopy)
+  }
   func configure(model: WorkspaceModel?) {
     if self.model !== model { stop() }
     self.model = model
+    stopped = false
     refresh()
   }
   func invalidateMarkup() { parsedSourceVersion = nil }
   private func deferRefresh(on view: NativeMediaTextView) {
     deferredRefresh = true
-    // Ongoing composition is not a retry timer. Actual unmarking schedules
-    // its safe close if the enclosing native command is still open.
     if !view.hasMarkedText() { view.deferMediaProjection() }
   }
   func resumeDeferredRefresh() {
@@ -340,29 +395,34 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
     refresh()
     if hadMedia || !spans.isEmpty { view.mediaChanged() }
   }
-  /// Explicit consumers can join the actual loads already entered on this
-  /// surface; ordinary input and display refresh never await them.
-  func joinPendingLoads() async {
-    for task in Array(tasks.values) { await task.value }
+  /// Joins real entered workers, including cancellation, then already-enqueued
+  /// file disposal. This never revokes files still owned by another surface.
+  @discardableResult func joinPendingLoads() async -> NativeInlineMediaFileCleanupFailure? {
+    while let loadTask { await loadTask.value }
+    let joinedCleanup = await disposal.joinQueued()
+    if cleanupFailure == nil, let cleanup = joinedCleanup {
+      cleanupFailure = cleanup
+      if let original = lastFailure { lastFailure = NativeInlineMediaCleanupFailure(original: original, cleanup: cleanup) }
+      else { lastFailure = cleanup }
+      // This is a disposable preview failure, not a source/persistence latch.
+      model?.status = cleanup.localizedDescription
+      PerformanceTrace.event("Editor.SourceRead")
+    }
+    return cleanupFailure
   }
-  /// Both views belong to the same workspace and exact displayed source.
-  /// Share already immutable, verified presentation bytes so the adopted
-  /// editor has the same media glyph metrics before original mouse tracking.
   func adoptReadyDisplayItems(from other: NativeInlineMedia, ids: [UUID]) {
     guard model === other.model else { return }
     let wanted = Set(ids)
     for (id, item) in other.items where wanted.contains(id) {
-      guard item.bytes != nil || item.failure != nil else { continue }
-      tasks.removeValue(forKey: id)?.cancel()
+      // Geometry is lightweight and must transfer even when pixels were
+      // evicted. An actual ready file/image remains shared, never copied.
       items[id] = item
     }
   }
   func refresh() {
     let trace = PerformanceTrace.begin("Editor.MediaRefresh")
     defer { PerformanceTrace.end("Editor.MediaRefresh", trace) }
-    guard let view, let storage = view.textStorage else { return }
-    // Keep Cocoa's live shifted attributes throughout marked input. A ready
-    // asset remains retained; its display is resumed by actual unmarking.
+    guard let view, let storage = view.textStorage, !stopped else { return }
     guard !view.mediaRefreshIsDeferred else { deferRefresh(on: view); return }
     deferredRefresh = false
     let version = view.sourceVersion
@@ -371,36 +431,127 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
       spans = view.markupProjection.media
       parsedSourceVersion = pendingCharacters ? nil : version
     }
-    let records = model?.state.attachments ?? []
     let ids = Set(spans.map(\.id))
-    for id in Array(items.keys) where !ids.contains(id) { tasks.removeValue(forKey: id)?.cancel(); items.removeValue(forKey: id) }
-    // No active media can depend on unrelated workspace attachment records.
-    // Project still removes any old media attributes and presentation hosts.
+    for id in Array(items.keys) where !ids.contains(id) { items.removeValue(forKey: id) }
+    // Ordinary text must not scan the workspace's unrelated attachments.
     if ids.isEmpty { project(); return }
-    for record in records where ids.contains(record.id) {
-      if items[record.id]?.record != record {
-        tasks.removeValue(forKey: record.id)?.cancel(); items[record.id] = InlineMediaItem(record)
+    for record in model?.state.attachments ?? [] where ids.contains(record.id) {
+      if items[record.id]?.record != record { items[record.id] = InlineMediaItem(record) }
+    }
+    project()
+  }
+  private func retireHost(_ key: String) {
+    guard let host = hosts.removeValue(forKey: key) else { return }
+    host.stopPlayback(); host.removeFromSuperview()
+  }
+  private func pump() {
+    guard !stopped, loadTask == nil, let view, view.window != nil, let vault = model?.store.vault else { return }
+    let work: Work
+    if let copy = pendingCopy {
+      pendingCopy = nil
+      guard copy.intent.isCurrent else { pump(); return }
+      work = .original(copy)
+    }
+    else {
+      guard !covered, !view.isHiddenOrHasHiddenAncestor else { return }
+      guard let item = visibleOrder.compactMap({ items[$0] })
+        .first(where: { !$0.isReady && $0.failure == nil }) else { return }
+      let width = max(1, (view.textContainer?.size.width ?? view.bounds.width)
+        - (view.textContainer?.lineFragmentPadding ?? 0) * 2)
+      work = .preview(item.record, width, view.window?.backingScaleFactor ?? 1)
+    }
+    let job = UUID()
+    loadID = job
+    if case .preview(let record, _, _) = work { loadingPreviewID = record.id }
+    else { loadingPreviewID = nil }
+    loadTask = Task { [weak self] in
+      guard let self else { return }
+      defer {
+        if self.loadID == job {
+          self.loadTask = nil; self.loadID = nil; self.loadingPreviewID = nil
+          self.pump()
+        }
       }
-      if items[record.id]?.bytes == nil && items[record.id]?.failure == nil && tasks[record.id] == nil, let vault = model?.store.vault {
-        tasks[record.id] = Task { [weak self] in
-          do {
-            let loaded = try await detachedWork {
-              let data = try vault.get(.attachment, id: record.id, limit: 67_108_864)
-              guard Digest.sha256(data) == record.rootDigest else { throw BoomError.invalid("Attachment original changed.") }
-              return (data, record.kind == .image ? NativeMedia.thumbnail(data, maximum: 1600) : nil)
-            }
-            guard let self, !Task.isCancelled, self.items[record.id]?.record.rootDigest == record.rootDigest else { return }
-            self.items[record.id] = InlineMediaItem(record, bytes: loaded.0, image: loaded.1)
-            self.tasks.removeValue(forKey: record.id); self.refresh(); self.view?.mediaChanged()
-          } catch {
-            guard let self, !Task.isCancelled else { return }
-            self.items[record.id] = InlineMediaItem(record, failure: error.localizedDescription)
-            self.tasks.removeValue(forKey: record.id); self.refresh(); self.view?.mediaChanged()
+      do {
+        switch work {
+        case .preview(let record, let width, let scale):
+          let disposal = self.disposal
+          let ready = try await detachedWork {
+            try NativeInlineMediaPrepared.load(record: record, vault: vault,
+              availableWidth: width, scale: scale, disposal: disposal)
           }
+          guard !Task.isCancelled, !self.stopped, self.visibleIDs.contains(record.id),
+            self.items[record.id]?.record == record else { return }
+          self.items[record.id] = InlineMediaItem(record, file: ready.file, image: ready.image,
+            pdf: ready.pdf, asset: ready.asset, imageGeometry: ready.imageGeometry)
+          self.refresh(); self.view?.mediaChanged()
+        case .original(let copy):
+          let record = copy.record, file = copy.file
+          let prepared = try await detachedWork { try autoreleasepool {
+            try Task.checkCancellation()
+            let bytes: Data
+            if let file { bytes = try file.verifiedBytes(for: record) }
+            else { bytes = try vault.get(.attachment, id: record.id, limit: 67_108_864) }
+            guard Digest.sha256(bytes) == record.rootDigest else {
+              throw BoomError.stale("The requested original does not match its attachment record.")
+            }
+            guard let prepared = AttachmentInput.prepareWrite(.bytes(name: record.name, data: bytes)) else {
+              throw BoomError.invalid("The original could not be prepared for copying.")
+            }
+            try Task.checkCancellation()
+            return prepared
+          } }
+          guard !Task.isCancelled, !self.stopped, copy.intent.isCurrent, let view = self.view,
+            view.textStorage === copy.storage, view.sourceVersion == copy.version,
+            view.selectedRange() == copy.selection, !view.hasMarkedText(), !view.nativeEditInProgress,
+            !copy.storage.editedMask.contains(.editedCharacters),
+            let current = self.item(for: copy.selection)?.record,
+            current.id == record.id, current.rootDigest == record.rootDigest,
+            self.model?.state.attachments.contains(where: { $0.id == record.id && $0.rootDigest == record.rootDigest }) == true else { return }
+          guard AttachmentInput.write(prepared, to: .general) else {
+            throw BoomError.unavailable("The original clipboard representation could not be published.")
+          }
+          if copy.cutting {
+            // This dynamic native entry establishes its normal current input
+            // scope. No source range is removed before original publication.
+            guard copy.intent.isLatest, view.isEditable, view.textStorage === copy.storage,
+              view.sourceVersion == copy.version, view.selectedRange() == copy.selection else { return }
+            view.insertText("", replacementRange: copy.selection)
+          }
+        }
+      } catch is CancellationError {
+      } catch {
+        guard !Task.isCancelled, !self.stopped else { return }
+        if case .original(let copy) = work, !copy.intent.isLatest { return }
+        self.lastFailure = error
+        if case .original = work {
+          self.model?.status = error.localizedDescription
+          PerformanceTrace.event("Editor.ManagedAdmission")
+        }
+        if case .preview(let record, _, _) = work, self.items[record.id]?.record == record {
+          let geometry = self.items[record.id]?.imageGeometry
+          self.items[record.id] = InlineMediaItem(record, imageGeometry: geometry, failure: error.localizedDescription)
+          self.refresh(); self.view?.mediaChanged()
         }
       }
     }
-    project()
+  }
+  @discardableResult func copyOriginal(_ selection: NSRange, cutting: Bool) -> Bool {
+    guard !stopped, let view, let storage = view.textStorage, let item = item(for: selection),
+      model?.store.vault != nil else { return false }
+    let intent = ClipboardIntent.begin()
+    pendingCopy = OriginalCopy(intent: intent, record: item.record, file: item.file, storage: storage,
+      version: view.sourceVersion, selection: selection, cutting: cutting)
+    // A second clipboard intent supersedes only the previous clipboard work.
+    // A canceled entered producer still holds the one slot until its join.
+    loadTask?.cancel()
+    pump()
+    return true
+  }
+  private func item(for selection: NSRange) -> InlineMediaItem? {
+    guard let storage = view?.textStorage, currentRanges.contains(selection),
+      selection.location >= 0, selection.location < storage.length else { return nil }
+    return storage.attribute(.mediaItem, at: selection.location, effectiveRange: nil) as? InlineMediaItem
   }
   func project() {
     let trace = PerformanceTrace.begin("Editor.MediaProject")
@@ -439,48 +590,104 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
     storage.endEditing()
     positionViews()
   }
+  func setCovered(_ value: Bool) {
+    guard covered != value else { return }
+    covered = value
+    positionViews()
+  }
+  func viewportDidChange() {
+    guard let view, !stopped else { return }
+    // Most readonly rows are offscreen and have never loaded anything. A
+    // clip notification must not ask TextKit to lay those rows out.
+    if hosts.isEmpty && loadTask == nil && (covered || view.isHiddenOrHasHiddenAncestor || view.visibleRect.isEmpty) { return }
+    positionViews()
+  }
   func positionViews() {
     let trace = PerformanceTrace.begin("Editor.MediaLayout")
     defer { PerformanceTrace.end("Editor.MediaLayout", trace) }
-    guard let view else { return }
+    guard !positioning, !stopped, let view else { return }
+    // No attachment projection has no media geometry or preview work.
+    guard !spans.isEmpty || !hosts.isEmpty else { return }
     guard !view.mediaRefreshIsDeferred else { deferRefresh(on: view); return }
-    if spans.isEmpty {
-      for host in hosts.values { host.removeFromSuperview() }
-      hosts.removeAll()
-      return
-    }
     guard let (manager, container) = view.mediaPresentation, let storage = manager.textStorage else { return }
-    guard view.prepareTextLayout() else { deferredRefresh = true; return }
-    manager.ensureLayout(for: container)
-    var counts: [UUID: Int] = [:], retained = Set<String>()
-    var sourceRanges: [UUID: [NSRange]] = [:]
-    for span in spans { sourceRanges[span.id, default: []].append(span.range) }
-    storage.enumerateAttribute(.mediaStart, in: NSRange(location: 0, length: storage.length)) { value, range, _ in
-      guard value != nil, let item = storage.attribute(.mediaItem, at: range.location, effectiveRange: nil) as? InlineMediaItem else { return }
-      let occurrence = counts[item.record.id, default: 0]; counts[item.record.id] = occurrence + 1
-      let key = item.record.id.uuidString + ":" + String(occurrence)
+    guard view.prepareTextLayout(), parsedSourceVersion == view.sourceVersion,
+      !storage.editedMask.contains(.editedCharacters) else { deferredRefresh = true; return }
+    positioning = true
+    defer { positioning = false; pump() }
+    let visible: NSRect = covered || view.window == nil || view.isHiddenOrHasHiddenAncestor ? .zero
+      : view.visibleRect.offsetBy(dx: -view.textContainerOrigin.x, dy: -view.textContainerOrigin.y)
+    var visibleCharacters = NSRange(location: 0, length: 0)
+    if !visible.isEmpty {
+      manager.ensureLayout(forBoundingRect: visible, in: container)
+      let glyphs = manager.glyphRange(forBoundingRect: visible, in: container)
+      visibleCharacters = manager.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
+      // A tall control glyph can begin before the returned clipped character
+      // interval. Extend only its actual effective media run, not a text halo.
+      if visibleCharacters.location < storage.length {
+        var run = NSRange()
+        if storage.attribute(.mediaItem, at: visibleCharacters.location, effectiveRange: &run) != nil {
+          visibleCharacters = NSUnionRange(visibleCharacters, run)
+        }
+      }
+    }
+    var counts: [UUID: Int] = [:], retained = Set<String>(), wanted = Set<UUID>(), order: [UUID] = []
+    for span in spans where span.location >= 0 && span.length > 0 && NSMaxRange(span.range) <= storage.length {
+      guard let item = storage.attribute(.mediaItem, at: span.location, effectiveRange: nil) as? InlineMediaItem else { continue }
+      let occurrence = counts[span.id, default: 0]; counts[span.id] = occurrence + 1
+      let key = span.id.uuidString + ":" + String(occurrence)
+      let isVisible = NSIntersectionRange(span.range, visibleCharacters).length > 0
+      let playing = hosts[key]?.isPlaying == true
+      guard isVisible || playing else { continue }
       retained.insert(key)
+      if isVisible, wanted.insert(span.id).inserted { order.append(span.id) }
       let host: InlineMediaHost
       if let existing = hosts[key], existing.item === item { host = existing }
       else {
-        hosts.removeValue(forKey: key)?.removeFromSuperview()
+        retireHost(key)
         host = InlineMediaHost(item: item, owner: view)
         hosts[key] = host; view.addSubview(host)
+        if item.kind == .document {
+          // First visibility supplied its real reader. Reflow the actual
+          // marker with finite measured geometry instead of the placeholder.
+          _ = item.size(available: container.size.width - container.lineFragmentPadding * 2)
+          manager.invalidateLayout(forCharacterRange: span.range, actualCharacterRange: nil)
+        }
       }
-      if let ranges = sourceRanges[item.record.id], ranges.indices.contains(occurrence) {
-        host.sourceRange = ranges[occurrence]
-      } else { host.sourceRange = nil }
-      let glyph = manager.glyphIndexForCharacter(at: range.location)
-      let line = manager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
-      let position = manager.location(forGlyphAt: glyph)
-      let size = item.size(available: container.size.width - container.lineFragmentPadding * 2)
-      host.frame = NSRect(x: view.textContainerOrigin.x + line.minX + position.x,
-        y: view.textContainerOrigin.y + line.minY + 6, width: size.width, height: size.height)
+      host.sourceRange = span.range
+      if isVisible {
+        let glyph = manager.glyphIndexForCharacter(at: span.location)
+        guard glyph < manager.numberOfGlyphs else { continue }
+        let line = manager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+        let position = manager.location(forGlyphAt: glyph)
+        let size = item.size(available: container.size.width - container.lineFragmentPadding * 2)
+        host.frame = NSRect(x: view.textContainerOrigin.x + line.minX + position.x,
+          y: view.textContainerOrigin.y + line.minY + 6, width: size.width, height: size.height)
+      }
     }
-    for key in Array(hosts.keys) where !retained.contains(key) { hosts.removeValue(forKey: key)?.removeFromSuperview() }
+    if let loadingPreviewID, !wanted.contains(loadingPreviewID) { loadTask?.cancel() }
+    // A new visible intent may retry a prior preview failure without a timer
+    // or an ordinary-input failure latch. No retry loop while it stays visible.
+    var retry = false
+    for id in wanted.subtracting(visibleIDs) {
+      if let item = items[id], item.failure != nil {
+        items[id] = InlineMediaItem(item.record, imageGeometry: item.imageGeometry)
+        retry = true
+      }
+    }
+    visibleIDs = wanted; visibleOrder = order
+    for key in Array(hosts.keys) where !retained.contains(key) { retireHost(key) }
+    let playingIDs = Set(hosts.values.filter(\.isPlaying).map { $0.item.record.id })
+    var evicted = false
+    for id in Array(items.keys) {
+      guard let item = items[id], item.hasResidentPresentation,
+        !wanted.contains(id), !playingIDs.contains(id) else { continue }
+      // Attributes retain only this lightweight replacement. Pixel eviction
+      // never changes known image geometry or source coordinates.
+      items[id] = InlineMediaItem(item.record, imageGeometry: item.imageGeometry, failure: item.failure)
+      evicted = true
+    }
+    if evicted || retry { project() }
   }
-  // Native insertion updates attributes before didChangeText publishes the
-  // new source. Selection must use those live ranges, never a parsed snapshot.
   var currentRanges: [NSRange] {
     guard let storage = view?.textStorage else { return [] }
     var result: [NSRange] = []
@@ -489,15 +696,15 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
     }
     return result
   }
-  func selectedOriginal(_ selection: NSRange) -> AttachmentInput? {
-    guard let storage = view?.textStorage, currentRanges.contains(selection), selection.location < storage.length,
-      let item = storage.attribute(.mediaItem, at: selection.location, effectiveRange: nil) as? InlineMediaItem, let bytes = item.bytes else { return nil }
-    return .bytes(name: item.record.name, data: bytes)
-  }
   func stop() {
-    deferredRefresh = false
-    for task in tasks.values { task.cancel() }; tasks.removeAll()
-    for host in hosts.values { host.removeFromSuperview() }; hosts.removeAll(); items.removeAll()
+    stopped = true; covered = false; deferredRefresh = false; pendingCopy = nil
+    visibleIDs.removeAll(); visibleOrder.removeAll()
+    // Retain the actual canceled handle until the entered worker finishes.
+    loadTask?.cancel()
+    for key in Array(hosts.keys) { retireHost(key) }
+    items.removeAll()
+    if let view, !view.mediaRefreshIsDeferred,
+      view.textStorage?.editedMask.contains(.editedCharacters) != true { project() }
   }
 }
 
@@ -506,6 +713,16 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
   weak var owner: NativeMediaTextView?
   var sourceRange: NSRange?
   private var content: NSView?
+  private var player: AVPlayer?
+  var isPlaying: Bool {
+    guard let player else { return false }
+    return player.rate > 0 || player.timeControlStatus == .waitingToPlayAtSpecifiedRate
+  }
+  func stopPlayback() {
+    player?.pause(); player?.replaceCurrentItem(with: nil)
+    (content as? AVPlayerView)?.player = nil
+    player = nil
+  }
   override var isFlipped: Bool { true }
   init(item: InlineMediaItem, owner: NativeMediaTextView) {
     self.item = item; self.owner = owner
@@ -515,9 +732,21 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
     if let image = item.image, item.kind == .image {
       let imageView = NSImageView(); imageView.image = NSImage(cgImage: image, size: .zero)
       imageView.imageScaling = .scaleProportionallyUpOrDown; content = imageView
-    } else if let bytes = item.bytes {
-      content = NSHostingView(rootView: AttachmentMediaView(name: item.record.name, bytes: bytes,
-        presentation: item.kind, text: item.record.text, maximumTextHeight: 480))
+    } else if let asset = item.asset, let file = item.file, item.kind == .audio || item.kind == .video {
+      let nativeItem = AVPlayerItem(asset: asset)
+      file.retainForLifetime(of: nativeItem)
+      let player = AVPlayer(playerItem: nativeItem), native = AVPlayerView()
+      native.controlsStyle = .inline; native.videoGravity = .resizeAspect; native.player = player
+      self.player = player; content = native
+    } else if let pdf = item.pdf {
+      let native = PDFView(); native.document = pdf
+      native.autoScales = true; native.displayMode = .singlePageContinuous
+      content = native
+    } else if item.kind == .document {
+      let scroll = NativeTextScrollView(attachmentViewport: true)
+      scroll.reader.setSource(item.record.text)
+      item.documentReader = scroll.reader
+      content = scroll
     } else {
       let symbol = NSImageView(); symbol.image = NSImage(systemSymbolName: item.failure == nil ? item.kind.symbol : "exclamationmark.triangle", accessibilityDescription: item.record.name)
       content = symbol
@@ -578,9 +807,19 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
     owner.cut(sender)
   }
   @objc private func exportOriginal(_ sender: Any?) {
-    guard let bytes = item.bytes, let model = owner?.inlineMedia.model else { return }
-    let panel = NSSavePanel(); panel.nameFieldStringValue = item.record.name
-    guard panel.runModal() == .OK, let url = panel.url else { return }
-    model.exportFile(to: url) { bytes }
+    guard let owner = menuOwner(sender), let model = owner.inlineMedia.model else { return }
+    let record = item.record, file = item.file, vault = model.store.vault
+    let panel = NSSavePanel(); panel.nameFieldStringValue = record.name
+    guard panel.runModal() == .OK, let url = panel.url,
+      menuOwner(sender) === owner, model.state.attachments.contains(record) else { return }
+    model.exportFile(to: url) {
+      let bytes: Data
+      if let file { bytes = try file.verifiedBytes(for: record) }
+      else { bytes = try vault.get(.attachment, id: record.id, limit: 67_108_864) }
+      guard Digest.sha256(bytes) == record.rootDigest else {
+        throw BoomError.stale("The exported original no longer matches its captured record.")
+      }
+      return bytes
+    }
   }
 }

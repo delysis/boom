@@ -195,10 +195,17 @@ fit the receiving width; media never owns an independent fixed-width card.
 
 Text attachments use the shared TextKit reader in a bounded native viewport.
 Short content must consume its measured height; only long content scrolls.
+Offscreen document geometry must not construct or fully lay out an extracted-text
+reader. Visible inline cards use finite-rectangle measurement on their actual
+reader, without the isolated full-height snapshot. Their first complete Markdown
+styling pass remains a separately measured cost; a finite layout request alone
+does not prove a Main-thread latency bound. Preserve all extracted text and its
+Markdown presentation when scrolling to the end.
 Inspect PDF text as well as scanned pages in the actual embedded preview.
 PDFKit's layer-backed viewer once showed a blank page in an unshown host while
-extraction and inference passed. The preview now draws locally rendered pages;
-a successful extraction or thumbnail alone cannot qualify that embedded view.
+extraction and inference passed. The file-backed native viewer must show its
+actual embedded page in the qualified bundle; successful extraction or a
+thumbnail alone cannot qualify that view.
 
 Media preparation replaces a placeholder with a player. Attach preparation and
 teardown to a stable container, not that changing conditional branch. The player
@@ -207,15 +214,20 @@ frame and a timeline with nonzero width, alongside playback and decoder checks.
 An unboxed player that shows only controls does not pass visual acceptance.
 Codec decoding is not playback readiness: AVAudioPlayer once accepted Ogg/Opus
 metadata while returning false from prepareToPlay. Both controls now use the
-same memory-backed AVPlayer readiness gate. Every audio/video fixture must
-reach readyToPlay and advance its muted timeline in the exact-bundle journey.
+same AVPlayer readiness requirement. Inline previews use verified immutable
+file-backed assets; model media preparation retains its existing input route.
+Every audio/video fixture must reach readyToPlay and advance its muted timeline
+in the exact-bundle journey; descriptor admission alone is insufficient.
 
-Switch documents and verify playback stops and memory-backed media is released.
-Inspect app-owned storage for plaintext media. Copy or export Markdown and confirm
-its source references remain intact. An explicit copy of one embedded object
-retains its original bytes for pasting into another workspace, with no plaintext
-app-owned temporary file. Re-run the receiving-surface routing matrix after each
-new media type.
+Switch documents and verify playback stops and retired native media is released.
+Workspace records are ordinary local files. Native previews may own verified
+plaintext clones in system replacement directories; require exact digest,
+last-native-owner lifetime and joined cleanup diagnostics. Do not claim that
+escaped platform references or process-crash temporary files disappear at surface
+close. Copy or export Markdown and confirm its source references remain intact.
+An explicit copy of one embedded object retains its exact original bytes for
+pasting into another workspace. Re-run the receiving-surface routing matrix after
+each new media type.
 
 For chunked transcription, test two consecutive segments of a real compressed
 recording, then one final short segment. Each segment must contain converted

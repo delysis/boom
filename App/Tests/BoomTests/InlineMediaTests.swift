@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import BoomCore
 import XCTest
 @testable import Boom
@@ -44,7 +45,7 @@ final class InlineMediaTests: XCTestCase {
     let view = MarkdownTextView(frame: NSRect(x: 0, y: 0, width: 700, height: 900))
     view.isRichText = false; view.allowsUndo = true; view.documentUndo = UndoManager()
     window.contentView = view; view.string = saved.text; view.setMedia(model: model); MarkdownStyle.apply(to: view)
-    for _ in 0..<100 where !view.subviews.contains(where: { ($0 as? InlineMediaHost)?.item.bytes != nil }) { try await Task.sleep(for: .milliseconds(10)) }
+    for _ in 0..<100 where !view.subviews.contains(where: { ($0 as? InlineMediaHost)?.item.isReady == true }) { try await Task.sleep(for: .milliseconds(10)) }
     let media = try XCTUnwrap(view.subviews.compactMap { $0 as? InlineMediaHost }.first)
     let layout = try XCTUnwrap(view.layoutManager), container = try XCTUnwrap(view.textContainer)
     let measurement = NativeTextMeasurement()
@@ -179,7 +180,7 @@ final class InlineMediaTests: XCTestCase {
       var host: InlineMediaHost?
       for _ in 0..<500 {
         host = display.subviews.compactMap { $0 as? InlineMediaHost }
-          .first(where: { $0.item.record.id == record.id && $0.item.bytes != nil })
+          .first(where: { $0.item.record.id == record.id && $0.item.isReady })
         if host != nil { break }
         try await Task.sleep(for: .milliseconds(10))
       }
@@ -196,7 +197,11 @@ final class InlineMediaTests: XCTestCase {
       XCTAssertEqual(native.selectedRange(), nativeSelection)
       XCTAssertTrue(window.firstResponder === native)
       NSPasteboard.general.clearContents()
+      NSPasteboard.general.setString("retained-original-while-copy-prepares", forType: .string)
       _ = target.perform(action, with: entry)
+      XCTAssertEqual(NSPasteboard.general.string(forType: .string), "retained-original-while-copy-prepares")
+      await display.inlineMedia.joinPendingLoads()
+      XCTAssertNil(display.inlineMedia.lastFailure)
       guard case .bytes(let name, let copied)? = AttachmentInput.read(.general)?.first else {
         throw BoomError.invalid("Readonly media Copy forwarded unrelated native text instead of its original.")
       }
@@ -224,7 +229,7 @@ final class InlineMediaTests: XCTestCase {
       try await model.shutdown(); window.close()
       try FileManager.default.removeItem(at: root)
     } catch {
-      precondition(Self.failedDisplayCopyControls.count < 4)
+      precondition(Self.failedDisplayCopyControls.count < 8)
       Self.failedDisplayCopyControls.append((model, window, error))
       throw error
     }
@@ -269,7 +274,13 @@ final class InlineMediaTests: XCTestCase {
         let beforeSource = try session.captureLogicalState().source
         XCTAssertTrue(window.isKeyWindow); XCTAssertTrue(window.firstResponder === view)
         NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString("retained-before-original-publication", forType: .string)
         view.cut(nil)
+        XCTAssertEqual(Data(view.string.utf8), Data(source.utf8),
+          "Cut must retain its complete source until the actual original is published.")
+        XCTAssertEqual(NSPasteboard.general.string(forType: .string), "retained-before-original-publication")
+        await view.inlineMedia.joinPendingLoads()
+        XCTAssertNil(view.inlineMedia.lastFailure)
         XCTAssertEqual(Data(view.string.utf8), Data(deleted.utf8),
           "\(marker): actual native Cut must remove the entire marker and retain its definition and Unicode neighbors.")
         guard case .bytes(let name, let copied)? = AttachmentInput.read(.general)?.first else {
@@ -306,9 +317,383 @@ final class InlineMediaTests: XCTestCase {
       try await model.shutdown(); window.close()
       try FileManager.default.removeItem(at: root)
     } catch {
-      precondition(Self.failedDisplayCopyControls.count < 4)
+      precondition(Self.failedDisplayCopyControls.count < 8)
       Self.failedDisplayCopyControls.append((model, window, error))
       throw error
+    }
+  }
+
+  @MainActor func testActualViewportEvictsOffscreenImagesPreservesGeometryAndCopiesOriginalOnDemand() async throws {
+    try PagedNativeFixtureApplication.bootstrap()
+    let failures = testRun?.failureCount ?? 0
+    let root = try PagedNativeFixtureApplication.scratchRoot(prefix: "public-lazy-media-")
+    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: root), loadModels: false)
+    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: 80, y: 80, width: 620, height: 280))
+    window.isReleasedWhenClosed = false
+    let view = MarkdownTextView(frame: NSRect(x: 0, y: 0, width: 600, height: 6000))
+    do {
+      if model.selectedChat == nil { try model.newChat() }
+      var originals: [UUID: Data] = [:], records: [AttachmentRecord] = []
+      for (index, color) in [NSColor.systemRed, .systemBlue, .systemGreen, .systemOrange, .systemPurple, .systemYellow].enumerated() {
+        let bytes = try Self.image(color)
+        model.attachToCurrentChat([.bytes(name: "visible-\(index).png", data: bytes)])
+        try await finish(model)
+        let record = try XCTUnwrap(model.state.attachments.last)
+        records.append(record); originals[record.id] = bytes
+      }
+      let source = records.map { "[Attachment: \($0.name)](boom-attachment:\($0.id))\n\n" }.joined()
+      let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 620, height: 280))
+      scroll.hasVerticalScroller = true; scroll.documentView = view; window.contentView = scroll
+      view.isRichText = false; view.string = source
+      view.textContainer?.widthTracksTextView = false
+      view.textContainer?.size = NSSize(width: 580, height: .greatestFiniteMagnitude)
+      view.setMedia(model: model); MarkdownStyle.apply(to: view)
+      view.inlineMedia.positionViews(); await view.inlineMedia.joinPendingLoads()
+      XCTAssertNil(view.inlineMedia.lastFailure)
+      let spans = view.inlineMedia.spans
+      XCTAssertEqual(spans.count, records.count)
+      let key = NSAttributedString.Key("BloomInlineMedia")
+      @MainActor func item(_ index: Int) throws -> InlineMediaItem {
+        try XCTUnwrap(view.textStorage?.attribute(key, at: spans[index].location, effectiveRange: nil) as? InlineMediaItem)
+      }
+      XCTAssertNotNil(try item(0).image); XCTAssertNil(try item(0).file)
+      XCTAssertNil(try item(records.count - 1).image); XCTAssertNil(try item(records.count - 1).file)
+      XCTAssertLessThan(view.subviews.compactMap { $0 as? InlineMediaHost }.count, records.count,
+        "Only actual visible media occurrences create native hosts.")
+      let geometry = try XCTUnwrap(try item(0).imageGeometry), version = view.sourceVersion
+      let manager = try XCTUnwrap(view.layoutManager), container = try XCTUnwrap(view.textContainer)
+      let lastGlyph = manager.glyphIndexForCharacter(at: try XCTUnwrap(spans.last).location)
+      let lastLine = manager.lineFragmentRect(forGlyphAt: lastGlyph, effectiveRange: nil)
+      scroll.contentView.scroll(to: NSPoint(x: 0, y: lastLine.minY + view.textContainerOrigin.y))
+      scroll.reflectScrolledClipView(scroll.contentView)
+      view.inlineMedia.viewportDidChange(); await view.inlineMedia.joinPendingLoads()
+      XCTAssertNil(view.inlineMedia.lastFailure)
+      XCTAssertNil(try item(0).image); XCTAssertNil(try item(0).file)
+      XCTAssertEqual(try item(0).imageGeometry, geometry)
+      XCTAssertNotNil(try item(records.count - 1).image)
+      XCTAssertEqual(view.sourceVersion, version); XCTAssertEqual(view.string, source)
+      // Copying an offscreen original does not load or retain its thumbnail.
+      view.setSelectedRange(spans[0].range)
+      scroll.contentView.scroll(to: NSPoint(x: 0, y: lastLine.minY + view.textContainerOrigin.y))
+      view.inlineMedia.viewportDidChange()
+      NSPasteboard.general.clearContents(); NSPasteboard.general.setString("previous-original", forType: .string)
+      view.copy(nil)
+      XCTAssertEqual(NSPasteboard.general.string(forType: .string), "previous-original")
+      await view.inlineMedia.joinPendingLoads()
+      guard case .bytes(let name, let copied)? = AttachmentInput.read(.general)?.first else {
+        throw BoomError.invalid("The real offscreen Copy did not publish its original.")
+      }
+      XCTAssertEqual(name, records[0].name); XCTAssertEqual(copied, originals[records[0].id])
+      XCTAssertNil(try item(0).image); XCTAssertNil(try item(0).file)
+      XCTAssertEqual(try model.store.vault.get(.attachment, id: records[0].id), originals[records[0].id])
+      scroll.contentView.scroll(to: .zero); scroll.reflectScrolledClipView(scroll.contentView)
+      view.inlineMedia.viewportDidChange(); await view.inlineMedia.joinPendingLoads()
+      XCTAssertNotNil(try item(0).image); XCTAssertEqual(try item(0).imageGeometry, geometry)
+      XCTAssertEqual(view.sourceVersion, version); XCTAssertEqual(view.string, source)
+      withExtendedLifetime(container) {}
+      guard (testRun?.failureCount ?? 0) == failures else {
+        throw BoomError.invalid("Actual viewport/original assertions failed; the native graph is retained.")
+      }
+      view.inlineMedia.stop(); await view.inlineMedia.joinPendingLoads()
+      XCTAssertNil(view.inlineMedia.lastFailure)
+      NSPasteboard.general.clearContents()
+      try await model.shutdown(); window.close(); try FileManager.default.removeItem(at: root)
+    } catch {
+      view.inlineMedia.stop(); await view.inlineMedia.joinPendingLoads()
+      precondition(Self.failedDisplayCopyControls.count < 8)
+      Self.failedDisplayCopyControls.append((model, window, error)); throw error
+    }
+  }
+
+  @MainActor func testActualMediaCopyLatestIntentWinsAcrossSurfacesAndStaleSourcePreservesClipboard() async throws {
+    try PagedNativeFixtureApplication.bootstrap()
+    let failures = testRun?.failureCount ?? 0
+    let root = try PagedNativeFixtureApplication.scratchRoot(prefix: "public-media-copy-order-")
+    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: root), loadModels: false)
+    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: 80, y: 80, width: 620, height: 700))
+    window.isReleasedWhenClosed = false
+    let parent = NSView(frame: NSRect(x: 0, y: 0, width: 620, height: 700))
+    let a = MarkdownTextView(frame: NSRect(x: 0, y: 0, width: 600, height: 330))
+    let b = MarkdownTextView(frame: NSRect(x: 0, y: 350, width: 600, height: 330))
+    do {
+      if model.selectedChat == nil { try model.newChat() }
+      let red = try Self.image(.systemRed), blue = try Self.image(.systemBlue)
+      model.attachToCurrentChat([.bytes(name: "first.png", data: red)]); try await finish(model)
+      let first = try XCTUnwrap(model.state.attachments.last)
+      model.attachToCurrentChat([.bytes(name: "latest.png", data: blue)]); try await finish(model)
+      let latest = try XCTUnwrap(model.state.attachments.last)
+      parent.addSubview(a); parent.addSubview(b); window.contentView = parent
+      for (view, record) in [(a, first), (b, latest)] {
+        view.isRichText = false; view.isEditable = true; view.allowsUndo = true; view.documentUndo = UndoManager()
+        view.string = "[Attachment: \(record.name)](boom-attachment:\(record.id))"
+        view.setMedia(model: model); MarkdownStyle.apply(to: view)
+        view.setSelectedRange(try XCTUnwrap(view.inlineMedia.spans.first).range)
+      }
+      await a.inlineMedia.joinPendingLoads(); await b.inlineMedia.joinPendingLoads()
+      NSPasteboard.general.clearContents(); NSPasteboard.general.setString("previous-copy", forType: .string)
+      a.copy(nil); b.copy(nil)
+      XCTAssertEqual(NSPasteboard.general.string(forType: .string), "previous-copy")
+      await a.inlineMedia.joinPendingLoads(); await b.inlineMedia.joinPendingLoads()
+      XCTAssertNil(a.inlineMedia.lastFailure); XCTAssertNil(b.inlineMedia.lastFailure)
+      guard case .bytes(let name, let copied)? = AttachmentInput.read(.general)?.first else {
+        throw BoomError.invalid("The latest actual media Copy did not publish.")
+      }
+      XCTAssertEqual(name, latest.name); XCTAssertEqual(copied, blue)
+      let before = a.string
+      NSPasteboard.general.clearContents(); NSPasteboard.general.setString("keep-on-stale-source", forType: .string)
+      a.copy(nil)
+      a.setSelectedRange(NSRange(location: a.string.utf16.count, length: 0))
+      a.insertText("Z", replacementRange: a.selectedRange())
+      XCTAssertEqual(a.string, before + "Z", "Ordinary typing never waits for Copy preparation.")
+      await a.inlineMedia.joinPendingLoads()
+      XCTAssertEqual(NSPasteboard.general.string(forType: .string), "keep-on-stale-source")
+      try XCTUnwrap(a.documentUndo).undo(); XCTAssertEqual(a.string, before)
+      XCTAssertEqual(try model.store.vault.get(.attachment, id: first.id), red)
+      XCTAssertEqual(try model.store.vault.get(.attachment, id: latest.id), blue)
+      guard (testRun?.failureCount ?? 0) == failures else {
+        throw BoomError.invalid("Actual clipboard/source assertions failed; the native graph is retained.")
+      }
+      a.inlineMedia.stop(); b.inlineMedia.stop()
+      await a.inlineMedia.joinPendingLoads(); await b.inlineMedia.joinPendingLoads()
+      NSPasteboard.general.clearContents()
+      try await model.shutdown(); window.close(); try FileManager.default.removeItem(at: root)
+    } catch {
+      a.inlineMedia.stop(); b.inlineMedia.stop()
+      await a.inlineMedia.joinPendingLoads(); await b.inlineMedia.joinPendingLoads()
+      precondition(Self.failedDisplayCopyControls.count < 8)
+      Self.failedDisplayCopyControls.append((model, window, error)); throw error
+    }
+  }
+
+  @MainActor func testActualFileBackedNativeAssetKeepsVerifiedCloneAfterVaultReplacementAndReleasesOwnedFile() async throws {
+    try PagedNativeFixtureApplication.bootstrap()
+    let failures = testRun?.failureCount ?? 0
+    let root = try PagedNativeFixtureApplication.scratchRoot(prefix: "public-media-file-lifetime-")
+    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: root), loadModels: false)
+    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: 80, y: 80, width: 620, height: 400))
+    window.isReleasedWhenClosed = false
+    var captured: NativeInlineMediaPrepared?
+    var escapedAsset: AVURLAsset?
+    var restoreOriginal: (Vault, UUID, Data)?
+    let disposal = NativeInlineMediaDisposal()
+    do {
+      if model.selectedChat == nil { try model.newChat() }
+      let url = try XCTUnwrap(Bundle.module.url(forResource: "local-audio.m4a", withExtension: nil, subdirectory: "Fixtures"))
+      let original = try Data(contentsOf: url)
+      model.attachToCurrentChat([.bytes(name: "misleading-original.bin", data: original)]); try await finish(model)
+      let record = try XCTUnwrap(model.state.attachments.last), vault = model.store.vault
+      captured = try await detachedWork {
+        try NativeInlineMediaPrepared.load(record: record, vault: vault, availableWidth: 600, scale: 1, disposal: disposal)
+      }
+      let cloneURL = try XCTUnwrap(captured?.file?.url)
+      weak var fileOwner = captured?.file
+      escapedAsset = try XCTUnwrap(captured?.asset)
+      XCTAssertEqual(escapedAsset?.url, cloneURL)
+      var player: AVPlayer? = AVPlayer(playerItem: AVPlayerItem(asset: try XCTUnwrap(escapedAsset)))
+      for _ in 0..<500 where player?.currentItem?.status == .unknown { try await Task.sleep(for: .milliseconds(10)) }
+      XCTAssertEqual(player?.currentItem?.status, .readyToPlay,
+        player?.currentItem?.error?.localizedDescription ?? "Native file playback was not ready.")
+      autoreleasepool { player?.pause(); player?.replaceCurrentItem(with: nil); player = nil }
+      // Replace the REAL canonical record atomically. The captured clone and
+      // its admitted digest still denote the original, not the new pathname.
+      let replacement = Data("different canonical record".utf8)
+      restoreOriginal = (vault, record.id, original)
+      try await detachedWork { try vault.put(replacement, kind: .attachment, id: record.id) }
+      var isolationFailure: Error?
+      do {
+        let preserved = try await detachedWork {
+          try RegularFile(cloneURL, limit: 67_108_864, allowEmpty: false).data()
+        }
+        XCTAssertEqual(preserved, original)
+        XCTAssertEqual(try vault.get(.attachment, id: record.id), replacement)
+      } catch { isolationFailure = error }
+      // Restore through the same actual publication before any exit/reopen.
+      try await detachedWork { try vault.put(original, kind: .attachment, id: record.id) }
+      restoreOriginal = nil
+      if let isolationFailure { throw isolationFailure }
+      captured = nil
+      XCTAssertNotNil(fileOwner, "The actual escaped AVURLAsset owns the file after its presentation retires.")
+      XCTAssertTrue(FileManager.default.fileExists(atPath: cloneURL.path))
+      autoreleasepool { escapedAsset = nil }
+      let cleanup = await disposal.joinQueued()
+      XCTAssertNil(cleanup)
+      // AVFoundation may still retain an actual native object. A join must
+      // never revoke that ownership merely to make a file-count oracle pass.
+      if fileOwner != nil { XCTAssertTrue(FileManager.default.fileExists(atPath: cloneURL.path)) }
+      else { XCTAssertFalse(FileManager.default.fileExists(atPath: cloneURL.path)) }
+      var direct: NativeInlineMediaFile? = try await detachedWork {
+        try NativeInlineMediaFile.clone(record: record, vault: vault, disposal: disposal)
+      }
+      let releasedURL = try XCTUnwrap(direct?.url)
+      weak var directOwner = direct
+      autoreleasepool { direct = nil }
+      XCTAssertNil(directOwner)
+      let directCleanup = await disposal.joinQueued()
+      XCTAssertNil(directCleanup)
+      XCTAssertFalse(FileManager.default.fileExists(atPath: releasedURL.path),
+        "The real worker must finish deleting its last-owner disposable file.")
+      XCTAssertEqual(try vault.get(.attachment, id: record.id), original)
+      guard (testRun?.failureCount ?? 0) == failures else {
+        throw BoomError.invalid("Actual native file ownership assertions failed; the native graph is retained.")
+      }
+      try await model.shutdown(); window.close(); try FileManager.default.removeItem(at: root)
+    } catch {
+      var failure = error
+      if let (vault, id, original) = restoreOriginal {
+        do { try await detachedWork { try vault.put(original, kind: .attachment, id: id) } }
+        catch { failure = NativeInlineMediaCleanupFailure(original: failure, cleanup: error) }
+      }
+      captured = nil; escapedAsset = nil
+      if let cleanup = await disposal.joinQueued() {
+        failure = NativeInlineMediaCleanupFailure(original: failure, cleanup: cleanup)
+      }
+      precondition(Self.failedDisplayCopyControls.count < 8)
+      Self.failedDisplayCopyControls.append((model, window, failure)); throw failure
+    }
+  }
+
+  @MainActor func testActualInlineDocumentCardsKeepNaturalShortHeightAndCompleteLongMarkdownReading() async throws {
+    try PagedNativeFixtureApplication.bootstrap()
+    let failures = testRun?.failureCount ?? 0
+    let root = try PagedNativeFixtureApplication.scratchRoot(prefix: "public-document-card-")
+    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: root), loadModels: false)
+    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: 80, y: 80, width: 620, height: 240))
+    window.isReleasedWhenClosed = false
+    let view = MarkdownTextView(frame: NSRect(x: 0, y: 0, width: 600, height: 10000))
+    do {
+      if model.selectedChat == nil { try model.newChat() }
+      let short = "# Short 🙂\n"
+      let long = String(repeating: "Body e\u{301}🙂 **strong** prose.\n", count: 6000) + "ACTUAL_DOCUMENT_END_CANARY"
+      var records: [AttachmentRecord] = []
+      for (name, text) in [("short.md", short), ("long.md", long)] {
+        model.attachToCurrentChat([.bytes(name: name, data: Data(text.utf8))]); try await finish(model)
+        let record = try XCTUnwrap(model.state.attachments.last)
+        XCTAssertEqual(record.kind, .document)
+        XCTAssertEqual(try model.store.vault.get(.attachment, id: record.id), Data(text.utf8))
+        records.append(record)
+      }
+      let source = "[Attachment: short](boom-attachment:\(records[0].id))\n"
+        + String(repeating: "Intervening source.\n", count: 300)
+        + "[Attachment: long](boom-attachment:\(records[1].id))"
+      let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 620, height: 240))
+      scroll.hasVerticalScroller = true; scroll.documentView = view; window.contentView = scroll
+      view.string = source; view.setMedia(model: model); MarkdownStyle.apply(to: view)
+      view.inlineMedia.positionViews(); await view.inlineMedia.joinPendingLoads()
+      let spans = view.inlineMedia.spans
+      XCTAssertEqual(spans.count, 2)
+      let shortHost = try XCTUnwrap(view.subviews.compactMap { $0 as? InlineMediaHost }
+        .first(where: { $0.item.record.id == records[0].id }))
+      XCTAssertGreaterThanOrEqual(shortHost.frame.height, 24); XCTAssertLessThan(shortHost.frame.height, 80)
+      let shortScroll = try XCTUnwrap(shortHost.subviews.compactMap { $0 as? NativeTextScrollView }.first)
+      XCTAssertEqual(shortScroll.reader.string, records[0].text)
+      XCTAssertFalse(view.subviews.compactMap { $0 as? InlineMediaHost }.contains(where: { $0.item.record.id == records[1].id }),
+        "The distant document must not own a reader just to answer its control-glyph geometry.")
+      let manager = try XCTUnwrap(view.layoutManager)
+      let glyph = manager.glyphIndexForCharacter(at: spans[1].location)
+      let line = manager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+      scroll.contentView.scroll(to: NSPoint(x: 0, y: line.minY + view.textContainerOrigin.y))
+      view.inlineMedia.viewportDidChange()
+      let longHost = try XCTUnwrap(view.subviews.compactMap { $0 as? InlineMediaHost }
+        .first(where: { $0.item.record.id == records[1].id }))
+      let longScroll = try XCTUnwrap(longHost.subviews.compactMap { $0 as? NativeTextScrollView }.first)
+      XCTAssertEqual(longHost.frame.height, 480)
+      XCTAssertEqual(longScroll.reader.string, records[1].text)
+      XCTAssertTrue(longScroll.reader.string.contains("ACTUAL_DOCUMENT_END_CANARY"))
+      for width: CGFloat in [600, 240, 420, 600] {
+        longHost.setFrameSize(NSSize(width: width, height: 480)); longHost.layoutSubtreeIfNeeded()
+        XCTAssertEqual(longHost.item.size(available: width).height, 480)
+        XCTAssertEqual(longScroll.reader.string, records[1].text)
+      }
+      let end = (longScroll.reader.string as NSString).range(of: "ACTUAL_DOCUMENT_END_CANARY")
+      XCTAssertNotEqual(end.location, NSNotFound)
+      longScroll.reader.setSelectedRange(end); longScroll.reader.scrollRangeToVisible(end)
+      longScroll.layoutSubtreeIfNeeded()
+      XCTAssertGreaterThan(longScroll.contentView.bounds.minY, 0, "All extracted text remains reachable in its real native scroller.")
+      XCTAssertEqual((longScroll.reader.string as NSString).substring(with: longScroll.reader.selectedRange()), "ACTUAL_DOCUMENT_END_CANARY")
+      XCTAssertFalse(longScroll.reader.string.hasSuffix("\n"))
+      let readingLayout = try XCTUnwrap(longScroll.reader.layoutManager)
+      let readingContainer = try XCTUnwrap(longScroll.reader.textContainer)
+      // This explicit fixture action fully lays the long reader. It covers
+      // the already-complete branch, not merely a still-unlaid suffix. Call
+      // the real helper directly so the item's width cache cannot mask it.
+      readingLayout.ensureLayout(for: readingContainer)
+      XCTAssertGreaterThanOrEqual(readingLayout.firstUnlaidCharacterIndex, longScroll.reader.string.utf16.count)
+      XCTAssertGreaterThan(readingLayout.usedRect(for: readingContainer).maxY, 480)
+      let revisitedHeight = longScroll.reader.boundedAttachmentHeight(at: longScroll.reader.frame.width, maximum: 480)
+      XCTAssertEqual(revisitedHeight, 480,
+        "A fully laid long no-final-newline reader cannot become a short card on revisit.")
+      longScroll.reader.scrollRangeToVisible(end)
+      XCTAssertEqual(longScroll.reader.string, records[1].text)
+      let storage = try XCTUnwrap(longScroll.reader.textStorage)
+      let strong = (longScroll.reader.string as NSString).range(of: "strong")
+      let font = try XCTUnwrap(storage.attribute(.font, at: strong.location, effectiveRange: nil) as? NSFont)
+      XCTAssertTrue(NSFontManager.shared.traits(of: font).contains(.boldFontMask), "The complete extraction keeps its existing Markdown presentation.")
+      XCTAssertEqual(view.string, source)
+      guard (testRun?.failureCount ?? 0) == failures else {
+        throw BoomError.invalid("Actual document geometry/reading assertions failed; graph retained.")
+      }
+      view.inlineMedia.stop(); await view.inlineMedia.joinPendingLoads()
+      try await model.shutdown(); window.close(); try FileManager.default.removeItem(at: root)
+    } catch {
+      view.inlineMedia.stop(); await view.inlineMedia.joinPendingLoads()
+      precondition(Self.failedDisplayCopyControls.count < 8)
+      Self.failedDisplayCopyControls.append((model, window, error)); throw error
+    }
+  }
+
+  @MainActor func testActualPreviewCleanupIdentityFailureReportsOwnedPathAndCloseDoesNotRefuseNativeTyping() async throws {
+    try PagedNativeFixtureApplication.bootstrap()
+    let failures = testRun?.failureCount ?? 0
+    let root = try PagedNativeFixtureApplication.scratchRoot(prefix: "public-media-cleanup-")
+    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: root), loadModels: false)
+    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: 80, y: 80, width: 620, height: 400))
+    window.isReleasedWhenClosed = false
+    var file: NativeInlineMediaFile?
+    do {
+      let viewport = try XCTUnwrap(model.pagedViewport), input = try XCTUnwrap(model.pagedInput)
+      window.contentView = viewport
+      let native = try XCTUnwrap(input.activeView)
+      try await PagedNativeFixtureApplication.focus(native, in: window)
+      if model.selectedChat == nil { try model.newChat() }
+      let original = try Self.image()
+      model.attachToCurrentChat([.bytes(name: "cleanup-original.png", data: original)]); try await finish(model)
+      let record = try XCTUnwrap(model.state.attachments.last), vault = model.store.vault
+      let owner = native.inlineMedia, disposal = owner.disposal
+      file = try await detachedWork { try NativeInlineMediaFile.clone(record: record, vault: vault, disposal: disposal) }
+      let originalURL = try XCTUnwrap(file?.url), directory = originalURL.deletingLastPathComponent()
+      let moved = directory.deletingLastPathComponent().appendingPathComponent("retained-media-control-" + UUID().uuidString)
+      // The original inode still exists, so the newly created path cannot be
+      // that captured directory. The real deletion worker must refuse it.
+      try await detachedWork {
+        try FileManager.default.moveItem(at: directory, to: moved)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+      }
+      file = nil
+      try await viewport.closePresentation()
+      let failure = try XCTUnwrap(owner.cleanupFailure)
+      XCTAssertEqual(failure.ownedDirectory, directory)
+      XCTAssertTrue(failure.original is BoomError)
+      XCTAssertTrue(model.status.contains(directory.path))
+      XCTAssertTrue(FileManager.default.fileExists(atPath: directory.path))
+      XCTAssertTrue(FileManager.default.fileExists(atPath: moved.appendingPathComponent(originalURL.lastPathComponent).path))
+      XCTAssertEqual(try vault.get(.attachment, id: record.id), original)
+      XCTAssertNil(input.firstRefusal); XCTAssertNil(model.pagedCommands?.firstFailure)
+      let before = native.string
+      native.setSelectedRange(NSRange(location: 0, length: 0)); native.insertText("Z", replacementRange: native.selectedRange())
+      XCTAssertEqual(native.string, "Z" + before, "A disposable preview refusal cannot turn the live source read-only.")
+      XCTAssertNil(input.firstRefusal); XCTAssertNil(model.pagedCommands?.firstFailure)
+      guard (testRun?.failureCount ?? 0) == failures else {
+        throw BoomError.invalid("Actual media cleanup/typing assertions failed; paths and graph retained.")
+      }
+      // Only the two exact paths this control created/moved are cleaned here;
+      // production deliberately left both identities untouched.
+      try await detachedWork { try FileManager.default.removeItem(at: directory); try FileManager.default.removeItem(at: moved) }
+      try await model.shutdown(); window.close(); try FileManager.default.removeItem(at: root)
+    } catch {
+      file = nil
+      if let owner = model.pagedInput?.activeView?.inlineMedia { await owner.joinPendingLoads() }
+      precondition(Self.failedDisplayCopyControls.count < 8)
+      Self.failedDisplayCopyControls.append((model, window, error)); throw error
     }
   }
 

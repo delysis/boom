@@ -358,7 +358,8 @@ enum WorkspaceBackup {
     if let failure { throw failure }
   }
 
-  private static func cloneFile(_ source: URL, to target: URL) throws {
+  /// Reused by source-bound native media previews; callers own/verify the clone.
+  static func cloneFile(_ source: URL, to target: URL) throws {
     let input = open(source.path, O_RDONLY | O_NOFOLLOW_ANY | O_NONBLOCK | O_CLOEXEC)
     guard input >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
     var parent: Int32 = -1

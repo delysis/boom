@@ -132,6 +132,9 @@ import Foundation
     let ownsFocus = sourceWindow?.firstResponder === old
     textView = new; self.sourceWindow = nil; coordinates = nil; preview = nil
     if documentView !== new { documentView = new }
+    // The actual source install is about to expose this native surface. Keep
+    // ready display pixels/geometry through the exact-window transfer below.
+    new.inlineMedia.setCovered(false)
     if let display = scrollText, let projection = display.currentDerivedMarkup(for: input.session.logicalWindow) {
       // The existing ticket installed this EXACT already-visible source
       // window. Reuse its proved arrays and ready immutable media metrics
@@ -458,13 +461,13 @@ import Foundation
         do {
           let snapshot = try mouseSelectionGesture?.source ?? input.session.captureLogicalRead()
           captured = snapshot
-          let trace = PerformanceTrace.begin("Editor.ManagedScrollRead")
+          let trace = PerformanceTrace.begin("Editor.SourceRead")
           let output: PagedNativeLogicalWindow
           do {
             let cancellation = CancellationFlag()
             scrollReadCancellation = cancellation
             defer { scrollReadCancellation = nil }
-            defer { PerformanceTrace.end("Editor.ManagedScrollRead", trace) }
+            defer { PerformanceTrace.end("Editor.SourceRead", trace) }
             output = try await input.session.readLogicalPresentation(snapshot, utf16Anchor: request.anchor,
               maximumBytes: PagedWorkingWindow.targetBytes, cancellation: cancellation)
           }
@@ -535,6 +538,8 @@ import Foundation
     MarkdownStyle.apply(to: view)
     view.sizeToFit()
     surface.contentView.scroll(to: .zero); surface.isHidden = false; showingScroll = true
+    (textView as? NativeMediaTextView)?.inlineMedia.setCovered(true)
+    view.inlineMedia.viewportDidChange()
     if let anchor, !window.text.isEmpty {
       guard anchor >= window.start.utf16, anchor - window.start.utf16 <= window.summary.utf16,
         let manager = view.layoutManager, let container = view.textContainer else {
@@ -1006,7 +1011,11 @@ import Foundation
       failPresentation(error); return true
     }
   }
-  private func hideScrollSurface() { showingScroll = false; scrollSurface?.isHidden = true }
+  private func hideScrollSurface() {
+    showingScroll = false; scrollSurface?.isHidden = true
+    (textView as? NativeMediaTextView)?.inlineMedia.setCovered(false)
+    scrollText?.inlineMedia.viewportDidChange()
+  }
   private func revealEditableWindow() {
     // A queued pointer is painted against its frozen source until its actual
     // chronological selection/window is delivered. Earlier mounts do not
@@ -1041,11 +1050,22 @@ import Foundation
       try await owner.joinPendingCommand()
     }
     stopMouseSelection()
+    let nativeMedia = (textView as? NativeMediaTextView)?.inlineMedia
+    let scrollMedia = scrollText?.inlineMedia
+    nativeMedia?.stop(); scrollMedia?.stop()
     displayRequest = UUID(); requestedScroll = nil; hideScrollSurface()
     scrollReadCancellation?.cancel()
     requestedMarkup = nil; markupCancellation?.cancel(); markupTask?.cancel()
     if let task = scrollTask { await task.value }
     if let task = markupTask { await task.value }
+    if let nativeMedia, let cleanup = await nativeMedia.joinPendingLoads() {
+      didRejectPresentation?(cleanup)
+    }
+    if let scrollMedia, let cleanup = await scrollMedia.joinPendingLoads() {
+      didRejectPresentation?(cleanup)
+    }
+    // Cleanup diagnostics preserve their owned URL and status; they do not
+    // refuse a coherent source close or poison the next editing admission.
     scrollProjection = nil; scrollSnapshot = nil
     deliveredMarkup = nil
     presentationClosed = true

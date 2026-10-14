@@ -187,6 +187,8 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
     private var backupRestoredWindow: NSWindow?
     private var backupRestoreCloseAttempted = false
     private var heldWriterVerified = false
+    private var heldScrollShiftVerified = false, visibleDemandVerified = false, collapsedMediaVerified = false
+    private var markupVerificationStage = "unentered"
     private var heldWriterFailureState: [String: Any]?
     private var documentInputStage = "unentered"
     private var documentContextVerified = false, adoptingFinalVerified = false, tabPointerVerified = false
@@ -760,7 +762,7 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
             guard let _ = await iterator.next() else { throw BoomError.unavailable("Actual writer body did not enter.") }
             view.setSelectedRange(NSRange(location: 1, length: 0))
             let beforeSelection = try input.currentDocumentSelection()
-            view.insertText("X", replacementRange: view.selectedRange())
+            view.insertText("Xé🙂", replacementRange: view.selectedRange())
             let afterSelection = try input.currentDocumentSelection()
             let edited = try session.captureLogicalState().source, editedGeneration = session.generation
             heldSave = try model.beginPagedWorkspaceSave() // actual owned reservation, before yielding
@@ -804,6 +806,25 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
                 "background_requests": queue.backgroundRequests, "cleanup_requests": queue.cleanupRequests]
               throw BoomError.invalid("Logical scroll or the real reserved save escaped the held writer condition.")
             }
+            let acceptedArena = session.arenaID
+            try input.setDocumentSelection(PagedNativeNavigationSelection(utf16Offset: 0,
+              utf16Length: 30_000, focusAtEnd: false, affinity: .upstream))
+            try viewport.requestScroll(toUTF16: 0); try await viewport.joinPresentation()
+            guard let head = viewport.visibleScrollWindow, head.start.utf16 == 0,
+              head.snapshot.isSame(edited), head.text.hasPrefix("AXé🙂") else {
+              throw BoomError.invalid("Actual dirty Unicode scroll did not retain its exact source under the held writer.")
+            }
+            try viewport.selectVisibleUTF16(5, extending: true)
+            let extended = try input.currentDocumentSelection()
+            guard extended.utf16Offset == 5, extended.utf16Length == 29_995,
+              extended.anchorUTF16 == 30_000, !extended.focusAtEnd, extended.affinity == .upstream,
+              session.generation == editedGeneration + 2, session.arenaID == acceptedArena,
+              session.activeNavigationOperationCount == 0, !commands.hasPendingCommand,
+              viewport.visibleScrollWindow == nil, try currentMixedView() === view,
+              session.sealedGeneration == savedGeneration, executor.snapshot.foregroundRequests >= 2 else {
+              throw BoomError.invalid("Actual held-writer Shift click lost its global anchor or entered source navigation/save.")
+            }
+            heldScrollShiftVerified = true
             try viewport.requestScroll(toUTF16: 0); try await viewport.joinPresentation()
             try viewport.selectVisibleUTF16(5); try await commands.joinPendingCommand()
             let current = try currentMixedView(), beforeTyping = session.generation
@@ -1763,9 +1784,259 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
       guard digest == expectedDigest else { throw BoomError.invalid("Ordinary export changed the actual generated whole source.") }
     }
 
+    // Existing signed App.run verification only, after timing/capture closes.
+    // The actual product viewport performs the initial head request; no observer
+    // is removed and no competing cold markup operation is invented.
+    private func verifyVisibleDemandMarkup(original: PagedNativeLogicalSnapshot, bytes: Data) async throws {
+      guard let model = workspace, let engine = model.pagedEngine, let session = model.pagedSession,
+        let input = model.pagedInput, let commands = model.pagedCommands, let viewport = model.pagedViewport,
+        let firstByte = bytes.first, firstByte < 0x80 else {
+        throw BoomError.invalid("Visible-demand verification lost its fixed public source/owners.")
+      }
+      let text = "# **Head 🙂**\n\n" + String(repeating: "ordinary paragraph\n\n", count: 2600)
+        + "# **Tail é🙂**\nΩ"
+      let replacement = Data(text.utf8)
+      guard bytes.count + replacement.count <= PagedCapturedEditInput.maximumInputBytes else {
+        throw BoomError.budget("The short verification edits exceed their actual captured-byte bound.")
+      }
+      try await mixedCaret(0, event: 0, measured: false)
+      try await model.flush(); await viewport.joinMarkup()
+      guard let record = model.pagedSelectedRecord else { throw BoomError.stale("The actual verification checkpoint is absent.") }
+      let windowID = session.logicalWindow.windowID
+      // Two exact descending edits make one real SDK group and leave its
+      // caret at0. The final non-ASCII scalar cannot reuse the ASCII old tail.
+      _ = try await commands.applyCapturedEdits(expected: record, edits: [
+        PagedTextLocalEdit(revision: record.document.revision, windowID: windowID,
+          byteStart: 1, byteEnd: UInt64(bytes.count), oldBytes: Data(bytes.dropFirst()), newBytes: replacement),
+        PagedTextLocalEdit(revision: record.document.revision, windowID: windowID,
+          byteStart: 0, byteEnd: 1, oldBytes: Data([firstByte]), newBytes: Data()),
+      ], actionName: "Public markup verification")
+      managedEditor = input.activeView
+      try await model.flush(); await viewport.joinMarkup()
+      guard viewport.markupFailure == nil, session.logicalWindow.start.utf16 == 0 else {
+        throw BoomError.invalid("The actual product head request did not finish at its cold source origin.")
+      }
+      try await requireDocumentInputSource(replacement)
+      let read = try session.captureLogicalRead(), head = session.logicalWindow
+      let generation = session.generation, arena = session.arenaID, version = try currentMixedView().sourceVersion
+      let custody = engine.custodySnapshot, whole: [MarkdownSpan] = try ProductCore.markdownSpans(text)
+      let ordered: ([MarkdownSpan]) -> [MarkdownSpan] = { rows in
+        rows.sorted { ($0.location, $0.length, $0.kind, $0.level) < ($1.location, $1.length, $1.kind, $1.level) }
+      }
+      let expected: (PagedNativeLogicalWindow) -> [MarkdownSpan] = { window in
+        let first = Int(window.start.utf16), last = Int(window.start.utf16 + window.summary.utf16)
+        return ordered(whole.compactMap { span -> MarkdownSpan? in
+          let lower = max(first, span.location), upper = min(last, span.location + span.length)
+          return lower < upper ? MarkdownSpan(kind: span.kind, location: lower - first,
+            length: upper - lower, level: span.level) : nil
+        })
+      }
+      let first = try await engine.logicalMarkup(head)
+      guard first.matches(head), first.style.complete, first.media.complete,
+        ordered(first.style.markdown) == expected(head) else {
+        throw BoomError.invalid("Actual head context differs from the complete native Core oracle.")
+      }
+      let afterHead = try await engine.fileStatistics(), release = DispatchSemaphore(value: 0)
+      let (signals, entered) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+      let executor = engine.storageExecutorForTesting
+      let writer = Task {
+        defer { entered.finish() }
+        try await executor.run {
+          entered.yield(())
+          guard release.wait(timeout: .now() + 10) == .success else {
+            throw BoomError.unavailable("Actual markup verification writer hold exceeded10s.")
+          }
+        }
+      }
+      var repeated: PagedNativeMarkupProjection?, failure: Error?
+      do {
+        repeated = try await withThrowingTaskGroup(of: PagedNativeMarkupProjection?.self) { group in
+          defer { group.cancelAll() }
+          group.addTask { @MainActor in
+            var iterator = signals.makeAsyncIterator()
+            guard let _ = await iterator.next() else { throw BoomError.unavailable("The actual markup writer did not enter.") }
+            return try await engine.logicalMarkup(head)
+          }
+          group.addTask {
+            try await Task.sleep(for: .seconds(5))
+            release.signal(); entered.finish()
+            throw BoomError.unavailable("An already-covered exact prefix waited on the held writer.")
+          }
+          guard let value = try await group.next() else { throw BoomError.unavailable("The actual prefix query did not join.") }
+          return value
+        }
+      } catch { failure = error }
+      release.signal(); entered.finish()
+      do { try await writer.value } catch {
+        if let original = failure { failure = DeveloperInputControlFailure(original: original, cleanup: error) }
+        else { failure = error }
+      }
+      if let failure { throw failure }
+      guard let repeated, repeated.matches(head), repeated.style.complete, repeated.media.complete,
+        ordered(repeated.style.markdown) == expected(head) else {
+        throw BoomError.invalid("The exact repeated prefix lost its actual complete projection.")
+      }
+      let afterRepeat = try await engine.fileStatistics()
+      guard afterRepeat.appendedPages == afterHead.appendedPages, afterRepeat.appendedBytes == afterHead.appendedBytes else {
+        throw BoomError.invalid("An unchanged exact prefix appended new derived pages.")
+      }
+      let tail = try await engine.logicalWindow(read.source, utf16Anchor: read.source.summary.utf16,
+        maximumBytes: PagedWorkingWindow.targetBytes)
+      let continued = try await engine.logicalMarkup(tail), afterTail = try await engine.fileStatistics()
+      guard continued.matches(tail), continued.style.complete, continued.media.complete,
+        ordered(continued.style.markdown) == expected(tail), afterTail.appendedPages > afterRepeat.appendedPages else {
+        throw BoomError.invalid("Actual current-to-tail continuation was eager, incomplete or differs from the whole-source oracle.")
+      }
+      _ = try await engine.logicalMarkup(tail); _ = try await engine.logicalMarkup(head)
+      let afterCached = try await engine.fileStatistics()
+      guard afterCached.appendedPages == afterTail.appendedPages, afterCached.appendedBytes == afterTail.appendedBytes,
+        afterCached.rootPublications == afterHead.rootPublications,
+        engine.custodySnapshot.jobs == custody.jobs, engine.custodySnapshot.reservedPayloadBytes == custody.reservedPayloadBytes,
+        session.isCurrent(read), session.generation == generation, session.arenaID == arena,
+        try currentMixedView().sourceVersion == version, input.firstRefusal == nil, commands.firstFailure == nil else {
+        throw BoomError.invalid("Derived demand queries changed the native source or leaked actual jobs/pages.")
+      }
+      try await requireDocumentInputSource(replacement, root: read.source)
+      try await mixedResponder(false, event: 0, measured: false)
+      try await requireDocumentInputSource(bytes, root: original)
+      try await mixedCaret(0, event: 0, measured: false)
+      visibleDemandVerified = true
+    }
+
+    // These are the original native source/range/clipboard/SDK-history
+    // assertions, hosted in the existing signed App.run instead of XCTest's
+    // unproved key-window lifecycle. They exercise no hardware input service.
+    private func verifyCollapsedMediaClipboard(original: PagedNativeLogicalSnapshot, bytes: Data) async throws {
+      guard let model = workspace, let input = model.pagedInput, let commands = model.pagedCommands,
+        let session = model.pagedSession, let viewport = model.pagedViewport,
+        let window, let documentID else {
+        throw BoomError.stale("Collapsed-media verification lost its actual document graph.")
+      }
+      let image = NSImage(size: NSSize(width: 72, height: 42))
+      image.lockFocus(); NSColor.systemRed.setFill(); NSRect(x: 0, y: 0, width: 72, height: 42).fill(); image.unlockFocus()
+      guard let tiff = image.tiffRepresentation, let bitmap = NSBitmapImageRep(data: tiff),
+        let png = bitmap.representation(using: .png, properties: [:]) else {
+        throw BoomError.invalid("The fixed public attachment could not be prepared.")
+      }
+      let chatVisible = model.state.showChat == true
+      if model.selectedChat == nil { try model.newChat() }
+      model.attachToCurrentChat([.bytes(name: "public-collapsed-verification.png", data: png)])
+      try await model.joinWorkspaceOperation(); try await model.flush()
+      guard !model.isBusy, model.errorMessage == nil,
+        let record = model.state.attachments.last,
+        record.name == "public-collapsed-verification.png",
+        try model.store.vault.get(.attachment, id: record.id) == png else {
+        throw BoomError.invalid("The real public attachment import did not join with its original bytes.")
+      }
+      if (model.state.showChat == true) != chatVisible { model.toggle("chat") }
+      // Chat attachment setup may transfer focus. Acquire this real live
+      // editor again; do not bypass currentMixedView's exact key/responder test.
+      guard let live = input.activeView, viewport.textView === live, live.window === window,
+        window.isKeyWindow, window.makeFirstResponder(live), window.firstResponder === live else {
+        throw BoomError.unavailable("Collapsed-media verification could not receive its actual editor focus.")
+      }
+      _ = try currentMixedView()
+      for marker in ["[asset][]", "![asset][]"] {
+        let prefix = "Before e\u{301}🙂\n"
+        let tail = "\nAfter\n\n[asset]: boom-attachment:\(record.id.uuidString)\n"
+        let text = prefix + marker + tail, deleted = prefix + tail
+        try await NativeCheckEvidence.replacePublicDocument(model, text: text, id: documentID, caret: 0)
+        let view = try currentMixedView()
+        await viewport.joinMarkup()
+        guard viewport.markupFailure == nil else {
+          throw BoomError.invalid("Collapsed-media verification did not join its actual source projection.")
+        }
+        view.setMedia(model: model); MarkdownStyle.apply(to: view)
+        await view.inlineMedia.joinPendingLoads()
+        let range = (text as NSString).range(of: marker)
+        guard view.inlineMedia.lastFailure == nil, view.inlineMedia.currentRanges == [range] else {
+          throw BoomError.invalid("Collapsed media did not project its entire accepted source marker.")
+        }
+        view.setSelectedRange(range, affinity: .upstream, stillSelecting: false)
+        let beforeSelection = try input.currentDocumentSelection()
+        let beforeSource = try session.captureLogicalState().source
+        let board = NSPasteboard.general, sentinel = "retained-before-original-publication"
+        board.clearContents()
+        guard view.selectedRange() == range, board.setString(sentinel, forType: .string) else {
+          throw BoomError.unavailable("Collapsed-media verification could not prepare its exact native selection/clipboard.")
+        }
+        view.cut(nil)
+        guard Data(view.string.utf8) == Data(text.utf8),
+          try session.captureLogicalState().source.isSame(beforeSource),
+          board.string(forType: .string) == sentinel else {
+          throw BoomError.invalid("Actual native Cut changed source/clipboard before original publication could join.")
+        }
+        // The production media join owns both preparation and publication,
+        // including entered cancellation and publication-first source deletion.
+        await view.inlineMedia.joinPendingLoads()
+        try await commands.joinPendingCommand()
+        guard view.inlineMedia.lastFailure == nil, Data(view.string.utf8) == Data(deleted.utf8),
+          case .bytes(let name, let copied)? = AttachmentInput.read(board)?.first,
+          name == record.name, copied == png,
+          try model.store.vault.get(.attachment, id: record.id) == png else {
+          throw BoomError.invalid("Actual collapsed Cut lost its full marker or byte-exact original clipboard representation.")
+        }
+        let cutSource = try session.captureLogicalState().source
+        try await requireDocumentInputSource(Data(deleted.utf8), root: cutSource)
+        try await mixedResponder(false, event: 0, measured: false)
+        guard try input.currentDocumentSelection() == beforeSelection,
+          window.firstResponder === input.activeView else {
+          throw BoomError.invalid("Actual responder Undo did not restore the complete collapsed-marker selection.")
+        }
+        try await requireDocumentInputSource(Data(text.utf8), root: beforeSource)
+        try await mixedResponder(true, event: 0, measured: false)
+        try await requireDocumentInputSource(Data(deleted.utf8), root: cutSource)
+        guard try model.store.vault.get(.attachment, id: record.id) == png,
+          input.firstRefusal == nil, commands.firstFailure == nil else {
+          throw BoomError.invalid("Native Cut/Undo/Redo changed the retained attachment or refused its actual source.")
+        }
+        try await mixedResponder(false, event: 0, measured: false) // undo Cut
+        try await mixedResponder(false, event: 0, measured: false) // undo real fixture replacement
+        try await requireDocumentInputSource(bytes, root: original)
+        await viewport.joinMarkup(); await view.inlineMedia.joinPendingLoads()
+      }
+      NSPasteboard.general.clearContents()
+      try await mixedCaret(0, event: 0, measured: false)
+      collapsedMediaVerified = true
+    }
+
+    private func verifyMarkupAndMediaControls() async throws {
+      guard plan.utf8Bytes == 72_196, NSApp.isRunning, NSApp.isActive,
+        let session = workspace?.pagedSession else {
+        throw BoomError.invalid("The short markup/media controls require their actual signed App.run source.")
+      }
+      let original = try session.captureLogicalState().source, bytes = try await documentInputBytes()
+      guard UInt64(bytes.count) == plan.utf8Bytes else {
+        throw BoomError.invalid("The markup/media controls lost their exact public baseline.")
+      }
+      do {
+        markupVerificationStage = "visible-demand"
+        try await verifyVisibleDemandMarkup(original: original, bytes: bytes)
+        markupVerificationStage = "collapsed-media"
+        try await verifyCollapsedMediaClipboard(original: original, bytes: bytes)
+        try await requireDocumentInputSource(bytes, root: original)
+        _ = try currentMixedView()
+        markupVerificationStage = "complete"
+      } catch {
+        var joined = await joinedDocumentInputFailure(error)
+        if let viewport = workspace?.pagedViewport {
+          await viewport.joinMarkup()
+          if let failure = viewport.markupFailure { joined = DeveloperInputControlFailure(original: joined, cleanup: failure) }
+        }
+        if let view = workspace?.pagedInput?.activeView {
+          await view.inlineMedia.joinPendingLoads()
+          if let failure = view.inlineMedia.lastFailure { joined = DeveloperInputControlFailure(original: joined, cleanup: failure) }
+        }
+        throw joined // the existing Prepared shutdown retains any failed graph
+      }
+    }
+
     func verifyAfterCapture() async throws {
       vmAfter = currentVMCategories()
       try requireManagedSource()
+      if plan.utf8Bytes == 72_196 && (plan.isMixed || normalMemory) {
+        try await verifyMarkupAndMediaControls()
+      }
       if let workspace { try await workspace.flush() }
       try await verifyOrdinaryExport(named: "final-export.txt"); finalExportJoined = true
       try requireManagedSource(); sourceVerified = true
@@ -1891,6 +2162,11 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
         "end_to_ready_stage": "Editor.PublicMixedOperation",
         "offscreen_sdk_diagnostic": !(plan.isMixed || normalMemory), "normal_release_memory_observation": normalMemory,
         "bitmap_raster_exercised": !normalMemory, "actual_held_writer_control_passed": heldWriterVerified,
+        "actual_held_writer_shift_anchor_passed": heldScrollShiftVerified,
+        "actual_visible_demand_markup_passed": visibleDemandVerified,
+        "actual_collapsed_media_clipboard_passed": collapsedMediaVerified,
+        "markup_media_verification_stage": markupVerificationStage,
+        "markup_media_control_scope": "Public72K signed App.run only, outside measured operations; exact head/tail demand, cached-prefix held writer, original clipboard and responder Undo. No hardware input, predecessor-display ABA or input-method service acceptance. Cold dependent-prefix cancellation is a separate Engine/ABI component.",
         "held_writer_failure_state": heldWriterFailureState ?? ["available": false],
         "document_input_control_stage": documentInputStage,
         "actual_document_context_control_passed": documentContextVerified,
