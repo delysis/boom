@@ -419,7 +419,8 @@ struct Gemma4IndependentBatchTests {
                 requests: prompts.indices.map { Digest.sha256("actual-request-\($0)") })
             let prepared = try model.prepare(cohort.input, cache: cohort.cache, state: nil, prefill: cohort.observedPrefill)
             guard case .logits(let output) = prepared else { throw TestFailure.notLogits }
-            eval(output.logits, cohort.cache)
+            asyncEval([output.logits] + cohort.cache.flatMap { $0.innerState() })
+            eval(output.logits)
             cohort.finishedPreparation(); cohort.markCacheSubmitted()
             Stream.defaultStream.synchronize()
             for row in prompts.indices {
@@ -475,7 +476,8 @@ struct Gemma4IndependentBatchTests {
                 requests: reversedQueries.indices.map { Digest.sha256("reversed-request-\($0)") })
             let second = try model.prepare(reversed.input, cache: reversed.cache, state: nil, prefill: reversed.observedPrefill)
             guard case .logits(let secondOutput) = second else { throw TestFailure.notLogits }
-            eval(secondOutput.logits, reversed.cache)
+            asyncEval([secondOutput.logits] + reversed.cache.flatMap { $0.innerState() })
+            eval(secondOutput.logits)
             reversed.finishedPreparation(); reversed.markCacheSubmitted()
             Stream.defaultStream.synchronize()
             for row in reversedQueries.indices {
