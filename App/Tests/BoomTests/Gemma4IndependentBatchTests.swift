@@ -434,7 +434,17 @@ struct Gemma4IndependentBatchTests {
                 let captures = cohort.rows.map { $0.retentionDiagnosticForTesting }
                 let layouts = cohort.cache.map { PrefixKVStorage.layout(of: $0) }
                 let positions = cohort.cache.map { ($0 as? any BatchKVCacheProtocol).flatMap(PrefixKVStorage.readyBatchPositions) }
-                Issue.record("Actual prepared publication: captures=\(captures), layouts=\(layouts), readyPositions=\(positions)")
+                let metadata = cohort.cache.map { value -> String in
+                    let native = PrefixKVStorage.unwrap(value)
+                    let wrapperState = value.innerState(), nativeState = native.innerState()
+                    let rowState = (native as? any BatchKVCacheProtocol)?.rowPositionState ?? []
+                    let rows = rowState.map { array in
+                        "shape=\(array.shape),dtype=\(array.dtype),ready=\(array.readyBuffer() != nil),wrapperIndices=\(wrapperState.indices.filter { wrapperState[$0] === array }),nativeIndices=\(nativeState.indices.filter { nativeState[$0] === array })"
+                    }
+                    let stateReady = wrapperState.map { $0.readyBuffer() != nil }
+                    return "native=\(type(of: native)),rows=\(rows),wrapperStateCount=\(wrapperState.count),nativeStateCount=\(nativeState.count),wrapperStateReady=\(stateReady)"
+                }
+                Issue.record("Actual prepared publication: captures=\(captures), layouts=\(layouts), readyPositions=\(positions), metadata=\(metadata)")
             }
             let original = try #require(manager.retainedLookupSnapshotObservations.first {
                 $0.namespace == namespace && $0.row == 0 && $0.tokenIDs.count == 7
