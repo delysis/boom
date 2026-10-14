@@ -882,6 +882,54 @@ private final class LiveBackupCopyHold: @unchecked Sendable {
     try await removeJoinedScratch(scratch)
   }
 
+  func testActualStreamedClipboardDescriptorAboveGiBDoesNotReadOrMaterializeItsBody() async throws {
+    let failures = testRun?.failureCount ?? 0
+    let scratch = try root(), file = scratch.appendingPathComponent("public-beyond-gib.txt")
+    let length: UInt64 = 1_073_741_825
+    let observed = try await Task.detached {
+      guard FileManager.default.createFile(atPath: file.path, contents: nil,
+        attributes: [.posixPermissions: 0o600]) else {
+        throw BoomError.unavailable("Could not create the public sparse metadata fixture.")
+      }
+      let writer = try FileHandle(forWritingTo: file)
+      var writerCloseAttempted = false
+      do {
+        // A real ordinary sparse file. No GiB buffer or body scan is needed
+        // to admit and pin the descriptor; full UTF8 import is separate.
+        try writer.truncate(atOffset: length)
+        writerCloseAttempted = true; try writer.close()
+      } catch {
+        let original = error
+        if !writerCloseAttempted {
+          do { try writer.close() }
+          catch { throw BoundedWorkspaceCleanupFailure(original: original, cleanup: error) }
+        }
+        throw original
+      }
+      let opened = try PagedClipboardTextFile.Opened(url: file)
+      var closeAttempted = false
+      do {
+        try opened.admit()
+        let result = (opened.expectedBytes, try opened.file.offset())
+        closeAttempted = true; try opened.close()
+        return result
+      } catch {
+        let original = error
+        if !closeAttempted {
+          do { try opened.close() }
+          catch { throw BoundedWorkspaceCleanupFailure(original: original, cleanup: error) }
+        }
+        throw original
+      }
+    }.value
+    XCTAssertEqual(observed.0, length)
+    XCTAssertEqual(observed.1, 0, "Descriptor admission must not consume or assemble the text body.")
+    guard (testRun?.failureCount ?? 0) == failures else {
+      throw BoomError.invalid("Actual larger-file descriptor assertions failed; its sparse public fixture is retained.")
+    }
+    try await removeJoinedScratch(scratch)
+  }
+
   func testActualClipboardTextIntentCapturesOriginalDescriptorAcrossBoardAndPathChanges() async throws {
     let failures = testRun?.failureCount ?? 0
     let scratch = try root(), source = try await writeSource(scratch)

@@ -88,8 +88,8 @@ struct PagedClipboardTextFile: Sendable, Equatable {
     init(url: URL) throws {
       var before = stat()
       guard lstat(url.path, &before) == 0, before.st_mode & S_IFMT == S_IFREG,
-        before.st_size >= 0, before.st_size <= 1_073_741_824 else {
-        throw BoomError.budget("Paste requires an ordinary UTF8 text file of at most 1 GiB.")
+        before.st_size >= 0 else {
+        throw BoomError.budget("Paste requires an ordinary UTF8 text file.")
       }
       let fd = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
       guard fd >= 0 else { throw BoomError.unavailable("The clipboard text file could not be opened.") }

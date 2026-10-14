@@ -2771,9 +2771,6 @@ private struct BoundedConsultationContext: Sendable {
         guard start < end, end <= snapshot.summary.bytes else {
           throw BoomError.invalid("Clipboard endpoints did not name the selected logical bytes.")
         }
-        guard end - start <= 1_073_741_824 else {
-          throw BoomError.budget("Copy up to 1 GiB at a time; larger selections can be exported as a document.")
-        }
         try Task.checkCancellation()
         let result = try self.publishClipboardSelection(snapshot: snapshot, engine: engine,
           publisher: publisher, start: start, end: end, intent: clipboardIntent)
