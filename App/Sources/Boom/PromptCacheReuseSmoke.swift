@@ -428,7 +428,7 @@ enum PromptCacheReuseSmoke {
       let status: String
       switch history.relation {
       case .sameObservedPartitions: status = exactObserved ? "passed" : "failed"
-      case .differentObservedPartitions:
+      case .differentObservedPartitions, .differentObservedInputs:
         status = exactObserved ? "equality_observed_unqualified" : "difference_observed_unqualified"
       case .unknown: status = "history_unknown"
       case .incompatibleRequest: status = "failed"

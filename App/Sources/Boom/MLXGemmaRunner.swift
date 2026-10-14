@@ -384,9 +384,9 @@ actor MLXGemmaRunner {
       policy: Self.policyDigest(policy), cacheAlgorithm: PromptPrefixCache.activeAlgorithm))
   }
   private nonisolated static func forwardOperandRequest(owner: PromptCacheOwner?, prepared: [Int],
-    seed: UInt64, output: Int, settings: SamplingSettings, row: Int, request: String? = nil) throws -> String {
+    seed: UInt64?, output: Int, settings: SamplingSettings, row: Int, request: String? = nil) throws -> String {
     struct Request: Encodable {
-      let owner: PromptCacheOwner?; let tokens: String; let seed: UInt64
+      let owner: PromptCacheOwner?; let tokens: String; let seed: UInt64?
       let output: Int; let sampling: String; let row: Int; let request: String?
     }
     guard let tokens = ForwardOperandBinding.tokenDigest([prepared]) else {
@@ -1753,9 +1753,12 @@ actor MLXGemmaRunner {
           cacheMissReason: cacheSession.observation.missReason)
         parameters.prefill = cacheSession.prefill
         if nativeReuse {
-          parameters.prefill.observeTextForward = cacheSession.bindForwardOperands(
-            model: try self.forwardOperandModelBinding(policy), requests: [try Self.forwardOperandRequest(
-              owner: cacheOwner, prepared: promptIDs, seed: seed, output: maxTokens, settings: settings, row: 0)])
+          let operandModel: String = try self.forwardOperandModelBinding(policy)
+          let operandRequest: String = try Self.forwardOperandRequest(owner: cacheOwner,
+            prepared: promptIDs, seed: seed, output: maxTokens, settings: settings, row: 0)
+          let operandObserver: (@Sendable (Range<Int>, Int, [Int]) -> Void)? =
+            cacheSession.bindForwardOperands(model: operandModel, requests: [operandRequest])
+          parameters.prefill.observeTextForward = operandObserver
         }
         let nativeReadmission = try selectedNativePlan.map { plan in
           try self.makeNativeReadmission(plan, flag: flag, authorization: joinedRetention?.authorization)
