@@ -116,10 +116,10 @@ impl<S: PageProvider> DelimiterStack for StackAccess<'_, S> {
         if self.stack.tail.contains(index) {
             return Ok(Some(self.stack.tail.at(index)?));
         }
-        if let Some(chunk) = &self.stack.read {
-            if chunk.contains(index) {
-                return Ok(Some(chunk.at(index)?));
-            }
+        if let Some(chunk) = &self.stack.read
+            && chunk.contains(index)
+        {
+            return Ok(Some(chunk.at(index)?));
         }
         let previous = self
             .stack

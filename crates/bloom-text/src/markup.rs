@@ -65,6 +65,14 @@ impl MarkupMemo {
     }
 }
 
+/// Source translation and retained side for splitting an unchanged interval.
+#[derive(Clone, Copy)]
+struct SplitMapping {
+    old_base: u64,
+    new_base: u64,
+    keep_prefix: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(
     tag = "state",
@@ -560,14 +568,13 @@ impl Segment {
         {
             return Err(Error::Invalid("markup HTML cannot become code"));
         }
-        if let Some((start, end)) = self.code {
-            if self.parsed
+        if let Some((start, end)) = self.code
+            && (self.parsed
                 || u64::from(start) > u64::from(end)
                 || u64::from(end) > self.summary.bytes
-                || self.definitions.is_some()
-            {
-                return Err(Error::Invalid("markup literal extent"));
-            }
+                || self.definitions.is_some())
+        {
+            return Err(Error::Invalid("markup literal extent"));
         }
         if self.boundaries.len() > 2
             || (self.parsed && self.boundaries.is_empty())
@@ -1046,10 +1053,13 @@ impl<S: PageProvider> TextEngine<S> {
         root: MarkRef,
         at: u64,
         base: u64,
-        old_base: u64,
-        new_base: u64,
-        keep_prefix: bool,
+        mapping: SplitMapping,
     ) -> Result<(Option<MarkRef>, Option<MarkRef>)> {
+        let SplitMapping {
+            old_base,
+            new_base,
+            keep_prefix,
+        } = mapping;
         if at == 0 {
             return Ok((None, Some(root)));
         }
@@ -1165,9 +1175,7 @@ impl<S: PageProvider> TextEngine<S> {
                             at - before,
                             base.checked_add(before)
                                 .ok_or(Error::Invalid("markup subtree split base"))?,
-                            old_base,
-                            new_base,
-                            keep_prefix,
+                            mapping,
                         )?;
                         left = self.mark_join(snapshot.origin(), mode, left, a)?;
                         right = self.mark_join(snapshot.origin(), mode, right, b)?;
@@ -1313,16 +1321,16 @@ impl<S: PageProvider> TextEngine<S> {
         at: u64,
     ) -> Result<(u64, Carry)> {
         let (before, segment) = self.mark_segment(source, mode, root, at)?;
-        if let Carry::Html(html) = &segment.incoming {
-            if let Some(dependency) = &html.opening {
-                return Ok((
-                    before
-                        .bytes
-                        .checked_sub(dependency.rewind)
-                        .ok_or(Error::Invalid("markup HTML opening checkpoint"))?,
-                    Carry::Root,
-                ));
-            }
+        if let Carry::Html(html) = &segment.incoming
+            && let Some(dependency) = &html.opening
+        {
+            return Ok((
+                before
+                    .bytes
+                    .checked_sub(dependency.rewind)
+                    .ok_or(Error::Invalid("markup HTML opening checkpoint"))?,
+                Carry::Root,
+            ));
         }
         if !segment.parsed || segment.incoming != Carry::Root || segment.outgoing != Carry::Root {
             return Ok((before.bytes, segment.incoming));
@@ -1584,43 +1592,45 @@ impl MarkupIndexBuilder {
                     value.container_load = Some(ContainerLoad::new(reference.clone())?);
                     value.containers = None;
                 }
-            } else if prefix.bytes > 0 {
-                if let Some(root) = &previous.root {
-                    // Never reuse an old EOF-only paragraph closure after append.
-                    let upper = prefix.bytes.min(proved.bytes);
-                    let (at, carry) = engine.mark_checkpoint_before(
-                        value.snapshot.origin(),
-                        mode,
-                        root.clone(),
-                        upper - 1,
-                    )?;
-                    let point = engine.logical_byte_position(&value.snapshot, at)?.point();
-                    let (left, _) = engine.mark_split(
-                        &value.snapshot,
-                        mode,
-                        root.clone(),
-                        at,
-                        0,
-                        0,
-                        0,
-                        true,
-                    )?;
-                    if left
-                        .as_ref()
-                        .map_or(TextSummary::EMPTY, |root| root.summary)
-                        != point
-                    {
-                        return Err(Error::Invalid("markup reused prefix scalar summary"));
-                    }
-                    if let Carry::Containers(reference) = &carry {
-                        value.container_load = Some(ContainerLoad::new(reference.clone())?);
-                        value.containers = None;
-                    }
-                    value.root = left;
-                    value.cursor = point;
-                    value.carry = carry;
-                    value.reused = point.bytes;
+            } else if prefix.bytes > 0
+                && let Some(root) = &previous.root
+            {
+                // Never reuse an old EOF-only paragraph closure after append.
+                let upper = prefix.bytes.min(proved.bytes);
+                let (at, carry) = engine.mark_checkpoint_before(
+                    value.snapshot.origin(),
+                    mode,
+                    root.clone(),
+                    upper - 1,
+                )?;
+                let point = engine.logical_byte_position(&value.snapshot, at)?.point();
+                let (left, _) = engine.mark_split(
+                    &value.snapshot,
+                    mode,
+                    root.clone(),
+                    at,
+                    0,
+                    SplitMapping {
+                        old_base: 0,
+                        new_base: 0,
+                        keep_prefix: true,
+                    },
+                )?;
+                if left
+                    .as_ref()
+                    .map_or(TextSummary::EMPTY, |root| root.summary)
+                    != point
+                {
+                    return Err(Error::Invalid("markup reused prefix scalar summary"));
                 }
+                if let Carry::Containers(reference) = &carry {
+                    value.container_load = Some(ContainerLoad::new(reference.clone())?);
+                    value.containers = None;
+                }
+                value.root = left;
+                value.cursor = point;
+                value.carry = carry;
+                value.reused = point.bytes;
             }
         }
         Ok(value)
@@ -1799,9 +1809,11 @@ impl MarkupIndexBuilder {
             root.clone(),
             old,
             0,
-            self.old_suffix,
-            self.new_suffix,
-            false,
+            SplitMapping {
+                old_base: self.old_suffix,
+                new_base: self.new_suffix,
+                keep_prefix: false,
+            },
         )?;
         let bytes = suffix.as_ref().map_or(0, |root| root.summary.bytes);
         self.root =
@@ -3118,14 +3130,14 @@ impl MarkupQuery {
         }
         if let Some(segment) = self.segments.pop_front() {
             if self.lookup {
-                if let Some(root) = &segment.segment.definitions {
-                    if self.wanted(root.labels) {
-                        self.definition_stack.push(DefinitionScan {
-                            root: root.clone(),
-                            before: segment.before,
-                            segment: segment.segment,
-                        });
-                    }
+                if let Some(root) = &segment.segment.definitions
+                    && self.wanted(root.labels)
+                {
+                    self.definition_stack.push(DefinitionScan {
+                        root: root.clone(),
+                        before: segment.before,
+                        segment: segment.segment,
+                    });
                 }
             } else {
                 self.begin_fragment(engine, segment, false, cancelled)?;
