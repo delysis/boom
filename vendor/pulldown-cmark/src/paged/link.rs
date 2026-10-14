@@ -8,19 +8,34 @@ use std::ops::Range;
 
 /// The actual ordinary inline passes accepted one complete Inline Link/Image
 /// subtree at this source origin. This carries no source or render authority.
-/// References and unfinished code/HTML dependencies remain unproved. Matched
+/// Reference-dependent subtrees require completed search/fuel proof from the
+/// captured owner. Unfinished code/HTML dependencies remain unproved. Matched
 /// children use the actual pinned pass, rather than a second child grammar.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct InlineLinkFragment { end: usize, image: bool }
+pub struct InlineLinkFragment { end: usize, image: bool , referenced: bool, closing: u8 }
 impl InlineLinkFragment {
     pub fn end(&self) -> usize { self.end }
     pub fn is_image(&self) -> bool { self.image }
+pub fn referenced(&self) -> bool { self.referenced }
+    pub fn ending(&self) -> char { char::from(self.closing) }
 }
 
 /// Reuse the actual LinkStack and child emphasis parser, including disabled
 /// outer links and images that can contain links. A copied page EOF cannot
 /// prove a reference absent or an unresolved earlier code/HTML scan failed.
 pub fn probe_inline_link(text: &str, options: crate::Options,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<InlineLinkFragment>, InlineRunError> {
+    probe_inline_link_with_definitions(text, options, crate::RefDefs::default(), false, None, cancelled)
+}
+
+/// A definition table is useful only with the captured owner's completed
+/// first-definition search and expansion bound. An empty unsearched map is
+/// never absence proof. `following` is one actual immutable source byte just
+/// after this copied interval, when available; it is not a fabricated EOF or
+/// extra parsed halo. Actual reference/inline precedence remains LinkStack.
+pub fn probe_inline_link_with_definitions<'a>(text: &'a str, options: crate::Options,
+    definitions: crate::RefDefs<'a>, absence_proven: bool, following: Option<u8>,
     cancelled: &mut impl FnMut() -> bool,
 ) -> Result<Option<InlineLinkFragment>, InlineRunError> {
     use crate::{BrokenLink, CowStr, Event, LinkType, Parser, Tag};
@@ -33,18 +48,26 @@ pub fn probe_inline_link(text: &str, options: crate::Options,
             first_reference = first_reference.min(broken.span.start); None
         };
         let parser = Parser::new_with_broken_link_callback_for_inline(text, options, Some(&mut unresolved))
-            .ok_or(InlineRunError::Invalid("inline link parser bound"))?;
+            .ok_or(InlineRunError::Invalid("inline link parser bound"))?.with_reference_definitions(definitions).with_reference_fuel(usize::MAX);
         let mut events = parser.into_offset_iter();
         if !matches!(events.next_with_check(cancelled).map_err(|_| InlineRunError::Cancelled)?,
             Some((Event::Start(Tag::Paragraph), _))) { return Ok(None); }
         let Some((event, range)) = events.next_with_check(cancelled).map_err(|_| InlineRunError::Cancelled)? else { return Ok(None); };
-        let image = match event {
-            Event::Start(Tag::Link { link_type: LinkType::Inline, .. }) => false,
-            Event::Start(Tag::Image { link_type: LinkType::Inline, .. }) => true,
+        let (image , kind) = match event {
+            Event::Start(Tag::Link { link_type, .. }) => (false, link_type),
+            Event::Start(Tag::Image { link_type, .. }) => (true, link_type),
             _ => return Ok(None),
         };
         if range.start != 0 || range.end == 0 || range.end > text.len()
-            || text.as_bytes()[range.end - 1] != b')' { return Ok(None); }
+            { return Ok(None); }
+        match kind {
+            LinkType::Inline if text.as_bytes()[range.end - 1] == b')' => (),
+            LinkType::Reference | LinkType::Collapsed if absence_proven && text.as_bytes()[range.end - 1] == b']' => (),
+            LinkType::Shortcut if absence_proven && text.as_bytes()[range.end - 1] == b']'
+                && text.as_bytes().get(range.end).copied().or(following).is_some_and(|next| !matches!(next, b'(' | b'[')) => (),
+            // A copied prefix ending exactly at [label] cannot exclude a
+            // later inline/full-reference continuation. No fake EOF proof.
+            _ => return Ok(None), }
         let mut depth = 1usize;
         while depth != 0 {
             let Some((event, _)) = events.next_with_check(cancelled).map_err(|_| InlineRunError::Cancelled)? else { return Ok(None); };
@@ -59,9 +82,9 @@ pub fn probe_inline_link(text: &str, options: crate::Options,
         // final; successful child spans and destination/title tokens skipped
         // by the actual LinkStack require no guessed absence proof.
         if !events.inline_probe_stable_through(range.end) { return Ok(None); }
-        InlineLinkFragment { end: range.end, image }
+        InlineLinkFragment { end: range.end, image , referenced: events.inline_probe_referenced_before(range.end), closing: text.as_bytes()[range.end - 1] }
     };
-    if first_reference < found.end { return Ok(None); }
+    if first_reference < found.end && !absence_proven { return Ok(None); }
     if cancelled() { return Err(InlineRunError::Cancelled); }
     Ok(Some(found))
 }

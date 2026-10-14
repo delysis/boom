@@ -19,7 +19,7 @@ mod code_runs;
 pub use code_runs::{CodeRun, CodeRunStream, CodeRuns, PreparedCodePair, prepare_code_pair};
 
 mod link;
-pub use link::{DestinationStatus, DestinationStep, LinkDestinationStream, InlineLinkFragment, probe_inline_link};
+pub use link::{DestinationStatus, DestinationStep, LinkDestinationStream, InlineLinkFragment, probe_inline_link, probe_inline_link_with_definitions};
 pub(crate) use link::scan_destination;
 
 mod inline_runs;
@@ -173,6 +173,20 @@ pub struct OpenParagraph { start: usize, options: Options, containers: BlockCarr
 impl OpenParagraph {
     pub(crate) fn new(start: usize, options: Options, containers: BlockCarry) -> Self {
         Self { start, options, containers }
+    }
+    /// Restore the root grammar state of an actual earlier first-pass
+    /// paragraph checkpoint. The source owner must retain its exact scope;
+    /// this supplies no EOF, source or rendering proof by itself.
+    pub fn from_root_checkpoint(options: Options) -> Self {
+        Self::new(0, options, BlockCarry::default())
+    }
+    /// The same leading-byte rule used by parse_refdef_total, applied only
+    /// at this captured actual root paragraph origin. A '[' candidate needs
+    /// the complete definition production; failed copied-EOF parsing cannot
+    /// exclude its later destination/title completion.
+    pub fn excludes_reference_definitions(&self, text: &str) -> bool {
+        self.start == 0 && self.containers.is_root() && !text.is_empty()
+            && !crate::firstpass::starts_reference_definition(text.as_bytes())
     }
     pub fn start(&self) -> usize { self.start }
     pub fn containers(&self) -> &BlockCarry { &self.containers }

@@ -141,13 +141,21 @@ impl InlineRunStream {
     /// The host has consumed a complete pinned Inline Link/Image subtree and
     /// keeps its child emphasis scope separate from this outer delimiter stack.
     pub fn resume_bracket(&mut self, start: InlinePoint, end: InlinePoint) -> Result<(), InlineRunError> {
+        self.resume_bracket_with_ending(start, end, ')')
+    }
+    /// A proved Reference/Collapsed/Shortcut ends at ']', not an inline ')'.
+    /// The actual pinned subtree probe supplies this source delimiter.
+    pub fn resume_bracket_with_ending(&mut self, start: InlinePoint, end: InlinePoint, ending: char) -> Result<(), InlineRunError> {
         let (actual, image) = self.bracket_start()?;
-        let minimum = if image { 5 } else { 4 };
+        let minimum = match ( image , ending) { (false, ')') => 4, (true, ')') => 5 ,
+            (false, ']') => 3, (true, ']') => 4 ,
+            _ => return Err(InlineRunError::Invalid("inline bracket actual closing delimiter")),
+        };
         if actual != start || end.bytes.checked_sub(start.bytes).is_none_or(|count| count < minimum)
             || end.utf16 <= self.point.utf16 || end.bytes - start.bytes < end.utf16 - start.utf16 {
             return Err(InlineRunError::Invalid("inline bracket subtree extent"));
         }
-        self.point = end; self.previous = Some(')'); self.pending_bang = false;
+        self.point = end; self.previous = Some(ending); self.pending_bang = false;
         self.stopped = None; Ok(())
     }
     /// The source host checked every copied scalar/counter before passing a

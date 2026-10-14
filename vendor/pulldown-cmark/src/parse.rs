@@ -197,6 +197,8 @@ pub struct Parser<'input, F = DefaultBrokenLinkCallback> {
     // Ordinary full-document parsing retains no extra dependency witness.
     inline_probe_unresolved: Option<usize>,
 
+    inline_probe_reference: Option<usize>,
+
     // https://github.com/pulldown-cmark/pulldown-cmark/issues/844
     // Consider this example:
     //
@@ -307,6 +309,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
         let (tree, allocs) = crate::firstpass::run_inline_fragment(text, options);
         let mut parser = Self::from_tree(text, options, broken_link_callback, tree, allocs);
         parser.inline_probe_unresolved = Some(usize::MAX);
+        parser.inline_probe_reference = Some(usize::MAX);
         Some(parser)
     }
 
@@ -330,6 +333,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
             html_scan_guard,
             cancelled: false,
             inline_probe_unresolved: None,
+            inline_probe_reference: None,
             // always allow 100KiB
             link_ref_expansion_limit: text.len().max(100_000),
             code_delims: CodeDelims::new(),
@@ -388,6 +392,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
         span: Range<usize>,
         link_type: LinkType,
     ) -> Option<(LinkType, CowStr<'input>, CowStr<'input>)> {
+        if let Some(first) = &mut self.inline_probe_reference { *first = (*first).min(span.start); }
         if self.link_ref_expansion_limit == 0 {
             return None;
         }
@@ -2275,6 +2280,10 @@ impl<'a, F: BrokenLinkCallback<'a>> OffsetIter<'a, F> {
     /// Only an unresolved earlier candidate can depend on uncopied source.
     pub(crate) fn inline_probe_stable_through(&self, end: usize) -> bool {
         matches!(self.inner.inline_probe_unresolved, Some(first) if first >= end)
+    }
+
+    pub(crate) fn inline_probe_referenced_before(&self, end: usize) -> bool {
+        self.inner.inline_probe_reference.is_some_and(|first| first < end)
     }
 
     /// Returns a reference to the internal reference definition tracker.

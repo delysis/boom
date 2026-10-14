@@ -219,6 +219,12 @@ pub(crate) fn probe_continuing_blocks(text: &str, options: Options, eof: bool,
         incomplete: pass.paged_incomplete, outgoing })
 }
 
+// Shared lexical admission for parse_refdef_total and captured root scopes.
+// A failed full parse at a copied EOF is NOT a negative definition proof.
+pub(crate) fn starts_reference_definition(bytes: &[u8]) -> bool {
+    bytes.first() == Some(&b'[')
+}
+
 pub(crate) fn run_first_pass_with_containers<'a>(text: &'a str, options: Options,
     incoming: &crate::paged::BlockCarry,
 ) -> (Tree<Item>, Allocations<'a>) {
@@ -2128,7 +2134,7 @@ impl<'a, 'b> FirstPass<'a, 'b> {
     /// Returns number of bytes scanned, label and definition on success.
     fn parse_refdef_total(&mut self, start: usize) -> Option<(usize, LinkLabel<'a>, LinkDef<'a>)> {
         let bytes = &self.text.as_bytes()[start..];
-        if bytes.get(0) != Some(&b'[') {
+        if !starts_reference_definition(bytes) {
             return None;
         }
         let (mut i, label) = self.parse_refdef_label(start + 1)?;

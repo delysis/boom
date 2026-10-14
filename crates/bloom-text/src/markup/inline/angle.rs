@@ -7,17 +7,19 @@ use pulldown_cmark::paged::{AngleGuard, AngleKind, AngleStatus, AngleStream};
 pub(super) struct PendingAngle {
     pub resume: TextSummary,
     pub start: InlinePoint,
+    pub resume_references: u64,
+    pub resume_pipe: bool,
     pub scanner: AngleStream,
 }
 impl PendingAngle {
-    pub fn new(stream: &InlineRunStream, resume: TextSummary, guard: AngleGuard) -> Result<Self> {
+    pub fn new(stream: &InlineRunStream, resume: TextSummary, guard: AngleGuard, resume_references: u64, resume_pipe: bool) -> Result<Self> {
         let start = stream.angle_start().map_err(inline_error)?;
         if start.bytes != resume.bytes || start.utf16 != resume.utf16 {
             return Err(Error::Invalid("markup angle captured source counters"));
         }
         Ok(Self {
             resume,
-            start,
+            start, resume_references, resume_pipe,
             scanner: AngleStream::new(start.bytes, guard),
         })
     }
@@ -64,6 +66,8 @@ impl LongParagraph {
                     .resume_angle(pending.start, None)
                     .map_err(inline_error)?;
                 self.summary = pending.resume.checked_add(TextSummary::of("<"))?;
+                self.reference_slots = pending.resume_references;
+                self.has_pipe = pending.resume_pipe;
                 self.buffer.clear();
                 Ok(true)
             }
