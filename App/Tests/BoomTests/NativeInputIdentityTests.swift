@@ -230,6 +230,11 @@ final class NativeInputIdentityTests: XCTestCase {
       XCTAssertFalse(completion.ghostSourcesRemainCurrent([], manuscriptID: UUID()))
       completion.refresh()
       XCTAssertNil(model.inputContextCache, "A changed context still must not encode on refresh.")
+      let beforePending = try model.inputContextStamp(target)
+      model.pendingAttachments = [UUID()]
+      XCTAssertNotEqual(try model.inputContextStamp(target), beforePending,
+        "Even an unresolved pending ID changes the prompt media links and must revoke ownership.")
+      model.pendingAttachments = []
       let capturedChat = try XCTUnwrap(original.chat)
       let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
       let expected = Digest.sha256(Digest.sha256(try encoder.encode(capturedChat)))

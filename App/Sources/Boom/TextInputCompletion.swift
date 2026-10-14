@@ -28,6 +28,7 @@ struct InputContextStamp: Equatable, Sendable {
   }
   let target: TextInputTarget
   let chatVersion: UUID?
+  let pendingAttachments: [UUID]
   let attachments: [Attachment]
 }
 
@@ -303,7 +304,7 @@ extension WorkspaceModel {
       target.chatID != nil || target.documentID == state.selectedDocument else { throw BoomError.stale("Input changed.") }
     let pending = target.messageID == nil && !target.instructions ? pendingAttachments : []
     return InputContextStamp(target: target, chatVersion: selectedChat?.contentVersion,
-      attachments: pending.compactMap { id in state.attachments.first(where: { $0.id == id }).map {
+      pendingAttachments: pending, attachments: pending.compactMap { id in state.attachments.first(where: { $0.id == id }).map {
         InputContextStamp.Attachment(id: $0.id, rootDigest: $0.rootDigest)
       } })
   }
