@@ -136,9 +136,9 @@ final class Vault: @unchecked Sendable {
         throw BoomError.invalid("Workspace storage is not a real directory.")
       }
     } else if errno != ENOENT { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-    self.root = selected.resolvingSymlinksInPath()
-    try FileManager.default.createDirectory(at: self.root, withIntermediateDirectories: true,
+    try FileManager.default.createDirectory(at: selected, withIntermediateDirectories: true,
       attributes: [.posixPermissions: 0o700])
+    self.root = try WorkspaceBackup.physicalDirectory(selected)
     let values = try self.root.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
     guard values.isDirectory == true, values.isSymbolicLink != true else {
       throw BoomError.invalid("Workspace storage is not a real directory.")
@@ -268,9 +268,9 @@ actor WorkspaceStore {
     if lstat(normalized.path, &existing) == 0 {
       guard existing.st_mode & S_IFMT == S_IFDIR else { throw BoomError.invalid("Workspace root is not a real directory.") }
     } else if errno != ENOENT { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-    root = normalized.resolvingSymlinksInPath()
-    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true,
+    try FileManager.default.createDirectory(at: normalized, withIntermediateDirectories: true,
       attributes: [.posixPermissions: 0o700])
+    root = try WorkspaceBackup.physicalDirectory(normalized)
     try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
     vault = try Vault(root: root.appendingPathComponent("Objects", isDirectory: true))
   }
