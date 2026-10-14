@@ -116,13 +116,18 @@ struct MarkdownSpan: Decodable, Sendable, Equatable {
       defer { PerformanceTrace.end("Editor.MarkdownParse", trace) }
       spans = (try? ProductCore.markdownSpans(source)) ?? []
     }
-    // Build once for both extension passes. Dense source must not compare
-    // every marker with every literal span on the main thread.
-    let literalRanges = LiteralRanges(spans.filter { $0.kind == "code" || $0.kind == "literal" }
-      .map { NSRange(location: $0.location, length: $0.length) })
-    let wikis = wikiDisplays(in: source, excluding: literalRanges, hasMarker: projection?.hasWikiMarker)
+    let hasWiki = projection?.hasWikiMarker
+      ?? (text.range(of: "[[", options: .literal).location != NSNotFound)
     let hasAttachment = projection?.hasAttachmentMarker
       ?? (text.range(of: "[Attachment: ", options: .literal).location != NSNotFound)
+    // Build once for both extension passes when either has actual markers.
+    // Dense source must not compare
+    // every marker with every literal span on the main thread.
+    let literalRanges = LiteralRanges(hasWiki || hasAttachment
+      ? spans.filter { $0.kind == "code" || $0.kind == "literal" }
+        .map { NSRange(location: $0.location, length: $0.length) }
+      : [])
+    let wikis = wikiDisplays(in: source, excluding: literalRanges, hasMarker: hasWiki)
     let attachments = hasAttachment ? (attachmentPattern?.matches(in: source, range: full) ?? []).filter { match in
       !literalRanges.overlaps(match.range)
     } : []
