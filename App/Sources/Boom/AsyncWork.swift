@@ -35,6 +35,14 @@ enum ExplicitFileExport {
       guard target.isFileURL, target != target.deletingLastPathComponent() else {
         throw BoomError.invalid("Export requires a selected file destination.")
       }
+      // Refuse an invalid existing destination before temporary storage or
+      // source streaming. Publication repeats this check after coordination.
+      var existing = stat()
+      let exists = lstat(target.path, &existing) == 0
+      guard exists || errno == ENOENT else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+      guard !exists || existing.st_mode & S_IFMT == S_IFREG else {
+        throw BoomError.denied("Export cannot replace a symlink, directory or device.")
+      }
       let manager = FileManager.default
       let directory = try manager.url(for: .itemReplacementDirectory, in: .userDomainMask,
         appropriateFor: target, create: true)

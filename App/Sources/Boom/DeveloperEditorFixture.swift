@@ -731,10 +731,20 @@ private final class DeveloperBackupCopyHold: @unchecked Sendable {
           attributes: [.posixPermissions: 0o700]); try sentinelBytes.write(to: sentinel)
       }
       let unrelated = try model.exportPagedDocument(to: refused)
-      guard case .failure(let unrelatedFailure) = await unrelated.result,
-        let refusal = unrelatedFailure as? BoomError,
+      let unrelatedFailure: Error
+      switch await unrelated.result {
+      case .success:
+        throw BoomError.invalid("Actual chosen-directory export unexpectedly succeeded.")
+      case .failure(let error): unrelatedFailure = error
+      }
+      guard let refusal = unrelatedFailure as? BoomError,
         case .denied(let reason) = refusal, reason == "Export cannot replace a symlink, directory or device." else {
-        throw BoomError.invalid("Actual chosen-directory export did not preserve its expected refusal.")
+        let native = unrelatedFailure as NSError
+        let detail = String(decoding: native.localizedDescription.utf8.prefix(512), as: UTF8.self)
+        let domain = String(decoding: native.domain.utf8.prefix(128), as: UTF8.self)
+        let type = String(decoding: String(reflecting: Swift.type(of: unrelatedFailure)).utf8.prefix(160), as: UTF8.self)
+        let underlying = native.userInfo[NSUnderlyingErrorKey] as? NSError
+        throw BoomError.invalid("Actual chosen-directory export did not preserve its expected refusal: type=\(type), domain=\(domain), code=\(native.code), underlying=\(underlying?.code.description ?? "none"); \(detail)")
       }
       model.dismissError()
       let backup = scratch.appendingPathComponent("retry"), hold = DeveloperBackupCopyHold(documentID: documentID)
