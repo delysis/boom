@@ -155,6 +155,24 @@ fn index(
         progress.incomplete_block
     )
 }
+fn assert_logical_source_bytes(
+    engine: &mut TextEngine<Pages>,
+    snapshot: &LogicalSnapshot,
+    expected: &str,
+) -> TestResult {
+    assert_eq!(snapshot.summary().bytes, expected.len() as u64);
+    let mut at = 0usize;
+    while at < expected.len() {
+        let mut end = (at + 64 * 1024).min(expected.len());
+        while !expected.is_char_boundary(end) { end -= 1; }
+        assert!(at < end);
+        let actual = engine.logical_read_range(snapshot, at as u64..end as u64, &mut || false)?;
+        assert_eq!(actual.as_slice(), &expected.as_bytes()[at..end], "exact source bytes {at}..{end}");
+        at = end;
+    }
+    assert_eq!(at, expected.len());
+    Ok(())
+}
 fn context_with_progress(
     engine: &mut TextEngine<Pages>,
     snapshot: &LogicalSnapshot,
@@ -2645,10 +2663,7 @@ fn actual_long_html_blocks_exclude_markdown_and_media_then_resume_root_grammar()
         assert!(
             paged_media_spans(&context(&mut engine, &snapshot, media, 32_767, 512)?)?.is_empty()
         );
-        assert_eq!(
-            engine.logical_read_range(&snapshot, 0..snapshot.summary().bytes, &mut || false)?,
-            text.as_bytes()
-        );
+        assert_logical_source_bytes(&mut engine, &snapshot, &text)?;
         assert!(source.capture().same(&snapshot));
     }
     for (opening, ending) in [
@@ -2745,12 +2760,7 @@ fn actual_multimegabyte_html_block_has_no_line_buffer_and_edit_undo_keeps_exact_
     let (restored, _) = index(&mut engine, &source.capture(), MarkupMode::Style)?;
     assert!(Arc::ptr_eq(&restored, &indexed));
     assert_eq!(engine.stats().page_writes, writes);
-    assert_eq!(
-        engine.logical_read_range(&source.capture(), 0..snapshot.summary().bytes, &mut || {
-            false
-        })?,
-        text.as_bytes()
-    );
+    assert_logical_source_bytes(&mut engine, &source.capture(), &text)?;
     Ok(())
 }
 
@@ -2956,19 +2966,21 @@ fn actual_type7_opening_stream_chooses_pinned_html_or_its_same_root_paragraph_fa
 fn actual_long_type7_openings_and_rejected_real_line_choices_match_the_full_parser() -> TestResult {
     let plain = "ordinary é🙂 source ".repeat(4000);
     let spaces = " ".repeat(70_000);
-    for text in [
-        format!("# Before\n\n<widget title='{plain}'>\n**opaque** `opaque`\n\n# Outside\n"),
-        format!("</widget{spaces}>\n**opaque**\n\n# Outside\n"),
-        format!("<widget>{spaces}\n**opaque**\n\n# Outside\n"),
-        format!("<widget title='{plain}'>"),
-        format!("<widget>{spaces}é **paragraph** `real code`\n\n# Outside\n"),
-        format!("<widget title='{plain}\ncontinued'> **paragraph**\n\n# Outside\n"),
-        format!("<widget title='{plain} **unclosed paragraph**"),
+    for (case, text) in [
+        ("preceding-root", format!("# Before\n\n<widget title='{plain}'>\n**opaque** `opaque`\n\n# Outside\n")),
+        ("closing-tag", format!("</widget{spaces}>\n**opaque**\n\n# Outside\n")),
+        ("blank-after-tag", format!("<widget>{spaces}\n**opaque**\n\n# Outside\n")),
+        ("actual-eof", format!("<widget title='{plain}'>")),
+        ("nonblank-fallback", format!("<widget>{spaces}é **paragraph** `real code`\n\n# Outside\n")),
+        ("multiline-fallback", format!("<widget title='{plain}\ncontinued'> **paragraph**\n\n# Outside\n")),
+        ("unclosed-fallback", format!("<widget title='{plain} **unclosed paragraph**")),
     ] {
         let (mut engine, mut source, _) = self::source(&text)?;
         let snapshot = source.capture_for_publication()?;
         let (style, progress) = index(&mut engine, &snapshot, MarkupMode::Style)?;
-        assert!(style.complete() && !progress.incomplete_block);
+        assert!(style.complete() && !progress.incomplete_block,
+            "case={case}, indexed_bytes={}, buffered_bytes={}, incomplete={}",
+            progress.indexed_bytes, progress.buffered_bytes, progress.incomplete_block);
         for anchor in [
             0,
             32_767,
@@ -3098,5 +3110,39 @@ fn actual_distant_type7_decision_edit_invalidates_early_literal_proof_and_undo_r
         at = end;
     }
     assert!(source.capture().same(&snapshot));
+    Ok(())
+}
+
+
+#[test]
+fn actual_completed_root_blank_lines_release_long_html_without_inventing_page_eof() -> TestResult {
+    use pulldown_cmark::paged::completed_root_blank_prefix;
+    for (text, expected) in [
+        ("\n \t\r\n<widget", Some(5)), ("\rX", Some(1)),
+        (" \t\r\n<widget", Some(4)), ("\n \t", Some(1)),
+        (" \t", None), (" \t\r", None), ("\r", None),
+        ("    <widget>", None), ("> \n", None), ("\n#", Some(1)),
+    ] {
+        assert_eq!(completed_root_blank_prefix(text), expected, "real source={text:?}");
+    }
+    for blank in ["\n", "\r\n", " \t\r\n", "\n \t\n"] {
+        let text = format!("# Before\n{blank}<widget title='{}'>\n**opaque** `opaque`\n\n# Outside\n",
+            "ordinary é🙂 source ".repeat(4000));
+        assert!(text.len() > 2 * pulldown_cmark::paged::PROBE_BYTES);
+        let blocks: Vec<_> = Parser::new_ext(&text, MarkupMode::Style.options()).filter_map(|event| {
+            match event { Event::Start(Tag::HtmlBlock) => Some("html"),
+                Event::Start(Tag::Heading { .. }) => Some("heading"), _ => None }
+        }).collect();
+        assert_eq!(blocks, vec!["heading", "html", "heading"], "actual pinned grammar, blank={blank:?}");
+        let (mut engine, mut source, _) = self::source(&text)?;
+        let snapshot = source.capture_for_publication()?;
+        let (style, progress) = index(&mut engine, &snapshot, MarkupMode::Style)?;
+        assert!(style.complete() && !progress.incomplete_block, "blank={blank:?}");
+        for anchor in [0, 32_767, snapshot.summary().utf16.saturating_sub(32)] {
+            assert_oracle(&text, &mut engine, &snapshot, anchor, 384)?;
+        }
+        assert_logical_source_bytes(&mut engine, &snapshot, &text)?;
+        assert!(source.capture().same(&snapshot));
+    }
     Ok(())
 }

@@ -281,6 +281,27 @@ pub fn begin_unfinished_paragraph(text: &str, options: Options, incoming: &Block
     crate::firstpass::probe_continuing_blocks(text, options, false, incoming)?.paragraph
 }
 
+/// Physically complete leading blank lines at an already proved root.
+/// scan_blank_line is the SAME ordinary first-pass scanner. Its EOF-as-EOL
+/// case, and a trailing CR whose optional LF is uncopied, confer no proof.
+/// This is only derived source coverage; it does not classify a later block.
+pub fn completed_root_blank_prefix(text: &str) -> Option<usize> {
+    if text.is_empty() || text.len() > PROBE_BYTES { return None; }
+    let bytes = text.as_bytes();
+    let mut at = 0usize;
+    while let Some(count) = crate::scanners::scan_blank_line(&bytes[at..]) {
+        if count == 0 { break; }
+        let end = at.checked_add(count)?;
+        match bytes.get(end - 1) {
+            Some(b'\n') => (),
+            Some(b'\r') if end < bytes.len() => (),
+            _ => break,
+        }
+        at = end;
+    }
+    (at != 0).then_some(at)
+}
+
 /// Admit a real first-pass-selected root HTML block even when its current
 /// physical line exceeds the probe. Type7 needs its complete actual opening
 /// line: a fake prefix EOF cannot establish the required trailing blank line.

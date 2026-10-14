@@ -1845,6 +1845,13 @@ impl MarkupIndexBuilder {
         if self.carry != Carry::Root || self.buffer.len() < PROBE_BYTES - 3 {
             return Ok(false);
         }
+        // The LF-only probe can retain a final root blank line in front of
+        // a long unfinished physical line. Drain only actual completed blank
+        // lines before asking that SAME first pass to admit the long block.
+        if let Some(count) = pulldown_cmark::paged::completed_root_blank_prefix(&self.buffer) {
+            self.append_literal(engine, count, None, Carry::Root)?;
+            return Ok(true);
+        }
         let Some(work) = pulldown_cmark::paged::begin_unfinished_html_work(
             &self.buffer,
             self.mode.options(),
