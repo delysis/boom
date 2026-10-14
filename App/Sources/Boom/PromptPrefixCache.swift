@@ -652,7 +652,7 @@ final class PromptPrefixCache: @unchecked Sendable {
     }
     func observeLane(row: Int, width: Int, completion: Completion, finished: Bool) -> Bool {
       lock.lock(); defer { lock.unlock() }
-      guard !discarded, samples.isEmpty, (1...3).contains(width), (0..<width).contains(row),
+      guard !discarded, samples.isEmpty, (1...4).contains(width), (0..<width).contains(row),
         completion.row == row, let processed = primaryCache?.offset,
         processed >= tokens.count, processed - tokens.count <= completion.observedTokenIDs.count else { return false }
       if let previous = lanes[row] {

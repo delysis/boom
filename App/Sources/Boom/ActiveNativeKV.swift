@@ -76,7 +76,7 @@ struct ActiveNativeKVAdmissionPlan: Codable, Sendable {
   /// forwards for pipelined decode or the final-chunk-plus-tail prefill edge.
   /// Source parents are already in measured U; initial hydration is additional.
   func transitionAllocations(width: Int, forwards: Int, hydration: Bool) throws -> [ActiveNativeKVAllocation] {
-    guard (1...3).contains(width), (1...2).contains(forwards), consumerWidth > 0 else {
+    guard (1...4).contains(width), (1...2).contains(forwards), consumerWidth > 0 else {
       throw BoomError.invalid("Invalid native KV allocation horizon.")
     }
     func scaled(_ value: UInt64) throws -> UInt64 {
@@ -167,7 +167,7 @@ final class ActiveNativeKVReadmission: @unchecked Sendable {
 enum ActiveNativeKVStorage {
   static func rowWidth(_ owners: [PrefixKVNativeOwnership]) throws -> Int {
     let widths = Set(owners.flatMap { $0.native.innerState().map { $0.dim(0) } })
-    guard widths.count == 1, let width = widths.first, (1...3).contains(width) else {
+    guard widths.count == 1, let width = widths.first, (1...4).contains(width) else {
       throw BoomError.invalid("Active native KV has no coherent physical row width.")
     }
     return width
@@ -176,7 +176,7 @@ enum ActiveNativeKVStorage {
     prefix: Int, prompt: Int, output: Int, width: Int, row: Int?, prefill: PrefillParameters
   ) throws -> ActiveNativeKVAdmissionPlan {
     guard owners.count == layouts.count, !owners.isEmpty, prefix > 0, prefix < prompt,
-      output > 0, (1...3).contains(width) else { throw BoomError.invalid("Invalid active native KV admission coordinates.") }
+      output > 0, (1...4).contains(width) else { throw BoomError.invalid("Invalid active native KV admission coordinates.") }
     let sourceWidth = try rowWidth(owners)
     guard (0..<sourceWidth).contains(row ?? 0) else { throw BoomError.invalid("Invalid active native source row.") }
     let (target, overflow) = prompt.addingReportingOverflow(output)

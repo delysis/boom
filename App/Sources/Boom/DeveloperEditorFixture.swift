@@ -117,6 +117,7 @@ import SwiftUI
     private var applicationBeforeFocus: [String: Any]?, applicationAfterFocus: [String: Any]?
     private var normalTimings: [[String: Any]] = []
     private var heldWriterVerified = false
+    private var heldWriterFailureState: [String: Any]?
     private var warmMarkedStates: [[String: Any]] = []
     private var heldSave: Task<Void, Error>?
     var memorySamplesURL: URL { root.appendingPathComponent("memory-samples.jsonl") }
@@ -392,9 +393,21 @@ import SwiftUI
             }
             let middle = edited.summary.utf16 / 2
             try viewport.requestScroll(toUTF16: middle); try await viewport.joinPresentation()
-            guard let displayed = viewport.visibleScrollWindow, displayed.snapshot.isSame(edited),
+            let displayed = viewport.visibleScrollWindow, queue = executor.snapshot
+            guard let displayed, displayed.snapshot.isSame(edited),
               displayed.start.utf16 <= middle, middle <= displayed.start.utf16 + displayed.summary.utf16,
-              session.sealedGeneration == savedGeneration, executor.snapshot.foregroundRequests >= 2 else {
+              session.sealedGeneration == savedGeneration, queue.foregroundRequests >= 2 else {
+              heldWriterFailureState = ["displayed_missing": displayed == nil,
+                "displayed_root": displayed?.snapshot.rootID.uuidString ?? "nil",
+                "edited_root": edited.rootID.uuidString,
+                "displayed_is_edited": displayed?.snapshot.isSame(edited) ?? false,
+                "displayed_start_utf16": displayed.map { $0.start.utf16 as Any } ?? NSNull(),
+                "displayed_extent_utf16": displayed.map { $0.summary.utf16 as Any } ?? NSNull(),
+                "requested_middle_utf16": middle, "edited_utf16": edited.summary.utf16,
+                "sealed_generation": session.sealedGeneration, "captured_saved_generation": savedGeneration,
+                "current_generation": session.generation,
+                "foreground_requests": queue.foregroundRequests,
+                "background_requests": queue.backgroundRequests, "cleanup_requests": queue.cleanupRequests]
               throw BoomError.invalid("Logical scroll or the real reserved save escaped the held writer condition.")
             }
             try viewport.requestScroll(toUTF16: 0); try await viewport.joinPresentation()
@@ -1095,6 +1108,7 @@ import SwiftUI
         "end_to_ready_stage": "Editor.PublicMixedOperation",
         "offscreen_sdk_diagnostic": true, "normal_release_memory_observation": normalMemory,
         "bitmap_raster_exercised": !normalMemory, "actual_held_writer_control_passed": heldWriterVerified,
+        "held_writer_failure_state": heldWriterFailureState ?? ["available": false],
         "slow_dispatch_threshold_ns": 8_000_000,
         "fixture_kind": plan.kind, "storage_route": "files",
         "primitive_replacements_per_cycle": plan.isMixed ? (NSNull() as Any) : (2 as Any), "public_utf8_bytes": plan.utf8Bytes,

@@ -13,6 +13,38 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
   }
 }
 
+/// Holds only after a real cloned pages file has written its first 64 KiB.
+/// The deadline is cleanup protection, never evidence that work completed.
+private final class LiveBackupCopyHold: @unchecked Sendable {
+  let entered: XCTestExpectation
+  private let documentName: String
+  private let releaseSignal = DispatchSemaphore(value: 0)
+  private let lock = NSLock()
+  private var observation: (source: URL, staged: URL, bytes: UInt64)?
+  private var held = false
+  private var expired = false
+  init(documentID: UUID, entered: XCTestExpectation) {
+    documentName = documentID.uuidString.lowercased(); self.entered = entered
+  }
+  func copied(_ source: URL, _ staged: URL, _ bytes: UInt64) throws {
+    guard source.lastPathComponent == "pages",
+      source.deletingLastPathComponent().lastPathComponent == documentName, bytes >= 65_536 else { return }
+    lock.lock()
+    guard observation == nil else { lock.unlock(); return }
+    observation = (source, staged, bytes); held = true
+    lock.unlock(); entered.fulfill()
+    let timedOut = releaseSignal.wait(timeout: .now() + .seconds(10)) != .success
+    lock.lock(); held = false; expired = timedOut; lock.unlock()
+    if timedOut { throw BoomError.unavailable("The actual backup copy missed its ten-second release deadline.") }
+  }
+  func release() { releaseSignal.signal() }
+  var isHeld: Bool { lock.lock(); defer { lock.unlock() }; return held }
+  var didTimeOut: Bool { lock.lock(); defer { lock.unlock() }; return expired }
+  var actualFiles: (source: URL, staged: URL, bytes: UInt64)? {
+    lock.lock(); defer { lock.unlock() }; return observation
+  }
+}
+
 /// Source-authored ordinary Model/WorkspaceView controls. No fake engine,
 /// WorkspaceState, durable ACK, native history or actor callback is supplied.
 @MainActor final class BoundedWorkspaceConsumerTests: XCTestCase {
@@ -1406,6 +1438,240 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
       throw BoomError.invalid("Actual truncated RI assertions failed; source and native owners retained.")
     }
     try await joinedClose(model); try await removeJoinedScratch(scratch)
+  }
+
+
+  func testActualLiveCloneBackupKeepsNativeUndoScrollAndLaterSaveWhileCopyHeldThenColdRestoresSnapshot() async throws {
+    let failures = testRun?.failureCount ?? 0
+    let parent = try diagnosticRoot(), scratch = parent.appendingPathComponent("workspace")
+    let model = try await open(scratch, requiresActualKeyWindow: false)
+    let source = try await writeSource(parent)
+    let originalHash = try await Task.detached { try ModelInstaller.hashFile(source, maxBytes: 3_145_728) }.value
+    try await model.importDocuments([source], flag: CancellationFlag())
+    try await focusCurrentEditor(model, requiresActualKeyWindow: false)
+    let imported = try XCTUnwrap(model.pagedSelectedRecord)
+    XCTAssertEqual(imported.document.revision.summary.bytes, 3_145_728)
+    let engine = try XCTUnwrap(model.pagedEngine), session = try XCTUnwrap(model.pagedSession)
+    let input = try XCTUnwrap(model.pagedInput), commands = try XCTUnwrap(model.pagedCommands)
+    let viewport = try XCTUnwrap(model.pagedViewport), manager = commands.manager
+    let window = try XCTUnwrap(Self.failedWindow), view = try XCTUnwrap(input.activeView)
+    let context = try XCTUnwrap(view.inputContext)
+    view.insertText("é🙂", replacementRange: NSRange(location: 0, length: 0))
+    model.draft = "Snapshot owner draft"
+    let attachmentID = UUID(), attachmentBytes = Data("Snapshot attachment bytes".utf8), vault = model.store.vault
+    try await Task.detached { try vault.put(attachmentBytes, kind: .attachment, id: attachmentID) }.value
+    try await commands.joinPendingCommand(); try await model.flush()
+    let captured = try XCTUnwrap(model.pagedSelectedRecord)
+    let capturedSelection = try input.currentDocumentSelection()
+    let capturedDigest = try await engine.wholeTextSha256(captured.document.revision)
+    XCTAssertEqual(captured.document.revision.summary.bytes, imported.document.revision.summary.bytes + 6)
+    let backup = parent.appendingPathComponent("backup"), restoredRoot = parent.appendingPathComponent("restored")
+    Self.failedExport = backup
+    let hold = LiveBackupCopyHold(documentID: captured.document.id,
+      entered: expectation(description: "Actual cloned pages export has written 64 KiB"))
+    defer { hold.release() }
+    let export = try model.exportWorkspaceBackup(to: backup, progress: { try hold.copied($0, $1, $2) })
+    var exportJoined = false
+    do {
+      guard await XCTWaiter.fulfillment(of: [hold.entered], timeout: 10) == .completed, hold.isHeld else {
+        throw BoomError.unavailable("The actual clone copy did not enter its bounded hold.")
+      }
+      let files = try XCTUnwrap(hold.actualFiles)
+      XCTAssertEqual(files.bytes, 65_536)
+      XCTAssertTrue(model.pagedEngine === engine); XCTAssertTrue(model.pagedSession === session)
+      XCTAssertTrue(model.pagedInput === input); XCTAssertTrue(model.pagedViewport === viewport)
+      XCTAssertTrue(model.pagedCommands === commands); XCTAssertTrue(commands.manager === manager)
+      XCTAssertTrue(input.activeView === view); XCTAssertTrue(view.inputContext === context)
+      XCTAssertTrue(window.firstResponder === view); XCTAssertTrue(view.isEditable)
+      XCTAssertFalse(model.isBusy); XCTAssertFalse(FileManager.default.fileExists(atPath: backup.path))
+
+      // This real subsequent file publication must complete while the clone's
+      // byte-copy worker remains held. Backup cannot retain either writer lock.
+      view.setSelectedRange(NSRange(location: 0, length: 0))
+      view.insertText("X", replacementRange: NSRange(location: NSNotFound, length: 0))
+      try await commands.joinPendingCommand(); try await model.flush()
+      XCTAssertEqual(session.sealedGeneration, session.generation)
+      XCTAssertEqual(session.sealedRootRecord.document.revision.summary.bytes, captured.document.revision.summary.bytes + 1)
+      XCTAssertTrue(try XCTUnwrap(input.activeView).string.hasPrefix("Xé🙂"))
+      XCTAssertTrue(hold.isHeld)
+      let undoItem = NSMenuItem(title: "Undo", action: NSSelectorFromString("undo:"), keyEquivalent: "z")
+      XCTAssertNil(undoItem.target)
+      XCTAssertTrue(try XCTUnwrap(window.firstResponder).tryToPerform(try XCTUnwrap(undoItem.action), with: undoItem))
+      try await commands.joinPendingCommand()
+      XCTAssertTrue(try XCTUnwrap(input.activeView).string.hasPrefix("é🙂"))
+      let undone = try session.captureLogicalState().source
+      XCTAssertEqual(undone.summary.bytes, captured.document.revision.summary.bytes)
+      let redoItem = NSMenuItem(title: "Redo", action: NSSelectorFromString("redo:"), keyEquivalent: "z")
+      XCTAssertNil(redoItem.target)
+      XCTAssertTrue(try XCTUnwrap(window.firstResponder).tryToPerform(try XCTUnwrap(redoItem.action), with: redoItem))
+      try await commands.joinPendingCommand(); try await model.flush()
+      let redone = try XCTUnwrap(input.activeView)
+      XCTAssertTrue(redone.string.hasPrefix("Xé🙂")); XCTAssertTrue(window.firstResponder === redone)
+      XCTAssertTrue(redone.undoManager === manager)
+      XCTAssertTrue(model.pagedEngine === engine); XCTAssertTrue(model.pagedSession === session)
+      XCTAssertTrue(model.pagedInput === input); XCTAssertTrue(model.pagedViewport === viewport)
+      XCTAssertTrue(model.pagedCommands === commands); XCTAssertTrue(commands.manager === manager)
+
+      model.draft = "Later owner draft"
+      try await Task.detached { try vault.put(Data("Later attachment bytes".utf8), kind: .attachment, id: attachmentID) }.value
+      try await model.flush()
+      redone.setMarkedText("漢", selectedRange: NSRange(location: 1, length: 0),
+        replacementRange: NSRange(location: NSNotFound, length: 0))
+      XCTAssertTrue(redone.hasMarkedText()); XCTAssertTrue(session.isPinned)
+      let extent = try session.documentCoordinates().projectedUTF16, anchor = extent - 4
+      try viewport.requestScroll(toUTF16: anchor); try await viewport.joinPresentation()
+      let tail = try XCTUnwrap(viewport.visibleScrollWindow)
+      XCTAssertTrue(tail.snapshot.isSame(try session.captureLogicalRead().source))
+      XCTAssertLessThanOrEqual(tail.text.utf8.count, 16_384)
+      XCTAssertLessThanOrEqual(tail.start.utf16, anchor)
+      XCTAssertGreaterThanOrEqual(tail.start.utf16 + tail.summary.utf16, anchor)
+      XCTAssertTrue(redone.hasMarkedText()); XCTAssertTrue(session.isPinned)
+      XCTAssertTrue(window.firstResponder === redone); XCTAssertTrue(hold.isHeld)
+      redone.unmarkText(); try await commands.joinPendingCommand(); try await model.flush()
+      XCTAssertTrue(try XCTUnwrap(input.activeView).string.hasPrefix("X漢é🙂"))
+      XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+      XCTAssertNil(session.persistenceFailure); XCTAssertNil(model.errorMessage)
+      hold.release()
+      exportJoined = true
+      let published = try await export.value
+      XCTAssertEqual(published, backup)
+      XCTAssertFalse(hold.didTimeOut)
+    } catch {
+      let original = error; hold.release()
+      if !exportJoined, case .failure(let cleanup) = await export.result {
+        throw BoundedWorkspaceCleanupFailure(original: original, cleanup: cleanup)
+      }
+      throw original
+    }
+    guard (testRun?.failureCount ?? 0) == failures else {
+      throw BoomError.invalid("Actual live backup assertions failed; native graph and files retained.")
+    }
+    try await joinedClose(model)
+    try await Task.detached { try FileManager.default.removeItem(at: source) }.value
+    let restoredStore = try await Task.detached { try WorkspaceStore(rootOverride: restoredRoot) }.value
+    try await Task.detached { try restoredStore.restoreBackup(from: backup) }.value
+    let restored = try await open(restoredRoot, requiresActualKeyWindow: false)
+    let restoredEngine = try XCTUnwrap(restored.pagedEngine), restoredSession = try XCTUnwrap(restored.pagedSession)
+    XCTAssertFalse(restoredEngine === engine); XCTAssertNotEqual(restoredSession.sessionID, session.sessionID)
+    let restoredRecord = try XCTUnwrap(restored.pagedSelectedRecord)
+    XCTAssertEqual(restoredRecord, captured)
+    XCTAssertEqual(try XCTUnwrap(restored.pagedInput).currentDocumentSelection(), capturedSelection)
+    XCTAssertEqual(restored.draft, "Snapshot owner draft")
+    let restoredAttachment = try await Task.detached { try restoredStore.vault.get(.attachment, id: attachmentID) }.value
+    XCTAssertEqual(restoredAttachment, attachmentBytes)
+    let restoredDigest = try await restoredEngine.wholeTextSha256(restoredRecord.document.revision)
+    XCTAssertEqual(restoredDigest, capturedDigest)
+    let originalRevision = try XCTUnwrap(restored.state.importedFiles?[restoredRecord.document.id]?.originalRevision)
+    let restoredOriginalDigest = try await restoredEngine.wholeTextSha256(originalRevision)
+    XCTAssertEqual(restoredOriginalDigest, originalHash.sha256)
+    XCTAssertEqual(originalRevision.summary.bytes, UInt64(originalHash.bytes))
+    XCTAssertTrue(try XCTUnwrap(restored.pagedInput?.activeView).string.hasPrefix("é🙂"))
+    let restoredCommands = try XCTUnwrap(restored.pagedCommands)
+    XCTAssertTrue(restoredCommands.manager.canUndo)
+    let undo = NSMenuItem(title: "Undo", action: NSSelectorFromString("undo:"), keyEquivalent: "z")
+    XCTAssertTrue(try XCTUnwrap(Self.failedWindow?.firstResponder).tryToPerform(try XCTUnwrap(undo.action), with: undo))
+    try await restoredCommands.joinPendingCommand(); try await restored.flush()
+    let restoredBefore = try XCTUnwrap(restored.pagedSelectedRecord)
+    let restoredBeforeDigest = try await restoredEngine.wholeTextSha256(restoredBefore.document.revision)
+    XCTAssertEqual(restoredBeforeDigest, originalHash.sha256)
+    guard (testRun?.failureCount ?? 0) == failures else {
+      throw BoomError.invalid("Actual backup cold graph/content assertions failed; restored owner/files retained.")
+    }
+    try await joinedClose(restored); try await removeJoinedScratch(parent)
+  }
+
+  func testActualCancelledCloneCopyCleansItsFilesAndUnrelatedFailedExportDoesNotPoisonBackupRetry() async throws {
+    let failures = testRun?.failureCount ?? 0
+    let parent = try diagnosticRoot(), model = try await open(parent.appendingPathComponent("workspace"),
+      requiresActualKeyWindow: false)
+    let source = try await writeSource(parent)
+    try await model.importDocuments([source], flag: CancellationFlag()); try await model.flush()
+    try await focusCurrentEditor(model, requiresActualKeyWindow: false)
+    let captured = try XCTUnwrap(model.pagedSelectedRecord), engine = try XCTUnwrap(model.pagedEngine)
+    let session = try XCTUnwrap(model.pagedSession), input = try XCTUnwrap(model.pagedInput)
+    let commands = try XCTUnwrap(model.pagedCommands), viewport = try XCTUnwrap(model.pagedViewport)
+    let refused = parent.appendingPathComponent("existing-file-export-directory")
+    let sentinel = refused.appendingPathComponent("retained"), sentinelBytes = Data("Retained chosen directory".utf8)
+    try await Task.detached {
+      try FileManager.default.createDirectory(at: refused, withIntermediateDirectories: false)
+      try sentinelBytes.write(to: sentinel)
+    }.value
+    let unrelated = try model.exportPagedDocument(to: refused)
+    guard case .failure(let unrelatedFailure) = await unrelated.result else {
+      throw BoomError.invalid("The genuine file export unexpectedly replaced its chosen directory.")
+    }
+    guard let refusal = unrelatedFailure as? BoomError,
+      case .denied(let reason) = refusal, reason == "Export cannot replace a symlink, directory or device." else {
+      throw unrelatedFailure
+    }
+    let unchangedSentinel = try await readSmallExport(sentinel)
+    XCTAssertEqual(unchangedSentinel, sentinelBytes)
+    model.dismissError()
+    let backup = parent.appendingPathComponent("backup"), hold = LiveBackupCopyHold(documentID: captured.document.id,
+      entered: expectation(description: "Actual backup copy entered after unrelated export refusal"))
+    Self.failedExport = backup
+    defer { hold.release() }
+    let cancelled = try model.exportWorkspaceBackup(to: backup, progress: { try hold.copied($0, $1, $2) })
+    var cancelledJoined = false
+    do {
+      guard await XCTWaiter.fulfillment(of: [hold.entered], timeout: 10) == .completed, hold.isHeld else {
+        throw BoomError.unavailable("The actual backup was poisoned by the unrelated retained export failure.")
+      }
+      let files = try XCTUnwrap(hold.actualFiles)
+      let clone = files.source.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+      let container = clone.deletingLastPathComponent()
+      let stage = files.staged.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+      XCTAssertEqual(clone.lastPathComponent, "Workspace"); XCTAssertTrue(stage.lastPathComponent.hasPrefix(".backup-"))
+      XCTAssertTrue(FileManager.default.fileExists(atPath: clone.path))
+      XCTAssertTrue(FileManager.default.fileExists(atPath: stage.path))
+      XCTAssertTrue(model.pagedEngine === engine); XCTAssertTrue(model.pagedSession === session)
+      XCTAssertTrue(model.pagedInput === input); XCTAssertTrue(model.pagedViewport === viewport)
+      XCTAssertTrue(model.pagedCommands === commands); XCTAssertTrue(try XCTUnwrap(input.activeView).isEditable)
+      try XCTUnwrap(input.activeView).insertText("Y", replacementRange: NSRange(location: 0, length: 0))
+      try await commands.joinPendingCommand(); try await model.flush()
+      let later = try XCTUnwrap(model.pagedSelectedRecord)
+      XCTAssertEqual(later.document.revision.summary.bytes, captured.document.revision.summary.bytes + 1)
+      XCTAssertTrue(hold.isHeld)
+      model.cancelExport(to: backup); hold.release()
+      cancelledJoined = true
+      switch await cancelled.result {
+      case .success: throw BoomError.invalid("The actual cancelled copy published instead of cancelling.")
+      case .failure(let error): if !(error is CancellationError) { throw error }
+      }
+      XCTAssertFalse(hold.didTimeOut)
+      XCTAssertFalse(FileManager.default.fileExists(atPath: backup.path))
+      XCTAssertFalse(FileManager.default.fileExists(atPath: stage.path))
+      XCTAssertFalse(FileManager.default.fileExists(atPath: container.path))
+      XCTAssertTrue(try XCTUnwrap(input.activeView).string.hasPrefix("Y"))
+      XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+      XCTAssertNil(session.persistenceFailure); XCTAssertNil(model.errorMessage)
+      let retry = try model.exportWorkspaceBackup(to: backup)
+      let retried = try await retry.value
+      XCTAssertEqual(retried, backup)
+      let copiedRoot = try await Task.detached {
+        let path = backup.appendingPathComponent("documents/" + later.document.id.uuidString.lowercased() + "/document-root.json")
+        let root = try JSONDecoder().decode(PagedDocumentRootRecord.self, from: RegularFile(path, limit: 16_384).data())
+        try root.validate(); return root
+      }.value
+      XCTAssertEqual(copiedRoot, later)
+      if case .failure(let retained) = await unrelated.result {
+        XCTAssertEqual((retained as NSError).domain, (unrelatedFailure as NSError).domain)
+        XCTAssertEqual((retained as NSError).code, (unrelatedFailure as NSError).code)
+        XCTAssertEqual(retained.localizedDescription, unrelatedFailure.localizedDescription)
+      } else { XCTFail("The original unrelated failure was silently replaced.") }
+      let retainedSentinel = try await readSmallExport(sentinel)
+      XCTAssertEqual(retainedSentinel, sentinelBytes)
+    } catch {
+      let original = error; hold.release()
+      if !cancelledJoined, case .failure(let cleanup) = await cancelled.result, !(cleanup is CancellationError) {
+        throw BoundedWorkspaceCleanupFailure(original: original, cleanup: cleanup)
+      }
+      throw original
+    }
+    guard (testRun?.failureCount ?? 0) == failures else {
+      throw BoomError.invalid("Actual backup cancellation/retry assertions failed; owner and files retained.")
+    }
+    try await joinedClose(model); try await removeJoinedScratch(parent)
   }
 
 }

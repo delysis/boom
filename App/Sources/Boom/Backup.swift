@@ -52,6 +52,10 @@ enum AtomicDirectoryReplacement {
 /// queue and category lock, then streams that immutable directory independently.
 /// Restore requires a fresh destination. One 64 KiB buffer serves the byte copy.
 enum WorkspaceBackup {
+  /// Reports a completed bounded write to the unpublished copy. Nil leaves
+  /// the ordinary export path without a progress observer.
+  typealias CopyProgress = @Sendable (URL, URL, UInt64) throws -> Void
+
   /// An ordinary private directory owned by the existing export Task. Its
   /// identity prevents cleanup from removing a replacement at the same name.
   struct CapturedDirectory: Sendable {
@@ -107,11 +111,11 @@ enum WorkspaceBackup {
   /// Only the immutable clone is read during the potentially large export.
   /// Disposal is joined even on cancellation; a refusal retains both errors.
   static func export(_ captured: CapturedDirectory, to target: URL,
-    cancellation: CancellationFlag) throws {
+    cancellation: CancellationFlag, progress: CopyProgress? = nil) throws {
     var failure: Error?
     do {
       try admitCapture(captured)
-      _ = try copyWorkspace(from: captured.root, to: target, restoring: false) {
+      _ = try copyWorkspace(from: captured.root, to: target, restoring: false, progress: progress) {
         try Task.checkCancellation(); try cancellation.check()
       }
     } catch { failure = error }
@@ -149,7 +153,7 @@ enum WorkspaceBackup {
   }
 
   private static func copyWorkspace(from source: URL, to target: URL, restoring: Bool,
-    cloneOnly: Bool = false,
+    cloneOnly: Bool = false, progress: CopyProgress? = nil,
     checkCancellation: @Sendable () throws -> Void = { try Task.checkCancellation() }) throws -> stat {
     try checkCancellation()
     guard source.isFileURL, target.isFileURL else {
@@ -206,7 +210,8 @@ enum WorkspaceBackup {
             attributes: [.posixPermissions: 0o700])
         } else if values.isRegularFile == true {
           if cloneOnly { try cloneFile(file, to: destination) }
-          else { try copyFile(file, to: destination, buffer: &buffer, checkCancellation: checkCancellation) }
+          else { try copyFile(file, to: destination, buffer: &buffer,
+            checkCancellation: checkCancellation, progress: progress) }
         } else { throw BoomError.invalid("Backup refuses nonregular files.") }
         return true
       }) {}
@@ -289,7 +294,7 @@ enum WorkspaceBackup {
   }
 
   private static func copyFile(_ source: URL, to target: URL, buffer: inout [UInt8],
-    checkCancellation: @Sendable () throws -> Void) throws {
+    checkCancellation: @Sendable () throws -> Void, progress: CopyProgress?) throws {
     let input = open(source.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
     guard input >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
     var output: Int32 = -1
@@ -323,6 +328,7 @@ enum WorkspaceBackup {
           guard written > 0 else { throw BoomError.unavailable("Backup write made no progress.") }
           offset += written
         }
+        try progress?(source, target, UInt64(copied))
       }
       var after = stat()
       guard fstat(input, &after) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }

@@ -16,11 +16,12 @@ final class ActiveNativeKVTests: XCTestCase {
       processorIdentity: "cpu-processor", policyDigest: String(repeating: "a", count: 64), operationID: UUID())
   }
   private func session(_ store: PromptPrefixCache, _ ids: [Int], _ owner: PromptCacheOwner,
-    step: Int = 2, window: Int = 4, globals: Int = 1, binding: JoinedKVRetentionBinding? = nil,
+    step: Int = 2, window: Int = 4, globals: Int = 1, batchWidth: Int = 1,
+    binding: JoinedKVRetentionBinding? = nil,
     admit: ((ActiveNativeKVAdmissionPlan?) throws -> Void)? = nil) throws -> PromptPrefixCache.Session {
     try store.makeSession(owner: owner, input: LMInput(tokens: MLXArray(ids, [1, ids.count])),
       promptTokenIDs: ids, prefill: .init(stepSize: step, chunking: .remainder),
-      joinedRetentionBinding: binding, useActiveNative: true, outputTokens: 2, batchWidth: 1,
+      joinedRetentionBinding: binding, useActiveNative: true, outputTokens: 2, batchWidth: batchWidth,
       admitNative: admit, makeCache: {
         let full: [KVCache] = (0..<globals).map { _ in let c = KVCacheSimple(); c.step = 4; return c }
         return full + [RotatingKVCache(maxSize: window, step: 2)]
@@ -74,6 +75,87 @@ final class ActiveNativeKVTests: XCTestCase {
       XCTAssertEqual(next.cache[0].state[0].asArray(Float.self), Array(0..<8).map(Float.init))
     }
   }
+  func testWarmFourRowAdmissionAndEveryGeneratedRowRestore() throws {
+    try Device.withDefaultDevice(.cpu) {
+      let ids = Array(0..<9), first = [901, 911, 921, 931], last = [902, 912, 922, 932]
+      try ProductCore.admitWritingBatch(width: 4, prompt: ids.count, output: 2, capacity: 16_384)
+      // Each selection needs its own real lifetime: native lookup transfers the
+      // sole active cache rather than copying a snapshot for four later queries.
+      for selectedRow in 0..<4 {
+        let store = PromptPrefixCache(byteLimit: 4_096), scope = owner()
+        try seed(store, ids, scope)
+        var admitted: ActiveNativeKVAdmissionPlan?
+        let warm = try session(store, ids, scope, batchWidth: 4, admit: { plan in
+          admitted = try XCTUnwrap(plan, "This must use warm admission, not a cold four-row control.")
+        })
+        let plan = try XCTUnwrap(admitted)
+        XCTAssertEqual(warm.cachedTokenCount, 8)
+        XCTAssertEqual(plan.cachedTokenCount, 8)
+        XCTAssertEqual(plan.sourceWidth, 1); XCTAssertEqual(plan.consumerWidth, 4)
+        let one = try plan.transitionAllocations(width: 1, forwards: 1, hydration: false)
+        let four = try plan.transitionAllocations(width: 4, forwards: 1, hydration: false)
+        for (single, batch) in zip(one, four) {
+          XCTAssertEqual(batch.destinationBytes, 4 * single.destinationBytes)
+          XCTAssertEqual(batch.zeroExtensionBytes, 4 * single.zeroExtensionBytes)
+          XCTAssertEqual(batch.hydrationBytes, 0); XCTAssertEqual(batch.sharedPrefillBytes, 0)
+        }
+        let flag = CancellationFlag()
+        let readmission = ActiveNativeKVReadmission(flag: flag, authorization: nil) { width, forwards in
+          _ = try plan.transitionAllocations(width: width, forwards: forwards, hydration: false)
+        }
+        try readmission.beforeBatchForward(width: 4)
+        XCTAssertEqual(readmission.observation.width, 4)
+        XCTAssertEqual(readmission.observation.checks, 1)
+        XCTAssertFalse(flag.isCancelled)
+
+        try prefill(warm); expand(warm, width: 4)
+        for row in 0..<4 {
+          XCTAssertTrue(warm.captureDecodeLane(row: row, width: 4,
+            emittedTokenIDs: [first[row]], finished: false))
+        }
+        append(warm, first, width: 4); eval(warm.cache); warm.markCacheSubmitted()
+        for row in 0..<4 {
+          XCTAssertTrue(warm.captureFinishedLane(row: row, width: 4,
+            emittedTokenIDs: [first[row], last[row]]))
+        }
+        XCTAssertTrue(store.publish(warm, completions: (0..<4).map {
+          .init(row: $0, emittedTokenIDs: [first[$0], last[$0]])
+        }))
+        let rows = store.retainedSnapshotObservations.sorted { ($0.row ?? -1) < ($1.row ?? -1) }
+        XCTAssertEqual(rows.count, 4)
+        for row in 0..<4 {
+          let value = try XCTUnwrap(rows.first { $0.row == row })
+          XCTAssertEqual(value.nativePhysicalWidth, 4)
+          XCTAssertEqual(value.tokenIDs, ids + [first[row]])
+          XCTAssertFalse(value.tokenIDs.contains(last[row]), "The delivered last token has not entered KV.")
+        }
+        XCTAssertLessThanOrEqual(store.retainedBytesUpperBound, 4_096)
+        let parentBytes = store.retainedNativeBytesUpperBound
+
+        let query = ids + [first[selectedRow], last[selectedRow]]
+        let selectedPlan = try XCTUnwrap(store.nativeAdmissionPlan(owner: scope, tokens: query,
+          prefill: .init(stepSize: 2, chunking: .remainder), outputTokens: 2, batchWidth: 4))
+        XCTAssertEqual(selectedPlan.sourceWidth, 4); XCTAssertEqual(selectedPlan.consumerWidth, 4)
+        XCTAssertEqual(selectedPlan.sourceRow, selectedRow)
+        let restored = try session(store, query, scope, batchWidth: 4)
+        XCTAssertEqual(restored.cachedTokenCount, 10)
+        XCTAssertEqual(restored.observation.cachedRow, selectedRow)
+        XCTAssertEqual(restored.observation.cachedNativePhysicalWidth, 4)
+        XCTAssertEqual(restored.input.text.tokens.asArray(Int.self), [last[selectedRow]])
+        XCTAssertEqual(restored.cache[0].state[0].asArray(Float.self), (ids + [first[selectedRow]]).map(Float.init))
+        XCTAssertEqual(restored.cache[1].state[0].asArray(Float.self), [6, 7, 8, first[selectedRow]].map(Float.init))
+        XCTAssertGreaterThanOrEqual(store.retainedNativeBytesUpperBound, parentBytes,
+          "A selected-row view must retain the complete four-row parent until its real joined transfer.")
+        try prefill(restored); expand(restored, width: 4)
+        XCTAssertTrue(restored.cache.allSatisfy { $0.innerState().allSatisfy { $0.dim(0) == 4 } })
+        XCTAssertEqual(restored.cache[0].state[0].asArray(Float.self),
+          Array(repeating: query.map(Float.init), count: 4).flatMap { $0 })
+        XCTAssertLessThanOrEqual(store.retainedBytesUpperBound, 4_096)
+        XCTAssertThrowsError(try selectedPlan.transitionAllocations(width: 5, forwards: 1, hydration: false))
+      }
+    }
+  }
+
   func testFullAttentionIncomingPagesAreNotHistoricalStaging() throws {
     try Device.withDefaultDevice(.cpu) {
       let scope = owner(), ids = Array(0..<62), one = PromptPrefixCache(), five = PromptPrefixCache()
