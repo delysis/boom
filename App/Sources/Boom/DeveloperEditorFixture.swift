@@ -2005,7 +2005,7 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
     private func verifyMarkupAndMediaControls() async throws {
       guard plan.utf8Bytes == 72_196, NSApp.isRunning, NSApp.isActive,
         let session = workspace?.pagedSession else {
-        throw BoomError.invalid("The short markup/media controls require their actual signed App.run source.")
+        throw BoomError.invalid("The short markup/media controls require their actual signed App.run source: bytes=\(plan.utf8Bytes), running=\(NSApp.isRunning), active=\(NSApp.isActive), session=\(workspace?.pagedSession != nil).")
       }
       let original = try session.captureLogicalState().source, bytes = try await documentInputBytes()
       guard UInt64(bytes.count) == plan.utf8Bytes else {
@@ -2037,6 +2037,9 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
       vmAfter = currentVMCategories()
       try requireManagedSource()
       if plan.utf8Bytes == 72_196 && (plan.isMixed || normalMemory) {
+        // The timing interval has ended. Reacquire actual readiness without
+        // changing its captured source or selection before responder controls.
+        try await receiveMixedReadiness(event: 0)
         try await verifyMarkupAndMediaControls()
       }
       if let workspace { try await workspace.flush() }
