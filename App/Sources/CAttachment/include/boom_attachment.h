@@ -92,6 +92,79 @@ BoomAttachmentBuffer bloom_text_request(uint64_t handle, const uint8_t *data,
 BoomAttachmentBuffer bloom_text_read_window(BloomTextHost host, const uint8_t *revision,
                                            size_t length, uint64_t utf16_offset,
                                            size_t maximum_bytes, BloomTextOperation operation);
+/* Native logical source values are distinct from file revisions and publisher
+ * records. Edits/Undo do no I/O and never acquire a writer engine slot. The
+ * native owner serializes source calls; snapshots/windows are immutable and
+ * reference-counted. Keep every handle alive through borrowers, then free it.
+ * A returned window borrows UTF8 only for its retained lifetime. Source edit
+ * endpoints come from that exact current window's scalar proof.
+ * Source replace preserves the physical local edited range through the outer
+ * Cocoa transaction; window_trim runs separately after that transaction.
+ * Capture(freeze=1) closes the insertion tail before a publication can yield.
+ * Materialize runs on the existing writer, returns only a candidate revision;
+ * normal page sync + complete-root CAS/publication and native receiving still
+ * have to join. release_synced_insertions frees RAM only after real data sync.
+ * read_window uses the existing read-only host, no EngineSlot/publication right.
+ * Each int function returns0 on success,1 on failure. The error buffer is empty
+ * on success, otherwise owned bounded JSON; free with boom_attachment_free. */
+typedef struct BloomLogicalCommand BloomLogicalCommand;
+typedef struct BloomLogicalSource BloomLogicalSource;
+typedef struct BloomLogicalSnapshot BloomLogicalSnapshot;
+typedef struct BloomLogicalWindow BloomLogicalWindow;
+typedef struct BloomLogicalWindowSeed BloomLogicalWindowSeed;
+typedef struct { uint64_t bytes, utf16, lf_count; } BloomLogicalPoint;
+typedef struct {
+  uint8_t root_id[16], owner_id[16], document_id[16]; BloomLogicalPoint summary;
+} BloomLogicalSnapshotInfo;
+typedef struct {
+  uint8_t root_id[16], window_id[16]; BloomLogicalPoint start, summary;
+  const uint8_t *text; size_t text_length;
+} BloomLogicalWindowInfo;
+int32_t bloom_logical_source_create(const uint8_t *, size_t, BloomLogicalSource **, BoomAttachmentBuffer *);
+void bloom_logical_source_free(BloomLogicalSource *);
+void bloom_logical_source_install_prepared(const BloomLogicalSource *source, const BloomLogicalSnapshot *snapshot);
+int32_t bloom_logical_source_opening_window(const BloomLogicalSource *source, const uint8_t *bytes, size_t length, const BloomLogicalWindow **output, BoomAttachmentBuffer *error);
+int32_t bloom_logical_window_seed(const BloomLogicalWindow *window, uint64_t focus_utf16, const BloomLogicalWindowSeed **output, BoomAttachmentBuffer *error);
+int32_t bloom_logical_seed_window(const BloomLogicalWindowSeed *seed, const BloomLogicalWindow **output, BoomAttachmentBuffer *error);
+typedef struct { BloomLogicalPoint start; BloomLogicalPoint summary; } BloomLogicalSeedInfo;
+int32_t bloom_logical_seed_info(const BloomLogicalWindowSeed *seed, BloomLogicalSeedInfo *output);
+void bloom_logical_seed_free(const BloomLogicalWindowSeed *seed);
+int32_t bloom_logical_source_prepare_replacement(const BloomLogicalSource *source, const BloomLogicalWindow *window, uint64_t first_utf16, uint64_t last_utf16, const uint8_t *insertion, size_t insertion_length, const BloomLogicalWindow **output, BloomLogicalPoint *cursor, uint8_t *changed, uint8_t *resident, BoomAttachmentBuffer *error);
+int32_t bloom_logical_source_capture(const BloomLogicalSource *, uint8_t freeze,
+                                    const BloomLogicalSnapshot **, BoomAttachmentBuffer *);
+int32_t bloom_logical_source_restore(const BloomLogicalSource *, const BloomLogicalSnapshot *, BoomAttachmentBuffer *);
+int32_t bloom_logical_source_replace(const BloomLogicalSource *, const BloomLogicalWindow *, size_t byte_start, size_t byte_end,
+                                    const uint8_t *insertion, size_t insertion_length,
+                                    const BloomLogicalWindow **, BloomLogicalPoint *cursor, uint8_t *changed, BoomAttachmentBuffer *);
+int32_t bloom_logical_window_trim(const BloomLogicalWindow *, uint64_t local_focus_utf16, size_t maximum_bytes,
+                                 const BloomLogicalWindow **, BoomAttachmentBuffer *);
+int32_t bloom_logical_window_info(const BloomLogicalWindow *, BloomLogicalWindowInfo *);
+int32_t bloom_logical_window_position(const BloomLogicalWindow *, uint64_t local_utf16, BloomLogicalPoint *, BoomAttachmentBuffer *);
+int32_t bloom_logical_window_snapshot(const BloomLogicalWindow *, const BloomLogicalSnapshot **);
+int32_t bloom_logical_snapshot_info(const BloomLogicalSnapshot *, BloomLogicalSnapshotInfo *);
+void bloom_logical_snapshot_retain(const BloomLogicalSnapshot *);
+void bloom_logical_snapshot_free(const BloomLogicalSnapshot *);
+void bloom_logical_window_retain(const BloomLogicalWindow *);
+void bloom_logical_window_free(const BloomLogicalWindow *);
+int32_t bloom_logical_read_window(BloomTextHost, const BloomLogicalSnapshot *, uint64_t utf16_anchor, size_t maximum_bytes,
+                                 BloomTextOperation, const BloomLogicalWindow **, BoomAttachmentBuffer *);
+int32_t bloom_logical_prepare_replacement(BloomTextHost, const BloomLogicalSnapshot *, uint64_t first_utf16, uint64_t last_utf16, const uint8_t *insertion, size_t insertion_length, BloomTextOperation, const BloomLogicalWindow **output, BloomLogicalPoint *cursor, uint8_t *changed, BoomAttachmentBuffer *error);
+int32_t bloom_logical_read_position(BloomTextHost, const BloomLogicalSnapshot *, uint64_t utf16_offset, uint8_t rounding, BloomTextOperation, BloomLogicalPoint *output, BoomAttachmentBuffer *error);
+int32_t bloom_logical_read_bytes(BloomTextHost host, const BloomLogicalSnapshot *snapshot,
+    uint64_t first, uint64_t last, BloomTextOperation operation, BoomAttachmentBuffer *output,
+    BoomAttachmentBuffer *error);
+int32_t bloom_logical_command_begin(BloomTextHost host, const BloomLogicalSnapshot *snapshot,
+    const uint8_t *json, size_t length, BloomTextOperation operation, BloomLogicalCommand **output, BoomAttachmentBuffer *error);
+int32_t bloom_logical_command_step(BloomTextHost host, const BloomLogicalCommand *command,
+    BloomTextOperation operation, BoomAttachmentBuffer *output, BoomAttachmentBuffer *error);
+int32_t bloom_logical_command_writer_step(uint64_t handle, const BloomLogicalCommand *command,
+  BloomTextOperation operation, BoomAttachmentBuffer *output, BoomAttachmentBuffer *error);
+int32_t bloom_logical_command_finish(const BloomLogicalCommand *command, const BloomLogicalWindow **window,
+    BoomAttachmentBuffer *output, BoomAttachmentBuffer *error);
+void bloom_logical_command_free(BloomLogicalCommand *command);
+
+BoomAttachmentBuffer bloom_text_materialize_logical(uint64_t, const BloomLogicalSnapshot *, BloomTextOperation);
+int32_t bloom_logical_release_synced_insertions(const BloomLogicalSnapshot *, BoomAttachmentBuffer *);
 #ifdef __cplusplus
 }
 #endif

@@ -126,13 +126,13 @@ impl RangeCursor {
         Ok(None)
     }
 }
-struct Builder {
+pub(super) struct Builder {
     pieces: Vec<Piece>,
     levels: Vec<Vec<TreeRef>>,
-    summary: TextSummary,
+    pub(super) summary: TextSummary,
 }
 impl Builder {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             pieces: Vec::with_capacity(FANOUT),
             levels: (0..=MAX_HEIGHT)
@@ -155,7 +155,7 @@ impl Builder {
         }
         Ok(())
     }
-    fn piece<S: PageProvider>(
+    pub(super) fn piece<S: PageProvider>(
         &mut self,
         engine: &mut TextEngine<S>,
         revision: &Revision,
@@ -192,7 +192,7 @@ impl Builder {
         self.summary = self.summary.checked_add(tree.summary)?;
         engine.frontier_push(revision, &mut self.levels, usize::from(tree.height), tree)
     }
-    fn finish_step<S: PageProvider>(
+    pub(super) fn finish_step<S: PageProvider>(
         &mut self,
         engine: &mut TextEngine<S>,
         revision: &Revision,

@@ -12,10 +12,7 @@ use std::{
 
 mod encoding;
 mod paged_text;
-pub use paged_text::{
-    bloom_text_close, bloom_text_create, bloom_text_read_window, bloom_text_request, BloomTextHost,
-    BloomTextOperation,
-};
+pub use paged_text::*;
 
 const MAX_INPUT: usize = 64 * 1024 * 1024;
 const MAX_OUTPUT: usize = 8 * 1024 * 1024;

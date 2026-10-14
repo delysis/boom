@@ -73,7 +73,10 @@ private struct BoundedConsultationContext: Sendable {
   private var pagedTransition = false
   private var pagedShutdownRequested = false
   private var saveEntered = false
+  private var explicitSaveRequested = false
   private var saveRequestID = UUID()
+  private var saveTaskID: UUID?
+  private var saveTaskWasEntered = false
   private var captureCache: [UUID: BoundedDocumentCapture] = [:]
   private var writingCapture: BoundedDocumentCapture?
   var completionSourceIdentity: String? {
@@ -313,7 +316,7 @@ private struct BoundedConsultationContext: Sendable {
   private var writingFlag: CancellationFlag?
   private var ghostFlag: CancellationFlag?
   private var pressureWatch: MemoryPressureWatch?
-  private var saveTask: Task<Void, Never>?
+  private var saveTask: Task<Void, Error>?
   private var exportTasks: [URL: (id: UUID, task: Task<Void, Never>, pagedResult: Task<URL, Error>?,
     clipboardResult: Task<Void, Error>?)] = [:]
   private var pagedExportTaskCount = 0
@@ -612,17 +615,34 @@ private struct BoundedConsultationContext: Sendable {
     retainComposerDraft()
   }
   func flush() async throws {
-    let pending = saveTask
-    if !saveEntered { pending?.cancel() }
-    if let pending { await pending.value }
-    saveTask = nil
-    try await performWorkspaceFlush()
+    if let failure = await joinWorkspaceSaveTasks() { throw failure }
+    let request = UUID(); saveRequestID = request
+    let task = startWorkspaceSave(request: request, expedited: true)
+    let outcome = await task.result
+    let followingFailure = await joinWorkspaceSaveTasks()
+    try outcome.get()
+    if let followingFailure { throw followingFailure }
   }
-  private func performWorkspaceFlush() async throws {
+  func save() {
+    guard !pagedShutdownRequested, !pagedTransition else { return }
+    explicitSaveRequested = true
+    scheduleSave()
+  }
+  private func performWorkspaceFlush(retryFailedSave: Bool = false) async throws {
     let trace = PerformanceTrace.begin("Workspace.Flush")
     defer { PerformanceTrace.end("Workspace.Flush", trace) }
     if let commands = pagedCommands { try await commands.joinPendingCommand() }
-    if let session = pagedSession { _ = try await session.flush(through: session.generation) }
+    if let session = pagedSession {
+      if retryFailedSave {
+        try requirePagedOperation()
+        await session.joinPendingSave()
+        guard pagedSession === session else { throw BoomError.stale("The selected saver changed during Save.") }
+        if let identity = session.failedSaveIdentity {
+          _ = try await session.retryFailedSave(expectedIdentity: identity)
+        }
+      }
+      _ = try await session.flush(through: session.generation)
+    }
     retainComposerDraft(schedule: false)
     state.documents = documentIndices
     let snapshot = state
@@ -630,21 +650,81 @@ private struct BoundedConsultationContext: Sendable {
   }
   func scheduleSave() {
     guard !pagedShutdownRequested, !pagedTransition else { return }
-    let id = UUID(); saveRequestID = id
+    let request = UUID(); saveRequestID = request
     if saveEntered { return }
-    saveTask?.cancel()
-    saveTask = Task { [weak self] in
-      do {
-        try await Task.sleep(for: .milliseconds(350))
-        guard let self else { return }
-        self.saveEntered = true
-        defer {
+    _ = startWorkspaceSave(request: request, expedited: explicitSaveRequested)
+  }
+  /// The existing saver owns every workspace write. Its token prevents an
+  /// older join from clearing a replacement; neither token nor saveEntered
+  /// is consulted by native input, selection or presentation.
+  private func startWorkspaceSave(request: UUID, expedited: Bool,
+    cancelSleepingPredecessor: Bool = true) -> Task<Void, Error> {
+    precondition(!saveEntered)
+    let previous = saveTask
+    let cancelledPrevious = cancelSleepingPredecessor && !saveTaskWasEntered
+    if cancelledPrevious { previous?.cancel() }
+    let id = UUID(); saveTaskID = id
+    // Immediate callers reserve the actual saver before their first yield.
+    saveEntered = expedited; saveTaskWasEntered = expedited
+    let task = Task<Void, Error> { [weak self] in
+      let preceding: Result<Void, Error>?
+      if let previous { preceding = await previous.result }
+      else { preceding = nil }
+      guard let self else { return }
+      var entered = expedited
+      defer {
+        if self.saveTaskID == id {
           self.saveEntered = false
-          if self.saveRequestID != id { self.scheduleSave() }
+          if !self.pagedShutdownRequested, !self.pagedTransition,
+            self.saveRequestID != request {
+            // The replacement retains this still-returning Task and joins
+            // its real result before entering the next save.
+            _ = self.startWorkspaceSave(request: self.saveRequestID,
+              expedited: self.explicitSaveRequested, cancelSleepingPredecessor: false)
+          }
         }
-        try await self.performWorkspaceFlush()
-      } catch is CancellationError {} catch { self?.report(error) }
+      }
+      do {
+        if let preceding, case .failure(let error) = preceding,
+          !(cancelledPrevious && error is CancellationError) {
+          // The old actual task retains its error. A new metadata request
+          // does not retry native publication; Session's fence remains until
+          // an explicit Save supplies its exact failed identity below.
+          self.status = error.localizedDescription
+        }
+        if !expedited && !self.explicitSaveRequested {
+          try await Task.sleep(for: .milliseconds(350))
+        }
+        try Task.checkCancellation()
+        guard self.saveTaskID == id else { throw CancellationError() }
+        let explicit = self.explicitSaveRequested
+        self.explicitSaveRequested = false
+        self.saveEntered = true; self.saveTaskWasEntered = true; entered = true
+        try await self.performWorkspaceFlush(retryFailedSave: explicit)
+      } catch {
+        if entered || !(error is CancellationError) { self.status = error.localizedDescription }
+        throw error
+      }
     }
+    saveTask = task
+    return task
+  }
+  /// Drain the actual current and replacement handles. Only a known canceled
+  /// pre-entry sleeper is neutral; entered save errors are returned unchanged.
+  private func joinWorkspaceSaveTasks() async -> Error? {
+    var original: Error?
+    while let pending = saveTask, let id = saveTaskID {
+      let cancelledBeforeEntry = !saveTaskWasEntered
+      if cancelledBeforeEntry { pending.cancel() }
+      if case .failure(let error) = await pending.result,
+        !(cancelledBeforeEntry && error is CancellationError), original == nil {
+        original = error
+      }
+      if saveTaskID == id {
+        saveTask = nil; saveTaskID = nil; saveTaskWasEntered = false
+      }
+    }
+    return original
   }
   func newDocument() throws {
     try requirePagedOperation()
@@ -978,10 +1058,10 @@ private struct BoundedConsultationContext: Sendable {
         completed = true
       } catch is CancellationError {
         self.status = "Stopped"
-        do { try await self.performWorkspaceFlush() } catch { self.report(error) }
+        do { try await self.flush() } catch { self.report(error) }
       } catch {
         self.report(error)
-        do { try await self.performWorkspaceFlush() } catch { self.report(error) }
+        do { try await self.flush() } catch { self.report(error) }
       }
     }
   }
@@ -1008,8 +1088,7 @@ private struct BoundedConsultationContext: Sendable {
     if let speechSetupTask { await speechSetupTask.value }
     speechSetupTask = nil
     for input in inputCompletions { await input.value?.join() }
-    if !saveEntered { saveTask?.cancel() }
-    if let saveTask { await saveTask.value }
+    let priorSaveFailure = await joinWorkspaceSaveTasks()
     searchEpoch &+= 1; searchTask?.cancel()
     if let searchTask { await searchTask.value }
     if let recordingAttachmentTask {
@@ -1023,7 +1102,10 @@ private struct BoundedConsultationContext: Sendable {
     await joinAndClearPromptCaches()
     for operation in Array(exportTasks.values) { await operation.task.value }
     await VideoPreparationCache.shared.release()
-    try await performWorkspaceFlush()
+    let followingSaveFailure = await joinWorkspaceSaveTasks()
+    if let priorSaveFailure { throw priorSaveFailure }
+    if let followingSaveFailure { throw followingSaveFailure }
+    try await flush()
     try await closePagedSelection()
     guard pagedImported == nil, pagedInitialized == nil else {
       throw BoomError.stale("A document import has not joined shutdown.")
@@ -2326,12 +2408,12 @@ private struct BoundedConsultationContext: Sendable {
             throw BoomError.stale("Later source input preceded this export capture.")
           }
           let revision = try await session.flush(through: generation)
+          let record = session.sealedRootRecord
           guard self.pagedSession === session, session.generation == generation,
-            let projection = session.canonicalHistory,
-            projection.scope.coveredSequence == generation, projection.record.document.revision == revision else {
+            session.sealedGeneration == generation, record.document.revision == revision else {
             throw BoomError.stale("The exported native prefix changed before its actual full-record capture.")
           }
-          captured = projection.record
+          captured = record
         }
         if captured == nil {
           let read = try await engine.currentDocumentRecordRetaining(publisher, documentID: documentID)
@@ -2367,9 +2449,9 @@ private struct BoundedConsultationContext: Sendable {
     exportTasks[url.standardizedFileURL]?.pagedResult?.cancel()
     exportTasks[url.standardizedFileURL]?.clipboardResult?.cancel()
   }
-  /// Only the actual native client delegates a logical selection that exceeds
-  /// its mounted String. The existing command owner fences the exact prefix;
-  /// the existing export registry owns publication after that capture joins.
+  /// The actual native client supplies the complete logical selection. The
+  /// immutable capture includes accepted dirty text; the existing export task
+  /// retains it without waiting for or borrowing a saved document record.
   func copyDocumentSelection(from view: PagedNativeTextView, cutting: Bool) {
     do {
       try requirePagedOperation()
@@ -2381,47 +2463,42 @@ private struct BoundedConsultationContext: Sendable {
       let observed = try input.observeSelection()
       let (engine, publisher) = try pagedOwners()
       let clipboardChange = NSPasteboard.general.changeCount
-      _ = try commands.requestDocumentClipboard(selection, cutting: cutting) { [weak self] record in
+      _ = try commands.requestDocumentClipboard(selection, cutting: cutting) { [weak self] captured in
         guard let self, self.pagedInput === input, input.activeView === view,
           self.pagedSession === session, try input.observeSelection() == observed,
           try input.currentDocumentSelection() == selection,
-          record.document.id == self.selectedDocumentID else {
+          captured.source.sourceRevision.documentID == self.selectedDocumentID else {
           throw BoomError.stale("The clipboard selection changed before its immutable source capture.")
         }
-        let capture = try await engine.currentDocumentRecordRetaining(publisher, documentID: record.document.id)
-        var transferred = false
-        do {
-          guard capture.value == record,
-            selection.utf16Offset <= record.document.revision.summary.utf16,
-            selection.utf16Length <= record.document.revision.summary.utf16 - selection.utf16Offset else {
-            throw BoomError.stale("Clipboard capture has another complete document record.")
-          }
-          let start = try await engine.byteAtUTF16(record.document.revision, offset: selection.utf16Offset)
-          let end = try await engine.byteAtUTF16(record.document.revision,
-            offset: selection.utf16Offset + selection.utf16Length)
-          guard start < end, end <= record.document.revision.summary.bytes else {
-            throw BoomError.invalid("Clipboard endpoints did not name the selected source bytes.")
-          }
-          guard end - start <= 1_073_741_824 else {
-            throw BoomError.budget("Copy up to 1 GiB at a time; larger selections can be exported as a document.")
-          }
+        try session.admitLogicalRead(captured)
+        let snapshot = captured.source
+        guard selection.utf16Offset <= snapshot.summary.utf16,
+          selection.utf16Length <= snapshot.summary.utf16 - selection.utf16Offset else {
+          throw BoomError.stale("Clipboard selection exceeds its captured logical source.")
+        }
+        let cancellation = CancellationFlag()
+        let start = try await engine.logicalPosition(snapshot, utf16Offset: selection.utf16Offset,
+          cancellation: cancellation).bytes
+        let end = try await engine.logicalPosition(snapshot,
+          utf16Offset: selection.utf16Offset + selection.utf16Length, cancellation: cancellation).bytes
+        guard start < end, end <= snapshot.summary.bytes else {
+          throw BoomError.invalid("Clipboard endpoints did not name the selected logical bytes.")
+        }
+        guard end - start <= 1_073_741_824 else {
+          throw BoomError.budget("Copy up to 1 GiB at a time; larger selections can be exported as a document.")
+        }
+        try Task.checkCancellation()
+        let result = try self.publishClipboardSelection(snapshot: snapshot, engine: engine,
+          publisher: publisher, start: start, end: end, expectedChange: clipboardChange)
+        if cutting {
+          try await withTaskCancellationHandler { try await result.value } onCancel: { result.cancel() }
           try Task.checkCancellation()
-          let result = try self.publishClipboardSelection(capture: capture, engine: engine,
-            publisher: publisher, start: start, end: end, expectedChange: clipboardChange)
-          transferred = true
-          if cutting {
-            try await withTaskCancellationHandler { try await result.value } onCancel: { result.cancel() }
-            try Task.checkCancellation()
-          }
-        } catch {
-          guard !transferred else { throw error }
-          let original = error
-          do { try await engine.abandonJoinedRootOutput(capture.lease) }
-          catch { throw PagedTextCustodyHandoffFailure(original: original, handoff: error, lease: capture.lease) }
-          throw original
         }
       }
-    } catch { report(error) }
+    } catch {
+      status = error.localizedDescription
+      PerformanceTrace.event("Editor.ManagedAdmission")
+    }
   }
 
   /// File paste enters the same physical command fence as selected-source
@@ -2429,7 +2506,7 @@ private struct BoundedConsultationContext: Sendable {
   /// joins; no manuscript-sized String or clipboard buffer is constructed.
   @discardableResult
   func pasteDocumentTextFile(_ clipboard: PagedClipboardTextFile, from view: PagedNativeTextView)
-    throws -> Task<PagedDocumentRootRecord, Error> {
+    throws -> Task<PagedNativeLogicalSnapshot, Error> {
     try requirePagedOperation(); try clipboard.admitCurrent()
     guard let input = pagedInput, input.activeView === view, let commands = pagedCommands,
       let session = pagedSession, view.session === session, view.isEditable, !view.hasMarkedText() else {
@@ -2437,12 +2514,13 @@ private struct BoundedConsultationContext: Sendable {
     }
     let selected = try input.currentDocumentSelection(), observed = try input.observeSelection()
     let (engine, _) = try pagedOwners()
-    return try commands.requestDocumentImportedReplacement(selected, importing: { [weak self] record in
+    return try commands.requestDocumentImportedReplacement(selected, importing: { [weak self] captured in
       guard let self, self.pagedInput === input, input.activeView === view,
-        self.pagedSession === session, record.document.id == self.selectedDocumentID,
+        self.pagedSession === session, captured.source.sourceRevision.documentID == self.selectedDocumentID,
         try input.observeSelection() == observed, try input.currentDocumentSelection() == selected else {
         throw BoomError.stale("Text paste changed before capturing its original source and selection.")
       }
+      try session.admitLogicalRead(captured)
       try clipboard.admitCurrent(); try Task.checkCancellation()
       let scoped = clipboard.url.startAccessingSecurityScopedResource()
       defer { if scoped { clipboard.url.stopAccessingSecurityScopedResource() } }
@@ -2452,7 +2530,7 @@ private struct BoundedConsultationContext: Sendable {
       var closeAttempted = false
       do {
         let output = try await withTaskCancellationHandler {
-          try await engine.importUTF8Retaining(documentID: record.document.id, from: opened.file,
+          try await engine.importUTF8Retaining(documentID: captured.source.sourceRevision.documentID, from: opened.file,
             expectedBytes: opened.expectedBytes, cancellation: cancellation, priority: .foreground)
         } onCancel: { cancellation.cancel() }
         imported = output
@@ -2481,7 +2559,7 @@ private struct BoundedConsultationContext: Sendable {
     }, discard: { lease in try await engine.abandonJoinedRootOutput(lease) })
   }
 
-  private func publishClipboardSelection(capture: PagedTextCustodiedValue<PagedDocumentRootRecord>,
+  private func publishClipboardSelection(snapshot: PagedNativeLogicalSnapshot,
     engine: PagedTextEngineAdapter, publisher: PagedWorkspacePublisher,
     start: UInt64, end: UInt64, expectedChange: Int) throws -> Task<Void, Error> {
     guard pagedExportTaskCount < Self.maximumPagedExportTasks else {
@@ -2495,10 +2573,9 @@ private struct BoundedConsultationContext: Sendable {
       throw BoomError.budget("Eight file publication destinations are already owned.")
     }
     let target = directory.appendingPathComponent("Selection-" + UUID().uuidString.lowercased() + ".txt")
-    let previous = exportTasks[directory], id = UUID(), revision = capture.value.document.revision
+    let previous = exportTasks[directory], id = UUID()
     pagedExportTaskCount += 1
     let producer = Task<Void, Error> { [self] in
-      var releaseAttempted = false
       var preparedFile: URL?
       do {
         if let previous {
@@ -2511,26 +2588,11 @@ private struct BoundedConsultationContext: Sendable {
           throw BoomError.stale("A newer clipboard item is already present.")
         }
         let retained = (pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+        let cancellation = CancellationFlag()
         if end - start <= UInt64(PagedTextWindow.maximumBytes) {
-          let read = try await engine.windowRetaining(revision, byteStart: start, maximumBytes: Int(end - start))
-          let text = read.value.text
-          var readReleaseAttempted = false
-          do {
-            guard UInt64(text.utf8.count) == end - start else {
-              throw BoomError.invalid("Clipboard text did not contain the complete selected range.")
-            }
-            readReleaseAttempted = true
-            try await engine.abandonJoinedRootOutput(read.lease)
-          } catch {
-            let original = error
-            if readReleaseAttempted {
-              throw PagedDocumentExportReceivingFailure(original: original, publishedURL: nil, lease: read.lease)
-            }
-            if !readReleaseAttempted {
-              do { try await engine.abandonJoinedRootOutput(read.lease) }
-              catch { throw PagedTextCustodyHandoffFailure(original: original, handoff: error, lease: read.lease) }
-            }
-            throw original
+          let bytes = try await engine.logicalBytes(snapshot, byteRange: start..<end, cancellation: cancellation)
+          guard UInt64(bytes.count) == end - start, let text = String(data: bytes, encoding: .utf8) else {
+            throw BoomError.invalid("Clipboard text did not contain the complete selected logical range.")
           }
           try Task.checkCancellation()
           guard pasteboard.changeCount == expectedChange else { throw BoomError.stale("The clipboard changed while selected text was read.") }
@@ -2540,7 +2602,7 @@ private struct BoundedConsultationContext: Sendable {
         } else {
           try await detachedWork { try Self.prepareClipboardDirectory(directory, retaining: retained) }
           let file = try await ExplicitFileExport.write(to: target, stream: { handle in
-            try await Self.streamClipboardSelection(revision, start: start, end: end, engine: engine, to: handle)
+            try await engine.exportLogical(snapshot, to: handle, byteRange: start..<end, cancellation: cancellation)
           })
           preparedFile = file
           try Task.checkCancellation()
@@ -2548,17 +2610,8 @@ private struct BoundedConsultationContext: Sendable {
           try PagedClipboardTextFile.write(file, to: pasteboard)
           status = "Copied file"
         }
-        releaseAttempted = true
-        try await engine.abandonJoinedRootOutput(capture.lease)
       } catch {
         let original = error
-        if releaseAttempted {
-          throw PagedDocumentExportReceivingFailure(original: original, publishedURL: preparedFile, lease: capture.lease)
-        }
-        if !releaseAttempted {
-          do { try await engine.abandonJoinedRootOutput(capture.lease) }
-          catch { throw PagedTextCustodyHandoffFailure(original: original, handoff: error, lease: capture.lease) }
-        }
         if let preparedFile {
           throw ExplicitStreamExportFailure(original: original, cleanup: nil,
             retainedDirectory: nil, publishedURL: preparedFile)
@@ -2571,7 +2624,10 @@ private struct BoundedConsultationContext: Sendable {
       do {
         try await producer.value
         if self?.exportTasks[directory]?.id == id { self?.exportTasks[directory] = nil }
-      } catch { self?.report(error) }
+      } catch {
+        self?.status = error.localizedDescription
+        PerformanceTrace.event("Editor.ManagedAdmission")
+      }
     }
     exportTasks[directory] = (id, observer, nil, producer)
     return producer
@@ -2602,34 +2658,6 @@ private struct BoundedConsultationContext: Sendable {
     // current clipboard file remains usable after the application exits.
   }
 
-  nonisolated private static func streamClipboardSelection(_ revision: PagedTextRevision,
-    start: UInt64, end: UInt64, engine: PagedTextEngineAdapter, to file: FileHandle) async throws {
-    var offset = start
-    while offset < end {
-      try Task.checkCancellation()
-      let read = try await engine.windowRetaining(revision, byteStart: offset, maximumBytes: Int(min(65_536, end - offset)), priority: .background)
-      var releaseAttempted = false
-      do {
-        let bytes = Data(read.value.text.utf8)
-        guard !bytes.isEmpty, UInt64(bytes.count) <= end - offset else { throw BoomError.invalid("Clipboard stream did not advance its exact range.") }
-        try file.write(contentsOf: bytes)
-        offset += UInt64(bytes.count)
-        releaseAttempted = true
-        try await engine.abandonJoinedRootOutput(read.lease)
-      } catch {
-        let original = error
-        if releaseAttempted {
-          throw PagedDocumentExportReceivingFailure(original: original, publishedURL: nil, lease: read.lease)
-        }
-        if !releaseAttempted {
-          do { try await engine.abandonJoinedRootOutput(read.lease) }
-          catch { throw PagedTextCustodyHandoffFailure(original: original, handoff: error, lease: read.lease) }
-        }
-        throw original
-      }
-      await Task.yield()
-    }
-  }
   func revealDocument(_ id: UUID) {
     NSWorkspace.shared.activateFileViewerSelecting([store.root.appendingPathComponent("documents/" + id.uuidString.lowercased(), isDirectory: true)])
   }
@@ -3414,15 +3442,20 @@ extension WorkspaceModel {
         PerformanceTrace.event("Editor.ManagedAdmission")
       }
     }
-    session.didFail = { [weak self] error in self?.failPagedSource(error) }
+    session.didFail = { [weak self] error in
+      // Durability failure belongs to the retained saver; live source and
+      // ordinary input remain usable. Explicit durable operations receive it.
+      self?.status = error.localizedDescription
+      PerformanceTrace.event("Editor.ManagedSaveFailure")
+    }
     session.didSeal = { [weak self, weak session] _ in
-      guard let self, let session, self.pagedSession === session,
-        let projection = session.canonicalHistory,
-        projection.record.document.id == self.pagedSelectedRecord?.document.id else { return }
+      guard let self, let session, self.pagedSession === session else { return }
+      let record = session.sealedRootRecord
+      guard record.document.id == self.pagedSelectedRecord?.document.id else { return }
       // The actual worker projection is already received. No title-array
       // rebuild, document hash, metadata encode, IO or whole source copy here.
-      self.pagedSelectedRecord = projection.record
-      self.captureCache.removeValue(forKey: projection.record.document.id)
+      self.pagedSelectedRecord = record
+      self.captureCache.removeValue(forKey: record.document.id)
       if !self.librarySearch.isEmpty { self.refreshSearch() }
     }
     viewport.didRejectPresentation = { [weak self] error in
@@ -3470,15 +3503,16 @@ extension WorkspaceModel {
     _ = try await session.flush(through: generation)
     try await viewport.closePresentation()
     try await commands.joinPendingCommand()
-    guard session.generation == generation, let history = session.canonicalHistory,
-      history.record == pagedSelectedRecord else {
+    guard session.generation == generation, session.sealedGeneration == generation,
+      session.sealedRootRecord == pagedSelectedRecord else {
       throw BoomError.stale("Later admitted input keeps its existing source; selection did not discard it.")
     }
-    _ = try session.windowForNativeInstallation() // real source/producer/IME join admission
+    let record = session.sealedRootRecord
+    try session.requireJoinedNativeClose()
     try commands.closeInput()
     try commands.requireJoinedClose(); try input.requireJoinedClose()
     try await backend.detachJoinedController(sessionID: session.sessionID,
-      sequence: generation, record: history.record)
+      sequence: generation, record: record)
     // Clearing requires the actual Input/Foundation retirement AND the exact
     // same Engine/head transfer. Retained old contexts contain inert proxies.
     session.didSeal = nil; session.didFail = nil
@@ -3486,19 +3520,11 @@ extension WorkspaceModel {
     pagedSession = nil; pagedBackend = nil; pagedSelectedRecord = nil
   }
 
-  @discardableResult func beginPagedWorkspaceSave() throws -> Task<Void, Never> {
+  @discardableResult func beginPagedWorkspaceSave() throws -> Task<Void, Error> {
     try requirePagedOperation()
-    let previous = saveTask
-    if !saveEntered { previous?.cancel() }
-    let task = Task { [weak self] in
-      if let previous { await previous.value }
-      guard let self else { return }
-      self.saveEntered = true
-      defer { self.saveEntered = false }
-      do { try await self.performWorkspaceFlush() } catch { self.report(error) }
-    }
-    saveTask = task
-    return task
+    let request = UUID(); saveRequestID = request
+    if saveEntered, let current = saveTask { return current }
+    return startWorkspaceSave(request: request, expedited: true)
   }
   private func selectedPagedRecord(_ id: UUID) async throws -> PagedDocumentRootRecord {
     if let session = pagedSession, pagedSelectedRecord?.document.id == id {
@@ -3506,7 +3532,8 @@ extension WorkspaceModel {
       if let commands = pagedCommands { try await commands.joinPendingCommand() }
       _ = try await session.flush(through: generation)
       guard pagedSession === session, session.generation == generation,
-        let record = session.canonicalHistory?.record else { throw BoomError.stale("Later input changed the captured document.") }
+        session.sealedGeneration == generation else { throw BoomError.stale("Later input changed the captured document.") }
+      let record = session.sealedRootRecord
       pagedSelectedRecord = record
       return record
     }
@@ -3535,7 +3562,7 @@ extension WorkspaceModel {
     restoreComposerDraft(); resetContinuationView()
     if !preservingSelection { selectedDocumentIDs = [id] }
     compactPane = "document"; composerFocusEpoch &+= 1
-    invalidateGhost(); try await performWorkspaceFlush(); focusEditor(id)
+    invalidateGhost(); try await flush(); focusEditor(id)
   }
   private func createPagedDocument(flag: CancellationFlag) async throws {
     try await importAuthoredDocument(DocumentSnapshot(title: "Untitled", text: ""), selecting: true, flag: flag)
@@ -3586,7 +3613,7 @@ extension WorkspaceModel {
         selectedDocumentIDs = [documentID]; compactPane = "document"
         restoreComposerDraft(); resetContinuationView(); composerFocusEpoch &+= 1
       }
-      try await performWorkspaceFlush()
+      try await flush()
       if selecting { focusEditor(documentID) }
     } catch {
       let original = error
@@ -3622,7 +3649,7 @@ extension WorkspaceModel {
       state.selectedDocument = documentIndices.first?.id
       if let id = state.selectedDocument { try await openPagedSelection(try await selectedPagedRecord(id)) }
     }
-    restoreComposerDraft(); invalidateGhost(); try await performWorkspaceFlush()
+    restoreComposerDraft(); invalidateGhost(); try await flush()
   }
   func previewDocument(_ id: UUID) async throws -> BoundedDocumentCapture {
     try await captureDocument(id, maximumBytes: 16_384)

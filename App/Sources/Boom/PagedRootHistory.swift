@@ -77,6 +77,16 @@ struct PagedRootHistory: Codable, Equatable, Sendable {
     undo = []; redo = []; activeGroup = nil
   }
 
+  /// The worker materializes the actual Foundation projection. This is one
+  /// immutable save capture, not independently stepped storage history.
+  init(materializedCurrent: PagedTextRevision, cursor: PagedSealedCursor,
+    undo: [PagedRootHistoryEntry], redo: [PagedRootHistoryEntry], activeGroup: UUID?, generation: UInt64) throws {
+    schema = 1; purpose = "bloom/native-root-history/v1"
+    ownerID = materializedCurrent.ownerID; documentID = materializedCurrent.documentID
+    current = materializedCurrent; currentCursor = cursor
+    self.undo = undo; self.redo = redo; self.activeGroup = activeGroup; self.generation = generation
+    try validate(expected: materializedCurrent)
+  }
   func validate(expected: PagedTextRevision) throws {
     guard schema == 1, purpose == "bloom/native-root-history/v1",
       ownerID == expected.ownerID, documentID == expected.documentID,

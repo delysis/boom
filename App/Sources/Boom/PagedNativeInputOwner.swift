@@ -190,12 +190,8 @@ private final class PagedNativeInputObservers {
     let view: PagedNativeTextView
     let context: NSTextInputContext?
   }
-  private enum StageTicket {
-    case history(PagedNativeHistoryInstallationTicket)
-    case navigation(PagedNativeNavigationInstallationTicket)
-  }
   private struct StagedClient {
-    let ticket: StageTicket
+    let ticket: PagedNativeNavigationInstallationTicket
     let client: PhysicalClient
     let sourceSelection: PagedNativeSelectionObservation
     let sourceKeyboardID: String?
@@ -297,8 +293,13 @@ private final class PagedNativeInputObservers {
     stagedClient?.client.view.didRejectInput = activeView?.didRejectInput
   }
 
+  /// Read only the explicitly owned selection. Session's native-coordinate
+  /// fallback must not call currentDocumentSelection() and recurse into itself.
+  var currentOwnedDocumentSelection: PagedNativeNavigationSelection? {
+    documentSelectionGeneration == session.generation ? documentSelection : nil
+  }
   func currentDocumentSelection() throws -> PagedNativeNavigationSelection {
-    if let documentSelection, documentSelectionGeneration == session.generation { return documentSelection }
+    if let selection = currentOwnedDocumentSelection { return selection }
     let selection = try session.navigationSelection(activeView.selectedRange())
     // A normalized NSRange supplies no independent anchor. Preserve the
     // observed visual affinity without manufacturing direction from it.
@@ -320,6 +321,7 @@ private final class PagedNativeInputObservers {
   func userSelectionDidChange(from view: PagedNativeTextView,
     previousRange: NSRange?, previousGeneration: UInt64) {
     guard view === activeView, !isAdopting, !projectingDocumentSelection else { return }
+    defer { commandOwner?.inputSelectionDidChange() }
     var previous = documentSelectionGeneration == session.generation ? documentSelection : nil
     documentSelection = nil; documentSelectionGeneration = nil
     do {
@@ -382,6 +384,7 @@ private final class PagedNativeInputObservers {
   func notifyNativeState(from view: PagedNativeTextView, edited: Bool) {
     guard view === activeView, !isAdopting, !canonicalActivationPending,
       view.inputBinding?.state == .active else { return }
+    commandOwner?.inputSelectionDidChange()
     do {
       let coordinates = try session.documentCoordinates(), range = view.selectedRange()
       guard range.location >= 0, range.location != NSNotFound, range.length >= 0 else {
@@ -484,10 +487,10 @@ private final class PagedNativeInputObservers {
     self.session = session
     try session.registerManagedArenaOwner(self)
     do {
-      let window = try session.windowForNativeInstallation()
+      let window = session.logicalWindow
       let binding = makeBinding(arenaID: session.arenaID, windowID: window.windowID)
       let view = try PagedNativeTextView(frame: frame, session: session,
-        inputBinding: binding, stagedTicket: nil, canonicalOpening: session.canonicalOpening)
+        inputBinding: binding, canonicalOpening: session.canonicalOpening)
       activeView = view
       binding.owner = self
       canonicalActivationPending = session.canonicalOpening != nil
@@ -557,46 +560,43 @@ private final class PagedNativeInputObservers {
     guard let binding = view.inputBinding, binding.owner === self,
       binding.identity == activeIdentity || isAdopting else { return }
     focusEpoch.advance()
+    if !isAdopting { commandOwner?.inputSelectionDidChange() }
   }
 
   /// No storage request, source move, stage, context or mount is needed when
-  /// this joined projection already has the exact target extent. Any changed
+  /// this resident projection already has the exact target extent. Any changed
   /// range uses the SAME native client with actual selection/epoch admission.
   func reuseJoinedNavigationWindow(toUTF16 anchor: UInt64, selection: PagedNativeNavigationSelection,
-    observedSelection observed: PagedNativeSelectionObservation) throws -> PagedTextWindow? {
+    observedSelection observed: PagedNativeSelectionObservation) throws -> PagedNativeLogicalWindow? {
     try requirePhysicalStageSource(observed)
-    guard let cached = try session.joinedNavigationWindow(owner: self, toUTF16: anchor, selection: selection) else { return nil }
+    let window = session.logicalWindow
+    let end = window.start.utf16.addingReportingOverflow(window.summary.utf16)
+    guard !end.overflow, anchor >= window.start.utf16, anchor <= end.partialValue,
+      selection.focusUTF16 >= window.start.utf16, selection.focusUTF16 <= end.partialValue else { return nil }
+    let localSelection = try window.localRange(for: selection)
     let view = activeView!
     let currentSelection = try currentDocumentSelection()
-    let changesSelection = cached.localSelection != observed.range || selection != currentSelection
+    let changesSelection = localSelection != observed.range || selection != currentSelection
     let epoch = observed.selectionEpoch.addingReportingOverflow(changesSelection ? 1 : 0)
     guard !epoch.overflow else { throw BoomError.budget("Joined native selection identity is exhausted.") }
     if changesSelection { try setDocumentSelection(selection) }
     let after = try observeSelection()
     guard activeView === view, after.identity == observed.identity, after.generation == observed.generation,
       after.inputLease == observed.inputLease, after.selectionEpoch == epoch.partialValue,
-      after.range == cached.localSelection, after.affinity == selection.affinity.native,
+      after.range == localSelection, after.affinity == selection.affinity.native,
       firstRefusal == nil, view.boundedStorage.mutationFailure == nil,
-      let joined = try session.joinedNavigationWindow(owner: self, toUTF16: anchor, selection: selection),
-      joined.window.windowID == cached.window.windowID, joined.localSelection == cached.localSelection else {
+      session.logicalWindow.windowID == window.windowID,
+      try session.logicalWindow.localRange(for: selection) == localSelection else {
       throw BoomError.stale("The exact joined native range/input/source changed during selection reuse.")
     }
-    return cached.window
+    return window
   }
 
-  /// History and ordinary recentering share one bounded physical stage. The
-  /// old client remains active until the lexical source consumer really moves.
-  func stage(_ prepared: PagedNativePreparedHistoryMove,
-    observedSelection: PagedNativeSelectionObservation) throws -> PagedNativeHistoryInstallationTicket {
-    try requirePhysicalStageSource(observedSelection)
-    let ticket = try session.stageHistoryInstallation(prepared)
-    try constructStage(.history(ticket), observedSelection: observedSelection)
-    return ticket
-  }
+  /// Navigation and logical Undo share one bounded physical installation.
   func stageNavigation(_ ticket: PagedNativeNavigationInstallationTicket,
     observedSelection: PagedNativeSelectionObservation) throws {
     try requirePhysicalStageSource(observedSelection)
-    try constructStage(.navigation(ticket), observedSelection: observedSelection)
+    try constructStage(ticket, observedSelection: observedSelection)
   }
   private func requirePhysicalStageSource(_ observed: PagedNativeSelectionObservation) throws {
     guard !isAdopting, stagedClient == nil, let activeView,
@@ -605,43 +605,23 @@ private final class PagedNativeInputObservers {
       throw BoomError.stale("Native source, selection or physical input changed before construction.")
     }
   }
-  private func constructStage(_ ticket: StageTicket,
+  private func constructStage(_ ticket: PagedNativeNavigationInstallationTicket,
     observedSelection: PagedNativeSelectionObservation) throws {
-    do {
-      let window: PagedTextWindow, arena: UUID
-      let history: PagedNativeHistoryInstallationTicket?
-      let navigation: PagedNativeNavigationInstallationTicket?
-      switch ticket {
-      case .history(let value):
-        window = try session.windowForStagedNativeInstallation(value); arena = value.provisionalArenaID
-        history = value; navigation = nil
-      case .navigation(let value):
-        window = try session.windowForStagedNavigationInstallation(value); arena = value.provisionalArenaID
-        history = nil; navigation = value
-      }
-      let binding = makeBinding(arenaID: arena, windowID: window.windowID)
-      let view = try PagedNativeTextView(frame: activeView.frame, session: session,
-        inputBinding: binding, stagedTicket: history, stagedNavigationTicket: navigation)
-      view.completionClient = completionClient
-      view.owner = completionClient as? WorkspaceModel
-      view.setMedia(model: completionClient as? WorkspaceModel)
-      view.didRejectInput = activeView.didRejectInput
-      binding.owner = self
-      let keyboardID = activeContext?.selectedKeyboardInputSource, sourceWindow = activeView.window
-      stagedClient = StagedClient(ticket: ticket, client: PhysicalClient(view: view, context: nil),
-        sourceSelection: observedSelection, sourceKeyboardID: keyboardID, sourceWindow: sourceWindow)
-      let context = view.inputContext
-      stagedClient = StagedClient(ticket: ticket, client: PhysicalClient(view: view, context: context),
-        sourceSelection: observedSelection, sourceKeyboardID: keyboardID, sourceWindow: sourceWindow)
-    } catch {
-      let original = error
-      // Navigation's real outer owner performs its one cleanup attempt. A
-      // second implicit cancellation here would hide a refused stage cleanup.
-      if case .navigation = ticket { throw original }
-      do { try cancelSourceStage(ticket); retireConstructedStage() }
-      catch { throw PagedNativeNavigationCleanupFailure(original: original, cleanup: error) }
-      throw original
-    }
+    let window = try session.windowForStagedNavigationInstallation(ticket)
+    let binding = makeBinding(arenaID: ticket.provisionalArenaID, windowID: window.windowID)
+    let view = try PagedNativeTextView(frame: activeView.frame, session: session,
+      inputBinding: binding, stagedNavigationTicket: ticket)
+    view.completionClient = completionClient
+    view.owner = completionClient as? WorkspaceModel
+    view.setMedia(model: completionClient as? WorkspaceModel)
+    view.didRejectInput = activeView.didRejectInput
+    binding.owner = self
+    let keyboardID = activeContext?.selectedKeyboardInputSource, sourceWindow = activeView.window
+    stagedClient = StagedClient(ticket: ticket, client: PhysicalClient(view: view, context: nil),
+      sourceSelection: observedSelection, sourceKeyboardID: keyboardID, sourceWindow: sourceWindow)
+    let context = view.inputContext
+    stagedClient = StagedClient(ticket: ticket, client: PhysicalClient(view: view, context: context),
+      sourceSelection: observedSelection, sourceKeyboardID: keyboardID, sourceWindow: sourceWindow)
   }
   private func requireAdoptionSource(_ stage: StagedClient) throws {
     guard !isAdopting, activeView != nil, stage.sourceSelection == (try observeSelection()),
@@ -677,39 +657,10 @@ private final class PagedNativeInputObservers {
     }
     return nil
   }
-  func withStagedInstallation(_ ticket: PagedNativeHistoryInstallationTicket,
-    advancingFoundation: (() -> Void) -> Void,
-    mounted: @escaping (PagedNativeTextView, PagedNativeTextView) throws -> Void) throws -> PagedNativeHistoryAdmission {
-    guard let stage = stagedClient, case .history(let value) = stage.ticket, value === ticket else {
-      throw BoomError.stale("Another stage kind owns this physical client.")
-    }
-    try requireAdoptionSource(stage)
-    isAdopting = true; lastReplayTransition = nil
-    defer {
-      isAdopting = false
-      if activeIdentity?.arenaID == ticket.provisionalArenaID {
-        do { try setDocumentSelection(ticket.documentSelection) }
-        catch { activeView?.inputBinding?.recordRefusal(error) }
-      }
-      if let activeView { notifyNativeState(from: activeView, edited: false) }
-    }
-    var mountFailure: Error?
-    let admission = try session.withStagedHistoryInstallation(ticket) { consumer in
-      advancingFoundation { [self] in
-        _ = consumer.consume { _, arenaID, _ in
-          precondition(arenaID == stage.client.view.inputBinding?.identity.arenaID)
-          mountFailure = adopt(stage, mounted: mounted)
-        }
-      }
-    }
-    // Foundation's synchronous handler cannot throw. Propagate its actual
-    // mount failure after that scope closes, preserving its consumed source.
-    if let mountFailure { throw mountFailure }
-    return admission
-  }
   func withStagedNavigationInstallation(_ ticket: PagedNativeNavigationInstallationTicket,
-    mounted: (PagedNativeTextView, PagedNativeTextView) throws -> Void) throws -> PagedTextWindow {
-    guard let stage = stagedClient, case .navigation(let value) = stage.ticket, value === ticket else {
+    advancingFoundation: ((() -> Void) -> Void)? = nil,
+    mounted: @escaping (PagedNativeTextView, PagedNativeTextView) throws -> Void) throws -> PagedNativeLogicalWindow {
+    guard let stage = stagedClient, stage.ticket === ticket else {
       throw BoomError.stale("Another source stage owns this physical navigation.")
     }
     try requireAdoptionSource(stage)
@@ -725,37 +676,61 @@ private final class PagedNativeInputObservers {
       if let activeView { notifyNativeState(from: activeView, edited: false) }
     }
     var mountFailure: Error?
-    let window = try session.withStagedNavigationInstallation(ticket) { _, arena, _ in
+    // Session admits the complete source move before Foundation can pop its
+    // entry. Its lexical consumer performs only the prepared nonfallible move.
+    let window = try session.withStagedNavigationInstallation(ticket, consuming: { consume in
+      if let advancingFoundation { advancingFoundation(consume) } else { consume() }
+    }, installing: { _, arena, _ in
       precondition(arena == stage.client.view.inputBinding?.identity.arenaID)
       mountFailure = adopt(stage, mounted: mounted)
-    }
+    })
     if let mountFailure { throw mountFailure }
     return window
   }
-  private func cancelSourceStage(_ ticket: StageTicket) throws {
-    switch ticket {
-    case .history(let value): try session.cancelStagedHistoryInstallation(value)
-    case .navigation(let value): try session.cancelStagedNavigationInstallation(value)
-    }
+  private func cancelSourceStage(_ ticket: PagedNativeNavigationInstallationTicket) throws {
+    try session.cancelStagedNavigationInstallation(ticket)
   }
   private func retireConstructedStage() {
     guard let stage = stagedClient else { return }
     stage.client.view.inputBinding?.retire(); stage.client.view.retirePhysicalInputClient()
     stagedClient = nil
   }
-  func cancelStage(_ ticket: PagedNativeHistoryInstallationTicket) throws {
-    guard let stage = stagedClient, case .history(let value) = stage.ticket,
-      value === ticket, !isAdopting else { throw BoomError.stale("Another command owns this staged client.") }
-    try cancelSourceStage(stage.ticket); retireConstructedStage()
-  }
   func cancelNavigationStage(_ ticket: PagedNativeNavigationInstallationTicket) throws {
     guard !isAdopting else { throw BoomError.stale("Navigation is already in its source adoption scope.") }
     if let stage = stagedClient {
-      guard case .navigation(let value) = stage.ticket, value === ticket else {
+      guard stage.ticket === ticket else {
         throw BoomError.stale("Another physical stage owns this navigation reservation.")
       }
       try cancelSourceStage(stage.ticket); retireConstructedStage()
     } else { try session.cancelStagedNavigationInstallation(ticket) }
+  }
+
+  /// Spend the existing resident reserve before recentering; a full 16KiB
+  /// display must not recreate its native client for every additional key.
+  func recenterResidentWindowIfNeeded() throws {
+    guard let view = activeView, view.inputCommandIsClosed, !view.hasMarkedText(),
+      session.logicalWindow.summary.bytes > UInt64(PagedWorkingWindow.hardBytes),
+      !isAdopting, stagedClient == nil,
+      let commands = commandOwner, !commands.hasPendingCommand, let mount = commands.mountView else { return }
+    let selection = try currentDocumentSelection()
+    let start = session.logicalWindow.start.utf16
+    guard selection.focusUTF16 >= start,
+      let localFocus = Int(exactly: selection.focusUTF16 - start) else {
+      throw BoomError.invalid("The resident logical focus is outside its actual window.")
+    }
+    let observed = try observeSelection()
+    let ticket = try session.prepareResidentRecenter(localFocusUTF16: localFocus, owner: self)
+    do {
+      try stageNavigation(ticket, observedSelection: observed)
+      _ = try withStagedNavigationInstallation(ticket, mounted: mount)
+    } catch {
+      let original = error
+      if !ticket.wasConsumed {
+        do { try cancelNavigationStage(ticket) }
+        catch { throw PagedNativeNavigationCleanupFailure(original: original, cleanup: error) }
+      }
+      throw original
+    }
   }
 
   fileprivate func recordRefusal(_ error: Error, binding: PagedNativeInputBinding) {
@@ -778,10 +753,9 @@ private final class PagedNativeInputObservers {
       view.inputCommandIsClosed, !view.hasMarkedText() else {
       throw BoomError.stale("Native input or its command owner still requires an explicit disposition.")
     }
-    _ = try session.windowForNativeInstallation()
     guard commandOwner === expectedOwner, activeView === view, binding.state == .active,
       binding.identity.ownerID == ownerID, binding.identity.sessionID == session.sessionID,
-      firstRefusal == nil else {
+      binding.identity.arenaID == session.arenaID, firstRefusal == nil else {
       throw BoomError.stale("Physical input ownership changed during retirement preflight.")
     }
     // Managed navigation always adopts the physical and source arena together.
@@ -828,7 +802,6 @@ private final class PagedNativeInputObservers {
       !isAdopting, commandOwner == nil, firstRefusal == nil else {
       throw BoomError.stale("Native physical input is still installed or retains an unresolved refusal.")
     }
-    _ = try session.windowForNativeInstallation()
   }
 }
 

@@ -23,6 +23,10 @@ const CALLBACK_JSON_BYTES: usize = 4096;
 // document does not create an engine/cache or retain a resident history map.
 const ENGINE_COUNT: usize = 1;
 
+#[path = "logical_text.rs"]
+mod logical_text;
+pub use logical_text::*;
+
 type PageRead =
     unsafe extern "C" fn(*mut c_void, *const u8, usize, *mut u8, usize, *mut usize) -> i32;
 type PageWrite = unsafe extern "C" fn(

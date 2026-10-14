@@ -24,14 +24,15 @@ final class InlineMediaTests: XCTestCase {
   }
   @MainActor func testMediaBelongsAtPasteLocationWithOneLayoutAcrossWidthsAndEncryptedReload() async throws {
     let model = try await model()
-    guard let document = model.selectedDocument else { throw XCTSkip("No manuscript in chat edition.") }
-    try await NativeCheckEvidence.replacePublicDocument(model, text: "Before 👩‍💻\nAfter", id: document.id, caret: 0)
-    let destination = try XCTUnwrap(model.documentAttachmentDestination(id: document.id,
+    let documentID = try XCTUnwrap(model.selectedDocumentID, "This actual Author component requires its selected document.")
+    try await NativeCheckEvidence.replacePublicDocument(model, text: "Before 👩‍💻\nAfter", id: documentID, caret: 0)
+    let destination = try XCTUnwrap(model.documentAttachmentDestination(id: documentID,
       range: NSRange(location: "Before 👩‍💻\n".utf16.count, length: 0)))
     let bytes = try Self.image()
     model.attach([.bytes(name: "Public café.png", data: bytes)], to: destination)
     try await finish(model)
-    let saved = try XCTUnwrap(model.selectedDocument), record = try XCTUnwrap(model.state.attachments.first)
+    let capture = try await model.captureDocument(documentID)
+    let saved = try XCTUnwrap(capture.completeSnapshot), record = try XCTUnwrap(model.state.attachments.first)
     XCTAssertTrue(saved.text.hasPrefix("Before 👩‍💻\n[Attachment:")); XCTAssertTrue(saved.text.hasSuffix("\nAfter"))
     XCTAssertEqual(try model.store.vault.get(.attachment, id: record.id), bytes)
     let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 800, height: 900))
@@ -64,14 +65,14 @@ final class InlineMediaTests: XCTestCase {
     XCTAssertEqual(view.selectedRange().location, typingPosition + "Typed ".utf16.count,
       "Typing before media must not jump to its far edge using stale parsed offsets.")
     XCTAssertEqual(view.string, (saved.text as NSString).replacingCharacters(in: NSRange(location: typingPosition, length: 0), with: "Typed "))
-    model.pagedCommands?.manager.undo(); XCTAssertEqual(view.string, saved.text)
+    try XCTUnwrap(view.documentUndo).undo(); XCTAssertEqual(view.string, saved.text)
     let span = try XCTUnwrap(view.inlineMedia.spans.first)
     view.setSelectedRange(NSRange(location: span.location, length: 0))
     view.setSelectedRange(NSRange(location: span.location + 6, length: 0))
     XCTAssertEqual(view.selectedRange().location, NSMaxRange(span.range))
     view.deleteBackward(nil)
     XCTAssertEqual(view.string, "Before 👩‍💻\n\nAfter", "A pasted image deletes as one object, not one hidden bracket.")
-    model.pagedCommands?.manager.undo()
+    try XCTUnwrap(view.documentUndo).undo()
     XCTAssertEqual(view.string, saved.text)
     let reopened = try await NativeCheckEvidence.readPublicDocuments(model: model)
     XCTAssertEqual(reopened.first(where: { $0.id == saved.id }), saved)

@@ -194,19 +194,26 @@ import SwiftUI
           // never guess a deletion or accept a shifted source baseline.
           try await joinMixedInput(0, measured: false)
           let current = try currentMixedView()
-          guard let history = current.session.canonicalHistory,
-            current.session.generation == 1, history.record.historyGeneration == 1,
+          guard let commands = model.pagedCommands else {
+            throw BoomError.invalid("Public startup input lost its actual native history owner.")
+          }
+          let history = try commands.captureLogicalHistory()
+          guard current.session.generation == 1, history.generation == 1,
+            current.session.sealedRootRecord.historyGeneration == 1,
             history.undo.count == 1, history.redo.isEmpty,
-            history.undo[0].revision == importedRevision,
-            history.record.document.revision != importedRevision else {
+            history.undo[0].snapshot.sourceRevision == importedRevision,
+            history.undo[0].snapshot.summary == importedRevision.summary,
+            !history.snapshot.isSame(history.undo[0].snapshot) else {
             throw BoomError.invalid("Public startup input is not exactly one admitted edit of the imported source.")
           }
+          let startupTarget = history.undo[0].snapshot
           startupUndoAttempted = true
           try await mixedResponder(false, event: 0, measured: false)
           startupUndoJoined = true
           primingView = try currentMixedView()
-          guard primingView.session.canonicalHistory?.record.document.revision == importedRevision,
-            model.pagedSelectedRecord?.document.revision == importedRevision,
+          guard try primingView.session.captureLogicalState().source.isSame(startupTarget),
+            primingView.session.sealedGeneration == primingView.session.generation,
+            model.pagedSelectedRecord?.document.revision.summary == importedRevision.summary,
             try primingView.session.documentCoordinates().projectedUTF16 == extent else {
             throw BoomError.invalid("The actual startup Undo did not restore the original public source.")
           }
@@ -382,7 +389,23 @@ import SwiftUI
       guard let model = workspace, let view = model.pagedInput?.activeView,
         model.pagedViewport?.textView === view, let window,
         window.firstResponder === view, window.isKeyWindow else {
-        throw BoomError.stale("Mixed observation lost its actual mounted key-window client.")
+        // The accepted guard stays exact. Name its failed relationship only
+        // on refusal; no body, stack collection or IO enters a measured cycle.
+        let active = workspace?.pagedInput?.activeView
+        var missing: [String] = []
+        if workspace == nil { missing.append("model") }
+        if active == nil { missing.append("active-view") }
+        if let active, workspace?.pagedViewport?.textView !== active { missing.append("viewport-view") }
+        if window == nil { missing.append("window") }
+        if let active, let window {
+          if window.firstResponder !== active { missing.append("first-responder") }
+          if !window.isKeyWindow { missing.append("key-window") }
+          if active.window !== window { missing.append("attached-window") }
+        }
+        let responder = window?.firstResponder.map { String(String(reflecting: type(of: $0)).prefix(96)) } ?? "nil"
+        let slot = lastWarmSlot.map(String.init) ?? "none"
+        throw BoomError.stale("Mixed observation lost its actual mounted key-window client [" +
+          missing.joined(separator: ",") + "]; warm-slot=" + slot + "; responder=" + responder + ".")
       }
       managedEditor = view
       try requireManagedSource()

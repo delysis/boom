@@ -25,11 +25,6 @@ struct PagedTextCustodyHandoffFailure: Error, LocalizedError {
   let lease: PagedTextRootLease
   var errorDescription: String? { "\(original.localizedDescription) \(handoff.localizedDescription)" }
 }
-struct PagedNativeRetainedHistoryIntent: Sendable {
-  let prepared: PagedNativePreparedHistoryMove
-  let lease: PagedTextRootLease
-  var receiptID: UUID { lease.id }
-}
 
 /// Only process-local entered work and native receiving state. Files contain
 /// immutable pages and ordinary roots, never this registry or operation receipts.
@@ -43,12 +38,8 @@ final class PagedTextRootCustody: @unchecked Sendable {
   enum Purpose: Sendable, Equatable {
     case operation(UUID), controller(UUID)
     case nativeBatch(sessionID: UUID, batchID: UUID, first: UInt64, last: UInt64)
-    case capturedEdit(sessionID: UUID, commandID: UUID, sequence: UInt64)
-    case nativePreparation(routeID: UUID, commandID: UUID)
-    case nativePublication(routeID: UUID, preparationID: UUID)
-    case retainedHistory(routeID: UUID, preparationID: UUID)
   }
-  enum Phase: Sendable, Equatable { case admitted, running, output, liveController, preparedHistory, retainedHistory, unresolved }
+  enum Phase: Sendable, Equatable { case admitted, running, output, liveController, unresolved }
   struct Item: Sendable {
     let id: UUID; let purpose: Purpose; let phase: Phase; let claims: [PagedTextRootClaim]
     let payloadReservation: Int; let producerJoined: Bool; let writesAttempted: Bool
@@ -60,19 +51,11 @@ final class PagedTextRootCustody: @unchecked Sendable {
     let ownerID: UUID; let engineIncarnation: UUID; let closing: Bool; let jobs: Int
     let reservedPayloadBytes: Int; let metadataEnvelopeBytes: Int; let items: [Item]
   }
-  struct NativeFailure: Sendable {
-    let batch: PagedNativeCommitBatch
-    let acknowledgement: PagedNativeCommitAcknowledgement?
-    let publicationComplete: Bool
-  }
   private struct Entry {
     var purpose: Purpose; var phase: Phase = .admitted; var claims: [PagedTextRootClaim]
     var reservation: Int; var isJob = true; var joined = false; var wrote = false; var published = false
     var publicationComplete = false; var bulk: UUID?; var witness: Int?
-    var input: PagedNativeCommitBatch?; var acknowledgement: PagedNativeCommitAcknowledgement?
-    var capturedInput: PagedCapturedEditInput?; var capturedResult: PagedCapturedEditResult?
-    var preparation: PagedNativePreparedHistoryMove?; var historyAcknowledgement: PagedNativeHistoryAcknowledgement?
-    var historyAdmitted = false; var verifiedBefore = false
+    var logicalInput: PagedNativeLogicalPublication?; var acknowledgement: PagedNativeCommitAcknowledgement?
     var session: UUID?; var sequence: UInt64 = 0; var current: PagedDocumentRootRecord?; var pendingBatch: UUID?
     var error: Error?
   }
@@ -97,41 +80,23 @@ final class PagedTextRootCustody: @unchecked Sendable {
         pendingBatchID: e.pendingBatch, outputInFlightWitness: e.witness) }) }
   }
   func reserve(engine: PagedTextEngineAdapter, purpose: Purpose, claims: [PagedTextRootClaim],
-    payloadBytes: Int = 0, metadataBytes: Int = 0, nativeInput: PagedNativeCommitBatch? = nil,
-    capturedInput: PagedCapturedEditInput? = nil) throws -> PagedTextRootLease {
+    payloadBytes: Int = 0, metadataBytes: Int = 0, logicalInput: PagedNativeLogicalPublication? = nil) throws -> PagedTextRootLease {
     try validate(claims)
-    guard payloadBytes >= 0, payloadBytes <= PagedTextWindow.maximumBytes, metadataBytes >= 0,
+    guard payloadBytes >= 0, payloadBytes <= Self.maximumPayloadBytes, metadataBytes >= 0,
       metadataBytes <= Self.maximumNativeMetadataBytes, engine.ownerID == ownerID,
       engine.custodyIncarnation == engineIncarnation else { throw BoomError.invalid("Invalid source job reservation.") }
-    var charge = payloadBytes + metadataBytes
-    func chargeBuffer(_ bytes: Int) throws {
-      let next = charge.addingReportingOverflow(bytes)
-      guard bytes >= 0, !next.overflow, next.partialValue <= Self.maximumPayloadBytes else {
-        throw BoomError.budget("Entered source buffers exceed their fixed memory bound.")
+    let charge = payloadBytes + metadataBytes
+    if let logicalInput {
+      guard purpose == .nativeBatch(sessionID: logicalInput.sessionID, batchID: logicalInput.publicationID,
+          first: logicalInput.firstSequence, last: logicalInput.generation),
+        claims.contains(.record(logicalInput.expectedRecord)),
+        logicalInput.history.snapshot.engineIncarnation == engineIncarnation,
+        logicalInput.window.snapshot.isSame(logicalInput.history.snapshot) else {
+        throw BoomError.invalid("Logical publication escaped its same native owner.")
       }
-      charge = next.partialValue
-    }
-    if let input = nativeInput {
-      guard input.deltas.count <= PagedWorkingWindow.maximumQueuedDeltas,
-        input.groupCheckpoints.count <= PagedRootHistory.maximumEntries,
-        input.expected.text.utf8.count <= PagedWorkingWindow.hardBytes,
-        input.afterBytes.count <= PagedWorkingWindow.hardBytes else { throw BoomError.budget("Native input exceeds its fixed source arena.") }
-      try chargeBuffer(input.expected.text.utf8.count + input.afterBytes.count)
-      for delta in input.deltas { try chargeBuffer(delta.chargedBytes) }
-      for checkpoint in input.groupCheckpoints {
-        guard checkpoint.afterBytes.count <= PagedWorkingWindow.hardBytes else { throw BoomError.budget("Native checkpoint exceeds its fixed island.") }
-        try chargeBuffer(checkpoint.afterBytes.count + 128)
-      }
-      if let baseline = input.historyBaseline {
-        guard baseline.afterBytes.count <= PagedWorkingWindow.hardBytes else { throw BoomError.budget("Native baseline exceeds its fixed island.") }
-        try chargeBuffer(baseline.afterBytes.count + 128)
-      }
-    }
-    if let capturedInput {
-      guard nativeInput == nil,
-        purpose == .capturedEdit(sessionID: capturedInput.sessionID, commandID: capturedInput.commandID, sequence: capturedInput.sequence),
-        claims.contains(.record(capturedInput.expected)) else { throw BoomError.invalid("Captured input has another entered source job.") }
-      try chargeBuffer(capturedInput.inputCharge())
+      // Snapshots share resident insertion blocks with their actual SDK owner;
+      // no duplicate serialized input/archive is retained on the worker.
+      try logicalInput.history.validate()
     }
     return try state.withLock { s in
       guard !s.closing, s.entries.count < Self.maximumEntries,
@@ -139,7 +104,7 @@ final class PagedTextRootCustody: @unchecked Sendable {
         charge <= Self.maximumPayloadBytes - s.entries.values.reduce(0, { $0 + $1.reservation }) else {
         throw BoomError.unavailable("Source work is closing or exceeds its bounded memory.")
       }
-      let lease = mint(); s.entries[lease.id] = Entry(purpose: purpose, claims: claims, reservation: charge, input: nativeInput, capturedInput: capturedInput)
+      let lease = mint(); s.entries[lease.id] = Entry(purpose: purpose, claims: claims, reservation: charge, logicalInput: logicalInput)
       s.engine = engine; return lease
     }
   }
@@ -166,27 +131,15 @@ final class PagedTextRootCustody: @unchecked Sendable {
   func unresolvedBulk(_ lease: PagedTextRootLease) throws -> UUID { try state.withLock { s in guard let id = try require(lease, s).bulk else { throw BoomError.stale("No retained source stream.") }; return id } }
   func candidate(_ lease: PagedTextRootLease, claims: [PagedTextRootClaim]) throws { try validate(claims); try update(lease) { $0.claims = claims } }
   func stageNative(_ lease: PagedTextRootLease, acknowledgement: PagedNativeCommitAcknowledgement) throws { try update(lease) { $0.acknowledgement = acknowledgement } }
-  func stageCaptured(_ lease: PagedTextRootLease, result: PagedCapturedEditResult) throws {
-    try update(lease) { e in
-      guard let input = e.capturedInput, input.expected == result.beforeRecord, input.sessionID == result.sessionID,
-        input.commandID == result.commandID, input.groupID == result.groupID, input.sequence == result.sequence else {
-        throw BoomError.stale("Captured result has another exact entered command.")
-      }
-      e.capturedResult = result
-    }
-  }
-  func stageHistory(_ lease: PagedTextRootLease, prepared: PagedNativePreparedHistoryMove, acknowledgement: PagedNativeHistoryAcknowledgement) throws { try update(lease) { $0.preparation = prepared; $0.historyAcknowledgement = acknowledgement } }
   func publicationCompleted(_ lease: PagedTextRootLease) throws { try update(lease) { $0.publicationComplete = true } }
   func finishOutput(_ lease: PagedTextRootLease, claims: [PagedTextRootClaim], payloadBytes: Int,
-    inFlightWitness: Int, preparation: PagedNativePreparedHistoryMove? = nil,
-    nativeAcknowledgement: PagedNativeCommitAcknowledgement? = nil) throws {
+    inFlightWitness: Int, nativeAcknowledgement: PagedNativeCommitAcknowledgement? = nil) throws {
     try validate(claims)
     try update(lease) { e in
       guard e.isJob, e.phase == .running, e.bulk == nil, payloadBytes <= e.reservation,
         inFlightWitness > 0 else { throw BoomError.invalid("Source output escaped its real producer.") }
       e.claims = claims; e.joined = true; e.isJob = false; e.witness = inFlightWitness
-      e.phase = preparation == nil ? .output : .preparedHistory
-      if let preparation { e.preparation = preparation; e.published = false }
+      e.phase = .output
       if let nativeAcknowledgement { e.acknowledgement = nativeAcknowledgement }
     }
   }
@@ -195,11 +148,6 @@ final class PagedTextRootCustody: @unchecked Sendable {
   }
   @discardableResult func joinedFailure(_ lease: PagedTextRootLease, error: Error) throws -> Bool {
     try state.withLock { s in var e = try require(lease, s)
-      if let neutral = error as? PagedCapturedEditUnchanged, let input = e.capturedInput,
-        neutral.commandID == input.commandID, neutral.record == input.expected,
-        !e.wrote, !e.published, e.bulk == nil {
-        remove(lease.id, &s); return false
-      }
       if !e.published && e.bulk == nil, case .operation = e.purpose { remove(lease.id, &s); return false }
       e.isJob = false; e.joined = e.bulk == nil; e.phase = .unresolved; if e.error == nil { e.error = error }; s.entries[lease.id] = e; return true
     }
@@ -219,121 +167,42 @@ final class PagedTextRootCustody: @unchecked Sendable {
         e.claims.contains(.record(record)), e.error == nil || (e.phase == .output && e.publicationComplete) else { throw BoomError.stale("Native output cannot replace this controller.") }
       c.reservation = max(c.reservation, e.reservation)
       c.current = record; c.claims = [.record(expected), .record(record)]; c.acknowledgement = e.acknowledgement
-      c.input = e.input; c.capturedInput = e.capturedInput; c.capturedResult = e.capturedResult
+      c.logicalInput = e.logicalInput; c.error = e.error
       c.publicationComplete = e.publicationComplete
       if let ack = e.acknowledgement { c.session = ack.sessionID; c.sequence = ack.lastSequence; c.pendingBatch = ack.batchID }
-      if let captured = e.capturedResult {
-        let next = c.sequence.addingReportingOverflow(1)
-        guard !next.overflow, c.session == captured.sessionID, captured.sequence == next.partialValue,
-          captured.beforeRecord == expected, captured.record == record, e.publicationComplete else {
-          throw BoomError.stale("Captured output has another installed controller sequence or source.")
-        }
-        c.sequence = captured.sequence; c.pendingBatch = captured.commandID
-      }
       s.entries[controller.id] = c; remove(output.id, &s)
     }
-  }
-  func confirmNativeInput(_ controller: PagedTextRootLease, sessionID: UUID, sequence: UInt64, record: PagedDocumentRootRecord) throws {
-    try update(controller) { e in guard e.current == record, e.session == sessionID, e.sequence == sequence,
-      e.pendingBatch == nil else { throw BoomError.stale("Native source/sequence is not fully installed.") }; e.input = nil; e.acknowledgement = nil; e.capturedInput = nil; e.capturedResult = nil; e.claims = [.record(record)]
-      e.reservation = PagedWorkingWindow.hardBytes + Self.maximumNativeMetadataBytes }
   }
   func finishNativeCommit(_ controller: PagedTextRootLease, acknowledgement: PagedNativeCommitAcknowledgement) throws {
     try update(controller) { e in guard e.current == acknowledgement.sealedRootRecord, e.session == acknowledgement.sessionID,
       e.sequence == acknowledgement.lastSequence, let saved = e.acknowledgement, same(saved, acknowledgement),
       e.publicationComplete else { throw BoomError.stale("Native installation has another actual output.") }
-      e.pendingBatch = nil; e.input = nil; e.claims = [.record(acknowledgement.sealedRootRecord)]
+      e.pendingBatch = nil; e.logicalInput = nil; e.error = nil; e.claims = [.record(acknowledgement.sealedRootRecord)]
       e.reservation = PagedWorkingWindow.hardBytes + Self.maximumNativeMetadataBytes
     }
   }
-  func finishCapturedInstallation(_ controller: PagedTextRootLease, result: PagedCapturedEditResult) throws {
+  func logicalFailure(_ lease: PagedTextRootLease, publication: PagedNativeLogicalPublication)
+    throws -> (acknowledgement: PagedNativeCommitAcknowledgement?, completed: Bool) {
     try state.withLock { s in
-      var e = try require(controller, s)
-      guard e.current == result.record, e.session == result.sessionID, e.sequence == result.sequence,
-        let saved = e.capturedResult, saved == result, saved.window.text.utf8.elementsEqual(result.window.text.utf8),
-        e.pendingBatch == nil || e.pendingBatch == result.commandID, e.publicationComplete else {
-        throw BoomError.stale("Captured installation has another actual output.")
+      let e = try require(lease, s)
+      guard e.joined, !e.isJob, let input = e.logicalInput,
+        input.sessionID == publication.sessionID, input.publicationID == publication.publicationID,
+        input.firstSequence == publication.firstSequence, input.generation == publication.generation,
+        input.expectedRecord == publication.expectedRecord,
+        input.history.snapshot.isSame(publication.history.snapshot) else {
+        throw BoomError.stale("Failed save belongs to another captured logical source.")
       }
-      if let input = e.capturedInput, case .importedReplacement(_, let imported) = input.operation {
-        guard imported.lease != controller,
-          imported.value.revision.documentID == result.record.document.id else {
-          throw BoomError.stale("Streamed paste installation has another actual imported source.")
-        }
-        try admitJoinedSource(imported.lease, revision: imported.value.revision, state: s)
-        // Physical adoption and the same complete root have joined. Consume
-        // the real import output here, together with this receiving transition.
-        remove(imported.lease.id, &s)
-      }
-      e.pendingBatch = nil; e.capturedInput = nil; e.claims = [.record(result.record)]
-      e.reservation = PagedWorkingWindow.hardBytes + Self.maximumNativeMetadataBytes
-      s.entries[controller.id] = e
+      return (e.acknowledgement, e.publicationComplete)
     }
   }
-  func borrowNativeAcknowledgement(_ controller: PagedTextRootLease, batch: PagedNativeCommitBatch) throws -> PagedNativeCommitAcknowledgement {
-    try state.withLock { s in let e = try require(controller, s)
-      guard e.pendingBatch == batch.batchID, e.session == batch.sessionID, e.sequence == batch.lastSequence,
-        e.input?.batchID == batch.batchID, let ack = e.acknowledgement, e.publicationComplete,
-        ack.expectedRootRecord == batch.expectedRootRecord, ack.sealedWindow.text.utf8.elementsEqual(batch.afterBytes) else { throw BoomError.stale("Lost output no longer belongs to this admitted batch.") }; return ack }
-  }
-  func nativeFailure(_ lease: PagedTextRootLease, batch: PagedNativeCommitBatch) throws -> NativeFailure {
-    try state.withLock { s in let e = try require(lease, s); guard e.joined, !e.isJob, e.input?.batchID == batch.batchID,
-      e.input?.sessionID == batch.sessionID, e.input?.expectedRootRecord == batch.expectedRootRecord,
-      e.input?.firstSequence == batch.firstSequence, e.input?.lastSequence == batch.lastSequence else { throw BoomError.stale("Failed input has another real producer.") }
-      return NativeFailure(batch: e.input!, acknowledgement: e.acknowledgement, publicationComplete: e.publicationComplete) }
-  }
-  func admitActualNativeInput(_ lease: PagedTextRootLease, batch: PagedNativeCommitBatch) throws { _ = try nativeFailure(lease, batch: batch) }
-  func recoverNativeOutput(_ lease: PagedTextRootLease) throws { try update(lease) { e in guard e.joined, !e.isJob, e.acknowledgement != nil else { throw BoomError.stale("No original output to receive.") }; e.publicationComplete = true; e.phase = .output } }
-  func retryNative(_ lease: PagedTextRootLease) throws -> PagedNativeCommitBatch {
-    try state.withLock { s in var e = try require(lease, s); guard e.joined, !e.isJob, let input = e.input,
-      !e.publicationComplete else { throw BoomError.stale("Published input cannot replay.") }; e.isJob = true; e.joined = false; e.phase = .admitted; e.acknowledgement = nil; s.entries[lease.id] = e; return input }
-  }
-  func retainHistory(_ prepared: PagedNativePreparedHistoryMove, engine: PagedTextEngineAdapter) throws -> PagedNativeRetainedHistoryIntent {
-    let lease = try reserve(engine: engine, purpose: .retainedHistory(routeID: prepared.routeID, preparationID: prepared.preparationID),
-      claims: [.record(prepared.command.expectedRootRecord), .record(prepared.candidateRecord)],
-      payloadBytes: prepared.windowBytes, metadataBytes: Self.maximumNativeMetadataBytes)
-    try update(lease) { $0.isJob = false; $0.joined = true; $0.phase = .retainedHistory; $0.preparation = prepared }
-    return PagedNativeRetainedHistoryIntent(prepared: prepared, lease: lease)
-  }
-  func resolvePrepared(_ lease: PagedTextRootLease, prepared: PagedNativePreparedHistoryMove, disposition: PagedNativeHistoryIntentDisposition) throws {
-    try state.withLock { s in let e = try require(lease, s); guard e.joined, e.preparation == prepared, !e.historyAdmitted else { throw BoomError.stale("Admitted history cannot be abandoned.") }
-      if case .transferredToRetainedOwner(let id) = disposition { guard s.entries[id]?.preparation == prepared, id != lease.id else { throw BoomError.stale("History receiving owner is absent.") } }
-      remove(lease.id, &s)
+  func retryLogical(_ lease: PagedTextRootLease, publication: PagedNativeLogicalPublication) throws {
+    _ = try logicalFailure(lease, publication: publication)
+    try update(lease) { e in
+      guard !e.publicationComplete else { throw BoomError.stale("A published logical snapshot cannot replay.") }
+      e.isJob = true; e.joined = false; e.phase = .admitted; e.acknowledgement = nil
     }
   }
-  func admitHistoryPublication(_ lease: PagedTextRootLease, prepared: PagedNativePreparedHistoryMove) throws { try update(lease) { e in guard e.joined, e.preparation == prepared, !e.historyAdmitted || e.verifiedBefore else { throw BoomError.stale("History command already admitted.") }; e.historyAdmitted = true; e.verifiedBefore = false } }
-  func verifiedHistoryBefore(_ lease: PagedTextRootLease, prepared: PagedNativePreparedHistoryMove) throws { try update(lease) { e in guard e.preparation == prepared, e.joined else { throw BoomError.stale("History inspection lost its intent.") }; e.verifiedBefore = true; e.historyAdmitted = false } }
-  func absorbJoined(_ output: PagedTextRootLease, into receiver: PagedTextRootLease) throws {
-    try state.withLock { s in let e = try require(output, s); var r = try require(receiver, s)
-      guard output != receiver, e.joined, !e.isJob, r.joined, !r.isJob else { throw BoomError.stale("Unjoined output cannot transfer.") }
-      guard e.claims.allSatisfy({ r.claims.contains($0) || { if case .writerDocument = $0 { return true }; if case .workspace = $0 { return true }; return false }($0) }) else { throw BoomError.stale("History transfer has another source.") }
-      if let ack = e.historyAcknowledgement { r.historyAcknowledgement = ack; r.publicationComplete = e.publicationComplete }
-      if r.error == nil { r.error = e.error }; s.entries[receiver.id] = r; remove(output.id, &s)
-    }
-  }
-  func historyOutput(for prepared: PagedNativePreparedHistoryMove) throws -> (lease: PagedTextRootLease, acknowledgement: PagedNativeHistoryAcknowledgement?, completed: Bool) {
-    try state.withLock { s in
-      let candidates = s.entries.filter { $0.value.joined && !$0.value.isJob && $0.value.preparation == prepared }
-      guard let found = candidates.first(where: { $0.value.historyAcknowledgement != nil })
-        ?? candidates.first(where: { $0.value.historyAdmitted }) else { throw BoomError.stale("History publication has no retained actual intent.") }
-      return (mint(found.key), found.value.historyAcknowledgement, found.value.publicationComplete)
-    }
-  }
-  func historyOutput(_ lease: PagedTextRootLease, prepared: PagedNativePreparedHistoryMove) throws -> (PagedNativeHistoryAcknowledgement?, Bool) {
-    try state.withLock { s in let e = try require(lease, s); guard e.joined, e.preparation == prepared else { throw BoomError.stale("History output lost its preparation.") }; return (e.historyAcknowledgement, e.publicationComplete) }
-  }
-  func recoverHistoryOutput(_ lease: PagedTextRootLease) throws { try update(lease) { $0.publicationComplete = true; $0.phase = .preparedHistory } }
-  func finishHistoryInstallation(_ lease: PagedTextRootLease, controller: PagedTextRootLease,
-    prepared: PagedNativePreparedHistoryMove, admission: PagedNativeHistoryAdmission, record: PagedDocumentRootRecord) throws {
-    try admission.validate(for: prepared)
-    try state.withLock { s in let e = try require(lease, s); var c = try require(controller, s)
-      guard e.joined, e.preparation == prepared, e.publicationComplete,
-        e.historyAcknowledgement?.sealedRootRecord == record, e.historyAcknowledgement?.admittedSequence == admission.admittedSequence,
-        c.current == prepared.command.expectedRootRecord, c.session == admission.sessionID,
-        c.sequence == admission.expectedSequence, c.pendingBatch == nil else { throw BoomError.stale("History installation lost its real output/controller.") }
-      c.current = record; c.sequence = admission.admittedSequence; c.claims = [.record(record)]
-      c.acknowledgement = nil; c.input = nil; s.entries[controller.id] = c; remove(lease.id, &s)
-    }
-  }
+  func recoverLogicalOutput(_ lease: PagedTextRootLease) throws { try update(lease) { e in guard e.joined, !e.isJob, e.acknowledgement != nil else { throw BoomError.stale("No original output to receive.") }; e.publicationComplete = true; e.phase = .output } }
   func adoptUnclaimed(_ id: UUID) throws -> PagedTextRootLease { let lease = mint(id); _ = try state.withLock { try require(lease, $0) }; return lease }
   func claims(_ lease: PagedTextRootLease) throws -> [PagedTextRootClaim] { try state.withLock { try require(lease, $0).claims } }
   func admitJoinedSource(_ lease: PagedTextRootLease, revision: PagedTextRevision) throws {
@@ -345,6 +214,29 @@ final class PagedTextRootCustody: @unchecked Sendable {
       e.error == nil, e.phase == .output, e.pendingBatch == nil,
       e.claims.contains(.source(revision)), e.claims.contains(.writerDocument(revision.documentID)) else {
       throw BoomError.stale("Streamed editing requires its actual joined immutable source output.")
+    }
+  }
+  func prepareImportedSourceTransfer(_ imported: PagedTextCustodiedValue<PagedTextImportedRevision>,
+    controller: PagedTextRootLease, sessionID: UUID) throws -> () -> Void {
+    try state.withLock { s in
+      try admitJoinedSource(imported.lease, revision: imported.value.revision, state: s)
+      let c = try require(controller, s)
+      guard case .controller = c.purpose, c.joined, !c.isJob, c.session == sessionID,
+        c.current?.document.id == imported.value.revision.documentID else {
+        throw BoomError.stale("Imported source has another actual live native receiver.")
+      }
+    }
+    // The exact one-use output is held by the prepared ticket. Actual source
+    // adoption is synchronous; controller close is excluded by that ticket.
+    // File spans remain pinned by that SAME document controller, and cold GC
+    // cannot run while this editor or any capture is live.
+    return { [self] in
+      state.withLock { s in
+        let c = s.entries[controller.id], e = s.entries[imported.lease.id]
+        precondition(c?.session == sessionID && c?.current?.document.id == imported.value.revision.documentID)
+        precondition(e?.joined == true && e?.isJob == false && e?.claims.contains(.source(imported.value.revision)) == true)
+        remove(imported.lease.id, &s)
+      }
     }
   }
   func abandonJoined(_ lease: PagedTextRootLease) throws {

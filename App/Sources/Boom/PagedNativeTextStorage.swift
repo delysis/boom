@@ -12,7 +12,6 @@ final class PagedNativeTextStorage: NSTextStorage {
   // Only the standalone primitive controls use the in-place prototype. A
   // managed physical client instead has an immutable binding for its arena.
   private var arenaID: UUID
-  private let installationAttributes: [NSAttributedString.Key: Any]
   private var editingDepth = 0
   private var characterGateOpen = false
   @MainActor var hasOpenCharacterTransaction: Bool { characterGateOpen }
@@ -24,29 +23,21 @@ final class PagedNativeTextStorage: NSTextStorage {
 
   @MainActor init(session: PagedNativeSession, attributes: [NSAttributedString.Key: Any] = [:],
     inputBinding: PagedNativeInputBinding? = nil,
-    stagedTicket: PagedNativeHistoryInstallationTicket? = nil,
     stagedNavigationTicket: PagedNativeNavigationInstallationTicket? = nil) throws {
-    guard stagedTicket == nil || stagedNavigationTicket == nil else {
-      throw BoomError.invalid("A native projection has exactly one staged installation owner.")
-    }
-    let window: PagedTextWindow
+    let window: PagedNativeLogicalWindow
     if let stagedNavigationTicket {
       guard inputBinding != nil else { throw BoomError.invalid("Staged navigation requires its physical owner.") }
       window = try session.windowForStagedNavigationInstallation(stagedNavigationTicket)
-    } else if let stagedTicket {
-      guard inputBinding != nil else { throw BoomError.invalid("A staged text window requires its physical input owner.") }
-      window = try session.windowForStagedNativeInstallation(stagedTicket)
-    } else { window = try session.windowForNativeInstallation() }
+    } else { window = session.logicalWindow }
     self.session = session
     self.inputBinding = inputBinding
-    arenaID = stagedNavigationTicket?.provisionalArenaID ?? stagedTicket?.provisionalArenaID ?? session.arenaID
+    arenaID = stagedNavigationTicket?.provisionalArenaID ?? session.arenaID
     if let identity = inputBinding?.identity {
       guard identity.sessionID == session.sessionID, identity.arenaID == arenaID,
         identity.installationWindowID == window.windowID else {
         throw BoomError.stale("A native text window cannot borrow another physical client's identity.")
       }
     }
-    installationAttributes = attributes
     backing = NSMutableAttributedString(string: window.text, attributes: attributes)
     super.init()
   }
@@ -150,29 +141,6 @@ final class PagedNativeTextStorage: NSTextStorage {
   }
   @MainActor var currentNativeGroupID: UUID { nativeGroupID }
 
-  /// Source installation is a bounded projection change, not a user text
-  /// replacement. Its admitted command reserves the sequence before TextKit
-  /// observes the new arena, and ordinary primitives then continue in it.
-  @MainActor @discardableResult
-  func installPreparedHistory(_ prepared: PagedNativePreparedHistoryMove) throws -> PagedNativeHistoryAdmission {
-    guard inputBinding == nil else {
-      throw BoomError.denied("Managed input clients install a separately constructed source window.")
-    }
-    try admitsCurrentArena()
-    guard editingDepth == 0, !characterGateOpen, mutationFailure == nil else {
-      throw BoomError.stale("Native text storage is still processing an earlier character transaction.")
-    }
-    let attributed = NSAttributedString(string: prepared.window.text, attributes: installationAttributes)
-    return try session.installPreparedHistory(prepared) { [self] _, nextArena, _ in
-      let oldLength = backing.length
-      beginEditing()
-      arenaID = nextArena; nativeGroupID = UUID()
-      backing.setAttributedString(attributed)
-      edited(.editedCharacters, range: NSRange(location: 0, length: oldLength),
-        changeInLength: backing.length - oldLength)
-      endEditing()
-    }
-  }
   @MainActor func admitsCurrentArena() throws {
     if let inputBinding { try inputBinding.admitsInput(in: session) }
     guard session.arenaID == arenaID else {
@@ -245,13 +213,11 @@ final class PagedNativeTextStorage: NSTextStorage {
 
   init(frame: NSRect, session: PagedNativeSession,
     inputBinding: PagedNativeInputBinding? = nil,
-    stagedTicket: PagedNativeHistoryInstallationTicket? = nil,
     stagedNavigationTicket: PagedNativeNavigationInstallationTicket? = nil,
     canonicalOpening: PagedNativeCanonicalOpening? = nil) throws {
     if let canonicalOpening {
-      guard stagedTicket == nil, stagedNavigationTicket == nil, canonicalOpening.sessionID == session.sessionID,
-        session.canonicalOpening?.record == canonicalOpening.record,
-        session.canonicalOpening?.window.windowID == canonicalOpening.window.windowID else {
+      guard stagedNavigationTicket == nil, canonicalOpening.sessionID == session.sessionID,
+        session.canonicalOpening?.record == canonicalOpening.record else {
         throw BoomError.stale("Canonical physical construction has another unopened source owner.")
       }
     }
@@ -260,7 +226,7 @@ final class PagedNativeTextStorage: NSTextStorage {
     managedInputClient = inputBinding.map { PagedNativeTextInputClient(identity: $0.identity) }
     let storage = try PagedNativeTextStorage(session: session,
       attributes: [.font: MarkdownStyle.body],
-      inputBinding: inputBinding, stagedTicket: stagedTicket, stagedNavigationTicket: stagedNavigationTicket)
+      inputBinding: inputBinding, stagedNavigationTicket: stagedNavigationTicket)
     boundedStorage = storage
     let manager = NSLayoutManager()
     manager.allowsNonContiguousLayout = true
@@ -268,7 +234,7 @@ final class PagedNativeTextStorage: NSTextStorage {
     container.widthTracksTextView = true; container.heightTracksTextView = false
     storage.addLayoutManager(manager); manager.addTextContainer(container)
     super.init(frame: frame, textContainer: container)
-    documentID = session.sourceBaseRevision.documentID
+    documentID = session.logicalWindow.snapshot.sourceRevision.documentID
     isEditable = true; isSelectable = true; isRichText = false
     // Canonical Undo uses registered root/group handles. TextKit must not also
     // retain old source strings or add a competing automatic Undo stack.
@@ -293,11 +259,6 @@ final class PagedNativeTextStorage: NSTextStorage {
     }
     if let stagedNavigationTicket {
       super.setSelectedRange(stagedNavigationTicket.localSelection, affinity: stagedNavigationTicket.selectionAffinity, stillSelecting: false)
-    } else if let stagedTicket {
-      // Initial selection is part of the constructed projection, not a
-      // callback authorized to select another source arena.
-      super.setSelectedRange(NSRange(location: stagedTicket.localCaretUTF16, length: 0),
-        affinity: .downstream, stillSelecting: false)
     } else if let canonicalOpening {
       super.setSelectedRange(NSRange(location: canonicalOpening.localCaretUTF16, length: 0),
         affinity: .downstream, stillSelecting: false)
@@ -329,16 +290,6 @@ final class PagedNativeTextStorage: NSTextStorage {
     let accepted = super.resignFirstResponder()
     if accepted { inputBinding?.owner?.recordFocusTransition(from: self) }
     return accepted
-  }
-
-  @discardableResult
-  func installPreparedHistory(_ prepared: PagedNativePreparedHistoryMove) throws -> PagedNativeHistoryAdmission {
-    guard inputCommandDepth == 0, !hasMarkedText() else {
-      throw BoomError.stale("An active native input command pins its current source island.")
-    }
-    let admission = try boundedStorage.installPreparedHistory(prepared)
-    setSelectedRange(NSRange(location: prepared.localCaretUTF16, length: 0))
-    return admission
   }
 
   override func shouldChangeText(in affectedCharRange: NSRange, replacementString: String?) -> Bool {
@@ -798,6 +749,10 @@ final class PagedNativeTextStorage: NSTextStorage {
         if edited { clearGhost() }
         inputBinding?.owner?.notifyNativeState(from: self, edited: edited)
         inputBinding?.owner?.commandOwner?.inputCommandDidClose()
+        if inputBinding?.owner?.activeView === self {
+          do { try inputBinding?.owner?.recenterResidentWindowIfNeeded() }
+          catch { didRejectInput?(error) }
+        }
       }
     }
     operation()

@@ -29,7 +29,7 @@ private struct ScrollClickJoinFailure: Error, LocalizedError {
 @MainActor final class PagedNativeScrollProjectionTests: XCTestCase {
   private static var failedOutputs: PagedFileEngineControlOutputs?
   private static var nativeOwners: (PagedNativeSession, PagedNativeInputOwner,
-    PagedNativeUndoOwner, PagedStagedControlledStorage, PagedNativeStorageBackend, NSWindow)?
+    PagedNativeUndoOwner, PagedNativeLogicalControlStorage, PagedNativeStorageBackend, NSWindow)?
 
   private func fixture(_ body: (PagedFileEngineControlOutputs, PagedWorkspacePublisher) async throws -> Void) async throws {
     guard Self.failedOutputs == nil, Self.nativeOwners == nil else {
@@ -49,30 +49,60 @@ private struct ScrollClickJoinFailure: Error, LocalizedError {
       guard (testRun?.failureCount ?? 0) == failures else { throw BoomError.invalid("Public scroll assertions failed.") }
       try await outputs.close(); try FileManager.default.removeItem(at: store.root)
     } catch {
+      var original = error
       Self.failedOutputs = outputs
+      if let held = Self.nativeOwners {
+        // Join the actual save/read delivery gates and native tasks without
+        // retiring the failed physical owner or deleting its source files.
+        await held.3.closeAndJoin()
+        do { try await held.2.joinPendingCommand() } catch {
+          original = ScrollClickJoinFailure(original: original, cleanup: error)
+        }
+        await held.0.joinPendingSave()
+        if let saveFailure = held.0.persistenceFailure {
+          original = ScrollClickJoinFailure(original: original, cleanup: saveFailure)
+        }
+        if let viewport = held.5.contentView as? PagedDocumentViewport {
+          do { try await viewport.closePresentation() } catch {
+            original = ScrollClickJoinFailure(original: original, cleanup: error)
+          }
+        }
+      }
       print("Failed public scroll retained: \(store.root.path)")
-      throw error
+      throw original
     }
   }
 
   /// Small public oracle only; this is never a production document read.
-  private func assertProjection(_ result: PagedNativeScrollProjection, text: String, anchor: UInt64) throws {
-    try result.validate()
+  /// The logical reader supplies context around the anchor, rather than the
+  /// retired overlay's exact-start projection. Check the actual scalar origin
+  /// and every returned byte against the complete bounded public oracle.
+  private func assertProjection(_ result: PagedNativeLogicalWindow,
+    snapshot: PagedNativeLogicalSnapshot, text: String, anchor: UInt64) throws {
+    XCTAssertTrue(result.snapshot.isSame(snapshot))
     var units: UInt64 = 0, bytes = 0, lfs: UInt64 = 0
     for scalar in text.unicodeScalars {
       let count: UInt64 = scalar.value > 0xffff ? 2 : 1
-      if units + count > min(anchor, UInt64(text.utf16.count)) { break }
+      if units + count > result.start.utf16 { break }
       units += count; bytes += (scalar.value < 0x80 ? 1 : scalar.value < 0x800 ? 2 : scalar.value < 0x10000 ? 3 : 4)
       if scalar.value == 10 { lfs += 1 }
     }
-    XCTAssertEqual(result.utf16Start, units); XCTAssertEqual(result.byteStart, UInt64(bytes)); XCTAssertEqual(result.lfStart, lfs)
+    XCTAssertEqual(result.start.utf16, units); XCTAssertEqual(result.start.bytes, UInt64(bytes))
+    XCTAssertEqual(result.start.lfCount, lfs)
     let remaining = Data(text.utf8).dropFirst(bytes)
     XCTAssertEqual(Data(result.text.utf8), Data(remaining.prefix(result.text.utf8.count)))
     XCTAssertFalse(result.text.isEmpty && units < UInt64(text.utf16.count))
-    XCTAssertEqual(result.projectedSummary.bytes, UInt64(text.utf8.count))
-    XCTAssertEqual(result.projectedSummary.utf16, UInt64(text.utf16.count))
+    XCTAssertEqual(result.snapshot.summary.bytes, UInt64(text.utf8.count))
+    XCTAssertEqual(result.snapshot.summary.utf16, UInt64(text.utf16.count))
+    XCTAssertEqual(result.snapshot.summary.lfCount, UInt64(text.unicodeScalars.filter { $0.value == 10 }.count))
     XCTAssertLessThanOrEqual(result.text.utf8.count, PagedWorkingWindow.targetBytes)
-    try result.validateLocalPosition(result.text.utf16.count)
+    XCTAssertLessThanOrEqual(result.start.utf16, anchor)
+    XCTAssertLessThanOrEqual(anchor, result.start.utf16 + result.summary.utf16)
+    XCTAssertEqual(result.summary.bytes, UInt64(result.text.utf8.count))
+    XCTAssertEqual(result.summary.utf16, UInt64(result.text.utf16.count))
+    let end = try result.position(localUTF16: result.text.utf16.count)
+    XCTAssertEqual(end.bytes, result.start.bytes + result.summary.bytes)
+    XCTAssertEqual(end.utf16, result.start.utf16 + result.summary.utf16)
   }
 
   func testActualImmutableScrollCompletesWhileWriterExecutorIsEnteredAndHeld() async throws {
@@ -82,61 +112,78 @@ private struct ScrollClickJoinFailure: Error, LocalizedError {
       let record = try await outputs.publish(imported, title: "Public held writer", publisher: publisher)
       let window = outputs.retain(try await outputs.engine.windowRetaining(record.document.revision,
         byteStart: 0, maximumBytes: PagedWorkingWindow.targetBytes))
-      let working = try PagedWorkingWindow(window: window, rootRecord: record)
-      let snapshot = try working.captureScrollSnapshot()
+      let source = try PagedNativeLogicalSource(revision: record.document.revision,
+        sessionID: UUID(), engineIncarnation: outputs.engine.custodyIncarnation)
+      _ = try source.openingWindow(window)
+      let snapshot = try source.capture(forPublication: true)
       let gate = ScrollWriterHold(expectation(description: "actual writer executor entered"))
       let writer = Task { try await outputs.engine.storageExecutorForTesting.run { gate.enter() } }
       await fulfillment(of: [gate.entered], timeout: 5)
       let completed = expectation(description: "immutable file read returned before writer release")
       let read = Task {
         defer { completed.fulfill() }
-        return try await outputs.engine.scrollProjection(snapshot, utf16Anchor: 24_003)
+        return try await outputs.engine.logicalWindow(snapshot, utf16Anchor: 24_003,
+          maximumBytes: PagedWorkingWindow.targetBytes)
       }
       await fulfillment(of: [completed], timeout: 5)
       XCTAssertTrue(gate.isHeld, "This is an entered writer-body hold, not an actor preflight hold")
-      // Release and join both real tasks even when the bounded timeout exposed
-      // reader coupling; fixture teardown never runs across a live writer.
-      gate.release(); try await writer.value
-      let result = try await read.value
-      try assertProjection(result, text: text, anchor: 24_003)
-      XCTAssertEqual(result.revision, record.document.revision)
+      // Join both actual tasks even if the reader timeout or writer exposed a
+      // real failure. No failed root is closed while an entered task lives.
+      gate.release()
+      var failure: Error?, result: PagedNativeLogicalWindow?
+      do { try await writer.value } catch { failure = error }
+      do { result = try await read.value } catch {
+        if let original = failure { failure = ScrollClickJoinFailure(original: original, cleanup: error) }
+        else { failure = error }
+      }
+      if let failure { throw failure }
+      try assertProjection(try XCTUnwrap(result), snapshot: snapshot, text: text, anchor: 24_003)
+      XCTAssertEqual(snapshot.sourceRevision, record.document.revision)
       XCTAssertEqual(outputs.engine.custodySnapshot.jobs, 0)
     }
   }
 
-  func testActualNetOverlayInsertionAndEmptyDeletionMapBeforeInsideAfterAndSurrogates() async throws {
+  func testActualLogicalInsertionAndEmptyDeletionMapBeforeInsideAfterAndSurrogates() async throws {
     try await fixture { outputs, publisher in
       let prefix = String(repeating: "p", count: 400) + "\n"
       let island = "A🙂é\nBé🙂\n"
       let suffix = String(repeating: "tail🙂é\n", count: 5_000)
       let text = prefix + island + suffix
       let imported = try await outputs.imported(Data(text.utf8))
-      let record = try await outputs.publish(imported, title: "Public Unicode overlay", publisher: publisher)
+      let record = try await outputs.publish(imported, title: "Public Unicode logical source", publisher: publisher)
       let window = outputs.retain(try await outputs.engine.windowRetaining(record.document.revision,
         byteStart: UInt64(prefix.utf8.count), maximumBytes: island.utf8.count))
       XCTAssertEqual(Data(window.text.utf8), Data(island.utf8))
-      var working = try PagedWorkingWindow(window: window, rootRecord: record)
-      try working.replace(NSRange(location: 1, length: 2), with: "e\u{301}🙂\n", groupID: UUID())
-      let inFlight = try XCTUnwrap(working.takeCommitBatch())
-      try working.replace(NSRange(location: working.localUTF16Count, length: 0), with: "Ω🙂", groupID: UUID())
-      XCTAssertEqual(working.failedBatchRetained?.batchID, inFlight.batchID)
-      let replacement = try XCTUnwrap(String(data: working.bytes, encoding: .utf8))
-      let expected = prefix + replacement + suffix
-      let snapshot = try working.captureScrollSnapshot()
+      let source = try PagedNativeLogicalSource(revision: record.document.revision,
+        sessionID: UUID(), engineIncarnation: outputs.engine.custodyIncarnation)
+      var working = try source.openingWindow(window)
+      working = try source.replace(in: working, range: NSRange(location: 1, length: 2), with: "e\u{301}🙂\n").window
+      let first = try source.capture(forPublication: true)
+      let firstText = prefix + working.text + suffix
+      working = try source.replace(in: working, range: NSRange(location: Int(working.summary.utf16), length: 0),
+        with: "Ω🙂").window
+      let replacement = working.text, expected = prefix + replacement + suffix
+      let snapshot = try source.capture(forPublication: true)
+      XCTAssertFalse(snapshot.isSame(first))
+      // Older actual roots remain immutable after later local insertion.
+      try assertProjection(try await outputs.engine.logicalWindow(first, utf16Anchor: 405,
+        maximumBytes: PagedWorkingWindow.targetBytes), snapshot: first, text: firstText, anchor: 405)
       for anchor in [UInt64(0), 399, 400, 401, 404, 405,
         UInt64(prefix.utf16.count + replacement.utf16.count - 1),
         UInt64(prefix.utf16.count + replacement.utf16.count),
         UInt64(expected.utf16.count - 1), UInt64(expected.utf16.count)] {
-        try assertProjection(try await outputs.engine.scrollProjection(snapshot, utf16Anchor: anchor),
-          text: expected, anchor: anchor)
+        try assertProjection(try await outputs.engine.logicalWindow(snapshot, utf16Anchor: anchor,
+          maximumBytes: PagedWorkingWindow.targetBytes), snapshot: snapshot, text: expected, anchor: anchor)
       }
-      try working.replace(NSRange(location: 0, length: working.localUTF16Count), with: "", groupID: UUID())
-      let deleted = try working.captureScrollSnapshot(), afterDelete = prefix + suffix
+      working = try source.replace(in: working, range: NSRange(location: 0, length: Int(working.summary.utf16)), with: "").window
+      XCTAssertEqual(working.summary.bytes, 0)
+      let deleted = try source.capture(forPublication: true), afterDelete = prefix + suffix
       for anchor in [UInt64(399), 400, 401, 402, 406, UInt64(afterDelete.utf16.count)] {
-        try assertProjection(try await outputs.engine.scrollProjection(deleted, utf16Anchor: anchor),
-          text: afterDelete, anchor: anchor)
+        try assertProjection(try await outputs.engine.logicalWindow(deleted, utf16Anchor: anchor,
+          maximumBytes: PagedWorkingWindow.targetBytes), snapshot: deleted, text: afterDelete, anchor: anchor)
       }
-      XCTAssertEqual(record.document.revision, deleted.revision)
+      // The original file Revision is backing, never the dirty source digest.
+      XCTAssertEqual(record.document.revision, deleted.sourceRevision)
       XCTAssertEqual(outputs.engine.custodySnapshot.jobs, 0)
     }
   }
@@ -144,21 +191,23 @@ private struct ScrollClickJoinFailure: Error, LocalizedError {
   func testActualHeldNativeCommitAndIMEReadKeepLaterTypingAndSameGenerationACKSnapshot() async throws {
     try await fixture { outputs, publisher in
       let failuresBeforeNativeCase = testRun?.failureCount ?? 0
-      _ = NSApplication.shared
+      try PagedNativeFixtureApplication.bootstrap()
       let text = "aé🙂\n" + String(repeating: "public tail🙂é\n", count: 3_000)
       let imported = try await outputs.imported(Data(text.utf8))
       let record = try await outputs.publish(imported, title: "Public pending native", publisher: publisher)
       let backend = try await outputs.engine.makeNativeStorage(publisher, expected: record)
       let opening = try await backend.opening(sessionID: UUID())
-      let route = PagedStagedControlledStorage(backend)
+      let route = PagedNativeLogicalControlStorage(backend)
       let session = try PagedNativeSession(opening: opening, storage: route)
       let input = try PagedNativeInputOwner(frame: NSRect(x: 0, y: 0, width: 640, height: 320), session: session)
       let commands = try PagedNativeUndoOwner(input: input)
       let view = try XCTUnwrap(input.activeView)
       let window = NSWindow(contentRect: view.frame, styleMask: [.titled, .closable], backing: .buffered, defer: false)
-      window.isReleasedWhenClosed = false; window.contentView = view
-      window.makeKeyAndOrderFront(nil); XCTAssertTrue(window.makeFirstResponder(view))
+      let viewport = try PagedDocumentViewport(frame: view.frame, input: input)
+      commands.mountView = { old, new in try viewport.mountManagedView(from: old, to: new) }
+      window.isReleasedWhenClosed = false; window.contentView = viewport
       Self.nativeOwners = (session, input, commands, route, backend, window)
+      try await PagedNativeFixtureApplication.focus(view, in: window)
       let hold = try await route.holdNext(.commitBefore)
       let expected = NSMutableString(string: text)
       view.insertText("🙂e\u{301}\n", replacementRange: NSRange(location: 1, length: 0))
@@ -167,19 +216,20 @@ private struct ScrollClickJoinFailure: Error, LocalizedError {
       view.setMarkedText("界", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: 1, length: 2))
       expected.replaceCharacters(in: NSRange(location: 1, length: 2), with: "界")
       XCTAssertTrue(session.isPinned); XCTAssertTrue(view.hasMarkedText())
-      let stale = try session.captureScrollSnapshot()
-      try assertProjection(try await outputs.engine.scrollProjection(stale, utf16Anchor: 17_003),
-        text: expected as String, anchor: 17_003)
+      let stale = try session.captureLogicalRead()
+      try assertProjection(try await outputs.engine.logicalWindow(stale.source, utf16Anchor: 17_003,
+        maximumBytes: PagedWorkingWindow.targetBytes),
+        snapshot: stale.source, text: expected as String, anchor: 17_003)
       view.setMarkedText("界Z", selectedRange: NSRange(location: 2, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
       expected.replaceCharacters(in: NSRange(location: 1, length: 1), with: "界Z")
       XCTAssertFalse(session.isCurrent(stale), "A later real marked-text primitive invalidates old delivery")
-      let marked = try session.captureScrollSnapshot()
+      let marked = try session.captureLogicalRead()
       XCTAssertTrue(session.isCurrent(marked))
       // Unmark is an actual Cocoa character-command scope, not the ACK. It
       // can perform several accepted primitives even when final bytes match.
       // Keep the first real commit held until this synchronous input returns.
       view.unmarkText()
-      let latest = try session.captureScrollSnapshot()
+      let latest = try session.captureLogicalRead()
       XCTAssertFalse(session.isPinned); XCTAssertFalse(view.hasMarkedText())
       XCTAssertEqual(latest.sessionID, marked.sessionID, "Unmark changed the native session")
       XCTAssertEqual(latest.arenaID, marked.arenaID, "Unmark changed the physical arena")
@@ -197,10 +247,12 @@ private struct ScrollClickJoinFailure: Error, LocalizedError {
         "ACK check: marked generation \(marked.generation), post-unmark generation \(latest.generation), current \(session.generation)")
       XCTAssertTrue(session.isCurrent(latest),
         "Post-unmark ACK identity: session \(latest.sessionID), arena \(latest.arenaID), generation \(latest.generation), entered navigation \(session.activeNavigationOperationCount)")
-      XCTAssertNotEqual(session.sealedRevision, latest.revision)
+      XCTAssertNotEqual(session.sealedRevision, latest.source.sourceRevision)
+      XCTAssertEqual(session.sealedGeneration, latest.generation)
       for anchor in [UInt64(0), 4, 16_380, 17_003] {
-        try assertProjection(try await outputs.engine.scrollProjection(latest, utf16Anchor: anchor),
-          text: expected as String, anchor: anchor)
+        try assertProjection(try await outputs.engine.logicalWindow(latest.source, utf16Anchor: anchor,
+          maximumBytes: PagedWorkingWindow.targetBytes),
+          snapshot: latest.source, text: expected as String, anchor: anchor)
       }
       let saved = outputs.retain(try await outputs.engine.currentDocumentRecordRetaining(publisher,
         documentID: record.document.id))
@@ -213,9 +265,10 @@ private struct ScrollClickJoinFailure: Error, LocalizedError {
       guard (testRun?.failureCount ?? 0) == failuresBeforeNativeCase else {
         throw BoomError.invalid("Native scroll assertions failed; actual input/source owners remain retained.")
       }
-      try commands.closeInput(); window.contentView = nil; window.close()
+      try await viewport.closePresentation(); try commands.closeInput(); try commands.requireJoinedClose()
+      window.contentView = nil; window.close()
       await route.closeAndJoin()
-      try await backend.detachJoinedController(sessionID: session.sessionID, sequence: session.generation, record: saved)
+      try await backend.detachJoinedController(sessionID: session.sessionID, sequence: session.sealedGeneration, record: saved)
       Self.nativeOwners = nil
     }
   }
@@ -229,7 +282,7 @@ private struct ScrollClickJoinFailure: Error, LocalizedError {
       let original = try await outputs.publish(imported, title: "Public dirty local click", publisher: publisher)
       let backend = try await outputs.engine.makeNativeStorage(publisher, expected: original)
       let opening = try await backend.opening(sessionID: UUID())
-      let route = PagedStagedControlledStorage(backend)
+      let route = PagedNativeLogicalControlStorage(backend)
       let session = try PagedNativeSession(opening: opening, storage: route)
       let input = try PagedNativeInputOwner(frame: NSRect(x: 0, y: 0, width: 640, height: 320), session: session)
       let commands = try PagedNativeUndoOwner(input: input)
@@ -242,6 +295,7 @@ private struct ScrollClickJoinFailure: Error, LocalizedError {
       Self.nativeOwners = (session, input, commands, route, backend, window)
       try await PagedNativeFixtureApplication.focus(view, in: window)
       guard viewport.textView === view else { throw BoomError.stale("The public click control changed its mounted client.") }
+      let originalLogical = try session.captureLogicalState().source
       let gate = ScrollWriterHold(expectation(description: "actual writer body entered for local click"))
       let writer = Task { try await outputs.engine.storageExecutorForTesting.run { gate.enter() } }
       var reads: [Task<Void, Error>] = [] // exactly the two entered presentation joins below
@@ -273,7 +327,7 @@ private struct ScrollClickJoinFailure: Error, LocalizedError {
           utf16Length: 30_000, focusAtEnd: false, affinity: .upstream))
         try await readWhileHeld()
         let displayed = try XCTUnwrap(viewport.visibleScrollWindow)
-        XCTAssertEqual(displayed.utf16Start, 0); XCTAssertTrue(displayed.text.hasPrefix("publXic"))
+        XCTAssertEqual(displayed.start.utf16, 0); XCTAssertTrue(displayed.text.hasPrefix("publXic"))
         XCTAssertFalse(commands.hasPendingCommand)
         try viewport.selectVisibleUTF16(5, extending: true)
         let extended = try input.currentDocumentSelection()
@@ -340,17 +394,21 @@ private struct ScrollClickJoinFailure: Error, LocalizedError {
         }
         try await commands.joinPendingCommand(); _ = try await session.flush(through: session.generation)
       }
-      XCTAssertEqual(session.sealedRevision, original.document.revision)
+      XCTAssertTrue(session.logicalWindow.snapshot.isSame(originalLogical))
+      let undone = outputs.retain(try await outputs.engine.currentDocumentRecordRetaining(publisher,
+        documentID: original.document.id))
+      let undoneDigest = try await outputs.engine.wholeTextSha256(undone.document.revision)
+      XCTAssertEqual(undoneDigest, Digest.sha256(Data(text.utf8)))
       XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, 4)
       XCTAssertNil(session.persistenceFailure); XCTAssertNil(input.firstRefusal)
       guard (testRun?.failureCount ?? 0) == failures else {
         throw BoomError.invalid("Local-click source/Undo assertions failed; native and file owners retained.")
       }
-      try await viewport.closePresentation(); try commands.closeInput()
+      try await viewport.closePresentation(); try commands.closeInput(); try commands.requireJoinedClose()
       window.contentView = nil; window.close(); await route.closeAndJoin()
       let final = outputs.retain(try await outputs.engine.currentDocumentRecordRetaining(publisher,
         documentID: original.document.id))
-      try await backend.detachJoinedController(sessionID: session.sessionID, sequence: session.generation, record: final)
+      try await backend.detachJoinedController(sessionID: session.sessionID, sequence: session.sealedGeneration, record: final)
       Self.nativeOwners = nil
     }
   }

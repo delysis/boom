@@ -190,7 +190,7 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
     try await commands.joinPendingCommand(); try await model.flush()
     let edited = try await model.captureDocument(original.document.id)
     XCTAssertEqual(edited.completeSnapshot?.text, before + "a")
-    XCTAssertEqual(model.pagedSession?.canonicalHistory?.undo.count, 1)
+    XCTAssertEqual(try model.pagedCommands?.captureLogicalHistory().undo.count, 1)
     XCTAssertEqual(commands.manager.groupingLevel, 0)
     let entryKey = UndoManager.UserInfoKey(rawValue: "bloom.paged.native-entry.v1")
     XCTAssertNotNil(commands.manager.undoActionUserInfoValue(forKey: entryKey) as? NSObject)
@@ -228,7 +228,7 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
     let editedSelection = try input.currentDocumentSelection()
     XCTAssertEqual(editedCapture.completeSnapshot?.text, "é🙂")
     XCTAssertEqual(editedSelection.utf16Offset, 3); XCTAssertEqual(editedSelection.utf16Length, 0)
-    XCTAssertEqual(model.pagedSession?.canonicalHistory?.undo.count, 1)
+    XCTAssertEqual(try model.pagedCommands?.captureLogicalHistory().undo.count, 1)
 
     let undoAction = NSSelectorFromString("undo:"), redoAction = NSSelectorFromString("redo:")
     let undoItem = NSMenuItem(title: "Undo", action: undoAction, keyEquivalent: "z")
@@ -578,7 +578,7 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
     let view = try XCTUnwrap(input.activeView)
     Self.failedWindow?.contentView?.layoutSubtreeIfNeeded()
     if let container = view.textContainer { view.layoutManager?.ensureLayout(for: container) }
-    let undoCount = try XCTUnwrap(model.pagedSession).canonicalHistory?.undo.count
+    let undoCount = Optional(try XCTUnwrap(model.pagedCommands).captureLogicalHistory().undo.count)
 
     // The native oracle is THIS actual product view, source and layout. In
     // this RTL run, visual Left must not be aliased to logical Backward.
@@ -635,14 +635,15 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
     // converting that cluster, paragraph or document into a larger String.
     let nfdStart = edgeStart + 4, nfdEnd = nfdStart + 2, zwjEnd = nfdEnd + UInt64("👩🏽‍💻".utf16.count)
     let session = try XCTUnwrap(model.pagedSession)
-    let fullNFD = try await session.sealedGraphemeBoundary(atNativeUTF16: nfdStart + 1, forward: true)
-    let fullZWJ = try await session.sealedGraphemeBoundary(atNativeUTF16: nfdEnd + 2, forward: true)
-    let fullNFDStart = try await session.sealedGraphemeBoundary(atNativeUTF16: nfdStart + 1, forward: false)
-    let fullZWJStart = try await session.sealedGraphemeBoundary(atNativeUTF16: nfdEnd + 2, forward: false)
+    let logical = try session.captureLogicalRead()
+    let fullNFD = try await session.logicalGraphemeBoundary(logical, atNativeUTF16: nfdStart + 1, forward: true).utf16
+    let fullZWJ = try await session.logicalGraphemeBoundary(logical, atNativeUTF16: nfdEnd + 2, forward: true).utf16
+    let fullNFDStart = try await session.logicalGraphemeBoundary(logical, atNativeUTF16: nfdStart + 1, forward: false).utf16
+    let fullZWJStart = try await session.logicalGraphemeBoundary(logical, atNativeUTF16: nfdEnd + 2, forward: false).utf16
     XCTAssertEqual(fullNFD, nfdEnd); XCTAssertEqual(fullZWJ, zwjEnd)
     XCTAssertEqual(fullNFDStart, nfdStart); XCTAssertEqual(fullZWJStart, nfdEnd)
     XCTAssertEqual(model.pagedSelectedRecord, record)
-    XCTAssertEqual(session.canonicalHistory?.undo.count, undoCount)
+    XCTAssertEqual(Optional(try commands.captureLogicalHistory().undo.count), undoCount)
     XCTAssertFalse(commands.manager.canUndo); XCTAssertNil(input.firstRefusal)
 
     // Cocoa chooses an endpoint of the painted intersection; the managed
@@ -1001,7 +1002,7 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
     // or claim the removed SQL-era held-queue admission interleaving.
     let actualSave = try model.beginPagedWorkspaceSave()
     model.renameDocument(documentID, to: "After reserved save")
-    await actualSave.value
+    try await actualSave.value
     try await model.joinWorkspaceOperation()
     XCTAssertEqual(model.pagedSelectedRecord?.document.title, "After reserved save")
     XCTAssertEqual(model.pagedSelectedRecord?.document.revision, before.document.revision)
@@ -1017,7 +1018,7 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
     model.draft = "The reserved save must durably finish before shutdown."
     let finalSave = try model.beginPagedWorkspaceSave()
     let closing = Task { try await model.shutdown() }
-    await finalSave.value
+    try await finalSave.value
     try await closing.value
     XCTAssertNil(model.pagedEngine); XCTAssertNil(model.pagedViewport)
     XCTAssertTrue(engine.custodySnapshot.items.isEmpty)
@@ -1183,7 +1184,7 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
     try await commands.joinPendingCommand(); try await model.flush()
     let second = try await model.captureDocument(initial.document.id)
     XCTAssertEqual(second.completeSnapshot?.text, "ab")
-    XCTAssertEqual(session.canonicalHistory?.undo.count, 2)
+    XCTAssertEqual(Optional(try commands.captureLogicalHistory().undo.count), 2)
 
     commands.manager.undo(); try await commands.joinPendingCommand(); try await model.flush()
     let undone = try await model.captureDocument(initial.document.id)
@@ -1236,7 +1237,7 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
     try await commands.joinPendingCommand(); try await model.flush()
     view.setSelectedRange(NSRange(location: 4, length: 0))
     let record = try XCTUnwrap(model.pagedSelectedRecord), generation = session.generation
-    let selection = try input.currentDocumentSelection(), undoCount = session.canonicalHistory?.undo.count
+    let selection = try input.currentDocumentSelection(), undoCount = Optional(try commands.captureLogicalHistory().undo.count)
     let backing = view.string, selectionEpoch = try XCTUnwrap(view.inputBinding).selectionEpoch
 
     // UTF16 position2 is inside the actual emoji's surrogate pair. Neither
@@ -1251,7 +1252,7 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
     XCTAssertEqual(view.string, backing); XCTAssertEqual(view.selectedRange(), NSRange(location: 4, length: 0))
     XCTAssertEqual(try input.currentDocumentSelection(), selection)
     XCTAssertEqual(view.inputBinding?.selectionEpoch, selectionEpoch)
-    XCTAssertEqual(session.canonicalHistory?.undo.count, undoCount)
+    XCTAssertEqual(Optional(try commands.captureLogicalHistory().undo.count), undoCount)
     XCTAssertNil(view.boundedStorage.mutationFailure); XCTAssertNil(view.inputBinding?.firstRefusal)
     XCTAssertNil(input.firstRefusal); XCTAssertNil(model.errorMessage); XCTAssertNil(commands.firstFailure)
 
@@ -1262,7 +1263,7 @@ private struct BoundedWorkspaceCleanupFailure: Error, LocalizedError {
     try await commands.joinPendingCommand(); try await model.flush()
     let edited = try await model.captureDocument(initial.document.id)
     XCTAssertEqual(edited.completeSnapshot?.text, "A😀Zx")
-    XCTAssertEqual(session.canonicalHistory?.undo.count, (undoCount ?? 0) + 1)
+    XCTAssertEqual(Optional(try commands.captureLogicalHistory().undo.count), (undoCount ?? 0) + 1)
     commands.manager.undo(); try await commands.joinPendingCommand(); try await model.flush()
     let undone = try await model.captureDocument(initial.document.id)
     XCTAssertEqual(undone.completeSnapshot?.text, "A😀Z")

@@ -369,6 +369,7 @@ impl<S: PageProvider> TextEngine<S> {
 
 pub(super) struct ParagraphState {
     pub(super) revision: Revision,
+    logical: Option<LogicalSnapshot>,
     origin: TextSummary,
     include_line_endings: bool,
     at: TextSummary,
@@ -396,7 +397,34 @@ impl ParagraphState {
             engine.line_bounds(&doc, &revision, utf16)?.start
         };
         Ok(Self {
+            logical: None,
             revision,
+            origin,
+            include_line_endings,
+            at,
+            start: at,
+            pending_cr: None,
+            piece: None,
+            ready,
+            examined: 0,
+        })
+    }
+    pub(super) fn logical<S: PageProvider>(
+        engine: &mut TextEngine<S>,
+        snapshot: LogicalSnapshot,
+        utf16: u64,
+        include_line_endings: bool,
+    ) -> Result<Self> {
+        let origin = engine.logical_position(&snapshot, utf16, false)?.point();
+        let ready = engine.logical_paragraph_fast(&snapshot, origin, include_line_endings)?;
+        let at = if ready.is_some() {
+            origin
+        } else {
+            engine.logical_lf_line_start(&snapshot, origin)?
+        };
+        Ok(Self {
+            revision: snapshot.origin().clone(),
+            logical: Some(snapshot),
             origin,
             include_line_endings,
             at,
@@ -435,7 +463,13 @@ impl ParagraphState {
         if self.ready.is_some() {
             return Ok(self.progress());
         }
-        if self.at.bytes == self.revision.summary().bytes {
+        if self.at.bytes
+            == self
+                .logical
+                .as_ref()
+                .map_or_else(|| self.revision.summary(), LogicalSnapshot::summary)
+                .bytes
+        {
             if let Some(cr) = self.pending_cr.take() {
                 self.found(cr, self.at, false);
             }
@@ -449,7 +483,11 @@ impl ParagraphState {
                 });
             }
         } else if self.piece.is_none() {
-            self.piece = Some(engine.source_piece(&self.revision, self.at.bytes)?);
+            self.piece = Some(if let Some(logical) = &self.logical {
+                engine.logical_source_piece(logical, self.at.bytes)?
+            } else {
+                engine.source_piece(&self.revision, self.at.bytes)?
+            });
         } else {
             let piece = self
                 .piece

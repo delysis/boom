@@ -5,6 +5,9 @@ use std::io::{Seek, SeekFrom};
 use std::path::PathBuf;
 use unicode_segmentation::UnicodeSegmentation;
 
+#[path = "logical_tests.rs"]
+mod logical_controls;
+
 struct Row {
     owner: Uuid,
     document: Uuid,

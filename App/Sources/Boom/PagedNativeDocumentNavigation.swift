@@ -2,24 +2,6 @@ import AppKit
 import BoomCore
 import Foundation
 
-protocol PagedNativeDocumentNavigationStorage: PagedNativeSessionStorage {
-  func graphemeBoundary(expected: PagedTextRevision, utf16Offset: UInt64, forward: Bool) async throws -> PagedTextSummary
-  func paragraphBounds(expected: PagedTextRevision, utf16Offset: UInt64,
-    includeLineEndings: Bool) async throws -> PagedTextParagraphBounds
-  func documentPosition(expected: PagedTextRevision, utf16Offset: UInt64,
-    forward: Bool) async throws -> PagedTextSummary
-}
-
-extension PagedNativeDocumentNavigationStorage {
-  func paragraphBounds(expected: PagedTextRevision, utf16Offset: UInt64,
-    includeLineEndings: Bool) async throws -> PagedTextParagraphBounds {
-    throw BoomError.unavailable("This storage route has no document paragraph continuation.")
-  }
-  func graphemeBoundary(expected: PagedTextRevision, utf16Offset: UInt64, forward: Bool) async throws -> PagedTextSummary {
-    throw BoomError.unavailable("This storage route has no document grapheme continuation.")
-  }
-}
-
 /// Logical source commands only. Visual line and Left/Right commands keep
 /// their actual Cocoa geometry; a fragment is never treated as a paragraph.
 enum PagedNativeParagraphCommand {
@@ -51,8 +33,8 @@ enum PagedNativeParagraphCommand {
 }
 
 /// Presentation coordinates for the actual working arena. Projected extent
-/// includes local unsealed input; the immutable record remains the sealed
-/// authority. No summary/root or source digest is rewritten to describe it.
+/// describes the actual logical source; the separate record is its last saved
+/// checkpoint. No file revision is rewritten to describe unsaved text.
 struct PagedNativeDocumentCoordinates: Sendable {
   let record: PagedDocumentRootRecord
   let sessionID: UUID

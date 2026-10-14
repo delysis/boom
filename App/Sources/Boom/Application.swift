@@ -458,6 +458,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
     app.addItem(
       item("Quit Bloom", #selector(NSApplication.terminate(_:)), "q", target: NSApp))
     let file = submenu("File")
+    file.addItem(item("Save", #selector(saveWorkspace), "s", target: self))
     if model?.layout.isAuthor == true {
     file.addItem(item("New Document", #selector(newDocument), "n", target: self))
     file.addItem(item("New Chat", #selector(newChat), "n", [.command, .shift], target: self))
@@ -596,6 +597,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
   }
   @objc private func toggleDocument() { model?.toggle("document") }
   @objc private func toggleChat() { model?.toggle("chat") }
+  @objc private func saveWorkspace() { model?.save() }
   @objc private func newDocument() {
     do { try model?.newDocument() } catch { model?.report(error) }
   }

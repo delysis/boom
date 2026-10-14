@@ -1072,6 +1072,7 @@ fn callback_streams_preserve_unicode_exact_edits_and_joined_context_lifetime() {
     fragment_seek_steps(&mut host, &revision);
     paragraph_prefix_steps(&mut host, &revision);
     imported_tree_replacement(&mut host, &revision);
+    logical_native_controls(&mut host, &revision, source);
     assert_eq!(bloom_text_close(handle), 1);
     assert_eq!(
         response(handle, json!({"op":"stats"}), operation)["error"]["code"],
@@ -1088,4 +1089,303 @@ fn callback_streams_preserve_unicode_exact_edits_and_joined_context_lifetime() {
     );
     assert_eq!(bloom_text_close(fresh), 1);
     // All callbacks have joined before Host and its public pages are released.
+}
+
+fn logical_native_controls(host: &mut Host, revision: &Value, original: &str) {
+    use boom_attachment_ffi::*;
+    use std::mem::MaybeUninit;
+    fn empty() -> BoomAttachmentBuffer {
+        BoomAttachmentBuffer {
+            data: ptr::null_mut(),
+            length: 0,
+        }
+    }
+    unsafe fn check(status: i32, error: BoomAttachmentBuffer) {
+        let message = if error.data.is_null() {
+            String::new()
+        } else {
+            // SAFETY: actual error allocation is live until exactly-once free.
+            unsafe {
+                String::from_utf8_lossy(slice::from_raw_parts(error.data, error.length))
+                    .into_owned()
+            }
+        };
+        if !error.data.is_null() {
+            boom_attachment_free(error);
+        }
+        assert_eq!(status, 0, "{message}");
+    }
+    unsafe fn text_of(window: *const BloomLogicalWindow) -> String {
+        let mut info = MaybeUninit::<BloomLogicalWindowInfo>::uninit();
+        // SAFETY: actual retained window and writable metadata through return.
+        assert_eq!(
+            unsafe { bloom_logical_window_info(window, info.as_mut_ptr()) },
+            0
+        );
+        let info = unsafe { info.assume_init() };
+        assert!(info.text_length <= 24 * 1024);
+        unsafe {
+            std::str::from_utf8(slice::from_raw_parts(info.text, info.text_length))
+                .expect("native str")
+                .to_owned()
+        }
+    }
+    unsafe fn identity(snapshot: *const BloomLogicalSnapshot) -> [u8; 16] {
+        let mut info = MaybeUninit::<BloomLogicalSnapshotInfo>::uninit();
+        assert_eq!(
+            unsafe { bloom_logical_snapshot_info(snapshot, info.as_mut_ptr()) },
+            0
+        );
+        unsafe { info.assume_init().root_id }
+    }
+    let revision_json = serde_json::to_vec(revision).expect("actual bounded root");
+    let context = (host as *mut Host).cast();
+    let read_host = BloomTextHost {
+        schema: 3,
+        context,
+        read_page: Some(immutable_page_read),
+        write_page: None,
+    };
+    let operation = BloomTextOperation {
+        context,
+        is_cancelled: Some(cancelled),
+        ..Default::default()
+    };
+    // SAFETY: fixture owns all opaque handles and callback storage until each
+    // entered call returns. Every allocation below has an exact final free.
+    unsafe {
+        let mut source = ptr::null_mut();
+        let mut error = empty();
+        let status = bloom_logical_source_create(
+            revision_json.as_ptr(),
+            revision_json.len(),
+            &mut source,
+            &mut error,
+        );
+        check(status, error);
+        let mut before = ptr::null();
+        error = empty();
+        let status = bloom_logical_source_capture(source, 0, &mut before, &mut error);
+        check(status, error);
+        let mut window = ptr::null();
+        error = empty();
+        let status = bloom_logical_read_window(
+            read_host,
+            before,
+            0,
+            16_384,
+            operation,
+            &mut window,
+            &mut error,
+        );
+        check(status, error);
+        assert_eq!(text_of(window), original);
+        let pages = host.pages.len();
+        host.reject_read = true;
+        let insertion = "é🌱";
+        let mut edited = ptr::null();
+        let mut cursor = BloomLogicalPoint::default();
+        let mut changed = 0;
+        error = empty();
+        let status = bloom_logical_source_replace(
+            source,
+            window,
+            0,
+            0,
+            insertion.as_ptr(),
+            insertion.len(),
+            &mut edited,
+            &mut cursor,
+            &mut changed,
+            &mut error,
+        );
+        check(status, error);
+        assert_eq!(changed, 1);
+        assert_eq!(cursor.utf16, 3);
+        assert_eq!(text_of(edited), format!("{insertion}{original}"));
+        assert_eq!(
+            host.pages.len(),
+            pages,
+            "native edit neither reads nor writes the provider"
+        );
+        host.reject_read = false;
+        let mut old_read = ptr::null();
+        error = empty();
+        let status = bloom_logical_read_window(
+            read_host,
+            before,
+            0,
+            16_384,
+            operation,
+            &mut old_read,
+            &mut error,
+        );
+        check(status, error);
+        assert_eq!(text_of(old_read), original);
+        let mut current = ptr::null();
+        error = empty();
+        let status = bloom_logical_source_capture(source, 0, &mut current, &mut error);
+        check(status, error);
+        let id = identity(current);
+        let mut candidate = ptr::null();
+        let mut resident = 0;
+        error = empty();
+        let neutral_stage = "candidate🙂";
+        let total = original.encode_utf16().count() as u64 + 3;
+        let status = bloom_logical_source_prepare_replacement(
+            source,
+            edited,
+            0,
+            total,
+            neutral_stage.as_ptr(),
+            neutral_stage.len(),
+            &mut candidate,
+            &mut cursor,
+            &mut changed,
+            &mut resident,
+            &mut error,
+        );
+        check(status, error);
+        assert_eq!(resident, 1);
+        let mut unchanged = ptr::null();
+        error = empty();
+        let status = bloom_logical_source_capture(source, 0, &mut unchanged, &mut error);
+        check(status, error);
+        assert_eq!(
+            identity(unchanged),
+            id,
+            "preparation has not consumed/adopted the candidate"
+        );
+        bloom_logical_window_free(candidate);
+        bloom_logical_snapshot_free(unchanged);
+        // Abandoned candidate leaves the actual head and native window usable.
+        let mut later = ptr::null();
+        error = empty();
+        let status = bloom_logical_source_replace(
+            source,
+            edited,
+            insertion.len(),
+            insertion.len(),
+            b"!".as_ptr(),
+            1,
+            &mut later,
+            &mut cursor,
+            &mut changed,
+            &mut error,
+        );
+        check(status, error);
+        let mut frozen = ptr::null();
+        error = empty();
+        let status = bloom_logical_source_capture(source, 1, &mut frozen, &mut error);
+        check(status, error);
+        let reply = bloom_text_materialize_logical(host.handle, frozen, operation);
+        let materialized: Value =
+            serde_json::from_slice(slice::from_raw_parts(reply.data, reply.length))
+                .expect("actual logical candidate");
+        boom_attachment_free(reply);
+        assert_eq!(materialized["ok"], true, "{materialized}");
+        host.output.clear();
+        let actual_export = export_steps(host, &materialized["value"]);
+        assert_eq!(actual_export["ok"], true);
+        assert_eq!(host.output, format!("{insertion}!{original}").as_bytes());
+        error = empty();
+        let status = bloom_logical_source_restore(source, before, &mut error);
+        check(status, error);
+        let request = serde_json::to_vec(&json!({"kind":"linePrefix", "selection":{"start":0,
+            "length":original.encode_utf16().count(),"focusAtEnd":true}, "prefix":"> "}))
+        .expect("bounded command");
+        let mut command = ptr::null_mut();
+        error = empty();
+        let status = bloom_logical_command_begin(
+            read_host,
+            before,
+            request.as_ptr(),
+            request.len(),
+            operation,
+            &mut command,
+            &mut error,
+        );
+        check(status, error);
+        let mut needs_writer = false;
+        let mut complete = false;
+        for _ in 0..1000 {
+            let mut progress = empty();
+            error = empty();
+            let status = if needs_writer {
+                bloom_logical_command_writer_step(
+                    host.handle,
+                    command,
+                    operation,
+                    &mut progress,
+                    &mut error,
+                )
+            } else {
+                bloom_logical_command_step(read_host, command, operation, &mut progress, &mut error)
+            };
+            check(status, error);
+            let value: Value =
+                serde_json::from_slice(slice::from_raw_parts(progress.data, progress.length))
+                    .expect("real progress");
+            boom_attachment_free(progress);
+            assert!(
+                value["bufferedBytes"]
+                    .as_u64()
+                    .expect("actual fixed buffer")
+                    <= 131_072
+            );
+            needs_writer = value["needsWriter"].as_bool().expect("actual next step");
+            if value["complete"] == true {
+                complete = true;
+                break;
+            }
+        }
+        assert!(complete);
+        let mut formatted = ptr::null();
+        let mut result = empty();
+        error = empty();
+        let status = bloom_logical_command_finish(command, &mut formatted, &mut result, &mut error);
+        check(status, error);
+        let value: Value =
+            serde_json::from_slice(slice::from_raw_parts(result.data, result.length))
+                .expect("real selected result");
+        boom_attachment_free(result);
+        assert_eq!(value["kind"], "edit");
+        assert_eq!(
+            text_of(formatted),
+            original
+                .split_inclusive('\n')
+                .map(|line| format!("> {line}"))
+                .collect::<String>()
+        );
+        bloom_logical_command_free(command);
+        let mut head = ptr::null();
+        error = empty();
+        let status = bloom_logical_source_capture(source, 0, &mut head, &mut error);
+        check(status, error);
+        assert_eq!(
+            identity(head),
+            identity(before),
+            "worker prefix has not advanced native head"
+        );
+        let mut ready = ptr::null();
+        assert_eq!(bloom_logical_window_snapshot(formatted, &mut ready), 0);
+        bloom_logical_source_install_prepared(source, ready);
+        let mut installed = ptr::null();
+        error = empty();
+        let status = bloom_logical_source_capture(source, 0, &mut installed, &mut error);
+        check(status, error);
+        assert_eq!(identity(installed), identity(ready));
+        bloom_logical_snapshot_free(installed);
+        bloom_logical_snapshot_free(ready);
+        bloom_logical_snapshot_free(head);
+        bloom_logical_window_free(formatted);
+        bloom_logical_snapshot_free(frozen);
+        bloom_logical_window_free(later);
+        bloom_logical_snapshot_free(current);
+        bloom_logical_window_free(old_read);
+        bloom_logical_window_free(edited);
+        bloom_logical_window_free(window);
+        bloom_logical_snapshot_free(before);
+        bloom_logical_source_free(source);
+    }
 }

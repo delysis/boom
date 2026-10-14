@@ -16,8 +16,8 @@ import Foundation
   private var acknowledgedCharacterVersion: UUID?
   private var navigationEngine: PagedTextEngineAdapter?
   private var navigationPublisher: PagedWorkspacePublisher?
-  private var scrollProjection: PagedNativeScrollProjection?
-  private var scrollSnapshot: PagedNativeScrollSnapshot?
+  private var scrollProjection: PagedNativeLogicalWindow?
+  private var scrollSnapshot: PagedNativeLogicalReadSnapshot?
   private var scrollTask: Task<Void, Never>?
   private var requestedScroll: (id: UUID, anchor: UInt64)?
   private var displayRequest = UUID()
@@ -27,7 +27,7 @@ import Foundation
   private var closingPresentation = false
   private var presentationClosed = false
   private(set) var presentationFailure: Error?
-  var visibleScrollWindow: PagedNativeScrollProjection? { showingScroll ? scrollProjection : nil }
+  var visibleScrollWindow: PagedNativeLogicalWindow? { showingScroll ? scrollProjection : nil }
   var residentScrollWindowCount: Int { scrollProjection == nil ? 0 : 1 }
   var didRejectPresentation: ((Error) -> Void)?
 
@@ -108,7 +108,7 @@ import Foundation
     publisher: PagedWorkspacePublisher) throws {
     guard let input = managedInput, navigationEngine == nil, navigationPublisher == nil,
       !presentationClosed, engine.ownerID == publisher.ownerID,
-      publisher.ownerID == input.session.sealedRevision.ownerID else {
+      publisher.ownerID == input.session.logicalWindow.snapshot.sourceRevision.ownerID else {
       throw BoomError.denied("Document navigation requires its existing exact storage/input owners.")
     }
     try input.installDocumentNavigation(key: { [weak self] event, view in
@@ -175,7 +175,7 @@ import Foundation
     let start: UInt64
     let local: Int
     if showingScroll, let projection = scrollProjection, let surface = scrollSurface, let view = scrollText {
-      start = projection.utf16Start; local = visibleUTF16(in: view, surface: surface)
+      start = projection.start.utf16; local = visibleUTF16(in: view, surface: surface)
     } else { start = position.utf16Start; local = visibleUTF16(in: textView, surface: self) }
     let top = start.addingReportingOverflow(UInt64(local))
     guard !top.overflow else { throw BoomError.budget("Document scroll coordinate overflowed.") }
@@ -198,7 +198,7 @@ import Foundation
         if showingScroll, let projectedSurface = scrollSurface, let projectedView = scrollText {
           surface = projectedSurface; view = projectedView
         } else { surface = self; view = textView }
-        let start = showingScroll ? (scrollProjection?.utf16Start ?? coordinates.utf16Start) : coordinates.utf16Start
+        let start = showingScroll ? (scrollProjection?.start.utf16 ?? coordinates.utf16Start) : coordinates.utf16Start
         let local = visibleUTF16(in: view, surface: surface)
         let step = UInt64(max(1, visibleUTF16(in: view, surface: surface, atBottom: true) - local))
         let top = start.addingReportingOverflow(UInt64(local))
@@ -225,7 +225,7 @@ import Foundation
       try updateDocumentScroller()
       guard let input = managedInput, event.scrollingDeltaY != 0 else { return }
       let position = try input.session.documentCoordinates()
-      let start = showingScroll ? (scrollProjection?.utf16Start ?? position.utf16Start) : position.utf16Start
+      let start = showingScroll ? (scrollProjection?.start.utf16 ?? position.utf16Start) : position.utf16Start
       let bottom = max(0, view.frame.height - surface.contentSize.height)
       let atTop = surface.contentView.bounds.minY <= 0
       let atBottom = surface.contentView.bounds.minY >= bottom
@@ -265,15 +265,16 @@ import Foundation
         }
         guard let request = requestedScroll else { break }
         requestedScroll = nil
-        var captured: PagedNativeScrollSnapshot?
+        var captured: PagedNativeLogicalReadSnapshot?
         do {
-          let snapshot = try input.session.captureScrollSnapshot()
+          let snapshot = try input.session.captureLogicalRead()
           captured = snapshot
           let trace = PerformanceTrace.begin("Editor.ManagedScrollRead")
-          let output: PagedNativeScrollProjection
+          let output: PagedNativeLogicalWindow
           do {
             defer { PerformanceTrace.end("Editor.ManagedScrollRead", trace) }
-            output = try await engine.scrollProjection(snapshot, utf16Anchor: request.anchor)
+            output = try await engine.logicalWindow(snapshot.source, utf16Anchor: request.anchor,
+              maximumBytes: PagedWorkingWindow.targetBytes, cancellation: CancellationFlag())
           }
           // Saving an identical generation does not change the displayed text.
           // Actual later input or a different arena supersedes this read.
@@ -290,8 +291,10 @@ import Foundation
       }
     }
   }
-  private func showScrollSurface(_ window: PagedNativeScrollProjection) throws {
-    try window.validate()
+  private func showScrollSurface(_ window: PagedNativeLogicalWindow) throws {
+    guard window.summary.bytes <= UInt64(PagedWorkingWindow.targetBytes) else {
+      throw BoomError.budget("The logical scroll window exceeds its display bound.")
+    }
     if scrollSurface == nil {
       let storage = NSTextStorage(), manager = NSLayoutManager()
       manager.allowsNonContiguousLayout = true
@@ -339,8 +342,8 @@ import Foundation
     }
     let current = try input.session.documentCoordinates()
     guard input.session.isCurrent(snapshot) else { throw BoomError.stale("The visible projection has an earlier native edit generation.") }
-    try output.validateLocalPosition(local)
-    let absolute = output.utf16Start.addingReportingOverflow(UInt64(local))
+    _ = try output.position(localUTF16: local)
+    let absolute = output.start.utf16.addingReportingOverflow(UInt64(local))
     guard !absolute.overflow else { throw BoomError.budget("Scroll selection coordinate overflowed.") }
     let anchor = absolute.partialValue > 4096 ? absolute.partialValue - 4096 : 0
     // The read surface never becomes a keyboard client. An explicit selection
@@ -370,7 +373,28 @@ import Foundation
       view.scrollRangeToVisible(NSRange(location: focus, length: 0))
       return
     }
-    try owner.requestDocumentNavigation(toUTF16: anchor, selectingUTF16: selection, expected: current)
+    if !owner.hasPendingCommand, input.session.isCurrent(snapshot) {
+      // This is the exact logical window already displayed, not authority
+      // reconstructed from pixels or a saved file record. Adopt without I/O.
+      let observed = try input.observeSelection()
+      let ticket = try input.session.prepareLogicalWindowInstallation(output,
+        selectingUTF16: selection, owner: input)
+      do {
+        try input.stageNavigation(ticket, observedSelection: observed)
+        _ = try input.withStagedNavigationInstallation(ticket) { [self] old, new in
+          try mountManagedView(from: old, to: new)
+        }
+      } catch {
+        let original = error
+        if !ticket.wasConsumed {
+          do { try input.cancelNavigationStage(ticket) }
+          catch { throw PagedNativeNavigationCleanupFailure(original: original, cleanup: error) }
+        }
+        throw original
+      }
+    } else {
+      try owner.requestDocumentNavigation(toUTF16: anchor, selectingUTF16: selection, expected: current)
+    }
     revealEditableWindow()
   }
   private func moveDocument(_ selector: Selector, observed: PagedNativeSelectionObservation) throws {

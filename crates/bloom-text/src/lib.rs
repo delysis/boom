@@ -20,6 +20,14 @@ pub use paragraph::{ParagraphBounds, ParagraphProgress, ParagraphSummary};
 mod prefix;
 use prefix::LinePrefixState;
 pub use prefix::{LinePrefixProgress, LinePrefixResult};
+mod logical;
+pub use logical::{
+    LogicalEdit, LogicalPosition, LogicalSnapshot, LogicalSource, LogicalWindow, LogicalWindowSeed,
+    NATIVE_WINDOW_BYTES,
+};
+
+mod logical_commands;
+pub use logical_commands::{LogicalCommand, LogicalCommandRequest, LogicalCommandResult};
 
 pub const TEXT_PAGE_BYTES: usize = 64 * 1024;
 pub const INDEX_PAGE_BYTES: usize = 16 * 1024;

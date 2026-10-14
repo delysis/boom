@@ -143,8 +143,9 @@ enum GraphemeFetch {
     Piece(u64),
     Context(usize),
 }
-struct GraphemeSeekState {
+pub(super) struct GraphemeSeekState {
     revision: Revision,
+    logical: Option<LogicalSnapshot>,
     cursor: GraphemeCursor,
     forward: bool,
     piece: Option<SourcePiece>,
@@ -153,7 +154,7 @@ struct GraphemeSeekState {
     examined: u64,
 }
 impl GraphemeSeekState {
-    fn progress(&self) -> GraphemeSeekProgress {
+    pub(super) fn progress(&self) -> GraphemeSeekProgress {
         GraphemeSeekProgress {
             complete: self.ready.is_some(),
             result: self.ready,
@@ -161,9 +162,44 @@ impl GraphemeSeekState {
             examined_bytes: self.examined,
         }
     }
+    pub(super) fn logical<S: PageProvider>(
+        engine: &mut TextEngine<S>,
+        snapshot: LogicalSnapshot,
+        utf16: u64,
+        forward: bool,
+    ) -> Result<Self> {
+        let point = engine.logical_position(&snapshot, utf16, false)?.point();
+        let offset =
+            usize::try_from(point.bytes).map_err(|_| Error::Invalid("logical grapheme offset"))?;
+        let length = usize::try_from(snapshot.summary().bytes)
+            .map_err(|_| Error::Invalid("logical grapheme length"))?;
+        let endpoint = if forward {
+            offset == length
+        } else {
+            offset == 0
+        };
+        Ok(Self {
+            revision: snapshot.origin().clone(),
+            cursor: GraphemeCursor::new(offset, length, true),
+            ready: endpoint.then_some(if forward {
+                snapshot.summary()
+            } else {
+                TextSummary::EMPTY
+            }),
+            fetch: (!endpoint).then_some(GraphemeFetch::Piece(if forward {
+                point.bytes
+            } else {
+                point.bytes.saturating_sub(1)
+            })),
+            logical: Some(snapshot),
+            forward,
+            piece: None,
+            examined: 0,
+        })
+    }
     /// One piece/context fetch OR one cursor advance per call. A long cluster
     /// returns to the actual host/engine lane rather than yielding while locked.
-    fn step<S: PageProvider>(
+    pub(super) fn step<S: PageProvider>(
         &mut self,
         engine: &mut TextEngine<S>,
     ) -> Result<GraphemeSeekProgress> {
@@ -195,7 +231,11 @@ impl GraphemeSeekState {
                 )
                 .map_err(|_| Error::Invalid("grapheme context exceeds u64"))?,
             };
-            let piece = engine.source_piece(&self.revision, at)?;
+            let piece = if let Some(logical) = &self.logical {
+                engine.logical_source_piece(logical, at)?
+            } else {
+                engine.source_piece(&self.revision, at)?
+            };
             self.examined = self
                 .examined
                 .checked_add(
@@ -242,7 +282,9 @@ impl GraphemeSeekState {
             }
             Ok(None) => {
                 self.ready = Some(if self.forward {
-                    self.revision.summary()
+                    self.logical
+                        .as_ref()
+                        .map_or_else(|| self.revision.summary(), LogicalSnapshot::summary)
                 } else {
                     TextSummary::EMPTY
                 })
@@ -792,6 +834,7 @@ impl<S: PageProvider> TextEngine<S> {
         let owner = revision.owner_id;
         let document = revision.document_id;
         let state = GraphemeSeekState {
+            logical: None,
             revision,
             cursor: GraphemeCursor::new(offset, length, true),
             forward,

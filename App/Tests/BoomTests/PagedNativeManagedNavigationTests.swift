@@ -16,16 +16,15 @@ import XCTest
   var engine: PagedTextEngineAdapter?
   var publisher: PagedWorkspacePublisher?
   var backend: PagedNativeStorageBackend?
-  var route: PagedStagedControlledStorage?
+  var route: PagedNativeLogicalControlStorage?
   var session: PagedNativeSession?
   var input: PagedNativeInputOwner?
   var commands: PagedNativeUndoOwner?
-  var standaloneInput: PagedNativeInputOwner?
   var window: NSWindow?
   var scroll: PagedDocumentViewport?
   var sourceFile: FileHandle?
   private var outputs: [PagedTextRootLease] = []
-  private var enteredNavigation: [Task<PagedTextWindow, Error>] = []
+  private var enteredNavigation: [Task<PagedNativeLogicalWindow, Error>] = []
   private(set) var originalErrors: [Error] = []
   private(set) var mounts: [PagedNativeInputIdentity] = []
   private(set) var closed = false
@@ -75,7 +74,7 @@ import XCTest
     try await opened.saveState(state)
     let storage = try await actual.makeNativeStorage(pub, expected: record); backend = storage
     let opening = try await storage.opening(sessionID: UUID())
-    let forwarding = PagedStagedControlledStorage(storage); route = forwarding
+    let forwarding = PagedNativeLogicalControlStorage(storage); route = forwarding
     let source = try PagedNativeSession(opening: opening, storage: forwarding); session = source
     let physical = try PagedNativeInputOwner(frame: NSRect(x: 0, y: 0, width: 640, height: 320), session: source)
     input = physical
@@ -109,20 +108,44 @@ import XCTest
     host.documentView = physical.activeView
     try await PagedNativeFixtureApplication.focus(physical.activeView!, in: nativeWindow)
   }
-  func startNavigation(anchor: UInt64 = 48_000, caret: UInt64? = 50_000) throws -> Task<PagedTextWindow, Error> {
+  func startNavigation(anchor: UInt64 = 48_000, caret: UInt64? = 50_000) throws -> Task<PagedNativeLogicalWindow, Error> {
     guard enteredNavigation.count < 8, let commands else { throw BoomError.budget("Public navigation task/owner bound exceeded.") }
     let selection = caret.map { PagedNativeNavigationSelection(utf16Offset: $0, utf16Length: 0) }
     let task = Task { try await commands.navigate(toUTF16: anchor, selectingUTF16: selection) }
     enteredNavigation.append(task); return task
   }
-  func requireStale(_ task: Task<PagedTextWindow, Error>) async throws {
+  func requireStale(_ task: Task<PagedNativeLogicalWindow, Error>) async throws {
     do { _ = try await task.value }
     catch {
       let original = error; preserve(original)
-      guard case BoomError.stale = original else { throw original }
+      if !(original is CancellationError) {
+        guard case BoomError.stale = original else { throw original }
+      }
+      // Actual selection/source cancellation is a nonfatal joined read
+      // outcome. Preserve it and consume the corresponding owner diagnostic.
+      try await joinRefusedCommand(original: original)
       return
     }
     throw BoomError.invalid("An actual stale navigation unexpectedly adopted another physical view.")
+  }
+  func joinRefusedCommand(original: Error) async throws {
+    do { try await commands!.joinPendingCommand() }
+    catch {
+      preserve(error)
+      let same = String(reflecting: type(of: error)) == String(reflecting: type(of: original))
+        && error.localizedDescription == original.localizedDescription
+      // The actual ingress records its stale observation before canceling
+      // the reader. That separate original diagnostic can outlive the task's
+      // CancellationError; no other owner/source failure is accepted here.
+      let superseded: Bool
+      if case BoomError.stale(let message) = error,
+        message == "Selection or focus superseded its original bounded source read." {
+        if original is CancellationError { superseded = true }
+        else if case BoomError.stale = original { superseded = true }
+        else { superseded = false }
+      } else { superseded = false }
+      guard same || superseded else { throw error }
+    }
   }
   func replaceFirst(_ text: String) throws {
     let source = session!, before = source.generation
@@ -134,7 +157,7 @@ import XCTest
   func seal() async throws {
     let source = session!
     _ = try await source.flush(through: source.generation)
-    guard source.persistenceFailure == nil, source.historyFailure == nil, source.pendingCommitInstallation == nil,
+    guard source.persistenceFailure == nil, source.pendingCommitInstallation == nil,
       commands?.firstFailure == nil else { throw BoomError.unavailable("Actual native source or canonical receiving did not join.") }
   }
   func record() async throws -> PagedDocumentRootRecord {
@@ -146,7 +169,7 @@ import XCTest
     try await seal(); let record = try await record()
     let digest = try await engine!.wholeTextSha256(record.document.revision)
     XCTAssertEqual(digest, Digest.sha256(Data(expected.utf8)))
-    XCTAssertEqual(session?.canonicalHistory?.record, record)
+    XCTAssertEqual(session?.sealedRootRecord, record)
   }
   func key() throws -> NSEvent {
     try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
@@ -155,18 +178,18 @@ import XCTest
   }
   func close() async throws {
     for task in enteredNavigation { _ = await task.result } // actual entered task joins, including expected refusal
-    if let standaloneInput { try standaloneInput.retireInputForClose(); try standaloneInput.requireJoinedClose(); self.standaloneInput = nil }
     try await commands!.joinPendingCommand(); try await seal()
     let current = try await record()
+    try await scroll!.closePresentation()
     try commands!.closeInput(); try commands!.requireJoinedClose()
     _ = window?.makeFirstResponder(nil); scroll?.documentView = nil
     await route!.closeAndJoin()
     let joined = await route!.snapshot
     guard joined.activeCalls == 0, joined.startedCalls == joined.finishedCalls,
-      session!.activeNavigationOperationCount == 0, !session!.hasPendingHistoryCommand else {
+      session!.activeNavigationOperationCount == 0, !commands!.hasPendingCommand else {
       throw BoomError.unavailable("Actual navigation/source producers remain owned.")
     }
-    try await backend!.detachJoinedController(sessionID: session!.sessionID, sequence: session!.generation, record: current)
+    try await backend!.detachJoinedController(sessionID: session!.sessionID, sequence: session!.sealedGeneration, record: current)
     for lease in outputs { try await engine!.abandonJoinedRootOutput(lease) }
     outputs.removeAll()
     try await engine!.close()
@@ -211,6 +234,7 @@ import XCTest
       try await held.open(); try await body(held)
       guard (testRun?.failureCount ?? 0) == failures else { throw BoomError.invalid("Actual native assertion failed; owner/evidence retained.") }
       if retainedTerminal {
+        await held.route!.closeAndJoin()
         let joined = await held.route!.snapshot
         guard name == "testActualManagedMountRefusalRetainsMovedSourceAndInertOldClientWithoutReplayOrJoinedClose()",
           held.input?.firstRefusal != nil, held.commands?.firstFailure != nil,
@@ -241,16 +265,16 @@ import XCTest
       let oldClient = try XCTUnwrap(context.client as? PagedNativeTextInputClient)
       let oldIdentity = try XCTUnwrap(old.inputBinding?.identity), oldArena = source.arenaID
       let top = try XCTUnwrap(manager.undoActionUserInfoValue(forKey: Self.entryKey) as? NSObject)
-      let record = source.canonicalHistory?.record, sequence = source.generation
+      let record = source.sealedRootRecord, sequence = source.generation
       old.setSelectedRange(NSRange(location: 8_000, length: 0), affinity: .upstream, stillSelecting: false)
-      let task = try f.startNavigation(anchor: 6_000, caret: nil); let window = try await task.value
+      let task = try f.startNavigation(anchor: 17_000, caret: nil); let window = try await task.value
       XCTAssertTrue(f.input === input); XCTAssertTrue(f.commands === commands); XCTAssertTrue(f.session === source)
       XCTAssertTrue(commands.manager === manager); XCTAssertTrue(input.commandOwner === commands)
       XCTAssertFalse(f.view === old); XCTAssertNotEqual(source.arenaID, oldArena)
       XCTAssertEqual(input.activeIdentity?.arenaID, source.arenaID); XCTAssertEqual(source.generation, sequence)
-      XCTAssertEqual(source.canonicalHistory?.record, record)
+      XCTAssertEqual(source.sealedRootRecord, record)
       XCTAssertTrue((manager.undoActionUserInfoValue(forKey: Self.entryKey) as? NSObject) === top)
-      XCTAssertEqual(f.view.selectedRange(), NSRange(location: Int(8_000 - window.utf16Start), length: 0))
+      XCTAssertEqual(f.view.selectedRange(), NSRange(location: Int(8_000 - window.start.utf16), length: 0))
       XCTAssertEqual(f.view.selectionAffinity, .upstream); XCTAssertEqual(old.inputBinding?.state, .retired)
       XCTAssertEqual(oldClient.identity, oldIdentity); XCTAssertTrue(oldClient.isRetired)
       let currentBytes = Data(f.view.string.utf8), count = manager.undoCount
@@ -333,47 +357,39 @@ import XCTest
       try await f.assertSource(f.originalText)
     }
   }
-  func testQueuedUndoAndOriginalRawKeyInvalidateRecenterAndKeepChronologicalOwner() async throws {
+  func testQueuedUndoAndOriginalRawKeyFollowRealRecenterAndKeepChronologicalOwner() async throws {
     try await fixture(#function) { f in
-      try f.replaceFirst("A"); try await f.seal()
+      // A real insertion starts at a caret. Undo restores that actual empty
+      // selection, so the later original z inserts before the source.
+      f.view.setSelectedRange(NSRange(location: 0, length: 0))
+      f.view.insertText("A", replacementRange: f.view.selectedRange())
+      XCTAssertEqual(f.session!.generation, 1)
+      try await f.seal()
       let commands = f.commands!, manager = commands.manager
       let hold = try await f.route!.holdNext(.windowAfter), task = try f.startNavigation()
       try await f.route!.awaitHeld(hold)
       manager.undo(); f.view.keyDown(with: try f.key())
       XCTAssertEqual(commands.queuedRawKeyCount, 1); XCTAssertEqual(commands.unretainedRawKeyCount, 0)
-      try await f.route!.release(hold); try await f.requireStale(task)
+      try await f.route!.release(hold); _ = try await task.value
       try await commands.joinPendingCommand(); try await f.assertSource("z" + f.originalText)
       XCTAssertEqual(commands.queuedRawKeyCount, 0); XCTAssertEqual(commands.unretainedRawKeyCount, 0)
       XCTAssertNil(commands.firstFailure); XCTAssertNil(f.input!.firstRefusal); XCTAssertTrue(commands.manager === manager)
-      // Only the genuine Undo mount entered. No recenter-to48000 view adopted.
-      XCTAssertEqual(f.mounts.count, 1); XCTAssertEqual(f.session!.generation, 3)
-    }
-  }
-  func testDirectPrototypeNavigationRefusesActualInputOwnerWithoutGroupSubscription() async throws {
-    try await fixture(#function) { f in
-      try f.commands!.closeInput(); try f.commands!.requireJoinedClose()
-      let standalone = try PagedNativeInputOwner(frame: NSRect(x: 0, y: 0, width: 640, height: 320), session: f.session!)
-      f.standaloneInput = standalone
-      XCTAssertNil(standalone.commandOwner); XCTAssertEqual(standalone.activeView.inputBinding?.state, .active)
-      let before = await f.route!.snapshot, arena = f.session!.arenaID
-      var denied = false
-      do { _ = try await f.session!.navigate(toUTF16: 48_000) }
-      catch { f.preserve(error); guard case BoomError.denied = error else { throw error }; denied = true }
-      XCTAssertTrue(denied); XCTAssertEqual(f.session!.arenaID, arena)
-      let after = await f.route!.snapshot
-      XCTAssertEqual(after.startedCalls, before.startedCalls); XCTAssertEqual(after.finishedCalls, before.finishedCalls)
-      try standalone.retireInputForClose(); try standalone.requireJoinedClose(); f.standaloneInput = nil
+      // The requested navigation mounts first, then genuine Undo restores its own seed.
+      XCTAssertEqual(f.mounts.count, 2); XCTAssertEqual(f.session!.generation, 3)
     }
   }
   func testRequestedScalarInteriorCannotAdoptNewViewOrChangeCanonicalSource() async throws {
     try await fixture(#function) { f in
-      let old = f.view, arena = f.session!.arenaID, metadata = f.session!.canonicalHistory
+      let old = f.view, arena = f.session!.arenaID, metadata = f.session!.sealedRootRecord
       let task = try f.startNavigation(anchor: 72_000, caret: 72_197) // interior of actual🙂 surrogate pair
       var refused = false
       do { _ = try await task.value }
-      catch { f.preserve(error); guard case BoomError.invalid = error else { throw error }; refused = true }
+      catch {
+        f.preserve(error); guard case BoomError.invalid = error else { throw error }
+        try await f.joinRefusedCommand(original: error); refused = true
+      }
       XCTAssertTrue(refused); XCTAssertTrue(f.view === old); XCTAssertEqual(f.session!.arenaID, arena)
-      XCTAssertEqual(f.session!.canonicalHistory, metadata); XCTAssertTrue(f.mounts.isEmpty)
+      XCTAssertEqual(f.session!.sealedRootRecord, metadata); XCTAssertTrue(f.mounts.isEmpty)
       XCTAssertNil(f.input!.firstRefusal); XCTAssertNil(f.commands!.firstFailure)
       try await f.assertSource(f.originalText)
     }
@@ -384,14 +400,17 @@ import XCTest
       let old = f.view, input = f.input!, commands = f.commands!, source = f.session!
       let context = try XCTUnwrap(old.inputContext), manager = commands.manager
       let client = try XCTUnwrap(context.client as? PagedNativeTextInputClient)
-      let observed = try input.observeSelection(), record = source.canonicalHistory?.record
-      let joined = try source.windowForNativeInstallation(), before = await f.route!.snapshot
-      XCTAssertEqual(joined.byteStart, 0); XCTAssertEqual(joined.utf16Start, 0)
-      XCTAssertEqual(joined.text.utf8.count, 4_096); XCTAssertEqual(joined.revision.summary.bytes, 4_096)
+      let observed = try input.observeSelection(), record = source.sealedRootRecord
+      let joined = source.logicalWindow, before = await f.route!.snapshot
+      XCTAssertEqual(joined.start.bytes, 0); XCTAssertEqual(joined.start.utf16, 0)
+      XCTAssertEqual(joined.text.utf8.count, 4_096); XCTAssertEqual(joined.snapshot.summary.bytes, 4_096)
       let invalid = try f.startNavigation(anchor: 0, caret: 4_089) // actual emoji surrogate interior
       var refused = false
       do { _ = try await invalid.value }
-      catch { f.preserve(error); guard case BoomError.invalid = error else { throw error }; refused = true }
+      catch {
+        f.preserve(error); guard case BoomError.invalid = error else { throw error }
+        try await f.joinRefusedCommand(original: error); refused = true
+      }
       XCTAssertTrue(refused); XCTAssertTrue(f.view === old); XCTAssertEqual(try input.observeSelection(), observed)
       XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
       let reused = try await f.startNavigation(anchor: 0, caret: 1_024).value
@@ -400,7 +419,7 @@ import XCTest
       XCTAssertTrue(f.view === old); XCTAssertTrue(old.inputContext === context); XCTAssertFalse(client.isRetired)
       XCTAssertEqual(reused.windowID, joined.windowID); XCTAssertEqual(input.activeIdentity, observed.identity)
       XCTAssertEqual(source.arenaID, observed.identity.arenaID); XCTAssertEqual(source.generation, observed.generation)
-      XCTAssertEqual(source.canonicalHistory?.record, record); XCTAssertTrue(commands.manager === manager)
+      XCTAssertEqual(source.sealedRootRecord, record); XCTAssertTrue(commands.manager === manager)
       XCTAssertEqual(old.selectedRange(), NSRange(location: 1_024, length: 0)); XCTAssertTrue(f.mounts.isEmpty)
       XCTAssertEqual(try input.observeSelection().selectionEpoch, observed.selectionEpoch + 1)
       old.insertText("X", replacementRange: NSRange(location: NSNotFound, length: 0))
@@ -414,15 +433,15 @@ import XCTest
     try await fixture(#function) { f in
       let old = f.view, context = try XCTUnwrap(old.inputContext), source = f.session!, input = f.input!
       old.setSelectedRange(NSRange(location: 8_000, length: 0), affinity: .upstream, stillSelecting: false)
-      let observed = try input.observeSelection(), joined = try source.windowForNativeInstallation()
+      let observed = try input.observeSelection(), joined = source.logicalWindow
       XCTAssertEqual(joined.text.utf8.count, PagedWorkingWindow.targetBytes)
-      XCTAssertLessThan(UInt64(joined.text.utf8.count), joined.revision.summary.bytes)
-      let record = source.canonicalHistory?.record, before = await f.route!.snapshot
+      XCTAssertLessThan(UInt64(joined.text.utf8.count), joined.snapshot.summary.bytes)
+      let record = source.sealedRootRecord, before = await f.route!.snapshot
       let reused = try await f.startNavigation(anchor: 0, caret: nil).value
       let after = await f.route!.snapshot
       XCTAssertTrue(f.view === old); XCTAssertTrue(old.inputContext === context)
       XCTAssertEqual(reused.windowID, joined.windowID); XCTAssertEqual(try input.observeSelection(), observed)
-      XCTAssertEqual(source.canonicalHistory?.record, record); XCTAssertEqual(input.retainedClientCount, 1)
+      XCTAssertEqual(source.sealedRootRecord, record); XCTAssertEqual(input.retainedClientCount, 1)
       XCTAssertEqual(after.startedCalls, before.startedCalls); XCTAssertEqual(after.finishedCalls, before.finishedCalls)
       XCTAssertTrue(f.mounts.isEmpty); XCTAssertEqual(source.activeNavigationOperationCount, 0)
       XCTAssertNil(input.firstRefusal); XCTAssertNil(f.commands!.firstFailure)
@@ -433,17 +452,18 @@ import XCTest
     try await fixture(#function) { f in
       try f.replaceFirst(""); try await f.seal()
       let old = f.view, source = f.session!, input = f.input!, commands = f.commands!, manager = commands.manager
-      let joined = try source.windowForNativeInstallation(), before = await f.route!.snapshot
-      XCTAssertEqual(joined.utf16Start, 0); XCTAssertEqual(joined.text.utf8.count, PagedWorkingWindow.targetBytes - 1)
-      XCTAssertLessThan(joined.byteStart + UInt64(joined.text.utf8.count), joined.revision.summary.bytes)
-      let identity = input.activeIdentity, record = source.canonicalHistory?.record, sequence = source.generation
-      let refilled = try await f.startNavigation(anchor: 0, caret: 8).value
+      let joined = source.logicalWindow, before = await f.route!.snapshot
+      XCTAssertEqual(joined.start.utf16, 0); XCTAssertEqual(joined.text.utf8.count, PagedWorkingWindow.targetBytes - 1)
+      XCTAssertLessThan(joined.start.bytes + UInt64(joined.text.utf8.count), joined.snapshot.summary.bytes)
+      let identity = input.activeIdentity, record = source.sealedRootRecord, sequence = source.generation
+      let refilled = try await f.startNavigation(anchor: UInt64(PagedWorkingWindow.targetBytes), caret: 8).value
       let after = await f.route!.snapshot
-      XCTAssertEqual(after.startedCalls, before.startedCalls + 1); XCTAssertEqual(after.finishedCalls, before.finishedCalls + 1)
+      XCTAssertEqual(after.windowCalls, before.windowCalls + 1)
+      XCTAssertEqual(after.startedCalls, before.startedCalls + 3); XCTAssertEqual(after.finishedCalls, before.finishedCalls + 3)
       XCTAssertFalse(f.view === old); XCTAssertNotEqual(input.activeIdentity?.arenaID, identity?.arenaID)
       XCTAssertEqual(input.activeIdentity?.arenaID, source.arenaID); XCTAssertEqual(f.mounts.count, 1)
       XCTAssertNotEqual(refilled.windowID, joined.windowID); XCTAssertEqual(refilled.text.utf8.count, PagedWorkingWindow.targetBytes)
-      XCTAssertEqual(source.generation, sequence); XCTAssertEqual(source.canonicalHistory?.record, record)
+      XCTAssertEqual(source.generation, sequence); XCTAssertEqual(source.sealedRootRecord, record)
       XCTAssertTrue(commands.manager === manager); XCTAssertTrue(input.commandOwner === commands)
       var expected = f.originalText; expected.remove(at: expected.startIndex)
       try await f.assertSource(expected); XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
@@ -492,7 +512,7 @@ import XCTest
     let text = String(repeating: "q", count: count) + tail
     try await fixture(#function, text: text) { f in
       let commands = f.commands!, input = f.input!, source = f.session!, manager = commands.manager
-      let original = try await f.record()
+      let originalLogical = try source.captureLogicalState().source
       // The short native reference determines AppKit's actual endpoint and
       // selection conventions. Only its known first paragraph is stretched.
       func mapped(_ offset: Int) throws -> UInt64 {
@@ -517,7 +537,7 @@ import XCTest
         let selection = try input.currentDocumentSelection()
         let lower = try mapped(native.location), upper = try mapped(NSMaxRange(native))
         XCTAssertEqual(selection.utf16Offset, lower); XCTAssertEqual(selection.utf16Length, upper - lower)
-        XCTAssertEqual(source.sealedRevision, original.document.revision)
+        XCTAssertTrue(source.logicalWindow.snapshot.isSame(originalLogical))
         XCTAssertEqual(manager.undoCount, 0); XCTAssertNil(commands.firstFailure); XCTAssertNil(input.firstRefusal)
         XCTAssertLessThanOrEqual(f.view.boundedStorage.string.utf8.count, PagedWorkingWindow.targetBytes)
       }
@@ -530,16 +550,16 @@ import XCTest
       f.view.doCommand(by: NSSelectorFromString("deleteToEndOfParagraph:"))
       try await commands.joinPendingCommand(); try await f.assertSource(afterEnd)
       XCTAssertEqual(manager.undoCount, 1); XCTAssertTrue(oldClient.isRetired)
-      let changed = try await f.record()
+      let changed = try await f.record(), changedLogical = try source.captureLogicalState().source
       oldClient.insertText("OLD", replacementRange: NSRange(location: 0, length: 0))
       oldClient.doCommand(by: NSSelectorFromString("deleteToBeginningOfParagraph:"))
       XCTAssertEqual(source.sealedRevision, changed.document.revision)
       XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
       manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource(text)
-      XCTAssertEqual(source.sealedRevision, original.document.revision)
+      XCTAssertTrue(source.logicalWindow.snapshot.isSame(originalLogical))
       XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, UInt64(middle))
       manager.redo(); try await commands.joinPendingCommand(); try await f.assertSource(afterEnd)
-      XCTAssertEqual(source.sealedRevision, changed.document.revision)
+      XCTAssertTrue(source.logicalWindow.snapshot.isSame(changedLogical))
       manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource(text)
       f.view.doCommand(by: NSSelectorFromString("deleteToBeginningOfParagraph:"))
       try await commands.joinPendingCommand()
@@ -555,7 +575,7 @@ import XCTest
       f.view.doCommand(by: NSSelectorFromString("moveToEndOfParagraph:"))
       try await commands.joinPendingCommand()
       XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, second + secondLength)
-      XCTAssertEqual(source.sealedRevision, original.document.revision)
+      XCTAssertTrue(source.logicalWindow.snapshot.isSame(originalLogical))
       XCTAssertLessThanOrEqual(f.view.boundedStorage.string.utf8.count, PagedWorkingWindow.targetBytes)
     }
   }
@@ -616,18 +636,18 @@ import XCTest
         formattedAll += "> " + sourceText.substring(with: NSRange(location: offset, length: end - offset))
         offset = end
       }
-      let beforeAll = try await f.record()
+      let beforeAll = try await f.record(), beforeAllLogical = try source.captureLogicalState().source
       f.view.doCommand(by: NSSelectorFromString("selectAll:")); f.view.prefixLines("> ")
       try await commands.joinPendingCommand(); try await f.assertSource(formattedAll)
-      let afterAll = try await f.record()
+      let afterAll = try await f.record(), afterAllLogical = try source.captureLogicalState().source
       XCTAssertNotEqual(afterAll.document.revision, beforeAll.document.revision)
       XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, 0)
       XCTAssertEqual(try input.currentDocumentSelection().utf16Length, afterAll.document.revision.summary.utf16)
       XCTAssertLessThanOrEqual(f.view.boundedStorage.string.utf8.count, PagedWorkingWindow.targetBytes)
       manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource(afterY)
-      XCTAssertEqual(source.sealedRevision, beforeAll.document.revision)
+      XCTAssertTrue(source.logicalWindow.snapshot.isSame(beforeAllLogical))
       manager.redo(); try await commands.joinPendingCommand(); try await f.assertSource(formattedAll)
-      XCTAssertEqual(source.sealedRevision, afterAll.document.revision)
+      XCTAssertTrue(source.logicalWindow.snapshot.isSame(afterAllLogical))
       f.view.prefixLines("> ") // all lines carry the marker, so the real worker removes it
       try await commands.joinPendingCommand(); try await f.assertSource(afterY)
       manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource(formattedAll)
@@ -636,36 +656,50 @@ import XCTest
   }
 
 
-  func testActualHistoryPublicationDefersGlobalTypingAndParagraphDeletionUntilItsJoinedSource() async throws {
+  func testActualHeldSaveAllowsResidentUndoGlobalTypingAndParagraphDeletionBeforePublication() async throws {
     try await fixture(#function) { f in
-      try f.replaceFirst("A"); try await f.seal()
       let commands = f.commands!, input = f.input!, source = f.session!, manager = commands.manager
-      let hold = try await f.route!.holdNext(.historyBefore)
-      manager.undo()
-      try await f.route!.awaitHeld(hold) // real new arena, real history publication still pending
-      f.view.doCommand(by: NSSelectorFromString("selectAll:"))
-      let selected = PagedNativeNavigationSelection(utf16Offset: 0,
-        utf16Length: UInt64(f.originalText.utf16.count))
-      // The selection command itself is ordered ahead of typing and cannot
-      // operate on a source whose actual publication has not joined yet.
-      let generation = source.generation, visible = Data(f.view.string.utf8)
-      f.view.keyDown(with: try f.key()) // the original z cannot edit the provisional root
+      let original = source.sealedRootRecord, originalLogical = try source.captureLogicalState().source
+      let hold = try await f.route!.holdNext(.commitBefore)
+      try f.replaceFirst("A")
+      try await f.route!.awaitHeld(hold) // actual captured save, before its real backend call
+      let savedGeneration = source.sealedGeneration, beforeUndo = source.generation
+      manager.undo() // real seed restore and Foundation inverse complete synchronously
+      XCTAssertEqual(source.generation, beforeUndo + 1)
+      XCTAssertTrue(source.logicalWindow.snapshot.isSame(originalLogical))
+      XCTAssertEqual(source.sealedGeneration, savedGeneration); XCTAssertEqual(source.sealedRootRecord, original)
+      XCTAssertFalse(commands.hasPendingCommand); XCTAssertEqual(commands.queuedRawKeyCount, 0)
+      f.view.selectAll(nil) // the actual responder/menu selector owns the FULL source
+      let selected = try input.currentDocumentSelection()
+      XCTAssertEqual(selected.utf16Offset, 0)
+      XCTAssertEqual(selected.utf16Length, UInt64(f.originalText.utf16.count))
+      let generation = source.generation
+      f.view.keyDown(with: try f.key()) // actual z replaces the full source without a writer join
+      XCTAssertEqual(source.generation, generation + 1); XCTAssertEqual(f.view.string, "z")
+      XCTAssertEqual(commands.queuedRawKeyCount, 0); XCTAssertEqual(commands.unretainedRawKeyCount, 0)
       f.view.doCommand(by: NSSelectorFromString("deleteToBeginningOfParagraph:"))
-      XCTAssertEqual(commands.queuedRawKeyCount, 1)
-      XCTAssertEqual(source.generation, generation); XCTAssertEqual(Data(f.view.string.utf8), visible)
-      XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+      try await commands.joinPendingCommand()
+      XCTAssertEqual(source.logicalWindow.snapshot.summary.bytes, 0); XCTAssertEqual(f.view.string, "")
+      XCTAssertEqual(source.sealedRootRecord, original); XCTAssertEqual(source.sealedGeneration, savedGeneration)
+      XCTAssertEqual(manager.undoCount, 2); XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+      // All these source/history actions join while the SAME real save stays
+      // held. A distant retained selection may need its independent reader,
+      // but neither that read nor resident Undo waits for publication.
+      manager.undo(); try await commands.joinPendingCommand(); XCTAssertEqual(f.view.string, "z")
+      manager.undo(); try await commands.joinPendingCommand()
+      XCTAssertTrue(source.logicalWindow.snapshot.isSame(originalLogical))
+      XCTAssertEqual(try input.currentDocumentSelection(), selected)
+      manager.redo(); try await commands.joinPendingCommand(); XCTAssertEqual(f.view.string, "z")
+      manager.redo(); try await commands.joinPendingCommand(); XCTAssertEqual(f.view.string, "")
+      let latest = try source.captureLogicalState(), arena = source.arenaID
+      let stillHeld = await f.route!.snapshot
+      XCTAssertEqual(stillHeld.publicationCalls, 1); XCTAssertEqual(stillHeld.activeCalls, 1)
+      XCTAssertEqual(source.sealedRootRecord, original); XCTAssertEqual(source.sealedGeneration, savedGeneration)
       try await f.route!.release(hold)
-      try await commands.joinPendingCommand(); try await f.assertSource("")
-      // Typing replaces the full source once, then the later paragraph delete
-      // removes z. The original key is never appended behind that delete.
-      XCTAssertEqual(manager.undoCount, 2); XCTAssertEqual(commands.queuedRawKeyCount, 0)
-      manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource("z")
-      manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource(f.originalText)
-      XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, selected.utf16Offset)
-      XCTAssertEqual(try input.currentDocumentSelection().utf16Length, selected.utf16Length)
-      manager.redo(); try await commands.joinPendingCommand(); try await f.assertSource("z")
-      manager.redo(); try await commands.joinPendingCommand(); try await f.assertSource("")
-      XCTAssertNil(source.persistenceFailure); XCTAssertNil(source.historyFailure)
+      try await f.assertSource("")
+      XCTAssertTrue(source.isCurrent(latest)); XCTAssertEqual(source.arenaID, arena)
+      XCTAssertEqual(source.sealedGeneration, source.generation); XCTAssertTrue(commands.manager === manager)
+      XCTAssertNil(source.persistenceFailure); XCTAssertNil(source.pendingCommitInstallation)
       XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
     }
   }
@@ -675,19 +709,19 @@ import XCTest
     let expected = "> one\r\n> two\r> three\u{2029}> four\u{2028}> five\u{85}> six\n"
     try await fixture(#function, text: text) { f in
       let commands = f.commands!, input = f.input!, source = f.session!, manager = commands.manager
-      let original = try await f.record()
+      let originalLogical = try source.captureLogicalState().source
       f.view.doCommand(by: NSSelectorFromString("selectAll:")); f.view.prefixLines("> ")
       try await commands.joinPendingCommand(); try await f.assertSource(expected)
-      let prefixed = try await f.record()
+      let prefixedLogical = try source.captureLogicalState().source
       XCTAssertEqual(manager.undoCount, 1)
       XCTAssertEqual(try input.currentDocumentSelection().utf16Length, UInt64(expected.utf16.count))
       f.view.prefixLines("> ")
       try await commands.joinPendingCommand(); try await f.assertSource(text)
       XCTAssertEqual(manager.undoCount, 2)
       manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource(expected)
-      XCTAssertEqual(source.sealedRevision, prefixed.document.revision)
+      XCTAssertTrue(source.logicalWindow.snapshot.isSame(prefixedLogical))
       manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource(text)
-      XCTAssertEqual(source.sealedRevision, original.document.revision)
+      XCTAssertTrue(source.logicalWindow.snapshot.isSame(originalLogical))
       manager.redo(); try await commands.joinPendingCommand(); try await f.assertSource(expected)
       manager.redo(); try await commands.joinPendingCommand(); try await f.assertSource(text)
       XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
@@ -797,15 +831,17 @@ import XCTest
       let identity = input.activeIdentity, arena = source.arenaID, generation = source.generation
       let context = try XCTUnwrap(old.inputContext), manager = commands.manager
       let hold = try await f.route!.holdNext(.windowAfter)
-      let loading = try f.startNavigation(anchor: 6_000, caret: nil) // actual same logical selection
+      let loading = try f.startNavigation(anchor: 17_000, caret: nil) // actual same logical selection
       try await f.route!.awaitHeld(hold) // the genuine backend window call already entered/joined
-      XCTAssertFalse(commands.isNavigating); XCTAssertTrue(commands.hasPendingCommand)
+      XCTAssertFalse(commands.isNavigating); XCTAssertFalse(commands.hasPendingCommand)
       XCTAssertEqual(source.activeNavigationOperationCount, 1)
       let window = try XCTUnwrap(f.window)
       XCTAssertTrue(window.isKeyWindow); XCTAssertTrue(window.firstResponder === old)
       window.sendEvent(try f.key())
       XCTAssertEqual(source.generation, generation + 1)
-      XCTAssertTrue(source.needsRecentering, "The accepted island now exceeds targetBytes, while hardBytes still admits typing.")
+      XCTAssertFalse(source.needsRecentering, "The actual hardBytes reserve still admits local typing without another arena.")
+      XCTAssertGreaterThan(source.logicalWindow.summary.bytes, UInt64(PagedWorkingWindow.targetBytes))
+      XCTAssertLessThan(source.logicalWindow.summary.bytes, UInt64(PagedWorkingWindow.hardBytes))
       let next = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
         timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
         context: nil, characters: "q", charactersIgnoringModifiers: "q", isARepeat: false, keyCode: 12))

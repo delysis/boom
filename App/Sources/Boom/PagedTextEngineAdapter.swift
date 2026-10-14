@@ -55,6 +55,12 @@ private struct PagedWriteMetadata: Decodable {
   let kind: String
 }
 
+private final class PagedLogicalCommandHandle: @unchecked Sendable {
+  private(set) var pointer: OpaquePointer?
+  init(_ pointer: OpaquePointer) { self.pointer = pointer }
+  func release() { if let pointer { bloom_logical_command_free(pointer); self.pointer = nil } }
+  deinit { release() }
+}
 /// One borrowed document route on the existing engine queue.
 private final class PagedTextPageRouter {
   let ownerID: UUID
@@ -480,6 +486,404 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
     return value
   }
 
+  /// A captured source is pinned BEFORE yielding and borrowed only on the
+  /// independent existing read worker. The job joins before copied results
+  /// return; it never borrows the mutable writer router or activeCustody.
+  private func logicalRead<T: Sendable>(_ snapshot: PagedNativeLogicalSnapshot, payloadBytes: Int,
+    cancellation supplied: CancellationFlag,
+    body: @escaping @Sendable (BloomTextHost, BloomTextOperation) throws -> T) async throws -> T {
+    guard snapshot.engineIncarnation == custodyIncarnation, snapshot.sourceRevision.ownerID == ownerID,
+      (0...PagedTextWindow.maximumBytes).contains(payloadBytes) else {
+      throw BoomError.stale("Logical read crossed its actual source owner or bounded buffer.")
+    }
+    try supplied.check()
+    let lease = try rootCustody.reserve(engine: self, purpose: .operation(UUID()),
+      claims: [.source(snapshot.sourceRevision), .writerDocument(snapshot.sourceRevision.documentID)], payloadBytes: payloadBytes)
+    let cancellation = PagedTextCancellation()
+    let registration = supplied.onCancel { cancellation.cancel() }
+    defer { supplied.removeCancellationHandler(registration) }
+    return try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { continuation in
+        scrollReadQueue.async { [self] in
+          do {
+            try rootCustody.start(lease); try supplied.check()
+            let result = try autoreleasepool {
+              let reader = PagedImmutableScrollReadContext(root: sourceRoot, ownerID: ownerID,
+                storeID: sourceStoreID, documentID: snapshot.sourceRevision.documentID, cancellation: cancellation)
+              let pointer = Unmanaged.passUnretained(reader).toOpaque()
+              let host = BloomTextHost(schema: 3, context: pointer, read_page: pagedImmutableScrollRead, write_page: nil)
+              let operation = BloomTextOperation(context: pointer, read_stream: nil, write_stream: nil, is_cancelled: pagedImmutableScrollCancelled)
+              do {
+                let value = try withExtendedLifetime((snapshot, reader)) { try body(host, operation) }
+                if let failure = reader.failure { throw failure }; return value
+              } catch { throw reader.failure ?? error }
+            }
+            try supplied.check(); try rootCustody.finishRead(lease)
+            continuation.resume(returning: result)
+          } catch {
+            do {
+              if try rootCustody.joinedFailure(lease, error: error) {
+                continuation.resume(throwing: PagedTextCustodyFailure(original: error, lease: lease))
+              } else { continuation.resume(throwing: error) }
+            } catch let handoff {
+              continuation.resume(throwing: PagedTextCustodyHandoffFailure(original: error, handoff: handoff, lease: lease))
+            }
+          }
+        }
+      }
+    } onCancel: { supplied.cancel() }
+  }
+  func logicalWindow(_ snapshot: PagedNativeLogicalSnapshot, utf16Anchor: UInt64,
+    maximumBytes: Int, cancellation: CancellationFlag = CancellationFlag()) async throws -> PagedNativeLogicalWindow {
+    guard (4...PagedWorkingWindow.hardBytes).contains(maximumBytes), utf16Anchor <= snapshot.summary.utf16 else {
+      throw BoomError.invalid("Logical window is outside its bounded source.")
+    }
+    return try await logicalRead(snapshot, payloadBytes: maximumBytes, cancellation: cancellation) { host, operation in
+      var output: OpaquePointer?, error = BoomAttachmentBuffer(data: nil, length: 0)
+      try pagedLogicalResult(bloom_logical_read_window(host, snapshot.pointer, utf16Anchor, maximumBytes, operation, &output, &error), error)
+      guard let output else { throw BoomError.invalid("Logical reader returned no real island.") }
+      let window = try PagedNativeLogicalWindow(taking: output, sourceRevision: snapshot.sourceRevision,
+        sessionID: snapshot.sessionID, engineIncarnation: snapshot.engineIncarnation)
+      guard window.snapshot.isSame(snapshot) else { throw BoomError.invalid("Logical reader changed its immutable source.") }
+      return window
+    }
+  }
+  /// rounding is 0 for every explicit source endpoint, 1/2 only for generated
+  /// native movement anchors which may land inside a UTF16 surrogate pair.
+  func logicalPosition(_ snapshot: PagedNativeLogicalSnapshot, utf16Offset: UInt64,
+    rounding: UInt8 = 0, cancellation: CancellationFlag = CancellationFlag()) async throws -> PagedTextSummary {
+    guard utf16Offset <= snapshot.summary.utf16, rounding <= 2 else { throw BoomError.invalid("Invalid logical position.") }
+    return try await logicalRead(snapshot, payloadBytes: 0, cancellation: cancellation) { host, operation in
+      var point = BloomLogicalPoint(), error = BoomAttachmentBuffer(data: nil, length: 0)
+      try pagedLogicalResult(bloom_logical_read_position(host, snapshot.pointer, utf16Offset, rounding, operation, &point, &error), error)
+      return PagedTextSummary(bytes: point.bytes, utf16: point.utf16, lfCount: point.lf_count)
+    }
+  }
+  func logicalBytes(_ snapshot: PagedNativeLogicalSnapshot, byteRange: Range<UInt64>,
+    cancellation: CancellationFlag = CancellationFlag()) async throws -> Data {
+    guard byteRange.upperBound <= snapshot.summary.bytes,
+      let count = Int(exactly: byteRange.upperBound - byteRange.lowerBound), count <= PagedTextWindow.maximumBytes else {
+      throw BoomError.invalid("Logical byte read exceeds its bounded source.")
+    }
+    return try await logicalRead(snapshot, payloadBytes: count, cancellation: cancellation) { host, operation in
+      var output = BoomAttachmentBuffer(data: nil, length: 0), error = BoomAttachmentBuffer(data: nil, length: 0)
+      defer { if output.data != nil { boom_attachment_free(output) } }
+      try pagedLogicalResult(bloom_logical_read_bytes(host, snapshot.pointer, byteRange.lowerBound, byteRange.upperBound,
+        operation, &output, &error), error)
+      guard output.length == count else { throw BoomError.invalid("Logical byte read returned an incomplete range.") }
+      if count == 0 { return Data() }
+      guard let bytes = output.data else { throw BoomError.invalid("Logical byte read lost its buffer.") }
+      return Data(bytes: bytes, count: count)
+    }
+  }
+  func exportLogical(_ snapshot: PagedNativeLogicalSnapshot, to file: FileHandle,
+    byteRange suppliedRange: Range<UInt64>? = nil,
+    cancellation: CancellationFlag = CancellationFlag()) async throws {
+    let range = suppliedRange ?? 0..<snapshot.summary.bytes
+    guard range.upperBound <= snapshot.summary.bytes else { throw BoomError.invalid("Logical export is outside its captured source.") }
+    var at = range.lowerBound
+    while at < range.upperBound {
+      try cancellation.check()
+      let end = at + min(65_536, range.upperBound - at)
+      let bytes = try await logicalBytes(snapshot, byteRange: at..<end, cancellation: cancellation)
+      try await detachedWork { try cancellation.check(); try file.write(contentsOf: bytes) }
+      at = end; await Task.yield()
+    }
+    try cancellation.check()
+  }
+
+  func logicalReplacement(_ snapshot: PagedNativeLogicalSnapshot, selection: PagedNativeNavigationSelection,
+    replacement: Data, cancellation: CancellationFlag) async throws -> PagedNativeLogicalEdit {
+    let end = selection.utf16Offset.addingReportingOverflow(selection.utf16Length)
+    guard !end.overflow, end.partialValue <= snapshot.summary.utf16,
+      replacement.count <= PagedCapturedEditInput.maximumInputBytes else { throw BoomError.invalid("Logical replacement exceeds its actual source/input.") }
+    return try await logicalRead(snapshot, payloadBytes: max(replacement.count, PagedWorkingWindow.targetBytes), cancellation: cancellation) { host, operation in
+      var output: OpaquePointer?, cursor = BloomLogicalPoint(), changed: UInt8 = 0
+      var error = BoomAttachmentBuffer(data: nil, length: 0)
+      let status = replacement.withUnsafeBytes {
+        bloom_logical_prepare_replacement(host, snapshot.pointer, selection.utf16Offset, end.partialValue,
+          $0.bindMemory(to: UInt8.self).baseAddress, replacement.count, operation, &output, &cursor, &changed, &error)
+      }
+      try pagedLogicalResult(status, error)
+      guard let output else { throw BoomError.invalid("Logical replacement returned no candidate.") }
+      return try PagedNativeLogicalEdit(changed: changed != 0,
+        window: PagedNativeLogicalWindow(taking: output, sourceRevision: snapshot.sourceRevision,
+          sessionID: snapshot.sessionID, engineIncarnation: snapshot.engineIncarnation),
+        cursor: PagedTextSummary(bytes: cursor.bytes, utf16: cursor.utf16, lfCount: cursor.lf_count))
+    }
+  }
+
+  private func onLogicalReadQueue<T: Sendable>(_ body: @escaping @Sendable () throws -> T) async throws -> T {
+    try await withCheckedThrowingContinuation { continuation in
+      scrollReadQueue.async {
+        do { continuation.resume(returning: try autoreleasepool(invoking: body)) }
+        catch { continuation.resume(throwing: error) }
+      }
+    }
+  }
+  func prepareLogicalImportedSourceTransfer(_ imported: PagedTextCustodiedValue<PagedTextImportedRevision>,
+    controller: PagedTextRootLease, sessionID: UUID) throws -> () -> Void {
+    try rootCustody.prepareImportedSourceTransfer(imported, controller: controller, sessionID: sessionID)
+  }
+  func logicalCommand(_ snapshot: PagedNativeLogicalSnapshot, command request: PagedNativeLogicalCommand,
+    cancellation: CancellationFlag) async throws -> PagedNativeLogicalCommandResult {
+    guard snapshot.engineIncarnation == custodyIncarnation, snapshot.sourceRevision.ownerID == ownerID else {
+      throw BoomError.stale("Logical command belongs to another actual reader/source.")
+    }
+    var claims: [PagedTextRootClaim] = [.source(snapshot.sourceRevision), .writerDocument(snapshot.sourceRevision.documentID)]
+    if case .imported(_, let output) = request {
+      try rootCustody.admitJoinedSource(output.lease, revision: output.value.revision)
+      claims.append(.source(output.value.revision))
+    }
+    let capturedClaims = claims
+    let lease = try rootCustody.reserve(engine: self, purpose: .operation(UUID()), claims: capturedClaims,
+      payloadBytes: request.reservation())
+    var handle: PagedLogicalCommandHandle?
+    do {
+      // Hold the exact command/source pin through all steps, while each step
+      // yields the SAME read lane and discards its <=256KiB ephemeral cache.
+      try rootCustody.start(lease)
+      let payload = try await detachedWork { try JSONEncoder().encode(request.payload()) }
+      guard payload.count <= 1_048_576 else { throw BoomError.budget("Logical command encoding exceeds its actual fixed bound.") }
+      let command: PagedLogicalCommandHandle = try await logicalRead(snapshot, payloadBytes: 0, cancellation: cancellation) { host, operation in
+        var pointer: OpaquePointer?, error = BoomAttachmentBuffer(data: nil, length: 0)
+        let status = payload.withUnsafeBytes {
+          bloom_logical_command_begin(host, snapshot.pointer, $0.bindMemory(to: UInt8.self).baseAddress,
+            payload.count, operation, &pointer, &error)
+        }
+        try pagedLogicalResult(status, error)
+        guard let pointer else { throw BoomError.invalid("Logical command returned no actual continuation.") }
+        return PagedLogicalCommandHandle(pointer)
+      }
+      handle = command
+      struct Progress: Decodable, Sendable { let complete: Bool, bufferedBytes: Int, needsWriter: Bool }
+      var needsWriter = false
+      var appendedCandidate = false
+      while true {
+        let progress: Progress
+        if needsWriter {
+          let token = PagedTextCancellation()
+          let registration = cancellation.onCancel { token.cancel() }
+          defer { cancellation.removeCancellationHandler(registration) }
+          appendedCandidate = true
+          progress = try await onQueue(cancellation: token, custody: lease) {
+            try cancellation.check()
+            let context = try PagedTextOperationContext(cancellation: token)
+            try self.router.begin(document: snapshot.sourceRevision.documentID, writes: true,
+              beforeWrite: { try self.willWrite(snapshot.sourceRevision.documentID) })
+            defer { self.router.end() }
+            let operation = BloomTextOperation(context: Unmanaged.passUnretained(context).toOpaque(),
+              read_stream: nil, write_stream: nil, is_cancelled: pagedCancelled)
+            var output = BoomAttachmentBuffer(data: nil, length: 0), error = BoomAttachmentBuffer(data: nil, length: 0)
+            defer { if output.data != nil { boom_attachment_free(output) } }
+            let status = withExtendedLifetime(context) {
+              bloom_logical_command_writer_step(self.handle, command.pointer, operation, &output, &error)
+            }
+            if let failure = self.router.failure ?? context.failure {
+              if error.data != nil { boom_attachment_free(error) }; throw failure
+            }
+            try pagedLogicalResult(status, error)
+            guard let bytes = output.data, (1...4096).contains(output.length) else { throw BoomError.invalid("Invalid candidate append progress.") }
+            let value = try JSONDecoder().decode(Progress.self, from: Data(bytes: bytes, count: output.length))
+            guard (0...131_072).contains(value.bufferedBytes) else { throw BoomError.invalid("Candidate preparation exceeded its fixed buffers.") }
+            return value
+          }
+        } else { progress = try await logicalRead(snapshot, payloadBytes: 0, cancellation: cancellation) { host, operation in
+          var output = BoomAttachmentBuffer(data: nil, length: 0), error = BoomAttachmentBuffer(data: nil, length: 0)
+          defer { if output.data != nil { boom_attachment_free(output) } }
+          try pagedLogicalResult(bloom_logical_command_step(host, command.pointer, operation, &output, &error), error)
+          guard let bytes = output.data, (1...4096).contains(output.length) else { throw BoomError.invalid("Invalid logical command progress.") }
+          let value = try JSONDecoder().decode(Progress.self, from: Data(bytes: bytes, count: output.length))
+          guard (0...131_072).contains(value.bufferedBytes) else { throw BoomError.invalid("Logical command exceeded its bounded buffers.") }
+          return value
+        } }
+        if progress.complete { break }
+        needsWriter = progress.needsWriter
+        await Task.yield()
+      }
+      struct Result: Decodable {
+        let kind: String
+        let point: PagedTextSummary?
+        let bounds: PagedTextParagraphBounds?
+        let selection: PagedNativeLogicalCommand.Selection?
+        let changed: Bool?
+      }
+      let value: PagedNativeLogicalCommandResult = try await onLogicalReadQueue {
+        var window: OpaquePointer?, output = BoomAttachmentBuffer(data: nil, length: 0), error = BoomAttachmentBuffer(data: nil, length: 0)
+        var windowTaken = false
+        defer {
+          if output.data != nil { boom_attachment_free(output) }
+          if !windowTaken, let window { bloom_logical_window_free(window) }
+        }
+        try cancellation.check()
+        try pagedLogicalResult(bloom_logical_command_finish(command.pointer, &window, &output, &error), error)
+        guard let bytes = output.data, (1...4096).contains(output.length) else { throw BoomError.invalid("Invalid logical command result.") }
+        let result = try JSONDecoder().decode(Result.self, from: Data(bytes: bytes, count: output.length))
+        switch result.kind {
+        case "point":
+          guard let point = result.point, window == nil else { throw BoomError.invalid("Logical character result lost its actual point.") }
+          return .point(point)
+        case "paragraph":
+          guard let bounds = result.bounds, window == nil else { throw BoomError.invalid("Logical paragraph result lost its actual bounds.") }
+          return .paragraph(bounds)
+        case "edit":
+          guard let point = result.point, let selected = result.selection, let changed = result.changed, let window else {
+            throw BoomError.invalid("Logical command lost its actual candidate/selection.")
+          }
+          windowTaken = true
+          return .edit(try PagedNativeLogicalEdit(changed: changed,
+            window: PagedNativeLogicalWindow(taking: window, sourceRevision: snapshot.sourceRevision,
+              sessionID: snapshot.sessionID, engineIncarnation: snapshot.engineIncarnation),
+            cursor: point, selection: selected.native))
+        default: throw BoomError.invalid("Logical command returned another result kind.")
+        }
+      }
+      try await onLogicalReadQueue { command.release() }
+      handle = nil
+      try cancellation.check()
+      if appendedCandidate {
+        // The actual append steps and read callbacks joined. The installed
+        // editor controller retains this document; cold GC never runs live.
+        // This receives an unpublished candidate, not a file/native ACK.
+        try await onQueue(custody: lease) {
+          try self.rootCustody.finishOutput(lease, claims: capturedClaims, payloadBytes: 0,
+            inFlightWitness: self.inFlightWitness)
+          try self.rootCustody.abandonJoined(lease)
+        }
+      } else { try rootCustody.finishRead(lease) }
+      return value
+    } catch {
+      // Cleanup is not cancelled. The actual last reader/callback must return
+      // and its continuation/cache must die before the operation pin releases.
+      if let handle { try await onLogicalReadQueue { handle.release() } }
+      if try rootCustody.joinedFailure(lease, error: error) { throw PagedTextCustodyFailure(original: error, lease: lease) }
+      throw error
+    }
+  }
+
+  func publishLogicalRetaining(_ publication: PagedNativeLogicalPublication,
+    publisher: PagedWorkspacePublisher) async throws -> PagedTextCustodiedValue<PagedNativeCommitAcknowledgement> {
+    try await rootOutput(purpose: .nativeBatch(sessionID: publication.sessionID,
+        batchID: publication.publicationID, first: publication.firstSequence, last: publication.generation),
+      claims: [.record(publication.expectedRecord), .writerDocument(publication.expectedRecord.document.id), .workspace],
+      payloadBytes: PagedWorkingWindow.hardBytes, metadataBytes: PagedTextRootCustody.maximumNativeMetadataBytes,
+      outputClaims: { [.record(publication.expectedRecord), .record($0.sealedRootRecord),
+        .writerDocument(publication.expectedRecord.document.id), .workspace] },
+      outputBytes: { $0.sealedBytes + PagedNativeCanonicalHistoryProjection.chargedBytes },
+      nativeAcknowledgement: { $0 }, logicalInput: publication) {
+        try self.makeLogicalAcknowledgement(publication, publisher: publisher)
+      }
+  }
+  private func materializeLogical(_ snapshot: PagedNativeLogicalSnapshot) throws -> PagedTextRevision {
+    guard snapshot.engineIncarnation == custodyIncarnation, snapshot.sourceRevision.ownerID == ownerID,
+      handle != 0, !filesClosed else { throw BoomError.stale("Logical materialization has another engine.") }
+    try router.begin(document: snapshot.sourceRevision.documentID, writes: true,
+      beforeWrite: { try self.willWrite(snapshot.sourceRevision.documentID) })
+    defer { router.end() }
+    let operation = BloomTextOperation(context: nil, read_stream: nil, write_stream: nil, is_cancelled: nil)
+    let buffer = withExtendedLifetime(snapshot) { bloom_text_materialize_logical(handle, snapshot.pointer, operation) }
+    defer { boom_attachment_free(buffer) }
+    if let failure = router.failure { throw failure }
+    guard let bytes = buffer.data, (1...16_384).contains(buffer.length) else { throw BoomError.invalid("Logical materialization returned an invalid root.") }
+    let reply = try JSONDecoder().decode(Envelope<PagedTextRevision>.self, from: Data(bytes: bytes, count: buffer.length))
+    guard reply.schema == 1, reply.ok, let revision = reply.value,
+      revision.ownerID == ownerID, revision.documentID == snapshot.sourceRevision.documentID,
+      revision.summary == snapshot.summary else { throw BoomError.invalid(reply.error?.message ?? "Logical file candidate differs from its source.") }
+    try revision.validate(); return revision
+  }
+  private func makeLogicalAcknowledgement(_ publication: PagedNativeLogicalPublication,
+    publisher: PagedWorkspacePublisher) throws -> PagedNativeCommitAcknowledgement {
+    try admit(publisher); try publication.history.validate()
+    try publisher.admitCurrentRecord(publication.expectedRecord, validateRecord: { try self.admitNavigationRecord($0) })
+    let before = try withNativeHistory(documentID: publication.expectedRecord.document.id, writes: false) { try $0.load(publication.expectedRecord) }
+    let current = try materializeLogical(publication.history.snapshot)
+    func entry(_ value: PagedNativeLogicalHistoryEntry) throws -> PagedRootHistoryEntry {
+      let revision = try materializeLogical(value.snapshot)
+      let actual: UInt64 = try execute(Request(op: "position", revision: revision, utf16Offset: value.cursor.utf16Offset))
+      guard actual == value.cursor.byteOffset else { throw BoomError.invalid("Logical history cursor differs from its actual file candidate.") }
+      if value.cursor.selectionLengthUTF16 != 0 {
+        let end = value.cursor.utf16Offset.addingReportingOverflow(value.cursor.selectionLengthUTF16)
+        guard !end.overflow else { throw BoomError.invalid("Logical history selection overflow.") }
+        let _: UInt64 = try execute(Request(op: "position", revision: revision, utf16Offset: end.partialValue))
+      }
+
+      return PagedRootHistoryEntry(revision: revision, cursor: value.cursor.sealed, groupID: value.groupID)
+    }
+    let undo = try publication.history.undo.map(entry), redo = try publication.history.redo.map(entry)
+    let next = publication.expectedRecord.historyGeneration.addingReportingOverflow(1)
+    guard !next.overflow else { throw BoomError.budget("File history generation is exhausted.") }
+    let history = try PagedRootHistory(materializedCurrent: current, cursor: publication.history.cursor.sealed,
+      undo: undo, redo: redo, activeGroup: publication.history.activeGroup, generation: next.partialValue)
+    let actualCursor: UInt64 = try execute(Request(op: "position", revision: current, utf16Offset: history.currentCursor.utf16Offset))
+    guard actualCursor == history.currentCursor.byteOffset else { throw BoomError.invalid("Logical current cursor has another scalar endpoint.") }
+    if history.currentCursor.selectionLengthUTF16 != 0 {
+      let end = history.currentCursor.utf16Offset.addingReportingOverflow(history.currentCursor.selectionLengthUTF16)
+      guard !end.overflow else { throw BoomError.invalid("Logical current selection overflow.") }
+      let _: UInt64 = try execute(Request(op: "position", revision: current, utf16Offset: end.partialValue))
+    }
+
+    let anchor = publication.window
+    guard let count = Int(exactly: anchor.summary.bytes), count <= PagedWorkingWindow.hardBytes else {
+      throw BoomError.invalid("Logical publication must capture its bounded post-command window.")
+    }
+    let window: PagedTextWindow = try execute(Request(op: "window", revision: current, byteStart: anchor.start.bytes,
+      maximumBytes: max(4, count)))
+    let exactWindow = count == 0
+      ? PagedTextWindow(revision: current, windowID: window.windowID, byteStart: window.byteStart,
+          utf16Start: window.utf16Start, lfStart: window.lfStart, text: "") : window
+    let document = PagedDocumentDescriptor(id: publication.expectedRecord.document.id,
+      title: publication.expectedRecord.document.title, revision: current)
+    let record = try withNativeHistory(documentID: document.id, writes: true) { try $0.writeNew(history, document: document) }
+    try pinCandidate([.record(publication.expectedRecord), .record(record), .writerDocument(document.id), .workspace])
+    let canonical = try nativeCanonicalProjection(history: history, beforeHistory: before, record: record,
+      beforeRecord: publication.expectedRecord, scope: .nativeBatch(sessionID: publication.sessionID,
+        batchID: publication.publicationID, first: publication.firstSequence, last: publication.generation))
+    let ack = try PagedNativeCommitAcknowledgement(validating: publication, sealedWindow: exactWindow,
+      sealedRootRecord: record, canonicalHistory: canonical)
+    guard let lease = activeCustody else { throw BoomError.denied("Logical save lost its entered source job.") }
+    try rootCustody.stageNative(lease, acknowledgement: ack)
+    try willPublish()
+    _ = try publisher.publishDocument(record, expected: publication.expectedRecord, validateRecord: { try self.validateNativeRecord($0) })
+    try rootCustody.publicationCompleted(lease)
+    // Actual publication sync joined, not merely candidate tree construction.
+    try publication.history.snapshot.releaseSyncedInsertions()
+    for entry in publication.history.undo + publication.history.redo { try entry.snapshot.releaseSyncedInsertions() }
+    return ack
+  }
+  func inspectLogicalPublication(_ publication: PagedNativeLogicalPublication, custody: PagedTextRootLease,
+    publisher: PagedWorkspacePublisher) async throws -> PagedNativeCommitAcknowledgement? {
+    try await rootRead(claims: [.record(publication.expectedRecord), .workspace]) {
+      try self.admit(publisher)
+      let original = try self.rootCustody.logicalFailure(custody, publication: publication)
+      let actual = try publisher.currentRecord(id: publication.expectedRecord.document.id)
+      if actual == publication.expectedRecord { return nil }
+      guard let ack = original.acknowledgement, actual == ack.sealedRootRecord else {
+        throw BoomError.stale("Failed logical save has another complete file root; all native input remains owned.")
+      }
+      if !original.completed { try self.router.files().synchronizeDocument(ack.sealedRootRecord) }
+      try self.validateNativeRecord(ack.sealedRootRecord)
+      try self.rootCustody.recoverLogicalOutput(custody)
+      return ack
+    }
+  }
+  func retryLogicalBeforeRetaining(_ publication: PagedNativeLogicalPublication, custody: PagedTextRootLease,
+    publisher: PagedWorkspacePublisher) async throws -> PagedTextCustodiedValue<PagedNativeCommitAcknowledgement> {
+    try await onQueue(custody: custody) {
+      try self.admit(publisher)
+      try publisher.admitCurrentRecord(publication.expectedRecord, validateRecord: { try self.validateNativeRecord($0) })
+      try self.rootCustody.retryLogical(custody, publication: publication)
+      try self.rootCustody.start(custody)
+      do {
+        let ack = try self.makeLogicalAcknowledgement(publication, publisher: publisher)
+        try self.rootCustody.finishOutput(custody, claims: [.record(publication.expectedRecord), .record(ack.sealedRootRecord),
+          .writerDocument(publication.expectedRecord.document.id), .workspace],
+          payloadBytes: ack.sealedBytes + PagedNativeCanonicalHistoryProjection.chargedBytes,
+          inFlightWitness: self.inFlightWitness, nativeAcknowledgement: ack)
+        return PagedTextCustodiedValue(value: ack, lease: custody)
+      } catch { _ = try self.rootCustody.joinedFailure(custody, error: error); throw error }
+    }
+  }
+
   func makeWorkspacePublisher() async throws -> PagedWorkspacePublisher {
     try await onQueue { PagedWorkspacePublisher(store: try self.router.files()) }
   }
@@ -570,400 +974,6 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
     }
   }
 
-  func commitCapturedEditRetaining(_ input: PagedCapturedEditInput,
-    publisher: PagedWorkspacePublisher) async throws -> PagedTextCustodiedValue<PagedCapturedEditResult> {
-    if case .linePrefix(let selection, let prefix) = input.operation {
-      return try await commitLinePrefixRetaining(input, selection: selection, prefix: prefix, publisher: publisher)
-    }
-    var claims: [PagedTextRootClaim] = [.record(input.expected), .writerDocument(input.expected.document.id), .workspace]
-    if case .importedReplacement(_, let imported) = input.operation {
-      try rootCustody.admitJoinedSource(imported.lease, revision: imported.value.revision)
-      claims.append(.source(imported.value.revision))
-    }
-    return try await rootOutput(purpose: .capturedEdit(sessionID: input.sessionID, commandID: input.commandID, sequence: input.sequence),
-      claims: claims,
-      payloadBytes: PagedWorkingWindow.targetBytes, metadataBytes: PagedTextRootCustody.maximumNativeMetadataBytes,
-      outputClaims: { [.record(input.expected), .record($0.record), .writerDocument(input.expected.document.id), .workspace] },
-      outputBytes: { $0.window.text.utf8.count + PagedNativeCanonicalHistoryProjection.chargedBytes }, capturedInput: input) {
-      try self.makeCapturedEdit(input, publisher: publisher)
-    }
-  }
-
-  private struct LinePrefixProgress: Decodable, Sendable {
-    let complete: Bool
-    let processedBytes: UInt64
-    let examinedBytes: UInt64
-    let bufferedBytes: Int
-  }
-  private struct LinePrefixResult: Decodable, Sendable {
-    let revision: PagedTextRevision
-    let byteStart: UInt64
-    let byteEnd: UInt64
-    let utf16Start: UInt64
-    let utf16Length: UInt64
-    let removing: Bool
-    let changed: Bool
-  }
-
-  /// A long selection occupies one existing bulk slot and one source job.
-  /// Each source step yields this executor; only the final root enters history.
-  private func commitLinePrefixRetaining(_ input: PagedCapturedEditInput,
-    selection: PagedNativeNavigationSelection, prefix: String,
-    publisher: PagedWorkspacePublisher) async throws -> PagedTextCustodiedValue<PagedCapturedEditResult> {
-    let cancellation = PagedTextCancellation()
-    let lease = try rootCustody.reserve(engine: self,
-      purpose: .capturedEdit(sessionID: input.sessionID, commandID: input.commandID, sequence: input.sequence),
-      claims: [.record(input.expected), .writerDocument(input.expected.document.id), .workspace],
-      payloadBytes: 65_536, metadataBytes: PagedTextRootCustody.maximumNativeMetadataBytes, capturedInput: input)
-    let bulk: UUID
-    do { bulk = try executor.reserveBulk(cancellation, priority: .foreground); try rootCustody.start(lease) }
-    catch { _ = try rootCustody.joinedFailure(lease, error: error); throw error }
-    defer { executor.releaseBulk(bulk) }
-    do {
-      return try await withTaskCancellationHandler {
-        let id: UUID = try await onQueue(cancellation: cancellation, custody: lease) {
-          try self.admitCapturedEdit(input, publisher: publisher)
-          let end = selection.utf16Offset.addingReportingOverflow(selection.utf16Length)
-          guard !end.overflow, end.partialValue <= input.expected.document.revision.summary.utf16 else {
-            throw BoomError.invalid("Line prefix has another source selection.")
-          }
-          let id: UUID = try self.execute(Request(op: "line_prefix_begin", revision: input.expected.document.revision,
-            utf16Start: selection.utf16Offset, utf16End: end.partialValue, prefix: prefix), cancellation: cancellation)
-          try self.rootCustody.beganBulk(lease, operationID: id)
-          return id
-        }
-        let transformed: LinePrefixResult
-        do {
-          var processed: UInt64 = 0, examined: UInt64 = 0
-          while true {
-            let previousProcessed = processed, previousExamined = examined
-            let progress: LinePrefixProgress = try await onQueue(priority: .background, cancellation: cancellation, custody: lease) {
-              try self.execute(Request(op: "line_prefix_step", revision: input.expected.document.revision,
-                operationID: id), cancellation: cancellation, writes: true)
-            }
-            // Sharing a whole immutable subtree can advance processedBytes
-            // by more than one page without reading its text.
-            guard progress.processedBytes >= previousProcessed,
-              progress.examinedBytes >= previousExamined,
-              progress.examinedBytes - previousExamined <= 65_536,
-              (0...65_536).contains(progress.bufferedBytes) else {
-              throw BoomError.invalid("Line prefix exceeded its bounded source step.")
-            }
-            processed = progress.processedBytes; examined = progress.examinedBytes
-            if progress.complete { break }
-          }
-          transformed = try await onQueue(priority: .background, cancellation: cancellation, custody: lease) {
-            let result: LinePrefixResult = try self.execute(Request(op: "line_prefix_finish",
-              revision: input.expected.document.revision, operationID: id), cancellation: cancellation)
-            try result.revision.validate()
-            let end = result.utf16Start.addingReportingOverflow(result.utf16Length)
-            guard result.revision.ownerID == self.ownerID,
-              result.revision.documentID == input.expected.document.id,
-              result.byteStart <= result.byteEnd, result.byteEnd <= result.revision.summary.bytes,
-              result.byteStart <= input.expected.document.revision.summary.bytes,
-              result.utf16Start <= input.expected.document.revision.summary.utf16,
-              !end.overflow, end.partialValue <= result.revision.summary.utf16,
-              result.revision.summary.lfCount == input.expected.document.revision.summary.lfCount,
-              result.changed == (result.revision != input.expected.document.revision) else {
-              throw BoomError.invalid("Line prefix finish lost its actual source extent.")
-            }
-            let startByte: UInt64 = try self.execute(Request(op: "position", revision: result.revision,
-              utf16Offset: result.utf16Start), cancellation: cancellation)
-            let endByte: UInt64 = try self.execute(Request(op: "position", revision: result.revision,
-              utf16Offset: end.partialValue), cancellation: cancellation)
-            guard startByte == result.byteStart, endByte == result.byteEnd else {
-              throw BoomError.invalid("Line prefix selection lost its scalar coordinates.")
-            }
-            // Validate before joining: if the finish consumed its Rust token,
-            // the existing idempotent abort still supplies the exact join.
-            try self.rootCustody.joinedBulk(lease, operationID: id)
-            return result
-          }
-        } catch {
-          try await abort(id, documentID: input.expected.document.id, original: error, custody: lease)
-          throw error
-        }
-        return try await onQueue(cancellation: cancellation, custody: lease) {
-          let after = PagedNativeNavigationSelection(utf16Offset: transformed.utf16Start,
-            utf16Length: transformed.utf16Length, focusAtEnd: selection.focusAtEnd, affinity: selection.affinity)
-          let result = try self.publishCapturedCandidate(input, publisher: publisher, candidate: transformed.revision,
-            endpoint: transformed.byteEnd, afterSelection: after)
-          try self.rootCustody.finishOutput(lease,
-            claims: [.record(input.expected), .record(result.record), .writerDocument(input.expected.document.id), .workspace],
-            payloadBytes: result.window.text.utf8.count + PagedNativeCanonicalHistoryProjection.chargedBytes,
-            inFlightWitness: self.inFlightWitness)
-          return PagedTextCustodiedValue(value: result, lease: lease)
-        }
-      } onCancel: { cancellation.cancel() }
-    } catch {
-      if try rootCustody.joinedFailure(lease, error: error) { throw PagedTextCustodyFailure(original: error, lease: lease) }
-      throw error
-    }
-  }
-
-  private func admitCapturedEdit(_ input: PagedCapturedEditInput,
-    publisher: PagedWorkspacePublisher) throws {
-    try admit(publisher); try input.expected.validate(); try input.beforeCursor.validate(in: input.expected.document.revision)
-    let zero = UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
-    guard input.sessionID != zero, input.commandID != zero, input.groupID != zero, input.sequence > 0 else {
-      throw BoomError.invalid("Captured edit lacks an exact native command identity.")
-    }
-    try publisher.admitCurrentRecord(input.expected, validateRecord: { try self.validateNativeRecord($0) })
-    let beforeByte: UInt64 = try execute(Request(op: "position", revision: input.expected.document.revision,
-      utf16Offset: input.beforeCursor.utf16Offset))
-    guard beforeByte == input.beforeCursor.byteOffset else { throw BoomError.stale("Captured edit has another observed start cursor.") }
-    if input.beforeCursor.selectionLengthUTF16 > 0 {
-      let selectionEnd = input.beforeCursor.utf16Offset + input.beforeCursor.selectionLengthUTF16
-      let _: UInt64 = try execute(Request(op: "position", revision: input.expected.document.revision, utf16Offset: selectionEnd))
-    }
-    switch input.operation {
-    case .replacement, .importedReplacement, .linePrefix:
-      guard input.afterSelection == nil else { throw BoomError.invalid("This command uses its actual transformed source selection.") }
-    case .edits: break
-    }
-  }
-
-  private func makeCapturedEdit(_ input: PagedCapturedEditInput,
-    publisher: PagedWorkspacePublisher) throws -> PagedCapturedEditResult {
-    try admitCapturedEdit(input, publisher: publisher)
-    let zero = UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
-    var candidate = input.expected.document.revision
-    var endpoint: UInt64?
-    switch input.operation {
-    case .edits(let edits):
-      var previousStart: UInt64?, previousWasInsertion = false
-      for edit in edits {
-        guard edit.revision == input.expected.document.revision, edit.windowID != zero,
-          edit.byteStart <= edit.byteEnd, edit.byteEnd <= input.expected.document.revision.summary.bytes,
-          edit.byteEnd - edit.byteStart == UInt64(edit.oldBytes.count),
-          let old = String(data: edit.oldBytes, encoding: .utf8), let new = String(data: edit.newBytes, encoding: .utf8) else {
-          throw BoomError.stale("Captured edit has another immutable source or exact scalar range.")
-        }
-        if let previousStart {
-          guard edit.byteEnd <= previousStart,
-            !(previousWasInsertion && edit.byteStart == previousStart && edit.byteStart == edit.byteEnd) else {
-            throw BoomError.invalid("Captured edits must be nonoverlapping and ordered from tail to head.")
-          }
-        }
-        previousStart = edit.byteStart; previousWasInsertion = edit.byteStart == edit.byteEnd
-        // Even an unchanged primitive must authenticate its exact old bytes.
-        let prior = candidate
-        candidate = try execute(Request(op: "splice", revision: candidate, byteStart: edit.byteStart,
-          byteEnd: edit.byteEnd, oldText: old, newText: new), writes: true)
-        if candidate != prior {
-          let end = edit.byteStart.addingReportingOverflow(UInt64(edit.newBytes.count))
-          guard !end.overflow else { throw BoomError.budget("Captured edit cursor exceeds source coordinates.") }
-          endpoint = end.partialValue
-        }
-      }
-    case .replacement(let selection, let replacement):
-      let end = selection.utf16Offset.addingReportingOverflow(selection.utf16Length)
-      guard !end.overflow, end.partialValue <= input.expected.document.revision.summary.utf16,
-        let new = String(data: replacement, encoding: .utf8) else {
-        throw BoomError.invalid("User replacement has another exact global selection or UTF8 buffer.")
-      }
-      let startByte: UInt64 = try execute(Request(op: "position", revision: candidate, utf16Offset: selection.utf16Offset))
-      let endByte: UInt64 = try execute(Request(op: "position", revision: candidate, utf16Offset: end.partialValue))
-      candidate = try execute(Request(op: "replace_user_range", revision: candidate,
-        byteStart: startByte, byteEnd: endByte, newText: new), writes: true)
-      let afterByte = startByte.addingReportingOverflow(UInt64(replacement.count))
-      guard !afterByte.overflow else { throw BoomError.budget("Replacement cursor exceeds source coordinates.") }
-      endpoint = afterByte.partialValue
-    case .importedReplacement(let selection, let imported):
-      let insertion = imported.value.revision
-      try rootCustody.admitJoinedSource(imported.lease, revision: insertion)
-      try insertion.validate(); try admit(insertion); try validateDigest(imported.value.wholeTextSha256)
-      let end = selection.utf16Offset.addingReportingOverflow(selection.utf16Length)
-      guard !end.overflow, end.partialValue <= candidate.summary.utf16,
-        insertion.documentID == candidate.documentID else {
-        throw BoomError.stale("Streamed paste has another actual document or global selection.")
-      }
-      let startByte: UInt64 = try execute(Request(op: "position", revision: candidate, utf16Offset: selection.utf16Offset))
-      let endByte: UInt64 = try execute(Request(op: "position", revision: candidate, utf16Offset: end.partialValue))
-      // Empty insertion at an empty selection remains the existing verified
-      // no-op; it must not be marked as an entered page writer.
-      if startByte != endByte || insertion.summary.bytes != 0 {
-        candidate = try execute(Request(op: "replace_user_tree", revision: candidate,
-          retained: insertion, byteStart: startByte, byteEnd: endByte), writes: true)
-      }
-      let afterByte = startByte.addingReportingOverflow(insertion.summary.bytes)
-      guard !afterByte.overflow else { throw BoomError.budget("Streamed paste cursor exceeds source coordinates.") }
-      endpoint = afterByte.partialValue
-    case .linePrefix:
-      throw BoomError.invalid("Line prefix must enter its bounded source continuation.")
-    }
-    return try publishCapturedCandidate(input, publisher: publisher, candidate: candidate,
-      endpoint: endpoint, afterSelection: input.afterSelection)
-  }
-
-  /// All explicit source transforms publish the same complete history/root,
-  /// canonical projection and bounded cursor island exactly once.
-  private func publishCapturedCandidate(_ input: PagedCapturedEditInput,
-    publisher: PagedWorkspacePublisher, candidate: PagedTextRevision, endpoint: UInt64?,
-    afterSelection: PagedNativeNavigationSelection?) throws -> PagedCapturedEditResult {
-    try admit(publisher)
-    try publisher.admitCurrentRecord(input.expected, validateRecord: { try self.admitNavigationRecord($0) })
-    var history = try withNativeHistory(documentID: input.expected.document.id, writes: false) { try $0.load(input.expected) }
-    let beforeHistory = history
-    guard candidate != input.expected.document.revision, let endpoint else {
-      try publisher.admitCurrentRecord(input.expected, validateRecord: { try self.admitNavigationRecord($0) })
-      throw PagedCapturedEditUnchanged(record: input.expected, commandID: input.commandID)
-    }
-    let cursor: PagedSealedCursor
-    if let selection = afterSelection {
-      let end = selection.utf16Offset.addingReportingOverflow(selection.utf16Length)
-      guard !end.overflow, end.partialValue <= candidate.summary.utf16 else {
-        throw BoomError.invalid("Formatted selection exceeds its actual changed source.")
-      }
-      let startByte: UInt64 = try execute(Request(op: "position", revision: candidate, utf16Offset: selection.utf16Offset))
-      let _: UInt64 = try execute(Request(op: "position", revision: candidate, utf16Offset: end.partialValue))
-      cursor = PagedSealedCursor(byteOffset: startByte, utf16Offset: selection.utf16Offset,
-        selectionLengthUTF16: selection.utf16Length, focusAtEnd: selection.focusAtEnd, affinity: selection.affinity)
-    } else {
-      let position: PagedTextSummary = try execute(Request(op: "byte_position", revision: candidate, byteStart: endpoint))
-      try position.validate()
-      guard position.bytes == endpoint else { throw BoomError.invalid("Captured edit lost its exact changed endpoint.") }
-      cursor = PagedSealedCursor(byteOffset: position.bytes, utf16Offset: position.utf16)
-    }
-    try history.record(candidate, cursor: cursor, beforeCursor: input.beforeCursor, groupID: input.groupID)
-    let window = try nativeHistoryWindow(candidate, cursor: cursor)
-    let localCaret = cursor.focusUTF16 - window.utf16Start
-    guard let localCaretUTF16 = Int(exactly: localCaret) else { throw BoomError.budget("Captured caret exceeds the bounded native island.") }
-    let document = PagedDocumentDescriptor(id: input.expected.document.id, title: input.expected.document.title, revision: candidate)
-    let record = try withNativeHistory(documentID: document.id, writes: true) { try $0.writeNew(history, document: document) }
-    try pinCandidate([.record(input.expected), .record(record), .writerDocument(document.id), .workspace])
-    let undoLineage: [Int?]
-    if beforeHistory.activeGroup == input.groupID {
-      undoLineage = beforeHistory.undo.indices.map { Optional($0) }
-    } else {
-      let expired = beforeHistory.undo.count + 1 - history.undo.count
-      guard (0...1).contains(expired) else { throw BoomError.invalid("Captured Undo lineage has another expiry.") }
-      undoLineage = (expired..<beforeHistory.undo.count).map { Optional($0) } + [nil]
-    }
-    guard let producer = activeCustody else { throw BoomError.denied("Captured edit lost its entered source job.") }
-    let canonical = try PagedNativeCanonicalHistoryProjection(storageHistory: history, record: record,
-      beforeRecord: input.expected, beforeHistory: beforeHistory,
-      scope: .capturedEdit(sessionID: input.sessionID, commandID: input.commandID, sequence: input.sequence),
-      producer: producer, undoFromBefore: undoLineage, redoFromBefore: [])
-    let result = PagedCapturedEditResult(sessionID: input.sessionID, commandID: input.commandID, groupID: input.groupID,
-      sequence: input.sequence, beforeRecord: input.expected, record: record, window: window, cursor: cursor,
-      localCaretUTF16: localCaretUTF16, canonicalHistory: canonical)
-    try result.validate(); try rootCustody.stageCaptured(producer, result: result)
-    try willPublish()
-    let published = try publisher.publishDocument(record, expected: input.expected, validateRecord: { try self.validateNativeRecord($0) })
-    guard published.record == record else { throw BoomError.invalid("Captured file publication changed its complete root.") }
-    try rootCustody.publicationCompleted(producer)
-    return result
-  }
-
-  func finishCapturedEditCustody(_ controller: PagedTextRootLease, result: PagedCapturedEditResult,
-    publisher: PagedWorkspacePublisher) async throws {
-    try await onQueue(custody: controller) {
-      try self.admit(publisher)
-      try publisher.admitCurrentRecord(result.record, validateRecord: { try self.admitNavigationRecord($0) })
-      try self.rootCustody.finishCapturedInstallation(controller, result: result)
-    }
-  }
-
-  func commitNativeRetaining(_ batch: PagedNativeCommitBatch,
-    publisher: PagedWorkspacePublisher) async throws -> PagedTextCustodiedValue<PagedNativeCommitAcknowledgement> {
-    try await rootOutput(purpose: .nativeBatch(sessionID: batch.sessionID, batchID: batch.batchID,
-      first: batch.firstSequence, last: batch.lastSequence),
-      claims: [.record(batch.expectedRootRecord), .writerDocument(batch.expected.revision.documentID), .workspace],
-      payloadBytes: PagedWorkingWindow.hardBytes, metadataBytes: PagedTextRootCustody.maximumNativeMetadataBytes,
-      outputClaims: { [.record(batch.expectedRootRecord), .record($0.sealedRootRecord), .writerDocument(batch.expected.revision.documentID), .workspace] },
-      outputBytes: { $0.sealedBytes + PagedNativeCanonicalHistoryProjection.chargedBytes },
-      nativeAcknowledgement: { $0 }, nativeInput: batch) {
-      try self.makeNativeAcknowledgement(batch, publisher: publisher)
-    }
-  }
-  private func makeNativeAcknowledgement(_ batch: PagedNativeCommitBatch,
-    publisher: PagedWorkspacePublisher) throws -> PagedNativeCommitAcknowledgement {
-      try self.admit(publisher)
-      let plan = try PagedNativeCommitPlan(batch)
-      try self.willPublish() // Actual transaction publication, never a read-only mark.
-      try publisher.admitCurrentRecord(batch.expectedRootRecord,
-        validateRecord: { try self.validateNativeRecord($0) })
-      _ = try self.readNativeIsland(batch.expected.revision, anchor: batch.expected,
-        exactBytes: plan.initialBytes)
-      var history = try self.withNativeHistory(documentID: batch.expected.revision.documentID, writes: false) {
-        try $0.load(batch.expectedRootRecord)
-      }
-      let beforeHistory = history
-      var lineage = PagedNativeHistorySlotLineage(history)
-      var candidate = batch.expected.revision, priorBytes = plan.initialBytes
-      for step in plan.steps {
-        if case .epochOnly = step.kind, priorBytes != step.afterBytes {
-          throw BoomError.invalid("An epoch-only native step cannot change source bytes.")
-        }
-        if priorBytes != step.afterBytes {
-          let end = batch.expected.byteStart.addingReportingOverflow(UInt64(priorBytes.count))
-          guard !end.overflow, let old = String(data: priorBytes, encoding: .utf8),
-            let new = String(data: step.afterBytes, encoding: .utf8) else {
-            throw BoomError.invalid("Native candidate loses its exact scalar island.")
-          }
-          candidate = try self.execute(Request(op: "splice", revision: candidate,
-            byteStart: batch.expected.byteStart, byteEnd: end.partialValue, oldText: old, newText: new), writes: true)
-        }
-        let cursorByte = batch.expected.byteStart.addingReportingOverflow(UInt64(step.localCursorByte))
-        let cursorUTF16 = batch.expected.utf16Start.addingReportingOverflow(UInt64(step.localCursorUTF16))
-        guard !cursorByte.overflow, !cursorUTF16.overflow else {
-          throw BoomError.budget("Native candidate cursor exceeds global source coordinates.")
-        }
-        let cursor = PagedSealedCursor(byteOffset: cursorByte.partialValue, utf16Offset: cursorUTF16.partialValue,
-          selectionLengthUTF16: UInt64(step.localSelectionLengthUTF16),
-          focusAtEnd: step.localFocusAtEnd, affinity: step.localAffinity)
-        switch step.kind {
-        case .expiredGroupBaseline:
-          try history.advanceExpiredNativeGroups(to: candidate, cursor: cursor); lineage.expiredBaseline()
-        case .nativeGroup:
-          guard let groupID = step.groupID else { throw BoomError.invalid("A native history group has no captured identity.") }
-          guard let localBefore = step.beforeCursor else { throw BoomError.invalid("A native history group has no observed start cursor.") }
-          let beforeByte = batch.expected.byteStart.addingReportingOverflow(UInt64(localBefore.byteOffset))
-          let beforeUTF16 = batch.expected.utf16Start.addingReportingOverflow(UInt64(localBefore.utf16Offset))
-          guard !beforeByte.overflow, !beforeUTF16.overflow else {
-            throw BoomError.budget("Native group start cursor exceeds global source coordinates.")
-          }
-          let beforeCursor = PagedSealedCursor(byteOffset: beforeByte.partialValue, utf16Offset: beforeUTF16.partialValue,
-            selectionLengthUTF16: UInt64(localBefore.selectionLengthUTF16),
-            focusAtEnd: localBefore.focusAtEnd, affinity: localBefore.affinity)
-          let priorRevision = history.current, priorActive = history.activeGroup, priorCount = history.undo.count
-          try history.record(candidate, cursor: cursor, beforeCursor: beforeCursor, groupID: groupID)
-          guard let checkpoint = batch.groupCheckpoints.first(where: { $0.lastSequence == step.lastSequence && $0.groupID == groupID }) else {
-            throw BoomError.invalid("Canonical native lineage lost its actual bounded checkpoint.")
-          }
-          try lineage.nativeRecord(priorRevision: priorRevision, priorActive: priorActive,
-            priorUndoCount: priorCount, beforeCursor: beforeCursor, after: history, checkpoint: checkpoint)
-        case .epochOnly:
-          guard candidate == history.current else { throw BoomError.invalid("Native epoch advancement has another source root.") }
-          try history.advanceNativeEpoch(cursor: cursor)
-        }
-        priorBytes = step.afterBytes
-      }
-      let sealedWindow = try self.readNativeIsland(candidate, anchor: batch.expected, exactBytes: batch.afterBytes)
-      let document = PagedDocumentDescriptor(id: batch.expectedRootRecord.document.id,
-        title: batch.expectedRootRecord.document.title, revision: candidate)
-      let sealedRecord = try self.withNativeHistory(documentID: document.id, writes: true) {
-        try $0.writeNew(history, document: document)
-      }
-      try self.pinCandidate([.record(batch.expectedRootRecord), .record(sealedRecord),
-        .writerDocument(document.id), .workspace])
-      let canonical = try self.nativeCanonicalProjection(history: history, beforeHistory: beforeHistory,
-        record: sealedRecord, beforeRecord: batch.expectedRootRecord,
-        scope: .nativeBatch(sessionID: batch.sessionID, batchID: batch.batchID,
-          first: batch.firstSequence, last: batch.lastSequence), lineage: lineage)
-      let acknowledgement = try PagedNativeCommitAcknowledgement(validating: batch, sealedWindow: sealedWindow,
-        sealedRootRecord: sealedRecord, canonicalHistory: canonical)
-      guard let lease = activeCustody else { throw BoomError.denied("Native write lost its entered job.") }
-      try rootCustody.stageNative(lease, acknowledgement: acknowledgement)
-      let published = try publisher.publishDocument(sealedRecord, expected: batch.expectedRootRecord,
-        validateRecord: { try self.validateNativeRecord($0) })
-      guard published.record == sealedRecord else { throw BoomError.invalid("File publication changed its complete root.") }
-      try rootCustody.publicationCompleted(lease)
-      return acknowledgement
-
-  }
-
   private func admitNavigationRecord(_ record: PagedDocumentRootRecord) throws {
     try record.validate(); try admit(record.document.revision)
     let actual: PagedTextRevision = try execute(Request(op: "open", revision: record.document.revision))
@@ -1035,87 +1045,6 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
     }
   }
 
-  func prepareNativeHistoryMoveRetaining(_ command: PagedNativeHistoryMoveCommand, routeID: UUID,
-    publisher: PagedWorkspacePublisher) async throws -> PagedTextCustodiedValue<PagedNativePreparedHistoryMove> {
-    try await rootOutput(purpose: .nativePreparation(routeID: routeID, commandID: command.commandID),
-      claims: [.record(command.expectedRootRecord), .writerDocument(command.handle.documentID), .workspace],
-      payloadBytes: PagedWorkingWindow.targetBytes, metadataBytes: PagedTextRootCustody.maximumNativeMetadataBytes,
-      outputClaims: { [.record(command.expectedRootRecord), .record($0.candidateRecord),
-        .writerDocument(command.handle.documentID), .workspace] },
-      outputBytes: { $0.windowBytes + PagedNativeCanonicalHistoryProjection.chargedBytes }, preparation: { $0 }) {
-      try self.admit(publisher); try command.validate()
-      try publisher.admitCurrentRecord(command.expectedRootRecord,
-        validateRecord: { try self.validateNativeRecord($0) })
-      let planned = try self.plannedNativeHistory(command)
-      let history = planned.after
-      let window = try self.nativeHistoryWindow(history.current, cursor: history.currentCursor)
-      let localCaret = history.currentCursor.focusUTF16 - window.utf16Start
-      guard let localCaretUTF16 = Int(exactly: localCaret) else {
-        throw BoomError.budget("Retained history cursor exceeds native island coordinates.")
-      }
-      let document = PagedDocumentDescriptor(id: command.expectedRootRecord.document.id,
-        title: command.expectedRootRecord.document.title, revision: history.current)
-      let record = try self.withNativeHistory(documentID: document.id, writes: true) { store in
-        let written = try store.writeNew(history, document: document)
-        guard try store.load(written) == history else {
-          throw BoomError.invalid("Prepared history differs from the exact retained-root move.")
-        }
-        return written
-      }
-      try self.pinCandidate([.record(command.expectedRootRecord), .record(record),
-        .writerDocument(command.handle.documentID), .workspace])
-      try publisher.admitCurrentRecord(command.expectedRootRecord,
-        validateRecord: { try self.validateNativeRecord($0) })
-      return try PagedNativePreparedHistoryMove(validating: command, routeID: routeID,
-        candidateRecord: record, window: window, cursor: history.currentCursor,
-        localCaretUTF16: localCaretUTF16,
-        canonicalHistory: try self.nativeCanonicalProjection(history: history, beforeHistory: planned.before,
-          record: record, beforeRecord: command.expectedRootRecord,
-          scope: .historyCandidate(sessionID: command.sessionID, routeID: routeID,
-            commandID: command.commandID, expected: command.expectedSequence), lineage: planned.lineage))
-    }
-  }
-
-  private struct NativeHistoryPlan { let before: PagedRootHistory; let after: PagedRootHistory; let lineage: PagedNativeHistorySlotLineage }
-  private struct ValidatedNativeHistory { let window: PagedTextWindow; let plan: NativeHistoryPlan }
-  private func plannedNativeHistory(_ command: PagedNativeHistoryMoveCommand) throws -> NativeHistoryPlan {
-    try command.validate(); try admit(command.expectedRootRecord.document.revision)
-    var history = try withNativeHistory(documentID: command.handle.documentID, writes: false) {
-      try $0.load(command.expectedRootRecord)
-    }
-    let before = history
-    var lineage = PagedNativeHistorySlotLineage(history)
-    if let selection = command.canonicalSelection {
-      try selection.admit(record: command.expectedRootRecord, history: history,
-        sessionID: command.sessionID, sequence: command.expectedSequence, engineIncarnation: custodyIncarnation)
-    }
-    let entry = command.handle.direction == .undo ? history.undo.last : history.redo.last
-    guard let entry, entry.groupID == command.handle.groupID else {
-      throw BoomError.stale("Native history handle is not the exact next retained group in this direction.")
-    }
-    let target: PagedTextRevision = try execute(Request(op: "checkout",
-      revision: history.current, retained: entry.revision))
-    guard target == entry.revision else {
-      throw BoomError.invalid("Retained history checkout changed its exact immutable root.")
-    }
-    switch command.handle.direction {
-    case .undo: _ = try history.stepUndo(expected: command.expectedRootRecord.document.revision)
-    case .redo: _ = try history.stepRedo(expected: command.expectedRootRecord.document.revision)
-    }
-    guard history.current == target, history.currentCursor == entry.cursor else {
-      throw BoomError.invalid("Retained history move lost its selected root or cursor.")
-    }
-    // Cursor bounds alone do not prove exact byte/UTF16 agreement or scalar
-    // boundaries. This visits a tree path and one bounded source page.
-    let byte: UInt64 = try execute(Request(op: "position", revision: target,
-      utf16Offset: history.currentCursor.utf16Offset))
-    guard byte == history.currentCursor.byteOffset else {
-      throw BoomError.invalid("Retained history cursor differs from its actual source coordinates.")
-    }
-    lineage.moved(command.handle.direction)
-    return NativeHistoryPlan(before: before, after: history, lineage: lineage)
-  }
-
   private func nativeHistoryWindow(_ revision: PagedTextRevision,
     cursor: PagedSealedCursor) throws -> PagedTextWindow {
     try cursor.validate(in: revision)
@@ -1147,44 +1076,24 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
       let localCaret = Int(exactly: cursor.focusUTF16 - anchor) else {
       throw BoomError.invalid("Retained history projection has another root, anchor or cursor.")
     }
-    try PagedNativePreparedHistoryMove.validate(window: window, cursor: cursor, localCaretUTF16: localCaret)
+    var bytes = 0, units = 0
+    for scalar in window.text.unicodeScalars {
+      if units == localCaret { break }
+      let value = scalar.value
+      bytes += value < 0x80 ? 1 : value < 0x800 ? 2 : value < 0x10000 ? 3 : 4
+      units += value < 0x10000 ? 1 : 2
+    }
+    let focusByte = window.byteStart.addingReportingOverflow(UInt64(bytes))
+    guard units == localCaret, !focusByte.overflow,
+      cursor.focusUTF16 != cursor.utf16Offset || focusByte.partialValue == cursor.byteOffset else {
+      throw BoomError.invalid("History window does not contain its exact scalar focus.")
+    }
     return window
-  }
-
-  private func validatePreparedNativeHistory(_ prepared: PagedNativePreparedHistoryMove) throws -> ValidatedNativeHistory {
-    let planned = try plannedNativeHistory(prepared.command)
-    let history = planned.after
-    let expectedDocument = PagedDocumentDescriptor(id: prepared.command.handle.documentID,
-      title: prepared.command.expectedRootRecord.document.title, revision: history.current)
-    guard prepared.candidateRecord.document == expectedDocument,
-      prepared.candidateRecord.historyGeneration == history.generation,
-      prepared.cursor == history.currentCursor else {
-      throw BoomError.invalid("Prepared native history has another retained root, generation or exact cursor.")
-    }
-    let stored = try withNativeHistory(documentID: expectedDocument.id, writes: false) {
-      try $0.load(prepared.candidateRecord)
-    }
-    guard stored == history,
-      let canonical = prepared.canonicalHistory, canonical.record == prepared.candidateRecord,
-      canonical.beforeRecord == prepared.command.expectedRootRecord,
-      canonical.undo == history.undo, canonical.redo == history.redo, canonical.currentCursor == history.currentCursor,
-      canonical.activeGroup == history.activeGroup,
-      canonical.undoFromBefore == planned.lineage.undo, canonical.redoFromBefore == planned.lineage.redo,
-      canonical.producer.ownerID == ownerID, canonical.producer.engineIncarnation == custodyIncarnation,
-      canonical.scope == .historyCandidate(sessionID: prepared.command.sessionID, routeID: prepared.routeID,
-        commandID: prepared.command.commandID, expected: prepared.command.expectedSequence) else {
-      throw BoomError.invalid("prepared history differs from the admitted native move.")
-    }
-    let window = try readNativeIsland(history.current, anchor: prepared.window,
-      exactBytes: Data(prepared.window.text.utf8))
-    try PagedNativePreparedHistoryMove.validate(window: window, cursor: prepared.cursor,
-      localCaretUTF16: prepared.localCaretUTF16)
-    return ValidatedNativeHistory(window: window, plan: planned)
   }
 
   private func nativeCanonicalProjection(history: PagedRootHistory, beforeHistory: PagedRootHistory?,
     record: PagedDocumentRootRecord, beforeRecord: PagedDocumentRootRecord?,
-    scope: PagedNativeCanonicalHistoryProjection.Scope, lineage: PagedNativeHistorySlotLineage?) throws -> PagedNativeCanonicalHistoryProjection {
+    scope: PagedNativeCanonicalHistoryProjection.Scope) throws -> PagedNativeCanonicalHistoryProjection {
     dispatchPrecondition(condition: .onQueue(queue))
     guard let activeCustody, activeCustody.ownerID == ownerID,
       activeCustody.engineIncarnation == custodyIncarnation else {
@@ -1194,19 +1103,7 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
     guard claims.contains(.record(record)) else { throw BoomError.denied("Canonical metadata escaped actual full-record job custody.") }
     if let beforeRecord, !claims.contains(.record(beforeRecord)) { throw BoomError.denied("Canonical metadata lost its before-record job custody.") }
     return try PagedNativeCanonicalHistoryProjection(storageHistory: history, record: record,
-      beforeRecord: beforeRecord, beforeHistory: beforeHistory, scope: scope, producer: activeCustody,
-      undoFromBefore: lineage?.undo ?? history.undo.map { _ in nil },
-      redoFromBefore: lineage?.redo ?? history.redo.map { _ in nil },
-      resolutions: try lineage?.resolutions(history) ?? [])
-  }
-
-  private func nativePublishedProjection(_ prepared: PagedNativePreparedHistoryMove,
-    admission: PagedNativeHistoryAdmission, validated: ValidatedNativeHistory) throws -> PagedNativeCanonicalHistoryProjection {
-    try nativeCanonicalProjection(history: validated.plan.after, beforeHistory: validated.plan.before,
-      record: prepared.candidateRecord, beforeRecord: prepared.command.expectedRootRecord,
-      scope: .historyPublished(sessionID: admission.sessionID, routeID: prepared.routeID,
-        commandID: admission.commandID, preparationID: admission.preparationID,
-        expected: admission.expectedSequence, admitted: admission.admittedSequence), lineage: validated.plan.lineage)
+      beforeRecord: beforeRecord, beforeHistory: beforeHistory, scope: scope, producer: activeCustody)
   }
 
   func bindNativeOpeningCustody(_ controller: PagedTextRootLease, sessionID: UUID,
@@ -1229,35 +1126,12 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
       }
       try publisher.admitCurrentRecord(expected, validateRecord: { try self.validateNativeRecord($0) })
       let projection = try self.nativeCanonicalProjection(history: history, beforeHistory: nil,
-        record: expected, beforeRecord: nil, scope: .opening(sessionID: sessionID, windowID: window.windowID), lineage: nil)
+        record: expected, beforeRecord: nil, scope: .opening(sessionID: sessionID, windowID: window.windowID))
       return PagedNativeCanonicalOpening(sessionID: sessionID, record: expected, window: window,
         history: projection, localCaretUTF16: caret)
     }
   }
 
-  func commitNativeHistoryMoveRetaining(_ prepared: PagedNativePreparedHistoryMove,
-    admission: PagedNativeHistoryAdmission, publisher: PagedWorkspacePublisher)
-    async throws -> PagedTextCustodiedValue<PagedNativeHistoryAcknowledgement> {
-    try await rootOutput(purpose: .nativePublication(routeID: prepared.routeID, preparationID: prepared.preparationID),
-      claims: [.record(prepared.command.expectedRootRecord), .record(prepared.candidateRecord), .workspace],
-      payloadBytes: PagedWorkingWindow.targetBytes, metadataBytes: PagedTextRootCustody.maximumNativeMetadataBytes,
-      outputClaims: { _ in [.record(prepared.command.expectedRootRecord), .record(prepared.candidateRecord), .workspace] },
-      outputBytes: { $0.sealedBytes + PagedNativeCanonicalHistoryProjection.chargedBytes }) {
-      try self.admit(publisher); try admission.validate(for: prepared)
-      try publisher.admitCurrentRecord(prepared.command.expectedRootRecord, validateRecord: { try self.validateNativeRecord($0) })
-      let validated = try self.validatePreparedNativeHistory(prepared)
-      let acknowledgement = try PagedNativeHistoryAcknowledgement(validating: prepared, admission: admission,
-        publishedRecord: prepared.candidateRecord, readWindow: validated.window,
-        canonicalHistory: try self.nativePublishedProjection(prepared, admission: admission, validated: validated))
-      guard let lease = self.activeCustody else { throw BoomError.denied("History publication lost its actual producer.") }
-      try self.rootCustody.stageHistory(lease, prepared: prepared, acknowledgement: acknowledgement)
-      try self.willPublish()
-      _ = try publisher.publishDocument(prepared.candidateRecord, expected: prepared.command.expectedRootRecord,
-        validateRecord: { try self.validateNativeRecord($0) })
-      try self.rootCustody.publicationCompleted(lease)
-      return acknowledgement
-    }
-  }
   private func withNativeHistory<T>(documentID: UUID, writes: Bool,
     _ work: (PagedRootHistoryStore) throws -> T) throws -> T {
     try router.begin(document: documentID, writes: writes, beforeWrite: writes ? { try self.willWrite(documentID) } : nil)
@@ -1803,18 +1677,17 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
     cancellation: PagedTextCancellation? = nil, priority: PagedTextStorageExecutor.Priority = .foreground,
     outputClaims: @escaping @Sendable (T) throws -> [PagedTextRootClaim],
     outputBytes: @escaping @Sendable (T) -> Int = { _ in 0 },
-    preparation: (@Sendable (T) -> PagedNativePreparedHistoryMove)? = nil,
     nativeAcknowledgement: (@Sendable (T) -> PagedNativeCommitAcknowledgement)? = nil,
-    nativeInput: PagedNativeCommitBatch? = nil, capturedInput: PagedCapturedEditInput? = nil,
+    logicalInput: PagedNativeLogicalPublication? = nil,
     _ work: @escaping @Sendable () throws -> T) async throws -> PagedTextCustodiedValue<T> {
     let lease = try rootCustody.reserve(engine: self, purpose: purpose, claims: claims,
-      payloadBytes: payloadBytes, metadataBytes: metadataBytes, nativeInput: nativeInput, capturedInput: capturedInput)
+      payloadBytes: payloadBytes, metadataBytes: metadataBytes, logicalInput: logicalInput)
     do {
       return try await onQueue(priority: priority, cancellation: cancellation, custody: lease) {
         try self.rootCustody.start(lease)
         let value = try work()
         try self.rootCustody.finishOutput(lease, claims: outputClaims(value), payloadBytes: outputBytes(value),
-          inFlightWitness: self.inFlightWitness, preparation: preparation?(value), nativeAcknowledgement: nativeAcknowledgement?(value))
+          inFlightWitness: self.inFlightWitness, nativeAcknowledgement: nativeAcknowledgement?(value))
         return PagedTextCustodiedValue(value: value, lease: lease)
       }
     } catch {
@@ -1840,112 +1713,14 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
       try self.rootCustody.transferJoinedToHead(lease, record: expected)
     }
   }
-  func retainNativeHistoryIntent(_ prepared: PagedNativePreparedHistoryMove) throws -> PagedNativeRetainedHistoryIntent { try rootCustody.retainHistory(prepared, engine: self) }
-  func releaseRetainedHistoryIntent(_ receipt: PagedNativeRetainedHistoryIntent) throws { try rootCustody.resolvePrepared(receipt.lease, prepared: receipt.prepared, disposition: .explicitlyAbandoned) }
-  func resolvePreparedCustody(_ lease: PagedTextRootLease, prepared: PagedNativePreparedHistoryMove,
-    disposition: PagedNativeHistoryIntentDisposition) throws { try rootCustody.resolvePrepared(lease, prepared: prepared, disposition: disposition) }
-  func admitPreparedCustody(_ lease: PagedTextRootLease, prepared: PagedNativePreparedHistoryMove) throws { try rootCustody.admitHistoryPublication(lease, prepared: prepared) }
-  func verifyPreparedCustodyBefore(_ lease: PagedTextRootLease, prepared: PagedNativePreparedHistoryMove) throws { try rootCustody.verifiedHistoryBefore(lease, prepared: prepared) }
-  func absorbJoinedCustody(_ output: PagedTextRootLease, into receiver: PagedTextRootLease) throws { try rootCustody.absorbJoined(output, into: receiver) }
   func installNativeCustody(_ output: PagedTextRootLease, controller: PagedTextRootLease,
     expected: PagedDocumentRootRecord, record: PagedDocumentRootRecord) throws { try rootCustody.installControllerOutput(output, into: controller, expected: expected, record: record) }
-  func confirmNativeInputCustody(_ controller: PagedTextRootLease, sessionID: UUID, sequence: UInt64,
-    record: PagedDocumentRootRecord, publisher: PagedWorkspacePublisher) async throws {
-    try await onQueue(custody: controller) {
-      try self.admit(publisher); try publisher.admitCurrentRecord(record, validateRecord: { try self.admitNavigationRecord($0) })
-      try self.rootCustody.confirmNativeInput(controller, sessionID: sessionID, sequence: sequence, record: record)
-    }
-  }
   func finishNativeCommitCustody(_ controller: PagedTextRootLease,
     acknowledgement: PagedNativeCommitAcknowledgement, publisher: PagedWorkspacePublisher) async throws {
     try await onQueue(custody: controller) {
       try self.admit(publisher); try publisher.admitCurrentRecord(acknowledgement.sealedRootRecord, validateRecord: { try self.admitNavigationRecord($0) })
       try self.rootCustody.finishNativeCommit(controller, acknowledgement: acknowledgement)
     }
-  }
-  func finishNativeHistoryCustody(_ preparedLease: PagedTextRootLease, controller: PagedTextRootLease,
-    prepared: PagedNativePreparedHistoryMove, admission: PagedNativeHistoryAdmission,
-    record: PagedDocumentRootRecord, publisher: PagedWorkspacePublisher) async throws {
-    try await onQueue(custody: preparedLease) {
-      try self.admit(publisher); try publisher.admitCurrentRecord(record, validateRecord: { try self.admitNavigationRecord($0) })
-      try self.rootCustody.finishHistoryInstallation(preparedLease, controller: controller, prepared: prepared, admission: admission, record: record)
-    }
-  }
-  func admitRetainedNativeInput(_ lease: PagedTextRootLease, batch: PagedNativeCommitBatch) throws { try rootCustody.admitActualNativeInput(lease, batch: batch) }
-  enum NativeCommitInspection: Sendable { case before, native(PagedNativeCommitAcknowledgement) }
-  func inspectFailedNativeCommitRetaining(_ batch: PagedNativeCommitBatch, custody: PagedTextRootLease,
-    publisher: PagedWorkspacePublisher) async throws -> PagedTextCustodiedValue<NativeCommitInspection> {
-    let result: NativeCommitInspection = try await rootRead(claims: [.record(batch.expectedRootRecord), .workspace]) {
-      try self.admit(publisher)
-      let retained = try self.rootCustody.nativeFailure(custody, batch: batch)
-      let current = try publisher.currentRecord(id: batch.expectedRootRecord.document.id)
-      if current == batch.expectedRootRecord { return .before }
-      guard let acknowledgement = retained.acknowledgement, current == acknowledgement.sealedRootRecord else {
-        throw BoomError.stale("The failed edit has another saved document root; accepted input retained.")
-      }
-      if !retained.publicationComplete { try self.router.files().synchronizeDocument(acknowledgement.sealedRootRecord) }
-      try self.validateNativeRecord(acknowledgement.sealedRootRecord)
-      _ = try self.readNativeIsland(acknowledgement.sealedWindow.revision, anchor: acknowledgement.sealedWindow, exactBytes: batch.afterBytes)
-      try self.rootCustody.recoverNativeOutput(custody)
-      return .native(acknowledgement)
-    }
-    return PagedTextCustodiedValue(value: result, lease: custody)
-  }
-  func inspectInstalledNativeCommit(_ controller: PagedTextRootLease,
-    batch: PagedNativeCommitBatch, publisher: PagedWorkspacePublisher) async throws -> PagedNativeCommitAcknowledgement {
-    try await rootRead(claims: [.workspace]) {
-      try self.admit(publisher)
-      let acknowledgement = try self.rootCustody.borrowNativeAcknowledgement(controller, batch: batch)
-      try publisher.admitCurrentRecord(acknowledgement.sealedRootRecord, validateRecord: { try self.admitNavigationRecord($0) })
-      _ = try self.readNativeIsland(acknowledgement.sealedWindow.revision, anchor: acknowledgement.sealedWindow, exactBytes: batch.afterBytes)
-      return acknowledgement
-    }
-  }
-  func retryNativeCommitBeforeRetaining(_ custody: PagedTextRootLease,
-    publisher: PagedWorkspacePublisher) async throws -> PagedTextCustodiedValue<PagedNativeCommitAcknowledgement> {
-    let batch = try rootCustody.retryNative(custody)
-    do {
-      return try await onQueue(custody: custody) {
-        try self.rootCustody.start(custody)
-        let acknowledgement = try self.makeNativeAcknowledgement(batch, publisher: publisher)
-        try self.rootCustody.finishOutput(custody, claims: [.record(batch.expectedRootRecord), .record(acknowledgement.sealedRootRecord), .workspace],
-          payloadBytes: acknowledgement.sealedBytes + PagedNativeCanonicalHistoryProjection.chargedBytes,
-          inFlightWitness: self.inFlightWitness, nativeAcknowledgement: acknowledgement)
-        return PagedTextCustodiedValue(value: acknowledgement, lease: custody)
-      }
-    } catch { _ = try rootCustody.joinedFailure(custody, error: error); throw PagedTextCustodyFailure(original: error, lease: custody) }
-  }
-  private func inspectHistoryFile(_ prepared: PagedNativePreparedHistoryMove,
-    admission: PagedNativeHistoryAdmission, publisher: PagedWorkspacePublisher) throws -> PagedNativeHistoryPublicationInspection {
-    try self.admit(publisher); try admission.validate(for: prepared)
-    let current = try publisher.currentRecord(id: prepared.command.handle.documentID)
-    if current == prepared.command.expectedRootRecord { return .notPublished }
-    guard current == prepared.candidateRecord else { return .conflict(current) }
-    let retained = try rootCustody.historyOutput(for: prepared)
-    guard let acknowledgement = retained.acknowledgement,
-      acknowledgement.admittedSequence == admission.admittedSequence else { throw BoomError.stale("Saved history has no original admitted output.") }
-    if !retained.completed { try router.files().synchronizeDocument(prepared.candidateRecord) }
-    _ = try validatePreparedNativeHistory(prepared)
-    try rootCustody.recoverHistoryOutput(retained.lease)
-    return .published(acknowledgement)
-  }
-  func inspectNativeHistoryPublicationRetaining(_ prepared: PagedNativePreparedHistoryMove,
-    admission: PagedNativeHistoryAdmission, publisher: PagedWorkspacePublisher)
-    async throws -> PagedTextCustodiedValue<PagedNativeHistoryPublicationInspection> {
-    try await rootOutput(claims: [.record(prepared.command.expectedRootRecord), .record(prepared.candidateRecord)],
-      payloadBytes: PagedWorkingWindow.targetBytes, metadataBytes: PagedTextRootCustody.maximumNativeMetadataBytes,
-      outputClaims: { _ in [.record(prepared.command.expectedRootRecord), .record(prepared.candidateRecord)] },
-      outputBytes: { if case .published(let acknowledgement) = $0 { return acknowledgement.sealedBytes }; return 0 }) {
-      try self.inspectHistoryFile(prepared, admission: admission, publisher: publisher)
-    }
-  }
-  func repairFailedNativeHistoryPublicationRetaining(_ prepared: PagedNativePreparedHistoryMove,
-    admission: PagedNativeHistoryAdmission, custody: PagedTextRootLease, publisher: PagedWorkspacePublisher)
-    async throws -> PagedTextCustodiedValue<PagedNativeHistoryPublicationInspection> {
-    let result = try await rootRead(claims: [.record(prepared.command.expectedRootRecord), .record(prepared.candidateRecord)]) {
-      try self.inspectHistoryFile(prepared, admission: admission, publisher: publisher)
-    }
-    return PagedTextCustodiedValue(value: result, lease: custody)
   }
   func joinRetainedBulkFailure(_ lease: PagedTextRootLease, documentID: UUID) async throws {
     let token = try rootCustody.unresolvedBulk(lease)
