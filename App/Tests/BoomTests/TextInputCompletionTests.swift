@@ -90,7 +90,12 @@ final class TextInputCompletionTests: XCTestCase {
   @MainActor func testCapturedContextPreservesSpeakersAndExcludesLaterTurnsAndTextAfterCaret() async throws {
     let model = try await model(), chat = try XCTUnwrap(model.selectedChat)
     let target = TextInputTarget(chatID: chat.id, documentID: nil, messageID: chat.messages[1].id)
-    let compiled = try model.inputContext(target, text: "A new answer. AFTER", caret: "A new answer.".utf16.count)
+    let document = DocumentSnapshot(title: "Public input", text: "A new answer. AFTER")
+    let prepared = try await model.prepareInputContext(target, document: document,
+      caret: "A new answer.".utf16.count, flag: CancellationFlag())
+    let compiled = try XCTUnwrap(prepared).raw
+    XCTAssertEqual(prepared?.digest, try model.inputContextDigest(target))
+    XCTAssertEqual(prepared?.stamp, try model.inputContextStamp(target))
     XCTAssertEqual(compiled, "You: A question.\n\nBloom: A new answer.")
     XCTAssertFalse(compiled.contains("AFTER")); XCTAssertFalse(compiled.contains("An answer."))
     let old = try model.inputContextDigest(target)

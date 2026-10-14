@@ -19,6 +19,64 @@ struct TextInputCapture: Codable, Sendable {
   let caretUTF16: Int
 }
 
+/// Main-thread validity uses local ownership only. The encoded digest remains
+/// part of the captured generation; it is never replaced with this stamp.
+struct InputContextStamp: Equatable, Sendable {
+  struct Attachment: Equatable, Sendable {
+    let id: UUID
+    let rootDigest: String
+  }
+  let target: TextInputTarget
+  let chatVersion: UUID?
+  let attachments: [Attachment]
+}
+
+/// Value snapshots share immutable String/Array storage until an author edits.
+/// Encoding, history projection and prompt compilation run on the worker.
+struct InputContextSnapshot: Sendable {
+  let stamp: InputContextStamp
+  let chat: ChatRecord?
+  let pendingAttachments: [UUID]
+
+  func digests(cachedChatDigest: String? = nil) throws -> (chat: String, context: String) {
+    let chatDigest: String
+    if let chat {
+      if let cachedChatDigest { chatDigest = cachedChatDigest }
+      else {
+        let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
+        chatDigest = Digest.sha256(try encoder.encode(chat))
+      }
+    } else { return ("", Digest.sha256("null")) }
+    return (chatDigest, Digest.sha256(chatDigest + stamp.attachments.map {
+      $0.id.uuidString + $0.rootDigest
+    }.joined()))
+  }
+  func compile(text: String, caret: Int) throws -> String {
+    let target = stamp.target
+    var messages = chat?.messages ?? []
+    var speaker = "You"
+    if let messageID = target.messageID {
+      guard let index = messages.firstIndex(where: { $0.id == messageID }) else { throw BoomError.stale("Message changed.") }
+      speaker = messages[index].speaker?.name ?? (messages[index].role == .user ? "You" : "Bloom")
+      messages = Array(messages[..<index])
+    }
+    if target.instructions { messages = [] }
+    let turns = messages.filter { $0.state == .complete }.map {
+      PromptTurn(role: $0.role.rawValue, text: Self.mediaLinks($0.directAttachments ?? []) + $0.text,
+        speaker: $0.speaker ?? Speaker(name: $0.role == .user ? "You" : "Bloom"))
+    }
+    let mediaIDs = target.instructions ? [] : target.messageID.flatMap { id in
+      chat?.messages.first(where: { $0.id == id }).map { $0.directAttachments ?? [] }
+    } ?? pendingAttachments
+    let context = [chat?.instructions ?? "", Self.mediaLinks(mediaIDs)].filter { !$0.isEmpty }.joined(separator: "\n")
+    return try ProductCore.inputContext(instructions: target.instructions ? "" : context,
+      history: turns, speaker: speaker, text: text, caret: caret)
+  }
+  private static func mediaLinks(_ ids: [UUID]) -> String {
+    ids.map { "[Attachment: media](boom-attachment:\($0.uuidString))\n" }.joined()
+  }
+}
+
 @MainActor private final class InputCandidateProgress {
   var bundle: CandidateBundle
   let publish: @MainActor (CandidateBundle) -> Void
@@ -53,6 +111,7 @@ struct TextInputCapture: Codable, Sendable {
   private var epoch: UInt64 = 0
   private var caret = 0
   private var contextDigest: String?
+  private var contextStamp: InputContextStamp?
   private(set) var bundle: CandidateBundle?
   private var task: Task<Void, Never>?
   private var flag: CancellationFlag?
@@ -60,7 +119,7 @@ struct TextInputCapture: Codable, Sendable {
 
   init(model: WorkspaceModel, target: TextInputTarget) {
     self.model = model; self.target = target
-    if !model.isBusy { contextDigest = try? model.inputContextDigest(target) }
+    if !model.isBusy { contextStamp = try? model.inputContextStamp(target) }
     model.registerInputCompletion(self)
   }
   func update(selection: NSRange, marked: Bool, target: TextInputTarget) {
@@ -78,24 +137,24 @@ struct TextInputCapture: Codable, Sendable {
       invalidateGhost()
       if !view.movingGhostBoundary {
         bundle = nil
-        if model?.isBusy == true { contextDigest = nil }
-        else { contextDigest = try? model?.inputContextDigest(target) }
+        if model?.isBusy == true { contextStamp = nil }
+        else { contextStamp = try? model?.inputContextStamp(target) }
         view.endGhostBoundary()
       }
     }
     if !marked, selection.length == 0, !view.movingGhostBoundary { schedule() }
   }
   func refresh() {
-    // Streaming responses change the chat version on every publication. Input
-    // completion is unavailable while busy, so defer its full-context digest.
+    // A local ownership comparison keeps status/streaming refresh independent
+    // of the size of the stored chat. Encoding belongs to the captured worker.
     if model?.isBusy == true { invalidateGhost(); return }
-    guard let model, let digest = try? model.inputContextDigest(target) else {
-      invalidateGhost(); bundle = nil; contextDigest = nil; view?.endGhostBoundary(); return
+    guard let model, let stamp = try? model.inputContextStamp(target) else {
+      invalidateGhost(); bundle = nil; contextStamp = nil; contextDigest = nil; view?.endGhostBoundary(); return
     }
-    if contextDigest != nil && contextDigest != digest {
+    if contextStamp != nil && contextStamp != stamp {
       invalidateGhost(); bundle = nil; view?.endGhostBoundary()
     }
-    contextDigest = digest
+    contextStamp = stamp
     guard !model.isBusy, model.state.autocomplete else { invalidateGhost(); return }
     schedule()
   }
@@ -140,13 +199,14 @@ struct TextInputCapture: Codable, Sendable {
         guard let self, let model, self.epoch == capturedEpoch, self.eligible else { return }
         // Full-prefix validation belongs to this captured operation, after the
         // debounce, not every status, selection or native layout callback.
-        let prefix = try ProductCore.authoredPrefix(document, caret: capturedCaret)
-        guard !prefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        let digest = try model.inputContextDigest(target)
-        self.contextDigest = digest
+        guard let prepared = try await model.prepareInputContext(target, document: document,
+          caret: capturedCaret, flag: operation), self.epoch == capturedEpoch, self.eligible,
+          self.completionDocument?.textVersion == document.textVersion,
+          (try? model.inputContextStamp(target)) == prepared.stamp else { return }
+        let digest = prepared.digest, raw = prepared.raw, capturedContext = prepared.stamp
+        self.contextDigest = digest; self.contextStamp = capturedContext
         let capture = TextInputCapture(chatID: target.chatID, messageID: target.messageID,
           contextDigest: digest, snapshot: document, caretUTF16: capturedCaret)
-        let raw = try model.inputContext(target, text: document.text, caret: capturedCaret)
         let compiled = DocumentSnapshot(id: document.id, title: document.title, text: raw)
         let result = try await model.generateInputCandidates(document: compiled, capture: capture,
           count: count, previous: previous, flag: operation,
@@ -160,7 +220,7 @@ struct TextInputCapture: Codable, Sendable {
                 sourceOwner.completionDocument?.textVersion == document.textVersion,
                 sourceOwner.view?.sourceVersion == sourceOwner.documentSourceVersion,
                 sourceOwner.caret == capturedCaret, sourceOwner.target == target,
-                (try? workspaceOwner.inputContextDigest(target)) == digest,
+                (try? workspaceOwner.inputContextStamp(target)) == capturedContext,
                 sourceOwner.view?.hasMarkedText() == false else {
                 throw BoomError.stale("The input source changed before prompt-cache publication.")
               }
@@ -169,7 +229,7 @@ struct TextInputCapture: Codable, Sendable {
             guard let self, self.epoch == capturedEpoch, !operation.isCancelled,
               self.completionDocument?.textVersion == document.textVersion,
               self.view?.sourceVersion == self.documentSourceVersion, self.caret == capturedCaret,
-              self.target == target, (try? self.model?.inputContextDigest(target)) == digest,
+              self.target == target, (try? self.model?.inputContextStamp(target)) == capturedContext,
               self.view?.hasMarkedText() == false else { operation.cancel(); return }
             var displayed = bundle
             if let prior = self.bundle, prior.id == bundle.id { displayed.selected = prior.selected }
@@ -212,8 +272,8 @@ struct TextInputCapture: Codable, Sendable {
     return CompletionSegment(accepted: chunk.accepted, remaining: chunk.remaining, whole: whole, sources: [])
   }
   func ghostSourcesRemainCurrent(_ sources: [SourceReference], manuscriptID: UUID) -> Bool {
-    guard let model, !model.isBusy, let contextDigest else { return false }
-    return (try? model.inputContextDigest(target)) == contextDigest
+    guard let model, !model.isBusy, let contextStamp else { return false }
+    return (try? model.inputContextStamp(target)) == contextStamp
   }
   func resumeGhost(_ text: String, documentID: UUID, caret: Int, sources: [SourceReference]) {
     guard completionDocument?.id == documentID, self.caret == caret,
@@ -223,7 +283,8 @@ struct TextInputCapture: Codable, Sendable {
   func navigateGhost(_ direction: Int) {
     guard eligible else { return }
     guard var current = bundle, current.input?.snapshot.revision == completionDocument?.revision,
-      current.input?.caretUTF16 == caret, current.input?.contextDigest == (try? model?.inputContextDigest(target))
+      current.input?.caretUTF16 == caret, current.input?.contextDigest == contextDigest,
+      ghostSourcesRemainCurrent([], manuscriptID: id)
     else { invalidateGhost(); start(count: 3, previous: nil, delay: .zero); return }
     if current.candidates.count == 1 {
       bundle = nil
@@ -237,43 +298,60 @@ struct TextInputCapture: Codable, Sendable {
 
 extension WorkspaceModel {
   var inputCompletionRunner: MLXGemmaRunner? { baseRunner ?? mlxRunner }
-  func inputContextDigest(_ target: TextInputTarget) throws -> String {
+  func inputContextStamp(_ target: TextInputTarget) throws -> InputContextStamp {
     guard target.chatID == state.selectedChat,
       target.chatID != nil || target.documentID == state.selectedDocument else { throw BoomError.stale("Input changed.") }
-    let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
-    guard let chat = selectedChat else { return Digest.sha256("null") }
-    let digest: String
-    if let cached = inputContextCache, cached.id == chat.id, cached.version == chat.contentVersion {
-      digest = cached.digest
-    } else {
-      digest = Digest.sha256(try encoder.encode(chat))
-      inputContextCache = (id: chat.id, version: chat.contentVersion, digest: digest)
-    }
     let pending = target.messageID == nil && !target.instructions ? pendingAttachments : []
-    return Digest.sha256(digest + pending.compactMap { id in state.attachments.first(where: { $0.id == id }).map { $0.id.uuidString + $0.rootDigest } }.joined())
+    return InputContextStamp(target: target, chatVersion: selectedChat?.contentVersion,
+      attachments: pending.compactMap { id in state.attachments.first(where: { $0.id == id }).map {
+        InputContextStamp.Attachment(id: $0.id, rootDigest: $0.rootDigest)
+      } })
+  }
+  func captureInputContext(_ target: TextInputTarget) throws -> InputContextSnapshot {
+    InputContextSnapshot(stamp: try inputContextStamp(target), chat: selectedChat,
+      pendingAttachments: pendingAttachments)
+  }
+  fileprivate func cachedInputChatDigest(_ snapshot: InputContextSnapshot) -> String? {
+    guard let chat = snapshot.chat, let cached = inputContextCache,
+      cached.id == chat.id, cached.version == chat.contentVersion else { return nil }
+    return cached.digest
+  }
+  fileprivate func retainInputChatDigest(_ digest: String, snapshot: InputContextSnapshot) {
+    guard let chat = snapshot.chat,
+      (try? inputContextStamp(snapshot.stamp.target)) == snapshot.stamp else { return }
+    inputContextCache = (id: chat.id, version: chat.contentVersion, digest: digest)
+  }
+  func prepareInputContext(_ target: TextInputTarget, document: DocumentSnapshot,
+    caret: Int, flag: CancellationFlag
+  ) async throws -> (stamp: InputContextStamp, digest: String, raw: String)? {
+    let snapshot = try captureInputContext(target)
+    let cachedDigest = cachedInputChatDigest(snapshot)
+    let prepared = try await detachedWork { () -> (chatDigest: String, digest: String, raw: String)? in
+      try flag.check()
+      let prefix = try ProductCore.authoredPrefix(document, caret: caret)
+      guard !prefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+      let digests = try snapshot.digests(cachedChatDigest: cachedDigest)
+      try flag.check()
+      let raw = try snapshot.compile(text: document.text, caret: caret)
+      try flag.check()
+      return (digests.chat, digests.context, raw)
+    }
+    guard let prepared else { return nil }
+    try flag.check()
+    guard (try? inputContextStamp(target)) == snapshot.stamp else { throw BoomError.stale("Input changed.") }
+    retainInputChatDigest(prepared.chatDigest, snapshot: snapshot)
+    return (snapshot.stamp, prepared.digest, prepared.raw)
+  }
+  // Synchronous projections remain available for explicit fixture inspection.
+  // Native input callbacks use only inputContextStamp; generation uses a worker.
+  func inputContextDigest(_ target: TextInputTarget) throws -> String {
+    let snapshot = try captureInputContext(target)
+    let digests = try snapshot.digests(cachedChatDigest: cachedInputChatDigest(snapshot))
+    retainInputChatDigest(digests.chat, snapshot: snapshot)
+    return digests.context
   }
   func inputContext(_ target: TextInputTarget, text: String, caret: Int) throws -> String {
-    _ = try inputContextDigest(target)
-    let chat = selectedChat
-    var messages = chat?.messages ?? []
-    var speaker = "You"
-    if let messageID = target.messageID {
-      guard let index = messages.firstIndex(where: { $0.id == messageID }) else { throw BoomError.stale("Message changed.") }
-      speaker = messages[index].speaker?.name ?? (messages[index].role == .user ? "You" : "Bloom")
-      messages = Array(messages[..<index])
-    }
-    if target.instructions { messages = [] }
-    let turns = messages.filter { $0.state == .complete }.map {
-      PromptTurn(role: $0.role.rawValue, text: inputMediaLinks($0.directAttachments ?? []) + $0.text,
-        speaker: $0.speaker ?? Speaker(name: $0.role == .user ? "You" : "Bloom"))
-    }
-    let mediaIDs = target.instructions ? [] : target.messageID.flatMap { id in chat?.messages.first(where: { $0.id == id }).map { $0.directAttachments ?? [] } } ?? pendingAttachments
-    let context = [chat?.instructions ?? "", inputMediaLinks(mediaIDs)].filter { !$0.isEmpty }.joined(separator: "\n")
-    return try ProductCore.inputContext(instructions: target.instructions ? "" : context,
-      history: turns, speaker: speaker, text: text, caret: caret)
-  }
-  private func inputMediaLinks(_ ids: [UUID]) -> String {
-    ids.map { "[Attachment: media](boom-attachment:\($0.uuidString))\n" }.joined()
+    try captureInputContext(target).compile(text: text, caret: caret)
   }
   func generateInputCandidates(document: DocumentSnapshot, capture: TextInputCapture, count: Int,
     previous: CandidateBundle?, flag: CancellationFlag,

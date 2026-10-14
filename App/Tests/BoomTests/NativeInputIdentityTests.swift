@@ -210,6 +210,37 @@ final class NativeInputIdentityTests: XCTestCase {
     }
   }
 
+  @MainActor func testInputRefreshUsesOwnershipWithoutEncodingStoredHistory() async throws {
+    try await withModel { model in
+      let index = try XCTUnwrap(model.state.chats.firstIndex { $0.id == model.state.selectedChat })
+      let target = TextInputTarget(chatID: model.state.selectedChat, documentID: nil)
+      model.state.chats[index].messages = [ChatMessage(role: .user,
+        text: String(repeating: "Café 👩🏽‍💻\n", count: 8192))]
+      model.state.chats[index].instructions = "Café"
+      model.inputContextCache = nil
+      let original = try model.captureInputContext(target)
+      let completion = TextInputCompletion(model: model, target: target)
+      for _ in 0..<8 { completion.refresh() }
+      XCTAssertNil(model.inputContextCache,
+        "Creating and refreshing the native input must not encode/hash the stored chat.")
+      XCTAssertTrue(completion.ghostSourcesRemainCurrent([], manuscriptID: UUID()))
+      model.state.chats[index].instructions = "Cafe\u{301}"
+      XCTAssertNotEqual(try model.inputContextStamp(target), original.stamp,
+        "Canonical-equivalent edits still revoke the captured owner.")
+      XCTAssertFalse(completion.ghostSourcesRemainCurrent([], manuscriptID: UUID()))
+      completion.refresh()
+      XCTAssertNil(model.inputContextCache, "A changed context still must not encode on refresh.")
+      let capturedChat = try XCTUnwrap(original.chat)
+      let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
+      let expected = Digest.sha256(Digest.sha256(try encoder.encode(capturedChat)))
+      let digest = try await detachedWork { try original.digests().context }
+      XCTAssertEqual(digest, expected, "The worker must bind the exact original encoded snapshot.")
+      XCTAssertNotEqual(try model.inputContextDigest(target), digest,
+        "A later edit must not change the immutable worker snapshot or share its digest.")
+      await completion.join()
+    }
+  }
+
   @MainActor func testExternalCanonicalDraftReplacementReachesNativeComposer() async throws {
     let original = "Café\nA lantern.", replacement = "Cafe\u{301}\nA lantern."
     let store = try await withModel { model in
