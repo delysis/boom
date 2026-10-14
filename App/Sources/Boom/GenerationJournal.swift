@@ -139,19 +139,25 @@ extension WorkspaceStore {
     stopReason: String?, stopTokenID: Int? = nil) throws {
     let trace = PerformanceTrace.begin("Storage.Checkpoint")
     defer { PerformanceTrace.end("Storage.Checkpoint", trace) }
-    let previous = try generationCheckpoint(identity: identity)
+    // The transition validator admits BOTH next and previous records. Reading
+    // the previous DTO here avoids admitting/encoding it through the bridge twice.
+    let previous = try readRawGenerationCheckpoint(attemptID: identity.attemptID)
     let next = try ProductCore.generationCheckpoint(
       GenerationCheckpoint(schema: 1, identity: identity, progress: progress, stopReason: stopReason, stopTokenID: stopTokenID),
       expected: identity, previous: previous)
     try vault.encode(next, kind: .generationJournal, id: identity.attemptID)
   }
   func generationCheckpoint(identity: GenerationIdentity) throws -> GenerationCheckpoint? {
+    guard let raw = try readRawGenerationCheckpoint(attemptID: identity.attemptID) else { return nil }
+    return try ProductCore.generationCheckpoint(raw, expected: identity)
+  }
+  /// Decoded bytes remain untrusted until the caller's Rust admission succeeds.
+  /// No raw checkpoint escapes the store or authorizes a write by itself.
+  private func readRawGenerationCheckpoint(attemptID: UUID) throws -> GenerationCheckpoint? {
     let trace = PerformanceTrace.begin("Storage.CheckpointRead")
     defer { PerformanceTrace.end("Storage.CheckpointRead", trace) }
-    guard vault.exists(.generationJournal, identity.attemptID) else { return nil }
-    return try ProductCore.generationCheckpoint(
-      vault.decode(GenerationCheckpoint.self, kind: .generationJournal, id: identity.attemptID),
-      expected: identity)
+    guard vault.exists(.generationJournal, attemptID) else { return nil }
+    return try vault.decode(GenerationCheckpoint.self, kind: .generationJournal, id: attemptID)
   }
   func consultationCheckpoint(id: UUID, receipt: ConsultationReceipt) throws -> GenerationCheckpoint? {
     let attemptID = receipt.attemptID ?? id

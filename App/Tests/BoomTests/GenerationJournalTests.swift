@@ -200,6 +200,22 @@ final class GenerationJournalTests: XCTestCase {
     XCTAssertEqual(try Data(contentsOf: url), before)
     try await f.store.checkpoint(progress(), identity: f.writing, stopReason: nil)
     let corruptedURL = f.store.vault.recordURL(.generationJournal, f.writing.attemptID)
+    let originalWritingBytes = try Data(contentsOf: corruptedURL)
+    // A decodable but foreign previous record must still fail in the single
+    // transition admission, before the current attempt can overwrite its bytes.
+    let foreign = GenerationIdentity(kind: f.writing.kind, operationID: f.writing.operationID,
+      recordID: f.writing.recordID, attemptID: f.writing.attemptID, model: f.writing.model,
+      seed: f.writing.seed - 1, requestDigest: f.writing.requestDigest,
+      maxTokens: f.writing.maxTokens, generationPolicy: f.writing.generationPolicy)
+    try f.store.vault.encode(GenerationCheckpoint(schema: 1, identity: foreign,
+      progress: progress(), stopReason: nil), kind: .generationJournal, id: f.writing.attemptID)
+    let foreignBytes = try Data(contentsOf: corruptedURL)
+    do {
+      try await f.store.checkpoint(progress(tokens: [1, 2, 3], elapsed: 2), identity: f.writing, stopReason: nil)
+      XCTFail("A foreign previous checkpoint was overwritten")
+    } catch {}
+    XCTAssertEqual(try Data(contentsOf: corruptedURL), foreignBytes)
+    try originalWritingBytes.write(to: corruptedURL)
     var damaged = try Data(contentsOf: corruptedURL); damaged[damaged.count / 2] ^= 1
     try damaged.write(to: corruptedURL)
     let index = try Data(contentsOf: f.store.vault.recordURL(.workspace, Vault.workspaceID))
