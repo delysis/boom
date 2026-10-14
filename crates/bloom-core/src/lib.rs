@@ -1158,8 +1158,15 @@ pub fn execute(request: Request) -> Result<Value, Error> {
             omitted_sources,
         } => {
             if prompt_contract == Some(ConsultationPromptContract::ReferenceBindingsV3) {
-                serde_json::to_value(hashline::context_v3_window(&documents, &attachments, &authority, body_bytes_limit, 32,
-                    preferred_document_id, omitted_sources)?)
+                serde_json::to_value(hashline::context_v3_window(
+                    &documents,
+                    &attachments,
+                    &authority,
+                    body_bytes_limit,
+                    32,
+                    preferred_document_id,
+                    omitted_sources,
+                )?)
             } else {
                 require(
                     attachments.is_empty(),
@@ -1168,9 +1175,18 @@ pub fn execute(request: Request) -> Result<Value, Error> {
                 serde_json::to_value(hashline::context(&documents, &authority)?)
             }
         }
-        Request::WindowReferenceContext { rendered_context, authority, captured_sources, body_bytes, maximum_sources } => {
-            serde_json::to_value(rendered_context.windowed(&authority, &captured_sources, body_bytes, maximum_sources)?)
-        }
+        Request::WindowReferenceContext {
+            rendered_context,
+            authority,
+            captured_sources,
+            body_bytes,
+            maximum_sources,
+        } => serde_json::to_value(rendered_context.windowed(
+            &authority,
+            &captured_sources,
+            body_bytes,
+            maximum_sources,
+        )?),
         Request::PlanDocumentPatch {
             patch,
             authority,
@@ -1847,10 +1863,23 @@ mod tests {
     }
     #[test]
     fn working_prose_window_preserves_policy_and_original_request_and_voice() -> Result<(), Error> {
-        let voice = validate_voice(VoiceDraft { id: Uuid::new_v4(), slug: "reader".into(), name: "Reader".into(),
-            instructions: "Voice direction e\u{301}👩‍💻 ".repeat(2_000),
-            examples: vec![Exchange { user: "Earlier question ".repeat(2_000), assistant: "Earlier answer ".repeat(2_000) }] }, &[])?;
-        let request = format!("{}What about the harbor?", "Old question e\u{301}👩‍💻 ".repeat(2_000));
+        let voice = validate_voice(
+            VoiceDraft {
+                id: Uuid::new_v4(),
+                slug: "reader".into(),
+                name: "Reader".into(),
+                instructions: "Voice direction e\u{301}👩‍💻 ".repeat(2_000),
+                examples: vec![Exchange {
+                    user: "Earlier question ".repeat(2_000),
+                    assistant: "Earlier answer ".repeat(2_000),
+                }],
+            },
+            &[],
+        )?;
+        let request = format!(
+            "{}What about the harbor?",
+            "Old question e\u{301}👩‍💻 ".repeat(2_000)
+        );
         let instructions = "Authored instructions ".repeat(3_000);
         let voice_before = serde_json::to_value(&voice).map_err(|e| Error(e.to_string()))?;
         let compile = |bytes| {
@@ -1861,21 +1890,34 @@ mod tests {
             execute_for_transport(request).map_err(ConsultationError::into_legacy)
         };
         let value = compile(96)?;
-        let texts = value["texts"].as_array().ok_or_else(|| Error("Missing prompt pool.".into()))?;
+        let texts = value["texts"]
+            .as_array()
+            .ok_or_else(|| Error("Missing prompt pool.".into()))?;
         let joined = texts.iter().filter_map(Value::as_str).collect::<String>();
         assert!(joined.contains("What about the harbor?"));
         assert!(joined.contains("Document permission: Ask (read only)"));
         assert!(joined.len() < 4_096);
-        assert_eq!(value["workingWindow"]["request"]["digest"], digest(request.as_bytes()));
+        assert_eq!(
+            value["workingWindow"]["request"]["digest"],
+            digest(request.as_bytes())
+        );
         assert_eq!(value["workingWindow"]["request"]["bytes"], request.len());
-        assert_eq!(value["workingWindow"]["instructions"]["digest"], digest(instructions.as_bytes()));
-        assert_eq!(value["workingWindow"]["voices"][0]["revision"], voice.revision);
+        assert_eq!(
+            value["workingWindow"]["instructions"]["digest"],
+            digest(instructions.as_bytes())
+        );
+        assert_eq!(
+            value["workingWindow"]["voices"][0]["revision"],
+            voice.revision
+        );
         let zero = compile(0)?;
         assert_eq!(zero["workingWindow"]["voices"][0]["omittedExamples"], 1);
-        assert_eq!(serde_json::to_value(&voice).map_err(|e| Error(e.to_string()))?, voice_before);
+        assert_eq!(
+            serde_json::to_value(&voice).map_err(|e| Error(e.to_string()))?,
+            voice_before
+        );
         assert!(request.ends_with("What about the harbor?"));
         assert_eq!(instructions.len(), "Authored instructions ".len() * 3_000);
         Ok(())
     }
-
 }

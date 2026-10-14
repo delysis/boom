@@ -27,17 +27,29 @@ pub struct Document {
 pub struct Authority {
     pub mode: Mode,
     pub target: Option<Document>,
-    #[serde(default, rename = "targetWindow", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "targetWindow",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub target_window: Option<crate::hashline::ContextTextWindow>,
 }
 
 impl Authority {
     pub(crate) fn admit_target_range(&self, start: usize, end: usize) -> Result<(), Error> {
         if let Some(window) = &self.target_window {
-            let target = self.target.as_ref().ok_or_else(|| Error("Missing captured target.".into()))?;
+            let target = self
+                .target
+                .as_ref()
+                .ok_or_else(|| Error("Missing captured target.".into()))?;
             window.validate(&target.text)?;
-            require(window.ranges.iter().any(|range| start >= range.start && end <= range.end),
-                "The edit addresses target text outside the supplied working window.")?;
+            require(
+                window
+                    .ranges
+                    .iter()
+                    .any(|range| start >= range.start && end <= range.end),
+                "The edit addresses target text outside the supplied working window.",
+            )?;
         }
         Ok(())
     }

@@ -129,17 +129,24 @@ pub unsafe extern "C" fn bloom_core_request(
         let bytes = unsafe { slice::from_raw_parts(data, length) };
         match serde_json::from_slice::<bloom_core::Request>(bytes) {
             Ok(request) => {
-                let windowed = matches!(&request,
-                    bloom_core::Request::CompileConsultation { working_text_bytes: Some(_), .. }
-                    | bloom_core::Request::CompileConsultationCompact { working_text_bytes: Some(_), .. });
+                let windowed = matches!(
+                    &request,
+                    bloom_core::Request::CompileConsultation {
+                        working_text_bytes: Some(_),
+                        ..
+                    } | bloom_core::Request::CompileConsultationCompact {
+                        working_text_bytes: Some(_),
+                        ..
+                    }
+                );
                 if length > 16 * 1024 * 1024 && !windowed {
                     return error("input_limit", "Product request exceeds 16 MiB.");
                 }
                 match bloom_core::execute_for_transport(request) {
-                Ok(value) => json!({"schema":1,"ok":true,"value":value}),
+                    Ok(value) => json!({"schema":1,"ok":true,"value":value}),
                     Err(e) => error(e.code(), &e.to_string()),
                 }
-            },
+            }
             Err(_) => error("request_invalid", "Malformed product request."),
         }
     }));

@@ -316,10 +316,20 @@ fn changed_or_duplicate_voice_is_never_a_trimming_signal() {
 
 #[test]
 fn explicitly_windowed_original_prose_can_cross_the_old_wire_limit() {
-    let voice = bloom_core::validate_voice(bloom_core::VoiceDraft {
-        id: uuid::Uuid::new_v4(), slug: "reader".into(), name: "Reader".into(), instructions: String::new(),
-        examples: vec![bloom_core::Exchange { user: "\u{1}".repeat(MIB), assistant: "\u{1}".repeat(MIB) }],
-    }, &[]).unwrap();
+    let voice = bloom_core::validate_voice(
+        bloom_core::VoiceDraft {
+            id: uuid::Uuid::new_v4(),
+            slug: "reader".into(),
+            name: "Reader".into(),
+            instructions: String::new(),
+            examples: vec![bloom_core::Exchange {
+                user: "\u{1}".repeat(MIB),
+                assistant: "\u{1}".repeat(MIB),
+            }],
+        },
+        &[],
+    )
+    .unwrap();
     let mut request = json!({"op":"compile_consultation_compact", "voices":[voice], "history":[],
         "instructions":"", "context":"", "request":"\u{1}".repeat(MIB), "routing":[], "workingTextBytes":0});
     let bytes = serde_json::to_vec(&request).unwrap();
@@ -327,7 +337,10 @@ fn explicitly_windowed_original_prose_can_cross_the_old_wire_limit() {
     let value = call_bytes(&bytes);
     assert_eq!(value["ok"], true, "{value}");
     assert_eq!(value["value"]["workingWindow"]["request"]["bytes"], MIB);
-    assert_eq!(value["value"]["workingWindow"]["voices"][0]["omittedExamples"], 1);
+    assert_eq!(
+        value["value"]["workingWindow"]["voices"][0]["omittedExamples"],
+        1
+    );
     assert!(serde_json::to_vec(&value).unwrap().len() < 4_096);
     request.as_object_mut().unwrap().remove("workingTextBytes");
     assert_eq!(call(&request)["error"]["code"], "input_limit");

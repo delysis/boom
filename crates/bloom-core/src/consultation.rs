@@ -199,17 +199,34 @@ pub(super) fn compile_with_contract(
     routing: &[String],
     prompt_contract: Option<ConsultationPromptContract>,
 ) -> Result<CompactConsultation, ConsultationError> {
-    compile_with_window(voices, history, instructions, context, request, routing,
-        prompt_contract, None, None)
+    compile_with_window(
+        voices,
+        history,
+        instructions,
+        context,
+        request,
+        routing,
+        prompt_contract,
+        None,
+        None,
+    )
 }
 
 pub(super) fn compile_with_window(
-    voices: &[Option<&Voice>], history: &[PromptTurn], instructions: &str,
-    context: &str, request: &str, routing: &[String],
-    prompt_contract: Option<ConsultationPromptContract>, working_text_bytes: Option<usize>,
+    voices: &[Option<&Voice>],
+    history: &[PromptTurn],
+    instructions: &str,
+    context: &str,
+    request: &str,
+    routing: &[String],
+    prompt_contract: Option<ConsultationPromptContract>,
+    working_text_bytes: Option<usize>,
     instructions_window: Option<crate::hashline::ContextTextWindow>,
 ) -> Result<CompactConsultation, ConsultationError> {
-    require(working_text_bytes.is_none_or(|n| n <= TEXT_LIMIT), "Invalid working prose bound.")?;
+    require(
+        working_text_bytes.is_none_or(|n| n <= TEXT_LIMIT),
+        "Invalid working prose bound.",
+    )?;
     let prompt_contract =
         prompt_contract.filter(|contract| *contract != ConsultationPromptContract::TextHistoryV1);
     require(
@@ -311,8 +328,11 @@ pub(super) fn compile_with_window(
             "You are {name}. Write only your own contribution in this conversation. The @mentions in the user's question route that question to individual participants; they do not ask you to impersonate them or write their replies. Other participants' contributions are quoted conversation, not your own answers. Do not prefix your reply with a participant name.\n"
         );
         let mut voice_window = voice.map(|voice| VoiceWorkingWindow {
-            id: voice.id, revision: voice.revision.clone(), instructions: None,
-            examples: Vec::new(), omitted_examples: 0,
+            id: voice.id,
+            revision: voice.revision.clone(),
+            instructions: None,
+            examples: Vec::new(),
+            omitted_examples: 0,
         });
         if let Some(voice) = voice {
             let (text, window) = match working_text_bytes {
@@ -320,7 +340,9 @@ pub(super) fn compile_with_window(
                 None => (voice.instructions.clone(), None),
             };
             system.push_str(&text);
-            if let Some(value) = &mut voice_window { value.instructions = window; }
+            if let Some(value) = &mut voice_window {
+                value.instructions = window;
+            }
         }
         if !instructions.is_empty() {
             system.push('\n');
@@ -332,13 +354,21 @@ pub(super) fn compile_with_window(
         if let Some(voice) = voice {
             for (index, example) in voice.examples.iter().enumerate() {
                 if working_text_bytes == Some(0) {
-                    if let Some(value) = &mut voice_window { value.omitted_examples += 1; }
+                    if let Some(value) = &mut voice_window {
+                        value.omitted_examples += 1;
+                    }
                     continue;
                 }
-                let ((user, user_window), (assistant, assistant_window)) = match working_text_bytes {
-                    Some(bytes) => (crate::hashline::window_text(&example.user, bytes, false)?,
-                        crate::hashline::window_text(&example.assistant, bytes, true)?),
-                    None => ((example.user.clone(), None), (example.assistant.clone(), None)),
+                let ((user, user_window), (assistant, assistant_window)) = match working_text_bytes
+                {
+                    Some(bytes) => (
+                        crate::hashline::window_text(&example.user, bytes, false)?,
+                        crate::hashline::window_text(&example.assistant, bytes, true)?,
+                    ),
+                    None => (
+                        (example.user.clone(), None),
+                        (example.assistant.clone(), None),
+                    ),
                 };
                 let user = pool.intern(safe(&user));
                 let assistant = pool.intern(safe(&assistant));
@@ -346,7 +376,11 @@ pub(super) fn compile_with_window(
                 plan.append(&mut pool, "assistant", &[assistant])?;
                 if let Some(value) = &mut voice_window {
                     if user_window.is_some() || assistant_window.is_some() {
-                        value.examples.push(ExampleWorkingWindow { index, user: user_window, assistant: assistant_window });
+                        value.examples.push(ExampleWorkingWindow {
+                            index,
+                            user: user_window,
+                            assistant: assistant_window,
+                        });
                     }
                 }
             }
@@ -375,7 +409,9 @@ pub(super) fn compile_with_window(
         }
         plan.append(&mut pool, "user", &body)?;
         plans.push(plan.finish(&mut pool));
-        if let Some(value) = voice_window { voice_windows.push(value); }
+        if let Some(value) = voice_window {
+            voice_windows.push(value);
+        }
     }
     Ok(CompactConsultation {
         schema: 1,
@@ -383,7 +419,9 @@ pub(super) fn compile_with_window(
         texts: pool.finish(),
         plans,
         working_window: working_text_bytes.map(|_| ConsultationWorkingWindow {
-            request: request_window, instructions: instructions_window, voices: voice_windows,
+            request: request_window,
+            instructions: instructions_window,
+            voices: voice_windows,
         }),
     })
 }
