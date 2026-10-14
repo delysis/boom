@@ -263,10 +263,10 @@ enum DeveloperStackWire {
       try challenge(tag: .ready, value: 2) // remain alive until sampler is joined.
     }
 
-    /// Utility drain only. A full Mach queue loses this batch explicitly; no
-    /// retry, growing queue, main-thread blocking or hidden retention occurs.
-    func phases(_ records: UnsafeBufferPointer<Phase>, tid: UInt64, role: Role) throws {
-      guard authenticated, (1...phasesPerMessage).contains(records.count) else { throw Failure.admission }
+    /// Utility drain only; zero-timeout during measured work. Final shutdown
+    /// alone may wait up to100ms after its sole producer has stopped.
+    func phases(_ records: UnsafeBufferPointer<Phase>, tid: UInt64, role: Role, timeout: UInt32 = 0) throws {
+      guard authenticated, (1...phasesPerMessage).contains(records.count), timeout <= 100 else { throw Failure.admission }
       prepare(.phases, tid: tid, role: role.rawValue, value: UInt64(records.count))
       for (index, phase) in records.enumerated() {
         let at = prefixBytes + index * phaseBytes
@@ -276,16 +276,16 @@ enum DeveloperStackWire {
         put(phase.stage, at: at + 48); put(phase.kind, at: at + 52)
         put(phase.reserved, at: at + 54); put(phase.value, at: at + 56)
       }
-      try send(size: prefixBytes + records.count * phaseBytes, timeout: 0)
+      try send(size: prefixBytes + records.count * phaseBytes, timeout: timeout)
     }
     func loss(tid: UInt64, role: Role, ringFull: UInt64, transport: UInt64,
-      unregistered: UInt64, invalid: UInt64, exhausted: UInt64, lostSnapshots: UInt64) throws {
-      guard authenticated else { throw Failure.identity }
+      unregistered: UInt64, invalid: UInt64, exhausted: UInt64, lostSnapshots: UInt64, timeout: UInt32 = 0) throws {
+      guard authenticated, timeout <= 100 else { throw Failure.admission }
       prepare(.loss, tid: tid, role: role.rawValue, value: ringFull)
       put(transport, at: prefixBytes); put(unregistered, at: prefixBytes + 8)
       put(invalid, at: prefixBytes + 16); put(exhausted, at: prefixBytes + 24)
       put(lostSnapshots, at: prefixBytes + 32)
-      try send(size: prefixBytes + 40, timeout: 0)
+      try send(size: prefixBytes + 40, timeout: timeout)
     }
   }
 }

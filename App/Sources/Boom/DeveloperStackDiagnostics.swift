@@ -300,7 +300,7 @@ enum DeveloperStackDiagnostics {
   /// One producer, the explicitly registered thread; one utility consumer.
   /// Queue allocation/initialization occurs before TLS publication. Release
   /// publication protects scalar storage, acquire tail prevents slot reuse.
-  private final class Ring: @unchecked Sendable {
+  final class Ring: @unchecked Sendable {
     let tid: UInt64
     let role: Wire.Role
     private let storage: UnsafeMutablePointer<Wire.Phase>
@@ -337,7 +337,7 @@ enum DeveloperStackDiagnostics {
         reserved: 0, value: value)
       position += 1; published.store(position, ordering: .releasing)
     }
-    func drain(into buffer: UnsafeMutableBufferPointer<Wire.Phase>) -> Int {
+    func peek(into buffer: UnsafeMutableBufferPointer<Wire.Phase>) -> Int {
       let head = published.load(ordering: .acquiring)
       var tail = consumed.load(ordering: .relaxed)
       guard tail <= head else { return 0 }
@@ -346,8 +346,21 @@ enum DeveloperStackDiagnostics {
         buffer[index] = storage[Int(tail & UInt64(Wire.ringRecords - 1))]
         tail += 1
       }
-      consumed.store(tail, ordering: .releasing)
       return count
+    }
+    /// The sole consumer releases slots only after their actual send succeeds.
+    func commit(_ count: Int) {
+      let tail = consumed.load(ordering: .relaxed), head = published.load(ordering: .acquiring)
+      precondition(count >= 0 && tail <= head && UInt64(count) <= head - tail)
+      consumed.store(tail + UInt64(count), ordering: .releasing)
+    }
+    /// Final shutdown only, after the producer stopped. Count a permanent
+    /// transport discard once, rather than counting each refused send.
+    func discardPending() -> UInt64 {
+      let tail = consumed.load(ordering: .relaxed), head = published.load(ordering: .acquiring)
+      precondition(tail <= head && head - tail <= UInt64(Wire.ringRecords))
+      consumed.store(head, ordering: .releasing)
+      return head - tail
     }
   }
 
@@ -439,53 +452,63 @@ enum DeveloperStackDiagnostics {
             throw Wire.Failure.admission
           }
           for _ in 0..<(Wire.ringRecords / Wire.phasesPerMessage) {
-            try phaseBuffer.withUnsafeMutableBufferPointer { buffer in
-              let count = current.drain(into: buffer)
-              if count > 0 {
-                do {
-                  try state.client.phases(UnsafeBufferPointer(start: buffer.baseAddress, count: count),
-                    tid: current.tid, role: current.role)
-                } catch {
-                  let lost = current.transportLost.addingReportingOverflow(UInt64(count))
-                  current.transportLost = lost.overflow ? UInt64.max : lost.partialValue
-                  // Explicit loss is permitted; DONE still waits for the
-                  // collector and its writers to join outside measured work.
-                }
-              }
+            do {
+              if try sendReadyPhases(current, state: state, timeout: 100) == 0 { break }
+            } catch {
+              let discarded = current.discardPending()
+              let lost = current.transportLost.addingReportingOverflow(discarded)
+              current.transportLost = lost.overflow ? UInt64.max : lost.partialValue
+              break
             }
           }
-          publishLossSnapshot(state)
+          // A terminal loss report is required before DONE. Failure remains
+          // explicit instead of claiming a fully reconciled capture.
+          try sendLossSnapshot(current, state: state, timeout: 100)
           try state.client.done(tid: current.tid, lastSequence: current.lastSequenceOutsidePhases())
         }
+      }
+    }
+    private func sendReadyPhases(_ ring: Ring, state: State, timeout: UInt32 = 0) throws -> Int {
+      try phaseBuffer.withUnsafeMutableBufferPointer { buffer in
+        let count = ring.peek(into: buffer)
+        if count > 0 {
+          try state.client.phases(UnsafeBufferPointer(start: buffer.baseAddress, count: count),
+            tid: ring.tid, role: ring.role, timeout: timeout)
+          ring.commit(count)
+        }
+        return count
       }
     }
     private func drain() {
       guard running.load(ordering: .acquiring) else { return }
       state.withLock { state in
-        // At most eight phase sends per tick, plus eight loss snapshots every
-        // tenth tick. All are zero-timeout and every failed batch is dropped.
-        for ring in state.rings {
-          phaseBuffer.withUnsafeMutableBufferPointer { buffer in
-            let count = ring.drain(into: buffer)
-            guard count > 0 else { return }
-            do { try state.client.phases(UnsafeBufferPointer(start: buffer.baseAddress, count: count),
-              tid: ring.tid, role: ring.role) }
-            catch { ring.transportLost = ring.transportLost.addingReportingOverflow(UInt64(count)).overflow
-              ? UInt64.max : ring.transportLost + UInt64(count) }
+        // Fixed512-slot rings, at most16 batches/ring per tick. Backpressure
+        // retains the uncommitted prefix and stops this tick without a wait.
+        draining: for _ in 0..<16 {
+          var progressed = false
+          for ring in state.rings {
+            do {
+              if try sendReadyPhases(ring, state: state) > 0 { progressed = true }
+            } catch { break draining }
           }
+          if !progressed { break }
         }
         drainTicks = drainTicks == UInt64.max ? 0 : drainTicks + 1
         if drainTicks.isMultiple(of: 10) { publishLossSnapshot(state) }
       }
     }
+    private func sendLossSnapshot(_ ring: Ring, state: State, timeout: UInt32 = 0) throws {
+      try state.client.loss(tid: ring.tid, role: ring.role,
+        ringFull: ring.ringFull.load(ordering: .acquiring), transport: ring.transportLost,
+        unregistered: unregistered.load(ordering: .acquiring),
+        invalid: ring.invalidValues.load(ordering: .acquiring),
+        exhausted: ring.exhausted.load(ordering: .acquiring), lostSnapshots: lostSnapshots,
+        timeout: timeout)
+    }
     /// Outside phases. Missing terminal loss counters after a crash are unknown.
     private func publishLossSnapshot(_ state: State) {
       for ring in state.rings {
-        do { try state.client.loss(tid: ring.tid, role: ring.role,
-            ringFull: ring.ringFull.load(ordering: .acquiring), transport: ring.transportLost,
-            unregistered: unregistered.load(ordering: .acquiring),
-            invalid: ring.invalidValues.load(ordering: .acquiring),
-            exhausted: ring.exhausted.load(ordering: .acquiring), lostSnapshots: lostSnapshots) }
+        do { try sendLossSnapshot(ring, state: state) }
         catch { lostSnapshots = lostSnapshots == UInt64.max ? UInt64.max : lostSnapshots + 1 }
       }
     }
