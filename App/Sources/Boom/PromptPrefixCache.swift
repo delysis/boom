@@ -291,6 +291,7 @@ final class PromptPrefixCache: @unchecked Sendable {
     }
     func observeDecodeOperands(_ sampled: [Int], active: [Bool]) { capture?.observeDecodeOperands(sampled, active: active) }
     var retentionObservation: RetentionObservation? { capture?.observation }
+    var retentionDiagnosticForTesting: [String: Int]? { capture?.retentionDiagnostic }
     func discardStagedAnchors() { capture?.discard() }
     var didSample: (@Sendable (MLXArray) -> Void)? {
       guard let capture else { return nil }
@@ -656,6 +657,15 @@ final class PromptPrefixCache: @unchecked Sendable {
       }
     }
     var coveredEnd: Int { lock.lock(); defer { lock.unlock() }; return end }
+    var retentionDiagnostic: [String: Int] {
+      lock.lock(); defer { lock.unlock() }
+      return ["complete": complete ? 1 : 0, "coherent": nativeCoherent ? 1 : 0,
+        "discarded": discarded ? 1 : 0, "submitted": submittedEnd, "end": end,
+        "prompt": tokens.count, "cached": cachedCount, "pendingLayers": pending?.layers.count ?? -1,
+        "pendingWidth": pending?.width ?? -1, "history": history.count, "lanes": lanes.count,
+        "finishedLanes": lanes.values.filter { $0.finished }.count,
+        "workingSubmitted": workingGraphSubmitted ? 1 : 0]
+    }
     var stagedBytes: UInt64 { lock.lock(); defer { lock.unlock() }; return novelBytes }
     var observation: RetentionObservation {
       lock.lock(); defer { lock.unlock() }

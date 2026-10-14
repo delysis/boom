@@ -426,9 +426,16 @@ struct Gemma4IndependentBatchTests {
                 #expect(cohort.captureLane(row, emitted: [], stop: nil, finished: true))
             }
             await manager.joinTextCohortSpill(cohort, cancelled: false)
-            #expect(manager.publishTextCohort(cohort, retention: prompts.indices.map {
+            let published = manager.publishTextCohort(cohort, retention: prompts.indices.map {
                 .init(completion: .init(row: $0, emittedTokenIDs: []), acknowledged: nil, proof: nil, authorization: nil)
-            }))
+            })
+            #expect(published)
+            if !published {
+                let captures = cohort.rows.map { $0.retentionDiagnosticForTesting }
+                let layouts = cohort.cache.map { PrefixKVStorage.layout(of: $0) }
+                let positions = cohort.cache.map { ($0 as? any BatchKVCacheProtocol).flatMap(PrefixKVStorage.readyBatchPositions) }
+                Issue.record("Actual prepared publication: captures=\(captures), layouts=\(layouts), readyPositions=\(positions)")
+            }
             let original = try #require(manager.retainedLookupSnapshotObservations.first {
                 $0.namespace == namespace && $0.row == 0 && $0.tokenIDs.count == 7
             })
