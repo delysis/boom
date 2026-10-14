@@ -88,7 +88,9 @@ struct MarkdownSpan: Decodable {
     let wikis = wikiDisplays(in: source, excluding: literalRanges, hasMarker: projection?.hasWikiMarker)
     let hasAttachment = projection?.hasAttachmentMarker
       ?? (text.range(of: "[Attachment: ", options: .literal).location != NSNotFound)
-    let attachments = hasAttachment ? (attachmentPattern?.matches(in: source, range: full) ?? []) : []
+    let attachments = hasAttachment ? (attachmentPattern?.matches(in: source, range: full) ?? []).filter { match in
+      !literalRanges.contains { NSIntersectionRange($0, match.range).length > 0 }
+    } : []
     view.typingAttributes = base
     defer {
       (view as? NativeMediaTextView)?.inlineMedia.refresh()
