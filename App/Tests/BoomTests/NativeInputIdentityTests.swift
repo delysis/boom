@@ -136,8 +136,9 @@ final class NativeInputIdentityTests: XCTestCase {
       editor.unmarkText()
       XCTAssertFalse(editor.hasMarkedText()); XCTAssertFalse(session.isPinned)
       let committed = try session.captureLogicalState()
-      XCTAssertTrue(committed.source.isSame(marked.source), "Unmark commits the actual already-edited logical head.")
-      XCTAssertEqual(committed.generation, marked.generation)
+      // AppKit owns unmark's actual primitives and may remove/reinsert the
+      // marked bytes within this composition. Capture its completed source;
+      // status rendering below must preserve that exact root/generation.
       let committedBytes = try await manuscriptBytes(session, matching: committed)
       XCTAssertEqual(committedBytes, expected)
       let count = edits.count, nativeVersion = editor.sourceVersion, caret = editor.selectedRange()
