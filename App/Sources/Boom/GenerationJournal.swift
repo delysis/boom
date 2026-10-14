@@ -126,7 +126,9 @@ struct GenerationCheckpoint: Codable, Sendable {
 extension ProductCore {
   static func generationCheckpoint(_ next: GenerationCheckpoint, expected: GenerationIdentity,
     previous: GenerationCheckpoint? = nil) throws -> GenerationCheckpoint {
-    try call(["op": "generation_checkpoint", "expected": object(expected),
+    let trace = PerformanceTrace.begin("Storage.CheckpointAdmission")
+    defer { PerformanceTrace.end("Storage.CheckpointAdmission", trace) }
+    return try call(["op": "generation_checkpoint", "expected": object(expected),
       "previous": try previous.map { try object($0) } ?? NSNull(), "next": object(next)])
   }
 }

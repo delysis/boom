@@ -127,6 +127,7 @@ enum DeveloperStackDiagnostics {
     Stage(id: 82, name: "Editor.PublicInputDispatch"),
     Stage(id: 83, name: "Editor.PublicReadyWait"),
     Stage(id: 84, name: "Editor.PublicRaster"),
+    Stage(id: 85, name: "Storage.CheckpointAdmission"),
   ]
   private static let runtime = AtomicLazyReference<Session>()
   private static let bootstrapping = Atomic<Bool>(false)
