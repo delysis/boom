@@ -377,6 +377,13 @@ import SwiftUI
             let afterSelection = try input.currentDocumentSelection()
             let edited = try session.captureLogicalState().source, editedGeneration = session.generation
             heldSave = try model.beginPagedWorkspaceSave() // actual owned reservation, before yielding
+            // Reservation precedes asynchronous command/save joins. Establish
+            // the actual queued save before exercising input against the held
+            // writer; the existing preparation deadline bounds this wait.
+            while executor.snapshot.foregroundRequests < 2 {
+              try Task.checkCancellation()
+              try await Task.sleep(for: .milliseconds(1))
+            }
             guard model.pagedInput === input, try currentMixedView().session === session,
               NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil),
               session.generation == editedGeneration + 1,
