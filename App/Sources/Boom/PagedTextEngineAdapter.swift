@@ -699,9 +699,17 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
           }
           try cancellation.check()
           if let onMode { await onMode(mode, delivered) }
+          try cancellation.check()
           if final { value = delivered; break }
-          // Taking a prefix result leaves the original builder in this SAME
-          // command. Continue it only while its captured source is requested.
+          if delivered.complete {
+            let latest = await latestWindow?() ?? queryWindow
+            try cancellation.check()
+            guard latest.snapshot.isSame(snapshot) else { throw CancellationError() }
+            if delivered.matches(latest) { value = delivered; break }
+          }
+          // A proved requested window needs no unread tail. Otherwise this
+          // SAME command retains/resumes its partial builder until the actual
+          // requested grammar/reference proof or terminal refusal is known.
           complete = false; writer = true
         }
         let progress: Progress

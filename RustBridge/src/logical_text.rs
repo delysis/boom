@@ -1064,6 +1064,7 @@ struct LogicalMarkup {
     indexed: Option<std::sync::Arc<bloom_text::MarkupIndex>>,
     query: Option<bloom_text::MarkupQuery>,
     result: Option<bloom_text::MarkupContext>,
+    // Nonterminal prefix query, including an exact memo hit before writer entry.
     queried_prefix: bool,
     tracked_reference_peak_bytes: usize,
     max_reference_count: usize,
@@ -1079,7 +1080,7 @@ impl LogicalMarkup {
                 .query
                 .as_ref()
                 .map_or(0, |query| query.progress().buffered_bytes);
-        json!({"complete":self.result.is_some(),"final":self.builder.is_none() && (self.query.is_some() || self.result.is_some()),
+        json!({"complete":self.result.is_some(),"final":self.builder.is_none() && !self.queried_prefix && (self.query.is_some() || self.result.is_some()),
             "needsWriter":self.query.is_none() && self.result.is_none(),"bufferedBytes":bytes,
             "trackedReferencePeakBytes":self.tracked_reference_peak_bytes,"maxReferenceCount":self.max_reference_count,
             "maxReferenceProbes":self.max_reference_probes})
@@ -1122,6 +1123,7 @@ impl LogicalMarkup {
                 std::sync::Arc::clone(&index),
             )?);
             self.indexed = Some(index);
+            self.queried_prefix = false;
         } else if !self.queried_prefix
             && progress.indexed_bytes
                 >= self
@@ -1175,10 +1177,11 @@ impl LogicalMarkup {
             .as_ref()
             .map(|index| bloom_text::MarkupQuery::new(window, std::sync::Arc::clone(index)))
             .transpose()?;
+        let continues_index = self.builder.is_some() || self.queried_prefix;
         self.window = window.clone();
         self.query = query;
         self.result = None;
-        self.queried_prefix = self.query.is_some();
+        self.queried_prefix = continues_index && self.query.is_some();
         self.indexed = index;
         Ok(self.progress())
     }
@@ -1253,7 +1256,11 @@ pub unsafe extern "C" fn bloom_logical_markup_begin(
             if window.value.text().len() > bloom_text::NATIVE_WINDOW_BYTES {
                 return Err(Error::Invalid("markup window budget"));
             }
-            let indexed = window.value.snapshot().markup_index(mode);
+            let end = window.value.start().bytes.checked_add(window.value.local_summary().bytes)
+                .ok_or(Error::Invalid("markup window endpoint"))?;
+            let indexed = window.value.snapshot().captured_markup_prefix(mode)?
+                .filter(|index| index.indexed_summary().bytes >= end);
+            let queried_prefix = indexed.as_ref().is_some_and(|index| !index.complete());
             let query = indexed
                 .as_ref()
                 .map(|index| {
@@ -1268,7 +1275,9 @@ pub unsafe extern "C" fn bloom_logical_markup_begin(
                     indexed,
                     query,
                     result: None,
-                    queried_prefix: false,
+                    // A cached partial query may prove this exact window. If
+                    // not, the SAME command lazily resumes its existing builder.
+                    queried_prefix,
                     tracked_reference_peak_bytes: 0,
                     max_reference_count: 0,
                     max_reference_probes: 0,
@@ -1367,7 +1376,7 @@ pub unsafe extern "C" fn bloom_logical_markup_step(
 /// # Safety
 /// Finish only after actual complete progress. This returns bounded derived
 /// arrays for the retained window. A prefix result consumes only the query;
-/// its same entered builder remains until final finish/cancellation and free.
+/// the same command may resume indexing or join and free its proved prefix.
 #[no_mangle]
 pub unsafe extern "C" fn bloom_logical_markup_finish(
     command: *const BloomLogicalMarkup,
@@ -1441,7 +1450,7 @@ pub unsafe extern "C" fn bloom_logical_markup_finish(
                 length: bytes.len(),
             };
             std::mem::forget(bytes);
-            if command.builder.is_none() {
+            if command.builder.is_none() && !command.queried_prefix {
                 guard.take();
             }
             Ok(())

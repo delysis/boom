@@ -507,16 +507,133 @@ import XCTest
     }
   }
 
+  func testActualProvedWindowStopsAndRepeatedQueriesAppendNoPagesThenTailContinuesExactly() async throws {
+    let text = "# **Head 🙂**\n\n" + String(repeating: "ordinary paragraph\n\n", count: 3400) + "# **Tail é🙂**\n"
+    try await fixture(#function, text: text) { f in
+      let engine = f.engine!, source = f.session!, view = f.view
+      let original = try source.captureLogicalRead(), head = source.logicalWindow
+      let generation = source.generation, arena = source.arenaID, version = view.sourceVersion
+      let baseline = engine.custodySnapshot
+      let whole: [MarkdownSpan] = try ProductCore.markdownSpans(text)
+      let ordered: ([MarkdownSpan]) -> [MarkdownSpan] = { rows in
+        rows.sorted { ($0.location, $0.length, $0.kind, $0.level) < ($1.location, $1.length, $1.kind, $1.level) }
+      }
+      let expected: (PagedNativeLogicalWindow) -> [MarkdownSpan] = { window in
+        let first = Int(window.start.utf16), last = Int(window.start.utf16 + window.summary.utf16)
+        return ordered(whole.compactMap { span -> MarkdownSpan? in
+          let lower = max(first, span.location), upper = min(last, span.location + span.length)
+          return lower < upper ? MarkdownSpan(kind: span.kind, location: lower - first,
+            length: upper - lower, level: span.level) : nil
+        })
+      }
+      let first = try await engine.logicalMarkup(head)
+      XCTAssertTrue(first.matches(head)); XCTAssertTrue(first.style.complete && first.media.complete)
+      XCTAssertEqual(ordered(first.style.markdown), expected(head))
+      let afterHead = try await engine.fileStatistics()
+      let release = DispatchSemaphore(value: 0)
+      let entered = expectation(description: "actual writer held after partial head proof")
+      let writer = Task { try await engine.storageExecutorForTesting.run {
+        entered.fulfill()
+        guard release.wait(timeout: .now() + 10) == .success else {
+          throw BoomError.unavailable("Actual partial-prefix writer hold exceeded its bounded deadline.")
+        }
+      } }
+      defer { release.signal() }
+      guard await XCTWaiter.fulfillment(of: [entered], timeout: 5) == .completed else {
+        release.signal(); _ = await writer.result
+        throw BoomError.unavailable("Actual partial-prefix writer did not enter.")
+      }
+      let completed = expectation(description: "actual covered partial-prefix query joined without writer")
+      let reader = Task { defer { completed.fulfill() }; return try await engine.logicalMarkup(head) }
+      let repeated: PagedNativeMarkupProjection
+      do {
+        guard await XCTWaiter.fulfillment(of: [completed], timeout: 5) == .completed else {
+          throw BoomError.unavailable("A covered partial-prefix query still required the held writer.")
+        }
+        repeated = try await reader.value
+        release.signal(); try await writer.value
+      } catch {
+        release.signal(); _ = await reader.result; _ = await writer.result
+        throw error
+      }
+      let afterRepeat = try await engine.fileStatistics()
+      XCTAssertTrue(repeated.matches(head)); XCTAssertTrue(repeated.style.complete && repeated.media.complete)
+      XCTAssertEqual(ordered(repeated.style.markdown), expected(head))
+      XCTAssertEqual(afterRepeat.appendedPages, afterHead.appendedPages)
+      XCTAssertEqual(afterRepeat.appendedBytes, afterHead.appendedBytes)
+      let tail = try await engine.logicalWindow(original.source, utf16Anchor: original.source.summary.utf16,
+        maximumBytes: PagedWorkingWindow.targetBytes)
+      let continued = try await engine.logicalMarkup(tail)
+      let afterTail = try await engine.fileStatistics()
+      XCTAssertTrue(continued.matches(tail)); XCTAssertTrue(continued.style.complete && continued.media.complete)
+      XCTAssertEqual(ordered(continued.style.markdown), expected(tail))
+      XCTAssertGreaterThan(afterTail.appendedPages, afterRepeat.appendedPages,
+        "The actual tail was not eagerly indexed for the head request.")
+      _ = try await engine.logicalMarkup(tail)
+      _ = try await engine.logicalMarkup(head)
+      let afterCached = try await engine.fileStatistics()
+      XCTAssertEqual(afterCached.appendedPages, afterTail.appendedPages)
+      XCTAssertEqual(afterCached.appendedBytes, afterTail.appendedBytes)
+      XCTAssertEqual(afterCached.rootPublications, afterHead.rootPublications)
+      XCTAssertEqual(engine.custodySnapshot.jobs, baseline.jobs)
+      XCTAssertEqual(engine.custodySnapshot.reservedPayloadBytes, baseline.reservedPayloadBytes)
+      XCTAssertTrue(source.isCurrent(original)); XCTAssertTrue(f.view === view)
+      XCTAssertEqual(source.generation, generation); XCTAssertEqual(source.arenaID, arena)
+      XCTAssertEqual(view.sourceVersion, version)
+      XCTAssertNil(f.input!.firstRefusal); XCTAssertNil(f.commands!.firstFailure)
+      try await f.assertSource(text)
+    }
+  }
+
+  func testActualCachedDependentPrefixContinuesUntilLaterDefinitionIsProved() async throws {
+    let id = UUID(uuidString: "884646c1-14b4-490d-be8c-8953af793315")!
+    let text = "# [visible][REMOTE]\n\n" + String(repeating: "ordinary paragraph\n\n", count: 3400)
+      + "[remote]: boom-attachment:\(id.uuidString)\n"
+    try await fixture(#function, text: text) { f in
+      let engine = f.engine!, source = f.session!, head = source.logicalWindow
+      let original = try source.captureLogicalRead(), baseline = engine.custodySnapshot
+      let prefix = expectation(description: "actual unproved source-bound prefix before later definition")
+      let cancellation = CancellationFlag()
+      do {
+        _ = try await engine.logicalMarkup(head, cancellation: cancellation) { mode, value in
+          guard mode == 0 && !value.complete else { return }
+          XCTAssertTrue(value.matches(head)); XCTAssertTrue(value.markdown.isEmpty)
+          prefix.fulfill(); cancellation.cancel()
+        }
+        XCTFail("A cancelled unproved prefix unexpectedly completed.")
+      } catch is CancellationError { }
+      guard await XCTWaiter.fulfillment(of: [prefix], timeout: 5) == .completed else {
+        throw BoomError.unavailable("The actual unproved prefix was not delivered.")
+      }
+      let afterPrefix = try await engine.fileStatistics()
+      let resolved = try await engine.logicalMarkup(head)
+      let afterResolved = try await engine.fileStatistics()
+      XCTAssertTrue(resolved.matches(head)); XCTAssertTrue(resolved.style.complete && resolved.media.complete)
+      let whole: [MarkdownSpan] = try ProductCore.markdownSpans(text)
+      XCTAssertEqual(resolved.style.markdown, whole)
+      XCTAssertEqual(resolved.media.media, try ProductCore.markdownMediaSpans(text))
+      XCTAssertEqual(resolved.media.media.map(\.id), [id])
+      XCTAssertGreaterThan(afterResolved.appendedPages, afterPrefix.appendedPages,
+        "An unproved cached prefix must actually continue to its distant definition.")
+      XCTAssertEqual(engine.custodySnapshot.jobs, baseline.jobs)
+      XCTAssertEqual(engine.custodySnapshot.reservedPayloadBytes, baseline.reservedPayloadBytes)
+      XCTAssertTrue(source.isCurrent(original))
+      XCTAssertNil(f.input!.firstRefusal); XCTAssertNil(f.commands!.firstFailure)
+      try await f.assertSource(text)
+    }
+  }
+
   func testActualCachedMarkupReadCompletesUnderEnteredWriterAndStaleTypingConvergesAfterRelease() async throws {
     let text = "# Head 🙂\n\n" + String(repeating: "ordinary paragraph\n\n", count: 2600) + "# Tail\n"
     try await fixture(#function, text: text) { f in
       let engine = f.engine!, source = f.session!, view = f.view, commands = f.commands!
       let original = try source.captureLogicalRead()
       _ = try await engine.logicalMarkup(source.logicalWindow)
-      try f.scroll!.enableDocumentNavigation(engine: engine, publisher: f.publisher!)
-      await f.scroll!.joinMarkup()
       let tail = try await engine.logicalWindow(original.source, utf16Anchor: original.source.summary.utf16,
         maximumBytes: PagedWorkingWindow.targetBytes)
+      _ = try await engine.logicalMarkup(tail)
+      try f.scroll!.enableDocumentNavigation(engine: engine, publisher: f.publisher!)
+      await f.scroll!.joinMarkup()
       let release = DispatchSemaphore(value: 0)
       let entered = expectation(description: "actual writer executor entered")
       let writer = Task { try await engine.storageExecutorForTesting.run {

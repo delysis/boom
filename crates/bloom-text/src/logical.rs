@@ -549,6 +549,19 @@ impl LogicalSnapshot {
     ) -> Option<Arc<crate::markup::MarkupIndex>> {
         self.0.markup[mode.slot()].get().cloned()
     }
+    /// A query may reuse the exact source's already-proved prefix without
+    /// entering the index writer. This is never whole-source completeness.
+    pub fn captured_markup_prefix(
+        &self,
+        mode: crate::markup::MarkupMode,
+    ) -> Result<Option<Arc<crate::markup::MarkupIndex>>> {
+        if let Some(index) = self.markup_index(mode) {
+            return Ok(Some(index));
+        }
+        Ok(self.previous_markup(mode)?.filter(|index| {
+            index.source.id == self.id() && index.source.summary == self.summary()
+        }))
+    }
     pub(super) fn previous_markup(
         &self,
         mode: crate::markup::MarkupMode,
