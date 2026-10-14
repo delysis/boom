@@ -16,8 +16,8 @@ use std::sync::Mutex;
 // shape inside the unchanged 16KiB Index-page limit.
 mod inline;
 mod references;
-use references::ReferencePass;
 use inline::{InlineParagraph, InlineRef, InlineScan, LongParagraph};
+use references::ReferencePass;
 
 const MARK_FANOUT: usize = 8;
 const MARK_HEIGHT: u8 = 12;
@@ -542,18 +542,31 @@ impl Segment {
         self.incoming.validate()?;
         self.outgoing.validate()?;
         if self.summary.bytes == 0
-            || (self.summary.bytes > PROBE_BYTES as u64 && self.inline.is_none()&& !self.pending_inline)
+            || (self.summary.bytes > PROBE_BYTES as u64
+                && self.inline.is_none()
+                && !self.pending_inline)
             || self.reference_slots > self.summary.bytes
         {
             return Err(Error::Invalid("markup segment bound"));
         }
-        if self.pending_inline && (self.inline.is_some() || !self.dependent_inline || self.parsed
-            || self.incoming != Carry::Root || self.outgoing != Carry::Root || self.code.is_some()
-            || self.definitions.is_some() || !self.boundaries.is_empty() || self.boundary_base != 0 || self.boundary_extent != 0) {
+        if self.pending_inline
+            && (self.inline.is_some()
+                || !self.dependent_inline
+                || self.parsed
+                || self.incoming != Carry::Root
+                || self.outgoing != Carry::Root
+                || self.code.is_some()
+                || self.definitions.is_some()
+                || !self.boundaries.is_empty()
+                || self.boundary_base != 0
+                || self.boundary_extent != 0)
+        {
             return Err(Error::Invalid("markup pending actual paragraph state"));
         }
         if self.dependent_inline && self.inline.is_none() && !self.pending_inline {
-            return Err(Error::Invalid("markup reference paragraph without source state"));
+            return Err(Error::Invalid(
+                "markup reference paragraph without source state",
+            ));
         }
         if let Some(inline) = &self.inline {
             inline.validate(self.summary)?;
@@ -562,7 +575,6 @@ impl Segment {
                 || self.outgoing != Carry::Root
                 || self.code.is_some()
                 || self.definitions.is_some()
-
                 || !self.boundaries.is_empty()
                 || self.boundary_base != 0
                 || self.boundary_extent != 0
@@ -595,7 +607,8 @@ impl Segment {
             || (!self.parsed && !self.boundaries.is_empty())
             || self.definition_base != self.boundary_base
             || self.inline.is_none()
-                && !self.pending_inline && u64::from(self.boundary_base)
+                && !self.pending_inline
+                && u64::from(self.boundary_base)
                     .checked_add(self.summary.bytes)
                     .is_none_or(|end| end > u64::from(self.boundary_extent))
         {
@@ -626,7 +639,8 @@ struct MarkRef {
     labels: Labels,
     reference_slots: u64,
     max_definition_cost: u64,
-    pending_inline: u64, dependent_inline: u64,
+    pending_inline: u64,
+    dependent_inline: u64,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(
@@ -711,7 +725,9 @@ fn validate_mark_ref(root: &MarkRef) -> Result<()> {
         || root.summary.bytes == 0
         || root.reference_slots > root.summary.bytes
         || root.max_definition_cost > 2 * PROBE_BYTES as u64
-    || root.pending_inline > root.dependent_inline || root.dependent_inline > root.summary.bytes {
+        || root.pending_inline > root.dependent_inline
+        || root.dependent_inline > root.summary.bytes
+    {
         return Err(Error::Invalid("markup node reference"));
     }
     Ok(())
@@ -793,7 +809,8 @@ impl<S: PageProvider> TextEngine<S> {
     ) -> Result<MarkNode> {
         validate_mark_ref(root)?;
         let node = self.read_mark_page(source, mode, &root.page)?;
-        let (summary, incoming, outgoing, labels, slots, max_cost, pending, dependent) = match &node {
+        let (summary, incoming, outgoing, labels, slots, max_cost, pending, dependent) = match &node
+        {
             MarkNode::Segments(values)
                 if root.height == 0 && !values.is_empty() && values.len() <= MARK_FANOUT =>
             {
@@ -817,8 +834,12 @@ impl<S: PageProvider> TextEngine<S> {
                         .ok_or(Error::Invalid("markup reference slots"))?;
                     max_cost =
                         max_cost.max(value.definitions.as_ref().map_or(0, |root| root.max_cost));
-                        pending = pending.checked_add(u64::from(value.pending_inline)).ok_or(Error::Invalid("markup pending paragraph aggregate"))?;
-                    dependent = dependent.checked_add(u64::from(value.dependent_inline)).ok_or(Error::Invalid("markup dependent paragraph aggregate"))?;
+                    pending = pending
+                        .checked_add(u64::from(value.pending_inline))
+                        .ok_or(Error::Invalid("markup pending paragraph aggregate"))?;
+                    dependent = dependent
+                        .checked_add(u64::from(value.dependent_inline))
+                        .ok_or(Error::Invalid("markup dependent paragraph aggregate"))?;
                 }
                 (
                     summary,
@@ -853,8 +874,12 @@ impl<S: PageProvider> TextEngine<S> {
                         .checked_add(value.reference_slots)
                         .ok_or(Error::Invalid("markup reference slots"))?;
                     max_cost = max_cost.max(value.max_definition_cost);
-                        pending = pending.checked_add(value.pending_inline).ok_or(Error::Invalid("markup pending branch aggregate"))?;
-                    dependent = dependent.checked_add(value.dependent_inline).ok_or(Error::Invalid("markup dependent branch aggregate"))?;
+                    pending = pending
+                        .checked_add(value.pending_inline)
+                        .ok_or(Error::Invalid("markup pending branch aggregate"))?;
+                    dependent = dependent
+                        .checked_add(value.dependent_inline)
+                        .ok_or(Error::Invalid("markup dependent branch aggregate"))?;
                 }
                 (
                     summary,
@@ -875,7 +900,9 @@ impl<S: PageProvider> TextEngine<S> {
             || labels != root.labels
             || slots != root.reference_slots
             || max_cost != root.max_definition_cost
-        || pending != root.pending_inline || dependent != root.dependent_inline {
+            || pending != root.pending_inline
+            || dependent != root.dependent_inline
+        {
             return Err(Error::Invalid("markup authenticated aggregate"));
         }
         Ok(node)
@@ -909,8 +936,12 @@ impl<S: PageProvider> TextEngine<S> {
                 .checked_add(value.reference_slots)
                 .ok_or(Error::Invalid("markup leaf reference slots"))?;
             max_cost = max_cost.max(value.definitions.as_ref().map_or(0, |root| root.max_cost));
-            pending = pending.checked_add(u64::from(value.pending_inline)).ok_or(Error::Invalid("markup new pending paragraph count"))?;
-            dependent = dependent.checked_add(u64::from(value.dependent_inline)).ok_or(Error::Invalid("markup new dependent paragraph count"))?;
+            pending = pending
+                .checked_add(u64::from(value.pending_inline))
+                .ok_or(Error::Invalid("markup new pending paragraph count"))?;
+            dependent = dependent
+                .checked_add(u64::from(value.dependent_inline))
+                .ok_or(Error::Invalid("markup new dependent paragraph count"))?;
         }
         if values.len() > MARK_FANOUT {
             return Err(Error::Invalid("markup leaf fanout"));
@@ -969,8 +1000,12 @@ impl<S: PageProvider> TextEngine<S> {
                 .checked_add(value.reference_slots)
                 .ok_or(Error::Invalid("markup branch reference slots"))?;
             max_cost = max_cost.max(value.max_definition_cost);
-            pending = pending.checked_add(value.pending_inline).ok_or(Error::Invalid("markup new pending branch count"))?;
-            dependent = dependent.checked_add(value.dependent_inline).ok_or(Error::Invalid("markup new dependent branch count"))?;
+            pending = pending
+                .checked_add(value.pending_inline)
+                .ok_or(Error::Invalid("markup new pending branch count"))?;
+            dependent = dependent
+                .checked_add(value.dependent_inline)
+                .ok_or(Error::Invalid("markup new dependent branch count"))?;
         }
         let page = self.write_mark_page(source, mode, MarkNode::Branch(values))?;
         Ok(Some(MarkRef {
@@ -1265,23 +1300,39 @@ impl<S: PageProvider> TextEngine<S> {
             }
         }
     }
-    fn first_reference_paragraph(&mut self, source: &Revision, mode: MarkupMode, mut root: MarkRef) -> Result<Option<u64>> {
-        if root.dependent_inline == 0 { return Ok(None); }
+    fn first_reference_paragraph(
+        &mut self,
+        source: &Revision,
+        mode: MarkupMode,
+        mut root: MarkRef,
+    ) -> Result<Option<u64>> {
+        if root.dependent_inline == 0 {
+            return Ok(None);
+        }
         let mut before = 0u64;
         loop {
             match self.mark_node(source, mode, &root)? {
                 MarkNode::Branch(values) => {
                     let mut found = None;
                     for value in values {
-                        if value.dependent_inline != 0 { found = Some(value); break; }
-                        before = before.checked_add(value.summary.bytes).ok_or(Error::Invalid("markup first reference paragraph extent"))?;
+                        if value.dependent_inline != 0 {
+                            found = Some(value);
+                            break;
+                        }
+                        before = before
+                            .checked_add(value.summary.bytes)
+                            .ok_or(Error::Invalid("markup first reference paragraph extent"))?;
                     }
                     root = found.ok_or(Error::Invalid("markup missing reference branch"))?;
                 }
                 MarkNode::Segments(values) => {
                     for value in values {
-                        if value.dependent_inline { return Ok(Some(before)); }
-                        before = before.checked_add(value.summary.bytes).ok_or(Error::Invalid("markup first reference segment extent"))?;
+                        if value.dependent_inline {
+                            return Ok(Some(before));
+                        }
+                        before = before
+                            .checked_add(value.summary.bytes)
+                            .ok_or(Error::Invalid("markup first reference segment extent"))?;
                     }
                     return Err(Error::Invalid("markup missing reference segment"));
                 }
@@ -1626,7 +1677,8 @@ impl MarkupIndexBuilder {
             // Conservatively rebuild from the first actual dependent block.
             if previous.source.id != value.snapshot.id()
                 && let Some(root) = previous.root.clone()
-                && let Some(at) = engine.first_reference_paragraph(value.snapshot.origin(), mode, root)?
+                && let Some(at) =
+                    engine.first_reference_paragraph(value.snapshot.origin(), mode, root)?
                 && at < prefix.bytes
             {
                 prefix = engine.logical_byte_position(&value.snapshot, at)?.point();
@@ -1722,7 +1774,11 @@ impl MarkupIndexBuilder {
                 + self
                     .long_paragraph
                     .as_ref()
-                    .map_or(0, LongParagraph::buffered_bytes)+ self.reference_pass.as_ref().map_or(0, ReferencePass::buffered_bytes),
+                    .map_or(0, LongParagraph::buffered_bytes)
+                + self
+                    .reference_pass
+                    .as_ref()
+                    .map_or(0, ReferencePass::buffered_bytes),
             reused_bytes: self.reused,
         }
     }
@@ -1743,10 +1799,23 @@ impl MarkupIndexBuilder {
         if self.cursor != self.snapshot.summary() || !self.buffer.is_empty() {
             return Err(Error::Invalid("markup full coverage summary"));
         }
-        if self.root.as_ref().is_some_and(|root| root.pending_inline != 0) {
-            if self.reference_pass.is_some() { return Err(Error::Invalid("markup reference pass still has pending paragraphs")); }
-            let definitions = Arc::new(MarkupIndex { source: self.snapshot.markup_source(), mode: self.mode,
-                root: self.root.clone(), complete: false, definitions_complete: true });
+        if self
+            .root
+            .as_ref()
+            .is_some_and(|root| root.pending_inline != 0)
+        {
+            if self.reference_pass.is_some() {
+                return Err(Error::Invalid(
+                    "markup reference pass still has pending paragraphs",
+                ));
+            }
+            let definitions = Arc::new(MarkupIndex {
+                source: self.snapshot.markup_source(),
+                mode: self.mode,
+                root: self.root.clone(),
+                complete: false,
+                definitions_complete: true,
+            });
             self.reference_pass = Some(ReferencePass::new(definitions));
             return Ok(());
         }
@@ -1754,7 +1823,8 @@ impl MarkupIndexBuilder {
             source: self.snapshot.markup_source(),
             mode: self.mode,
             root: self.root.clone(),
-            complete: true, definitions_complete: true,
+            complete: true,
+            definitions_complete: true,
         });
         self.snapshot.completed_markup(Arc::clone(&index))?;
         self.ready = Some(index);
@@ -1840,7 +1910,9 @@ impl MarkupIndexBuilder {
                 reference_slots: 0,
                 code,
                 inline: None,
-                pending_inline: false, dependent_inline: false, definitions: None,
+                pending_inline: false,
+                dependent_inline: false,
+                definitions: None,
                 definition_base: 0,
                 boundaries: Vec::new(),
                 boundary_base: 0,
@@ -1857,7 +1929,12 @@ impl MarkupIndexBuilder {
         let Some(previous) = &self.previous else {
             return Ok(false);
         };
-        if !previous.complete || previous.root.as_ref().is_some_and(|root| root.dependent_inline != 0) {
+        if !previous.complete
+            || previous
+                .root
+                .as_ref()
+                .is_some_and(|root| root.dependent_inline != 0)
+        {
             return Ok(false);
         }
         if self.cursor.bytes < self.new_suffix || self.new_suffix == self.snapshot.summary().bytes {
@@ -1981,7 +2058,10 @@ impl MarkupIndexBuilder {
             match pass.step(engine, &self.snapshot, &mut self.root, cancelled)? {
                 references::PassProgress::Working => self.reference_pass = Some(pass),
                 references::PassProgress::Complete => self.complete_index()?,
-                references::PassProgress::Incomplete => { self.incomplete = true; self.stopped = true; }
+                references::PassProgress::Incomplete => {
+                    self.incomplete = true;
+                    self.stopped = true;
+                }
             }
             self.snapshot.progressed_markup(self.captured_index())?;
             return Ok(self.progress());
@@ -2069,12 +2149,34 @@ impl MarkupIndexBuilder {
             paragraph.step(engine, &self.snapshot, self.mode, cancelled)?;
             check_cancel(cancelled)?;
             if paragraph.deferred() {
-                let (summary, reference_slots) = self.long_paragraph.take().ok_or(Error::Invalid("markup deferred paragraph missing"))?.into_deferred()?;
+                let (summary, reference_slots) = self
+                    .long_paragraph
+                    .take()
+                    .ok_or(Error::Invalid("markup deferred paragraph missing"))?
+                    .into_deferred()?;
                 self.buffer.clear();
-                self.append(engine, Segment { summary, incoming: Carry::Root, outgoing: Carry::Root,
-                    parsed: false, reference_slots, code: None, inline: None, pending_inline: true, dependent_inline: true,
-                    definitions: None, definition_base: 0, boundaries: Vec::new(), boundary_base: 0, boundary_extent: 0 })?;
-                if self.cursor == self.snapshot.summary() { self.complete_index()?; }
+                self.append(
+                    engine,
+                    Segment {
+                        summary,
+                        incoming: Carry::Root,
+                        outgoing: Carry::Root,
+                        parsed: false,
+                        reference_slots,
+                        code: None,
+                        inline: None,
+                        pending_inline: true,
+                        dependent_inline: true,
+                        definitions: None,
+                        definition_base: 0,
+                        boundaries: Vec::new(),
+                        boundary_base: 0,
+                        boundary_extent: 0,
+                    },
+                )?;
+                if self.cursor == self.snapshot.summary() {
+                    self.complete_index()?;
+                }
             } else if paragraph.unsupported() {
                 self.incomplete = true;
                 self.stopped = true;
@@ -2095,7 +2197,9 @@ impl MarkupIndexBuilder {
                         parsed: false,
                         reference_slots,
                         code: None,
-                        inline: Some(inline), pending_inline: false, dependent_inline: false,
+                        inline: Some(inline),
+                        pending_inline: false,
+                        dependent_inline: false,
                         definitions: None,
                         definition_base: 0,
                         boundaries: Vec::new(),
@@ -2304,7 +2408,9 @@ impl MarkupIndexBuilder {
                                     as u64,
                                 code: None,
                                 inline: None,
-                                pending_inline: false, dependent_inline: false, definitions,
+                                pending_inline: false,
+                                dependent_inline: false,
+                                definitions,
                                 definition_base: 0,
                                 boundaries,
                                 boundary_base: 0,
@@ -2371,7 +2477,8 @@ impl MarkupIndexBuilder {
             source: self.snapshot.markup_source(),
             mode: self.mode,
             root: self.root.take(),
-            complete: false, definitions_complete: false,
+            complete: false,
+            definitions_complete: false,
         }))
     }
 }
@@ -2570,14 +2677,13 @@ pub struct MarkupQuery {
     reference_scan: usize,
     reference_round_changed: bool,
     budget_proven: bool,
-operand_probe: bool,
+    operand_probe: bool,
     pending_inline: bool,
     reference_finished: bool,
     inline_validation: usize,
 }
 impl MarkupQuery {
     pub fn new(window: &LogicalWindow, index: Arc<MarkupIndex>) -> Result<Self> {
-
         if window.text().len() > NATIVE_WINDOW_BYTES {
             return Err(Error::Invalid("markup native window bound"));
         }
@@ -2585,18 +2691,33 @@ impl MarkupQuery {
         let end = start.checked_add(window.local_summary())?;
         Self::from_range(window.snapshot().clone(), index, start, end, true)
     }
-    fn from_range(snapshot: LogicalSnapshot, index: Arc<MarkupIndex>, start: TextSummary,
-        end: TextSummary, visit_window: bool,
+    fn from_range(
+        snapshot: LogicalSnapshot,
+        index: Arc<MarkupIndex>,
+        start: TextSummary,
+        end: TextSummary,
+        visit_window: bool,
     ) -> Result<Self> {
-        if snapshot.id() != index.source.id || snapshot.summary() != index.source.summary { return Err(Error::Stale); }
-        start.validate()?; end.validate()?;
-        if start.bytes > end.bytes || end.bytes > snapshot.summary().bytes || start.utf16 > end.utf16 || end.utf16 > snapshot.summary().utf16 {
+        if snapshot.id() != index.source.id || snapshot.summary() != index.source.summary {
+            return Err(Error::Stale);
+        }
+        start.validate()?;
+        end.validate()?;
+        if start.bytes > end.bytes
+            || end.bytes > snapshot.summary().bytes
+            || start.utf16 > end.utf16
+            || end.utf16 > snapshot.summary().utf16
+        {
             return Err(Error::Invalid("markup actual query extent"));
         }
-        let stack = if visit_window { index
-            .root
-            .as_ref()
-            .map_or_else(Vec::new, |root| vec![(root.clone(), TextSummary::EMPTY)])} else { Vec::new() };
+        let stack = if visit_window {
+            index
+                .root
+                .as_ref()
+                .map_or_else(Vec::new, |root| vec![(root.clone(), TextSummary::EMPTY)])
+        } else {
+            Vec::new()
+        };
         let budget_proven = index.definitions_complete
             && index.root.as_ref().is_none_or(|root| {
                 root.reference_slots
@@ -2648,22 +2769,40 @@ impl MarkupQuery {
     // Internal reference discovery only, never an authenticated native window
     // or a display-ready completed grammar claim. Its source String moves
     // from the existing paragraph buffer and is released during disk lookup.
-    fn inline_operand(snapshot: &LogicalSnapshot, index: Arc<MarkupIndex>, start: TextSummary,
+    fn inline_operand(
+        snapshot: &LogicalSnapshot,
+        index: Arc<MarkupIndex>,
+        start: TextSummary,
         text: String,
     ) -> Result<Self> {
         if text.is_empty() || text.len() > PROBE_BYTES || !index.definitions_complete {
-            return Err(Error::Invalid("markup inline reference operand bound/search"));
+            return Err(Error::Invalid(
+                "markup inline reference operand bound/search",
+            ));
         }
         let end = start.checked_add(TextSummary::of(&text))?;
         let mut value = Self::from_range(snapshot.clone(), index, start, end, false)?;
-        value.operand_probe = true; value.fragment_text_bytes = text.len();
-        value.fragments.push(MarkupFragment { start, text, code: None, parsed: true,
-            containers: BlockCarry::default(), reference_independent: None,
-            reference_indices: Vec::new(), inline_ready: false, inline_only: true });
+        value.operand_probe = true;
+        value.fragment_text_bytes = text.len();
+        value.fragments.push(MarkupFragment {
+            start,
+            text,
+            code: None,
+            parsed: true,
+            containers: BlockCarry::default(),
+            reference_independent: None,
+            reference_indices: Vec::new(),
+            inline_ready: false,
+            inline_only: true,
+        });
         Ok(value)
     }
     fn copied_source_bytes(&self) -> usize {
-        self.fragment_text_bytes + self.pending_fragment.as_ref().map_or(0, |value| value.text.len())
+        self.fragment_text_bytes
+            + self
+                .pending_fragment
+                .as_ref()
+                .map_or(0, |value| value.text.len())
     }
     pub fn progress(&self) -> MarkupQueryProgress {
         MarkupQueryProgress {
@@ -2785,19 +2924,25 @@ impl MarkupQuery {
                     indices.push(index as u16);
                     None
                 };
-                let  parser = if fragment.inline_only {
-                    Parser::new_with_broken_link_callback_for_inline(&fragment.text, self.index.mode.options(), Some(&mut collect))
-                        .ok_or(Error::Invalid("markup inline reference parser bound"))?
-                } else { Parser::new_with_broken_link_callback_and_containers(
-                    &fragment.text,
-                    self.index.mode.options(),
-                    Some(&mut collect),
-                    &fragment.containers,
-                )
+                let parser = if fragment.inline_only {
+                    Parser::new_with_broken_link_callback_for_inline(
+                        &fragment.text,
+                        self.index.mode.options(),
+                        Some(&mut collect),
+                    )
+                    .ok_or(Error::Invalid("markup inline reference parser bound"))?
+                } else {
+                    Parser::new_with_broken_link_callback_and_containers(
+                        &fragment.text,
+                        self.index.mode.options(),
+                        Some(&mut collect),
+                        &fragment.containers,
+                    )
                 };
-                let mut parser = parser.with_reference_definitions(definitions)
-                .with_reference_fuel(usize::MAX)
-                .into_offset_iter();
+                let mut parser = parser
+                    .with_reference_definitions(definitions)
+                    .with_reference_fuel(usize::MAX)
+                    .into_offset_iter();
                 loop {
                     if parser
                         .next_with_check(cancelled)
@@ -2843,38 +2988,83 @@ impl MarkupQuery {
             .as_ref()
             .map_or_else(Vec::new, |root| vec![(root.clone(), TextSummary::EMPTY)]);
         self.lookup = true;
-    if self.operand_probe {
+        if self.operand_probe {
             // The immutable source can supply this <=32KiB operand again.
             // Do not retain it alongside a copied definition candidate.
-            for fragment in &mut self.fragments { fragment.text = String::new(); }
+            for fragment in &mut self.fragments {
+                fragment.text = String::new();
+            }
             self.fragment_text_bytes = 0;
         }
     }
-    fn validate_next_inline<S: PageProvider>(&mut self, engine: &mut TextEngine<S>, cancelled: &mut impl FnMut() -> bool) -> Result<()> {
+    fn validate_next_inline<S: PageProvider>(
+        &mut self,
+        engine: &mut TextEngine<S>,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<()> {
         // Ordinary blocks already completed their actual reference rounds.
         // Skip a bounded batch of those descriptors, rather than adding an
         // extra host turn per unrelated block to every existing query.
         for _ in 0..128 {
-            let Some(fragment) = self.fragments.get(self.inline_validation) else { self.complete = true; return Ok(()); };
-            self.inline_validation = self.inline_validation.checked_add(1).ok_or(Error::Invalid("markup inline validation cursor"))?;
-            if self.operand_probe || !fragment.inline_only || fragment.reference_independent == Some(true) { continue; }
-            if !self.budget_proven { self.incomplete_inline = true; self.complete = true; return Ok(()); }
+            let Some(fragment) = self.fragments.get(self.inline_validation) else {
+                self.complete = true;
+                return Ok(());
+            };
+            self.inline_validation = self
+                .inline_validation
+                .checked_add(1)
+                .ok_or(Error::Invalid("markup inline validation cursor"))?;
+            if self.operand_probe
+                || !fragment.inline_only
+                || fragment.reference_independent == Some(true)
+            {
+                continue;
+            }
+            if !self.budget_proven {
+                self.incomplete_inline = true;
+                self.complete = true;
+                return Ok(());
+            }
             let mut definitions = RefDefs::default();
             for &index in &fragment.reference_indices {
-                let value = self.references.get(usize::from(index)).ok_or(Error::Invalid("markup inline selected reference"))?;
-                if let Some(value) = &value.value { definitions.insert_parsed(value.borrowed()); }
+                let value = self
+                    .references
+                    .get(usize::from(index))
+                    .ok_or(Error::Invalid("markup inline selected reference"))?;
+                if let Some(value) = &value.value {
+                    definitions.insert_parsed(value.borrowed());
+                }
             }
-            let after = fragment.start.bytes.checked_add(fragment.text.len() as u64)
+            let after = fragment
+                .start
+                .bytes
+                .checked_add(fragment.text.len() as u64)
                 .ok_or(Error::Invalid("markup reference follower source extent"))?;
             let following = if after < self.snapshot.summary().bytes {
-                let end = after.checked_add(1).ok_or(Error::Invalid("markup reference follower end"))?;
-                Some(*engine.logical_read_range(&self.snapshot, after..end, cancelled)?.first()
-                    .ok_or(Error::Invalid("markup reference follower source missing"))?)
-            } else { None };
-            let proved = pulldown_cmark::paged::probe_inline_link_with_definitions(&fragment.text,
-                self.index.mode.options(), definitions, true, following, cancelled).map_err(inline::inline_error)?;
+                let end = after
+                    .checked_add(1)
+                    .ok_or(Error::Invalid("markup reference follower end"))?;
+                Some(
+                    *engine
+                        .logical_read_range(&self.snapshot, after..end, cancelled)?
+                        .first()
+                        .ok_or(Error::Invalid("markup reference follower source missing"))?,
+                )
+            } else {
+                None
+            };
+            let proved = pulldown_cmark::paged::probe_inline_link_with_definitions(
+                &fragment.text,
+                self.index.mode.options(),
+                definitions,
+                true,
+                following,
+                cancelled,
+            )
+            .map_err(inline::inline_error)?;
             if proved.is_none_or(|value| value.end() != fragment.text.len()) {
-                self.incomplete_inline = true; self.complete = true;
+                self.incomplete_inline = true;
+                self.complete = true;
             }
             // At most one actual parser/source read per step.
             return Ok(());
@@ -3108,15 +3298,25 @@ impl MarkupQuery {
             return Ok(self.progress());
         }
         if self.reference_finished {
-            self.validate_next_inline(engine, cancelled)?; return Ok(self.progress());
+            self.validate_next_inline(engine, cancelled)?;
+            return Ok(self.progress());
         }
-        if self.operand_probe && !self.lookup && self.fragments.first().is_some_and(|value| value.text.is_empty()) {
-            let bytes = engine.logical_read_range(&self.snapshot, self.window.clone(), cancelled)?;
-            let text = String::from_utf8(bytes).map_err(|_| Error::Invalid("markup inline reference reload UTF8"))?;
+        if self.operand_probe
+            && !self.lookup
+            && self
+                .fragments
+                .first()
+                .is_some_and(|value| value.text.is_empty())
+        {
+            let bytes =
+                engine.logical_read_range(&self.snapshot, self.window.clone(), cancelled)?;
+            let text = String::from_utf8(bytes)
+                .map_err(|_| Error::Invalid("markup inline reference reload UTF8"))?;
             if self.window_start.checked_add(TextSummary::of(&text))? != self.window_end {
                 return Err(Error::Invalid("markup inline reference reload summary"));
             }
-            self.fragment_text_bytes = text.len(); self.fragments[0].text = text;
+            self.fragment_text_bytes = text.len();
+            self.fragments[0].text = text;
             return Ok(self.progress());
         }
         if let Some((first, last)) = self.inline_fragments.pop_front() {
@@ -3160,7 +3360,7 @@ impl MarkupQuery {
                 pulldown_cmark::paged::InlineRunError::Cancelled => Error::Cancelled,
                 pulldown_cmark::paged::InlineRunError::Invalid(value) => Error::Invalid(value),
             })?;
-            let independent = proved.is_some_and(|value| value.end() == text.len()) ;
+            let independent = proved.is_some_and(|value| value.end() == text.len());
 
             self.inline_fragment_bytes = charge;
             self.last_inline_fragment_end = last.bytes;
@@ -3382,7 +3582,9 @@ impl MarkupQuery {
                 value.searched = true;
             }
             self.lookup = false;
-        if self.operand_probe { return Ok(self.progress()); }
+            if self.operand_probe {
+                return Ok(self.progress());
+            }
         }
         match self.collect_references(cancelled)? {
             ReferenceProgress::Scanning => {}
@@ -3427,7 +3629,7 @@ impl MarkupQuery {
             inline_media: self.inline_media,
             inline_headings: self.inline_headings,
             references: self.references,
-            reference_budget_proven: covered && inline_ready&& !self.pending_inline,
+            reference_budget_proven: covered && inline_ready && !self.pending_inline,
             complete_blocks: covered && !self.operand_probe && !self.pending_inline,
         })
     }

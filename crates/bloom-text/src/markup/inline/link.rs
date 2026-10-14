@@ -1,7 +1,9 @@
 //! Actual completed inline subtrees reuse the pinned LinkStack and the SAME
 //! source-bound reference query. Pending labels are not absence proofs.
 use super::*;
-use pulldown_cmark::paged::{InlineLinkFragment, probe_inline_link, probe_inline_link_with_definitions};
+use pulldown_cmark::paged::{
+    InlineLinkFragment, probe_inline_link, probe_inline_link_with_definitions,
+};
 
 pub(super) struct PendingLink {
     start: InlinePoint,
@@ -12,7 +14,9 @@ pub(super) struct PendingLink {
 }
 impl PendingLink {
     pub(super) fn buffered_bytes(&self) -> usize {
-        self.lookup.as_ref().map_or(0, MarkupQuery::copied_source_bytes)
+        self.lookup
+            .as_ref()
+            .map_or(0, MarkupQuery::copied_source_bytes)
     }
 }
 impl LongParagraph {
@@ -49,14 +53,39 @@ impl LongParagraph {
         cancelled: &mut impl FnMut() -> bool,
     ) -> Result<bool> {
         if let Some(lookup) = &mut pending.lookup {
-            if !lookup.step(engine, cancelled)?.complete { return Ok(false); }
-            let mut context = pending.lookup.take().ok_or(Error::Invalid("markup inline lookup missing"))?.finish()?;
-            if !context.reference_budget_proven { self.unsupported = true; return Ok(true); }
-            let fragment = context.fragments.first().ok_or(Error::Invalid("markup inline lookup operand missing"))?;
-            let found = probe_inline_link_with_definitions(&fragment.text, mode.options(),
-                context.definitions_for(fragment)?, true, None, cancelled).map_err(inline_error)?;
-            if context.fragments.len() != 1 { return Err(Error::Invalid("markup inline lookup operand shape")); }
-            self.buffer = context.fragments.pop().ok_or(Error::Invalid("markup inline lookup operand lost"))?.text;
+            if !lookup.step(engine, cancelled)?.complete {
+                return Ok(false);
+            }
+            let mut context = pending
+                .lookup
+                .take()
+                .ok_or(Error::Invalid("markup inline lookup missing"))?
+                .finish()?;
+            if !context.reference_budget_proven {
+                self.unsupported = true;
+                return Ok(true);
+            }
+            let fragment = context
+                .fragments
+                .first()
+                .ok_or(Error::Invalid("markup inline lookup operand missing"))?;
+            let found = probe_inline_link_with_definitions(
+                &fragment.text,
+                mode.options(),
+                context.definitions_for(fragment)?,
+                true,
+                None,
+                cancelled,
+            )
+            .map_err(inline_error)?;
+            if context.fragments.len() != 1 {
+                return Err(Error::Invalid("markup inline lookup operand shape"));
+            }
+            self.buffer = context
+                .fragments
+                .pop()
+                .ok_or(Error::Invalid("markup inline lookup operand lost"))?
+                .text;
             pending.checked = Some((self.buffer.len(), found));
             return Ok(false);
         }
@@ -84,14 +113,22 @@ impl LongParagraph {
         let found = match pending.checked {
             Some((checked, found)) if checked == count => found,
             _ => {
-                let independent = probe_inline_link(&self.buffer[..count], mode.options(), cancelled).map_err(inline_error)?;
-                if independent.is_none() && let Some(index) = &self.reference_index {
+                let independent =
+                    probe_inline_link(&self.buffer[..count], mode.options(), cancelled)
+                        .map_err(inline_error)?;
+                if independent.is_none()
+                    && let Some(index) = &self.reference_index
+                {
                     // Move the only copied source operand into the existing
                     // query. Drop unused tail; immutable pages can reread it.
                     self.buffer.truncate(count);
                     let start = self.start.checked_add(self.summary)?;
-                    pending.lookup = Some(MarkupQuery::inline_operand(snapshot, Arc::clone(index), start,
-                        std::mem::take(&mut self.buffer))?);
+                    pending.lookup = Some(MarkupQuery::inline_operand(
+                        snapshot,
+                        Arc::clone(index),
+                        start,
+                        std::mem::take(&mut self.buffer),
+                    )?);
                     return Ok(false);
                 }
                 independent

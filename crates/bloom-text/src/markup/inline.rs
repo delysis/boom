@@ -656,9 +656,13 @@ pub(super) struct LongParagraph {
     angle_pending: Option<PendingAngle>,
     link_pending: Option<PendingLink>,
     survey_link: bool,
-    reference_index: Option<Arc<MarkupIndex>>, reference_slots: u64,
-    scope: Option<ParagraphScope>, defer_requested: bool, definitions_excluded: bool,
-    has_pipe: bool, table_sensitive: bool,
+    reference_index: Option<Arc<MarkupIndex>>,
+    reference_slots: u64,
+    scope: Option<ParagraphScope>,
+    defer_requested: bool,
+    definitions_excluded: bool,
+    has_pipe: bool,
+    table_sensitive: bool,
     heading: Option<u8>,
     heading_syntax: u64,
     prefix_open: bool,
@@ -702,8 +706,12 @@ impl LongParagraph {
             angle_pending: None,
             link_pending: None,
             survey_link: false,
-            reference_index: None, reference_slots: 0,
-            scope: None, defer_requested: false, definitions_excluded, has_pipe: false,
+            reference_index: None,
+            reference_slots: 0,
+            scope: None,
+            defer_requested: false,
+            definitions_excluded,
+            has_pipe: false,
             table_sensitive: mode.options().contains(Options::ENABLE_TABLES),
             heading: None,
             heading_syntax: 0,
@@ -719,22 +727,40 @@ impl LongParagraph {
     pub fn unsupported(&self) -> bool {
         self.unsupported
     }
-    pub fn deferred(&self) -> bool { self.defer_requested }
+    pub fn deferred(&self) -> bool {
+        self.defer_requested
+    }
     pub fn resolve_references(&mut self, index: Arc<MarkupIndex>) -> Result<()> {
-        if !index.definitions_complete { return Err(Error::Invalid("markup reference pass before real block EOF")); }
-        self.reference_index = Some(index); Ok(())
+        if !index.definitions_complete {
+            return Err(Error::Invalid(
+                "markup reference pass before real block EOF",
+            ));
+        }
+        self.reference_index = Some(index);
+        Ok(())
     }
     fn may_defer(&self) -> bool {
-        self.definitions_excluded && self.scope.is_some_and(|scope| !self.table_sensitive || !scope.has_pipe)
+        self.definitions_excluded
+            && self
+                .scope
+                .is_some_and(|scope| !self.table_sensitive || !scope.has_pipe)
     }
     pub fn into_deferred(self) -> Result<(TextSummary, u64)> {
-        if !self.defer_requested || self.reference_index.is_some() || !self.may_defer() { return Err(Error::Invalid("markup paragraph not deferred")); }
-        let scope = self.scope.ok_or(Error::Invalid("markup deferred paragraph has no real scope"))?;
+        if !self.defer_requested || self.reference_index.is_some() || !self.may_defer() {
+            return Err(Error::Invalid("markup paragraph not deferred"));
+        }
+        let scope = self.scope.ok_or(Error::Invalid(
+            "markup deferred paragraph has no real scope",
+        ))?;
         Ok((scope.block, scope.references))
     }
     pub fn buffered_bytes(&self) -> usize {
-        self.buffer.len() + self.code_survey.as_ref().map_or(0, Survey::buffered_bytes)
-            + self.link_pending.as_ref().map_or(0, PendingLink::buffered_bytes)
+        self.buffer.len()
+            + self.code_survey.as_ref().map_or(0, Survey::buffered_bytes)
+            + self
+                .link_pending
+                .as_ref()
+                .map_or(0, PendingLink::buffered_bytes)
     }
     fn at_eof(&self, snapshot: &LogicalSnapshot) -> bool {
         self.start
@@ -788,7 +814,14 @@ impl LongParagraph {
             return Err(Error::Invalid("markup paragraph consume boundary"));
         }
         self.has_pipe |= self.buffer.as_bytes()[..count].contains(&b'|');
-        self.reference_slots = self.reference_slots.checked_add(self.buffer[..count].bytes().filter(|byte| *byte == b'[').count() as u64)
+        self.reference_slots = self
+            .reference_slots
+            .checked_add(
+                self.buffer[..count]
+                    .bytes()
+                    .filter(|byte| *byte == b'[')
+                    .count() as u64,
+            )
             .ok_or(Error::Invalid("markup paragraph reference count"))?;
         self.summary = self
             .summary
@@ -998,10 +1031,19 @@ impl LongParagraph {
                 if self.code_limit.is_some_and(|old| old != scope.content) {
                     return Err(Error::Invalid("markup paragraph scope changed"));
                 }
-                scope.references = scope.references.checked_add(self.reference_slots).ok_or(Error::Invalid("markup full paragraph reference count"))?;
+                scope.references = scope
+                    .references
+                    .checked_add(self.reference_slots)
+                    .ok_or(Error::Invalid("markup full paragraph reference count"))?;
                 scope.has_pipe |= self.has_pipe;
-                if self.scope.is_some_and(|old| old.block != scope.block || old.references != scope.references || old.has_pipe != scope.has_pipe) {
-                    return Err(Error::Invalid("markup paragraph scope reference proof changed"));
+                if self.scope.is_some_and(|old| {
+                    old.block != scope.block
+                        || old.references != scope.references
+                        || old.has_pipe != scope.has_pipe
+                }) {
+                    return Err(Error::Invalid(
+                        "markup paragraph scope reference proof changed",
+                    ));
                 }
                 self.scope = Some(scope);
                 self.summary = resume;

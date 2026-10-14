@@ -12,14 +12,22 @@ pub(super) struct PendingAngle {
     pub scanner: AngleStream,
 }
 impl PendingAngle {
-    pub fn new(stream: &InlineRunStream, resume: TextSummary, guard: AngleGuard, resume_references: u64, resume_pipe: bool) -> Result<Self> {
+    pub fn new(
+        stream: &InlineRunStream,
+        resume: TextSummary,
+        guard: AngleGuard,
+        resume_references: u64,
+        resume_pipe: bool,
+    ) -> Result<Self> {
         let start = stream.angle_start().map_err(inline_error)?;
         if start.bytes != resume.bytes || start.utf16 != resume.utf16 {
             return Err(Error::Invalid("markup angle captured source counters"));
         }
         Ok(Self {
             resume,
-            start, resume_references, resume_pipe,
+            start,
+            resume_references,
+            resume_pipe,
             scanner: AngleStream::new(start.bytes, guard),
         })
     }

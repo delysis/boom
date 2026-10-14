@@ -753,17 +753,12 @@ fn bounded_inline_and_reference_media_complete_while_dense_fuel_stays_explicitly
     let (mut engine, mut source, _) = self::source(&text)?;
     let snapshot = source.capture_for_publication()?;
     let (completed, progress) = index(&mut engine, &snapshot, MarkupMode::Media)?;
-    assert!(completed.complete()&& !progress.incomplete_block);
+    assert!(completed.complete() && !progress.incomplete_block);
     let at = text.find("[late]").expect("actual reference source") as u64;
-    let view = context(
-        &mut engine,
-        &snapshot,
-        completed,
-        at,
-        256,
-    )?;
-    let actual =paged_media_spans(&view)?;
-    assert_eq!(actual.len(), 1); assert_eq!(actual[0].id.to_string(), id);
+    let view = context(&mut engine, &snapshot, completed, at, 256)?;
+    let actual = paged_media_spans(&view)?;
+    assert_eq!(actual.len(), 1);
+    assert_eq!(actual[0].id.to_string(), id);
     assert_oracle(&text, &mut engine, &snapshot, at, 256)?;
     let text = format!(
         "{}\n\n[x]: https://example.com/{}\n",
@@ -3707,9 +3702,9 @@ fn actual_unproved_reference_code_or_outer_link_never_becomes_a_completed_inline
     // real completed definition search may admit these SAME source fixtures.
     for node in [
         "[outer [missing]](https://unit.test)",
-        "![outer [missing]](https://image.test)"] {
-        assert!(probe_inline_link(node,
-        MarkupMode::Style.options(), &mut || false)?.is_none());
+        "![outer [missing]](https://image.test)",
+    ] {
+        assert!(probe_inline_link(node, MarkupMode::Style.options(), &mut || false)?.is_none());
         let text = format!("{} {node} later `\n\n# Outside\n", "plain ".repeat(7000));
         let (mut engine, mut source, _) = self::source(&text)?;
         let snapshot = source.capture_for_publication()?;
@@ -3934,38 +3929,88 @@ fn actual_image_adjacency_never_crosses_a_physical_paragraph_continuation() -> T
 }
 
 #[test]
-fn actual_reference_subtree_choices_use_pinned_first_definitions_and_image_exceptions() -> TestResult {
+fn actual_reference_subtree_choices_use_pinned_first_definitions_and_image_exceptions() -> TestResult
+{
     use pulldown_cmark::paged::{probe_blocks, probe_inline_link_with_definitions};
     let definitions_text = "[r]: https://first.test/é 'title'\n[R]: https://wrong.test/\n";
     let definitions = probe_blocks(definitions_text, MarkupMode::Style.options(), true)
-        .expect("real complete definition source").into_references();
-    assert_eq!(definitions.get("R").expect("first actual folded definition").dest.as_ref(), "https://first.test/é");
+        .expect("real complete definition source")
+        .into_references();
+    assert_eq!(
+        definitions
+            .get("R")
+            .expect("first actual folded definition")
+            .dest
+            .as_ref(),
+        "https://first.test/é"
+    );
     for (node, image) in [
-        ("[**é🙂**][r]", false), ("[r][]", false), ("[r]", false),
-        ("![r]", true), ("![outer [*inner*][r]][r]", true),
+        ("[**é🙂**][r]", false),
+        ("[r][]", false),
+        ("[r]", false),
+        ("![r]", true),
+        ("![outer [*inner*][r]][r]", true),
         ("[outer ![**alt**][r]][r]", false),
         ("[outer [missing]](https://outer.test)", false),
     ] {
         let input = format!("{node} after");
-        assert!(probe_inline_link_with_definitions(&input, MarkupMode::Style.options(),
-            definitions.borrowed(), false, None, &mut || false)?.is_none(),
-            "a supplied table alone is not completed search/fuel authority");
-        let actual = probe_inline_link_with_definitions(&input, MarkupMode::Style.options(),
-            definitions.borrowed(), true, None, &mut || false)?.expect("actual source-complete pinned Link/Image");
-        assert_eq!(actual.end(), node.len()); assert_eq!(actual.is_image(), image);
+        assert!(
+            probe_inline_link_with_definitions(
+                &input,
+                MarkupMode::Style.options(),
+                definitions.borrowed(),
+                false,
+                None,
+                &mut || false
+            )?
+            .is_none(),
+            "a supplied table alone is not completed search/fuel authority"
+        );
+        let actual = probe_inline_link_with_definitions(
+            &input,
+            MarkupMode::Style.options(),
+            definitions.borrowed(),
+            true,
+            None,
+            &mut || false,
+        )?
+        .expect("actual source-complete pinned Link/Image");
+        assert_eq!(actual.end(), node.len());
+        assert_eq!(actual.is_image(), image);
         assert!(actual.referenced());
         assert_eq!(actual.ending(), if node.ends_with(')') { ')' } else { ']' });
         let whole = format!("prefix {node} suffix\n\n{definitions_text}");
         let first = "prefix ".encode_utf16().count();
         let parser = Parser::new_inline_fragment(node, MarkupMode::Style.options())
-            .expect("actual bounded inline contents").with_reference_definitions(definitions.borrowed());
-        assert_eq!(coverage(spans_from_parser(node, parser)?),
-            coverage(clipped(&spans(&whole)?, first, first + node.encode_utf16().count())));
+            .expect("actual bounded inline contents")
+            .with_reference_definitions(definitions.borrowed());
+        assert_eq!(
+            coverage(spans_from_parser(node, parser)?),
+            coverage(clipped(
+                &spans(&whole)?,
+                first,
+                first + node.encode_utf16().count()
+            ))
+        );
     }
-    for input in ["[r]", "[r](uncopied", "[r][uncopied", "[outer [inner][r]][r]"] {
-        assert!(probe_inline_link_with_definitions(input, MarkupMode::Style.options(),
-            definitions.borrowed(), true, None, &mut || false)?.is_none(),
-            "copied shortcut EOF/possible extension and real disabled outer Link remain unproved");
+    for input in [
+        "[r]",
+        "[r](uncopied",
+        "[r][uncopied",
+        "[outer [inner][r]][r]",
+    ] {
+        assert!(
+            probe_inline_link_with_definitions(
+                input,
+                MarkupMode::Style.options(),
+                definitions.borrowed(),
+                true,
+                None,
+                &mut || false
+            )?
+            .is_none(),
+            "copied shortcut EOF/possible extension and real disabled outer Link remain unproved"
+        );
     }
     Ok(())
 }
@@ -3975,25 +4020,39 @@ fn actual_same_builder_indexes_later_definitions_before_resolving_long_paragraph
     let first = "884646c1-14b4-490d-be8c-8953af793315";
     let second = "adfcd7f6-e0c9-4d06-a75c-f64794d7760b";
     let body = "**outer [*child*][target] after** ![**asset**][media] [target][] [target] tail";
-    let text = format!("ordinary {} {body}\n\n# Outside\n\n[target]: https://first.test 'title'\n[TARGET]: https://wrong.test\n[media]: boom-attachment:{first}\n[MEDIA]: boom-attachment:{second}\n",
-        "authored é🙂 ".repeat(6000));
-    let anchor = text[..text.find(body).expect("actual dependent source")].encode_utf16().count() as u64;
+    let text = format!(
+        "ordinary {} {body}\n\n# Outside\n\n[target]: https://first.test 'title'\n[TARGET]: https://wrong.test\n[media]: boom-attachment:{first}\n[MEDIA]: boom-attachment:{second}\n",
+        "authored é🙂 ".repeat(6000)
+    );
+    let anchor = text[..text.find(body).expect("actual dependent source")]
+        .encode_utf16()
+        .count() as u64;
     let (mut engine, mut source, _) = self::source(&text)?;
     let snapshot = source.capture_for_publication()?;
     let mut build = MarkupIndexBuilder::new(&mut engine, snapshot.clone(), MarkupMode::Style)?;
     let mut progress = build.progress();
     let mut saw_deferred_full_coverage = false;
     for _ in 0..4096 {
-        if progress.complete { break; }
+        if progress.complete {
+            break;
+        }
         progress = build.step(&mut engine, &mut || false)?;
         assert!(progress.buffered_bytes <= pulldown_cmark::paged::PROBE_BYTES);
-        if progress.indexed_bytes == snapshot.summary().bytes && !progress.complete && !saw_deferred_full_coverage {
+        if progress.indexed_bytes == snapshot.summary().bytes
+            && !progress.complete
+            && !saw_deferred_full_coverage
+        {
             saw_deferred_full_coverage = true;
             let pending = build.captured_index();
-            assert!(!pending.complete(), "source block EOF cannot complete still-pending inline grammar");
+            assert!(
+                !pending.complete(),
+                "source block EOF cannot complete still-pending inline grammar"
+            );
             let view = context(&mut engine, &snapshot, pending, anchor, 128)?;
-            assert!(view.window.end <= text.find("\n\n# Outside").expect("actual paragraph end") as u64,
-                "this negative observes only the pending paragraph, not the independently ready heading");
+            assert!(
+                view.window.end <= text.find("\n\n# Outside").expect("actual paragraph end") as u64,
+                "this negative observes only the pending paragraph, not the independently ready heading"
+            );
             assert!(!view.complete_blocks && !view.reference_budget_proven);
             assert!(paged_spans(&view)?.is_empty());
         }
@@ -4010,22 +4069,31 @@ fn actual_same_builder_indexes_later_definitions_before_resolving_long_paragraph
     let (media, _) = index(&mut engine, &snapshot, MarkupMode::Media)?;
     let view = context(&mut engine, &snapshot, media, anchor, 512)?;
     let actual = paged_media_spans(&view)?;
-    assert_eq!(actual.len(), 1); assert_eq!(actual[0].id.to_string(), first,
-        "the actual earlier normalized definition wins over the later duplicate");
+    assert_eq!(actual.len(), 1);
+    assert_eq!(
+        actual[0].id.to_string(),
+        first,
+        "the actual earlier normalized definition wins over the later duplicate"
+    );
     assert_logical_source_bytes(&mut engine, &snapshot, &text)?;
     assert!(source.capture().same(&snapshot));
     Ok(())
 }
 
 #[test]
-fn actual_later_definition_edit_invalidates_earlier_child_precedence_and_undo_reuses_source() -> TestResult {
+fn actual_later_definition_edit_invalidates_earlier_child_precedence_and_undo_reuses_source()
+-> TestResult {
     let first = "884646c1-14b4-490d-be8c-8953af793315";
     let second = "adfcd7f6-e0c9-4d06-a75c-f64794d7760b";
     let third = "a2202375-ea5d-4798-8079-d83e490124c1";
     let node = "[outer [inner][missing]](https://outer.test)";
-    let text = format!("ordinary {} **around {node} after** ![asset][media] tail\n\n[media]: boom-attachment:{first}\n[MEDIA]: boom-attachment:{second}\n[unused]: https://inner.test\n",
-        "authored é🙂 ".repeat(5000));
-    let anchor = text[..text.find(node).expect("actual earlier node")].encode_utf16().count() as u64;
+    let text = format!(
+        "ordinary {} **around {node} after** ![asset][media] tail\n\n[media]: boom-attachment:{first}\n[MEDIA]: boom-attachment:{second}\n[unused]: https://inner.test\n",
+        "authored é🙂 ".repeat(5000)
+    );
+    let anchor = text[..text.find(node).expect("actual earlier node")]
+        .encode_utf16()
+        .count() as u64;
     let (mut engine, mut source, _) = self::source(&text)?;
     let original = source.capture_for_publication()?;
     let (before, _) = index(&mut engine, &original, MarkupMode::Style)?;
@@ -4043,8 +4111,10 @@ fn actual_later_definition_edit_invalidates_earlier_child_precedence_and_undo_re
     assert!(!Parser::new(&edited_text).any(|event| matches!(event, Event::Start(Tag::Link { dest_url, .. }) if dest_url.as_ref() == "https://outer.test")),
         "the newly actual inner reference disables the old outer Link");
     let (after, progress) = index(&mut engine, &edited, MarkupMode::Style)?;
-    assert!(!after.complete() && progress.incomplete_block,
-        "general disabled-outer recovery is still unproved; no old child annotations may be reused");
+    assert!(
+        !after.complete() && progress.incomplete_block,
+        "general disabled-outer recovery is still unproved; no old child annotations may be reused"
+    );
     let view = context(&mut engine, &edited, after, anchor, 512)?;
     assert!(!view.complete_blocks && !view.reference_budget_proven);
     assert!(paged_spans(&view)?.is_empty());
@@ -4052,9 +4122,17 @@ fn actual_later_definition_edit_invalidates_earlier_child_precedence_and_undo_re
     source.restore(&original)?;
     let writes = engine.stats().page_writes;
     let (restored, _) = index(&mut engine, &source.capture(), MarkupMode::Style)?;
-    assert!(Arc::ptr_eq(&restored, &before)); assert_eq!(engine.stats().page_writes, writes);
-    let definition = text.find(first).expect("actual earlier winning destination");
-    let window = engine.logical_window(&original, text[..definition].encode_utf16().count() as u64, 128, &mut || false)?;
+    assert!(Arc::ptr_eq(&restored, &before));
+    assert_eq!(engine.stats().page_writes, writes);
+    let definition = text
+        .find(first)
+        .expect("actual earlier winning destination");
+    let window = engine.logical_window(
+        &original,
+        text[..definition].encode_utf16().count() as u64,
+        128,
+        &mut || false,
+    )?;
     let local = window.text().find(first).expect("bounded real destination");
     source.replace_window(&window, local..local + first.len(), third)?;
     let changed = source.capture_for_publication()?;
@@ -4062,49 +4140,84 @@ fn actual_later_definition_edit_invalidates_earlier_child_precedence_and_undo_re
     let (media, progress) = index(&mut engine, &changed, MarkupMode::Media)?;
     assert!(media.complete() && !progress.incomplete_block);
     let actual = paged_media_spans(&context(&mut engine, &changed, media, anchor, 512)?)?;
-    assert_eq!(actual.len(), 1); assert_eq!(actual[0].id.to_string(), third);
+    assert_eq!(actual.len(), 1);
+    assert_eq!(actual[0].id.to_string(), third);
     assert_oracle(&changed_text, &mut engine, &changed, anchor, 512)?;
     source.restore(&original)?;
     let writes = engine.stats().page_writes;
     let (restored, _) = index(&mut engine, &source.capture(), MarkupMode::Media)?;
-    assert!(Arc::ptr_eq(&restored, &original_media)); assert_eq!(engine.stats().page_writes, writes);
+    assert!(Arc::ptr_eq(&restored, &original_media));
+    assert_eq!(engine.stats().page_writes, writes);
     assert_logical_source_bytes(&mut engine, &source.capture(), &text)?;
     Ok(())
 }
 
 #[test]
-fn actual_reference_pass_cancellation_and_ambiguous_long_definition_never_forge_absence() -> TestResult {
-    let paragraphs = (0..3).map(|number| format!("ordinary{number} {} [*target*][r] tail\n\n",
-        "authored é🙂 ".repeat(3000))).collect::<String>();
+fn actual_reference_pass_cancellation_and_ambiguous_long_definition_never_forge_absence()
+-> TestResult {
+    let paragraphs = (0..3)
+        .map(|number| {
+            format!(
+                "ordinary{number} {} [*target*][r] tail\n\n",
+                "authored é🙂 ".repeat(3000)
+            )
+        })
+        .collect::<String>();
     let text = format!("{paragraphs}[r]: https://unit.test 'actual title'\n");
     let (mut engine, mut source, _) = self::source(&text)?;
     let snapshot = source.capture_for_publication()?;
     let mut build = MarkupIndexBuilder::new(&mut engine, snapshot.clone(), MarkupMode::Style)?;
     let mut progress = build.progress();
     for _ in 0..4096 {
-        if progress.indexed_bytes == snapshot.summary().bytes && !progress.complete { break; }
+        if progress.indexed_bytes == snapshot.summary().bytes && !progress.complete {
+            break;
+        }
         progress = build.step(&mut engine, &mut || false)?;
         assert!(progress.buffered_bytes <= pulldown_cmark::paged::PROBE_BYTES);
     }
     assert!(progress.indexed_bytes == snapshot.summary().bytes && !progress.complete);
-    for _ in 0..4 { progress = build.step(&mut engine, &mut || false)?; }
+    for _ in 0..4 {
+        progress = build.step(&mut engine, &mut || false)?;
+    }
     assert!(!progress.complete && !build.captured_index().complete());
-    assert!(matches!(build.step(&mut engine, &mut || true), Err(bloom_text::Error::Cancelled)));
+    assert!(matches!(
+        build.step(&mut engine, &mut || true),
+        Err(bloom_text::Error::Cancelled)
+    ));
     drop(build);
     let (completed, progress) = index(&mut engine, &snapshot, MarkupMode::Style)?;
     assert!(completed.complete() && !progress.incomplete_block);
-    assert_oracle(&text, &mut engine, &snapshot, snapshot.summary().utf16 / 2, 384)?;
+    assert_oracle(
+        &text,
+        &mut engine,
+        &snapshot,
+        snapshot.summary().utf16 / 2,
+        384,
+    )?;
     assert_logical_source_bytes(&mut engine, &snapshot, &text)?;
     let destination = "é".repeat(40_000);
     let definition = format!("[r]: <https://unit.test/{destination}>\n\n# Outside\n");
-    let text = format!("ordinary {} [r] tail\n\n{definition}", "plain ".repeat(7000));
+    let text = format!(
+        "ordinary {} [r] tail\n\n{definition}",
+        "plain ".repeat(7000)
+    );
     let parser = Parser::new(&text);
-    assert!(parser.reference_definitions().get("r").expect("actual later long definition").dest.len() > pulldown_cmark::paged::PROBE_BYTES);
+    assert!(
+        parser
+            .reference_definitions()
+            .get("r")
+            .expect("actual later long definition")
+            .dest
+            .len()
+            > pulldown_cmark::paged::PROBE_BYTES
+    );
     let (mut engine, mut source, _) = self::source(&text)?;
     let snapshot = source.capture_for_publication()?;
     let (partial, progress) = index(&mut engine, &snapshot, MarkupMode::Style)?;
-    assert!(!partial.complete() && progress.incomplete_block,
-        "a long leading '[' destination/title can still become a definition; do not skip it as a paragraph");
+    assert!(
+        !partial.complete() && progress.incomplete_block,
+        "a long leading '[' destination/title can still become a definition; do not skip it as a paragraph"
+    );
     let view = context(&mut engine, &snapshot, partial, 32_767, 384)?;
     assert!(!view.complete_blocks && !view.reference_budget_proven);
     assert!(paged_spans(&view)?.is_empty());

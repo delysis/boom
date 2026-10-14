@@ -486,7 +486,10 @@ impl Sort {
 
 #[derive(Clone, Copy)]
 pub(super) struct ParagraphScope {
-    pub content: TextSummary, pub block: TextSummary, pub references: u64, pub has_pipe: bool,
+    pub content: TextSummary,
+    pub block: TextSummary,
+    pub references: u64,
+    pub has_pipe: bool,
 }
 pub(super) struct Survey {
     paragraph_start: TextSummary,
@@ -501,7 +504,9 @@ pub(super) struct Survey {
     scanned: bool,
     pub unsupported: bool,
     pub collect_code: bool,
-    references: u64, block_extra: TextSummary, has_pipe: bool,
+    references: u64,
+    block_extra: TextSummary,
+    has_pipe: bool,
 }
 impl Survey {
     pub fn new(
@@ -546,8 +551,15 @@ impl Survey {
         if !self.complete() || self.unsupported || !self.scanned || !self.runs.is_empty() {
             return Err(Error::Invalid("markup unfinished code survey"));
         }
-        Ok((self.sort.tail, ParagraphScope { content: self.summary,
-            block: self.summary.checked_add(self.block_extra)?, references: self.references, has_pipe: self.has_pipe }))
+        Ok((
+            self.sort.tail,
+            ParagraphScope {
+                content: self.summary,
+                block: self.summary.checked_add(self.block_extra)?,
+                references: self.references,
+                has_pipe: self.has_pipe,
+            },
+        ))
     }
     fn eof(&self, snapshot: &LogicalSnapshot) -> bool {
         self.paragraph_start
@@ -562,7 +574,9 @@ impl Survey {
             .get(..count)
             .ok_or(Error::Invalid("markup code survey source boundary"))?;
         self.has_pipe |= text.as_bytes().contains(&b'|');
-        self.references = self.references.checked_add(text.bytes().filter(|byte| *byte == b'[').count() as u64)
+        self.references = self
+            .references
+            .checked_add(text.bytes().filter(|byte| *byte == b'[').count() as u64)
             .ok_or(Error::Invalid("markup scope reference count"))?;
         self.summary = self.summary.checked_add(TextSummary::of(text))?;
         self.buffer.drain(..count);
@@ -674,10 +688,19 @@ impl Survey {
                     // Code matching ends at the actual paragraph's content,
                     // before a setext delimiter or a following block.
                     if let ParagraphFollowing::Setext { consumed, .. } = following {
-                        let last = ending.checked_add(consumed).ok_or(Error::Invalid("markup scope setext extent"))?;
-                        let delimiter = self.buffer.get(ending..last).ok_or(Error::Invalid("markup scope setext source"))?;
+                        let last = ending
+                            .checked_add(consumed)
+                            .ok_or(Error::Invalid("markup scope setext extent"))?;
+                        let delimiter = self
+                            .buffer
+                            .get(ending..last)
+                            .ok_or(Error::Invalid("markup scope setext source"))?;
                         self.block_extra = TextSummary::of(delimiter);
-                        self.references = self.references.checked_add(delimiter.bytes().filter(|byte| *byte == b'[').count() as u64)
+                        self.references = self
+                            .references
+                            .checked_add(
+                                delimiter.bytes().filter(|byte| *byte == b'[').count() as u64
+                            )
                             .ok_or(Error::Invalid("markup scope setext reference count"))?;
                     }
                     self.stream
