@@ -6,9 +6,11 @@
 use super::*;
 mod angle;
 mod code;
+mod link;
 use angle::PendingAngle;
 pub(super) use code::CodeRef;
 use code::{Lookup, Survey};
+use link::PendingLink;
 use pulldown_cmark::paged::AngleGuard;
 use pulldown_cmark::paged::{CodeRun, PreparedCodePair};
 use pulldown_cmark::paged::{
@@ -311,6 +313,7 @@ impl InlineParagraph {
 pub(super) enum InlineRow {
     Style([u64; 5]),
     Media([u64; 6]),
+    Fragment([u64; 4]),
 }
 fn media_row(value: [u64; 6]) -> Result<(Uuid, InlinePoint, InlinePoint)> {
     let [first, utf16_first, last, utf16_last, high, low] = value;
@@ -330,6 +333,13 @@ fn row_extent(value: &InlineRow) -> Result<(InlinePoint, InlinePoint)> {
         InlineRow::Media(words) => {
             let (_, start, end) = media_row(*words)?;
             Ok((start, end))
+        }
+        InlineRow::Fragment([first, utf16_first, last, utf16_last]) => {
+            let value = decode_style([0, *first, *utf16_first, *last, *utf16_last])?;
+            if last - first > PROBE_BYTES as u64 {
+                return Err(Error::Invalid("markup inline fragment bound"));
+            }
+            Ok((value.start, value.end))
         }
     }
 }
@@ -524,6 +534,15 @@ impl StyleWrite {
         self.items.push(InlineRow::Media(words));
         Ok(())
     }
+    fn append_fragment(&mut self, start: InlinePoint, end: InlinePoint) -> Result<()> {
+        if self.finishing || self.items.len() >= INLINE_PAGE_ITEMS {
+            return Err(Error::Invalid("markup inline fragment output bound"));
+        }
+        let row = InlineRow::Fragment([start.bytes, start.utf16, end.bytes, end.utf16]);
+        row_extent(&row)?;
+        self.items.push(row);
+        Ok(())
+    }
     fn needs_step(&self) -> bool {
         self.pending.is_some()
             || self.items.len() >= INLINE_PAGE_ITEMS
@@ -635,6 +654,8 @@ pub(super) struct LongParagraph {
     code_pending: Option<PendingCode>,
     angle_guard: AngleGuard,
     angle_pending: Option<PendingAngle>,
+    link_pending: Option<PendingLink>,
+    survey_link: bool,
     heading: Option<u8>,
     heading_syntax: u64,
     prefix_open: bool,
@@ -675,6 +696,8 @@ impl LongParagraph {
             code_pending: None,
             angle_guard: AngleGuard::default(),
             angle_pending: None,
+            link_pending: None,
+            survey_link: false,
             heading: None,
             heading_syntax: 0,
             prefix_open,
@@ -958,6 +981,9 @@ impl LongParagraph {
                     self.code_root = root;
                     self.code_known = true;
                     self.code_pending = Some(PendingCode::new(&self.stream)?);
+                } else if self.survey_link {
+                    self.begin_link()?;
+                    self.survey_link = false;
                 } else {
                     self.angle_pending = Some(PendingAngle::new(
                         &self.stream,
@@ -981,6 +1007,12 @@ impl LongParagraph {
         if let Some(mut pending) = self.angle_pending.take() {
             if !self.step_angle(&mut pending, engine, snapshot, mode, cancelled)? {
                 self.angle_pending = Some(pending);
+            }
+            return check_cancel(cancelled);
+        }
+        if let Some(mut pending) = self.link_pending.take() {
+            if !self.step_link(&mut pending, engine, snapshot, mode, cancelled)? {
+                self.link_pending = Some(pending);
             }
             return check_cancel(cancelled);
         }
@@ -1086,6 +1118,21 @@ impl LongParagraph {
                         false,
                     )?);
                 }
+            } else if self.buffer.starts_with('[') {
+                if self.code_limit.is_some() {
+                    self.begin_link()?;
+                } else {
+                    let stream = self.stream.code_survey().map_err(inline_error)?;
+                    self.survey_link = true;
+                    self.code_survey = Some(Survey::new(
+                        self.start,
+                        self.summary,
+                        self.seed.clone(),
+                        stream,
+                        std::mem::take(&mut self.buffer),
+                        false,
+                    )?);
+                }
             } else {
                 self.unsupported = true;
             }
@@ -1107,6 +1154,7 @@ impl LongParagraph {
             || self.code_survey.is_some()
             || self.code_pending.is_some()
             || self.angle_pending.is_some()
+            || self.link_pending.is_some()
         {
             return Err(Error::Invalid("markup paragraph not joined"));
         }
@@ -1157,6 +1205,7 @@ impl InlineScan {
         mode: MarkupMode,
         styles: &mut Vec<InlineStyle>,
         media: &mut Vec<(Uuid, InlinePoint, InlinePoint)>,
+        fragments: &mut VecDeque<(InlinePoint, InlinePoint)>,
     ) -> Result<bool> {
         let Some(root) = self.stack.pop() else {
             return Ok(true);
@@ -1207,6 +1256,12 @@ impl InlineScan {
                                     ));
                                 }
                                 media.push((media_row(words)?.0, start, end));
+                            }
+                            InlineRow::Fragment(_) => {
+                                if fragments.len() == INLINE_PAGE_ITEMS {
+                                    return Err(Error::Invalid("markup pending inline fragments"));
+                                }
+                                fragments.push_back((start, end));
                             }
                         }
                     }

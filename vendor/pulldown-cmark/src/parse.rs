@@ -192,6 +192,10 @@ pub struct Parser<'input, F = DefaultBrokenLinkCallback> {
     broken_link_callback: Option<F>,
     html_scan_guard: HtmlScanGuard,
     cancelled: bool,
+    // Enabled only for a bounded inline operand. A failed higher-precedence
+    // candidate before its accepted end could still match later real source.
+    // Ordinary full-document parsing retains no extra dependency witness.
+    inline_probe_unresolved: Option<usize>,
 
     // https://github.com/pulldown-cmark/pulldown-cmark/issues/844
     // Consider this example:
@@ -257,6 +261,12 @@ impl<'input> Parser<'input, DefaultBrokenLinkCallback> {
         Self::new_with_broken_link_callback(text, options, None)
     }
 
+    /// Bounded inline contents whose real paragraph scope is supplied by the
+    /// source owner. This is not a new block/document parse at a guessed edge.
+    pub fn new_inline_fragment(text: &'input str, options: Options) -> Option<Self> {
+        Self::new_with_broken_link_callback_for_inline(text, options, None)
+    }
+
     /// Parse a proved completed fragment with the pinned first pass's retained
     /// container state. Earlier container ranges are clipped to this input.
     pub fn new_ext_with_containers(text: &'input str, options: Options, carry: &crate::paged::BlockCarry) -> Self {
@@ -282,11 +292,27 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
     pub fn new_with_broken_link_callback_and_containers(text: &'input str, options: Options,
         broken_link_callback: Option<F>, carry: &crate::paged::BlockCarry,
     ) -> Self {
-        let (mut tree, allocs) = if carry.is_root() {
+        let (tree, allocs) = if carry.is_root() {
             run_first_pass(text, options)
         } else {
             crate::firstpass::run_first_pass_with_containers(text, options, carry)
         };
+        Self::from_tree(text, options, broken_link_callback, tree, allocs)
+    }
+
+    pub fn new_with_broken_link_callback_for_inline(text: &'input str, options: Options,
+        broken_link_callback: Option<F>,
+    ) -> Option<Self> {
+        if text.len() > crate::paged::PROBE_BYTES { return None; }
+        let (tree, allocs) = crate::firstpass::run_inline_fragment(text, options);
+        let mut parser = Self::from_tree(text, options, broken_link_callback, tree, allocs);
+        parser.inline_probe_unresolved = Some(usize::MAX);
+        Some(parser)
+    }
+
+    fn from_tree(text: &'input str, options: Options, broken_link_callback: Option<F>,
+        mut tree: Tree<Item>, allocs: Allocations<'input>,
+    ) -> Self {
         tree.reset();
         let inline_stack = Default::default();
         let link_stack = Default::default();
@@ -303,11 +329,16 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
             wikilink_stack,
             html_scan_guard,
             cancelled: false,
+            inline_probe_unresolved: None,
             // always allow 100KiB
             link_ref_expansion_limit: text.len().max(100_000),
             code_delims: CodeDelims::new(),
             math_delims: MathDelims::new(),
         }
+    }
+
+    fn unresolved_inline_probe(&mut self, at: usize) {
+        if let Some(first) = &mut self.inline_probe_unresolved { *first = (*first).min(at); }
     }
 
     /// Returns a reference to the internal `RefDefs` object, which provides access
@@ -493,6 +524,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                             continue;
                         }
                     }
+                    self.unresolved_inline_probe(self.tree[cur_ix].item.start);
                     self.tree[cur_ix].item.body = ItemBody::Text {
                         backslash_escaped: false,
                     };
@@ -597,6 +629,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                         if let Some(scan_ix) = self.code_delims.find(cur_ix, search_count) {
                             self.make_code_span_with_check(cur_ix, scan_ix, preceded_by_backslash, cancelled)?;
                         } else {
+                            self.unresolved_inline_probe(self.tree[cur_ix].item.start);
                             self.tree[cur_ix].item.body = ItemBody::Text {
                                 backslash_escaped: false,
                             };
@@ -625,6 +658,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                             scan = self.tree[scan_ix].next;
                         }
                         if scan.is_none() {
+                            self.unresolved_inline_probe(self.tree[cur_ix].item.start);
                             self.tree[cur_ix].item.body = ItemBody::Text {
                                 backslash_escaped: false,
                             };
@@ -2237,6 +2271,12 @@ pub struct OffsetIter<'a, F = DefaultBrokenLinkCallback> {
 }
 
 impl<'a, F: BrokenLinkCallback<'a>> OffsetIter<'a, F> {
+    /// Successful code/HTML children are closed by the actual pinned pass.
+    /// Only an unresolved earlier candidate can depend on uncopied source.
+    pub(crate) fn inline_probe_stable_through(&self, end: usize) -> bool {
+        matches!(self.inner.inline_probe_unresolved, Some(first) if first >= end)
+    }
+
     /// Returns a reference to the internal reference definition tracker.
     pub fn reference_definitions(&self) -> &RefDefs<'_> {
         self.inner.reference_definitions()

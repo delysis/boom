@@ -18,6 +18,10 @@ pub use inline_stack::{DelimiterReducer, DelimiterStack, ReduceProgress};
 mod code_runs;
 pub use code_runs::{CodeRun, CodeRunStream, CodeRuns, PreparedCodePair, prepare_code_pair};
 
+mod link;
+pub use link::{DestinationStatus, DestinationStep, LinkDestinationStream, InlineLinkFragment, probe_inline_link};
+pub(crate) use link::scan_destination;
+
 mod inline_runs;
 pub use inline_runs::{InlinePoint, InlineRunError, InlineRunStream, InlineStop, InlineToken, ScannedRuns};
 

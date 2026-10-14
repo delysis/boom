@@ -107,7 +107,8 @@ impl InlineRunStream {
         }
         let mut point = self.point;
         for value in ending.chars().chain(indentation.chars()) { point = point.after(value)?; }
-        self.point = point; self.previous = None; self.stopped = None; Ok(())
+        self.point = point; self.previous = None; self.pending_bang = false;
+        self.stopped = None; Ok(())
     }
     pub fn finish_line(&mut self, ending: &str) -> Result<(), InlineRunError> {
         self.continue_line(ending, "")?; self.complete = true; Ok(())
@@ -128,6 +129,26 @@ impl InlineRunStream {
         self.code_survey()?;
         if self.escape.is_some() { return Err(InlineRunError::Invalid("escaped angle is ordinary text")); }
         Ok(self.point)
+    }
+    pub fn bracket_start(&self) -> Result<(InlinePoint, bool), InlineRunError> {
+        let mut point = self.angle_start()?;
+        if self.pending_bang {
+            point.bytes = point.bytes.checked_sub(1).ok_or(InlineRunError::Invalid("image opener byte"))?;
+            point.utf16 = point.utf16.checked_sub(1).ok_or(InlineRunError::Invalid("image opener UTF16"))?;
+        }
+        Ok((point, self.pending_bang))
+    }
+    /// The host has consumed a complete pinned Inline Link/Image subtree and
+    /// keeps its child emphasis scope separate from this outer delimiter stack.
+    pub fn resume_bracket(&mut self, start: InlinePoint, end: InlinePoint) -> Result<(), InlineRunError> {
+        let (actual, image) = self.bracket_start()?;
+        let minimum = if image { 5 } else { 4 };
+        if actual != start || end.bytes.checked_sub(start.bytes).is_none_or(|count| count < minimum)
+            || end.utf16 <= self.point.utf16 || end.bytes - start.bytes < end.utf16 - start.utf16 {
+            return Err(InlineRunError::Invalid("inline bracket subtree extent"));
+        }
+        self.point = end; self.previous = Some(')'); self.pending_bang = false;
+        self.stopped = None; Ok(())
     }
     /// The source host checked every copied scalar/counter before passing a
     /// matched endpoint. Failed lookahead consumes only the known opening <.

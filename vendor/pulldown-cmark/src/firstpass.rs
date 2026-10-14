@@ -233,6 +233,36 @@ pub(crate) fn run_first_pass_with_containers<'a>(text: &'a str, options: Options
     }.run()
 }
 
+/// Tokenize only the inline contents of a bounded, already admitted paragraph
+/// interval. Block interruption belongs to the original paged first pass;
+/// interpreting a middle-of-paragraph '[' as a fresh reference definition is
+/// incorrect. Every inline token still comes from the ordinary parse_line.
+pub(crate) fn run_inline_fragment(text: &str, options: Options) -> (Tree<Item>, Allocations<'_>) {
+    let lookup_table = &create_lut(&options);
+    let mut pass = FirstPass {
+        text, tree: Tree::with_capacity(max(128, text.len() / 32)),
+        begin_list_item: None, last_line_blank: false, allocs: Allocations::new(),
+        options, lookup_table, brace_context_next: 0, brace_context_stack: Vec::new(),
+        paged_restart: None, paged_root_checkpoints: None, paged_open_fence: None,
+        paged_open_html: None, paged_html_ambiguous: false, paged_html_opening: None,
+        paged_open_paragraph: None, paged_incomplete: false,
+    };
+    pass.tree.append(Item { start: 0, end: 0, body: ItemBody::Paragraph }); pass.tree.push();
+    let mut at = 0;
+    while at < text.len() {
+        let (next, ending) = pass.parse_line(at, None, TableParseMode::Disabled);
+        debug_assert!(next > at);
+        at = next;
+        let mut line_start = LineStart::new(&text.as_bytes()[at..]);
+        line_start.scan_all_space(); at += line_start.bytes_scanned();
+        if at < text.len() {
+            if let Some(item) = ending { pass.tree.append(item); }
+        }
+    }
+    pass.pop(text.len());
+    (pass.tree, pass.allocs)
+}
+
 /// Execute the SAME paragraph following-line decision as parse_paragraph on
 /// real bounded source. The tiny tree is grammar context only; it has no old
 /// text nodes, source prefix, or fabricated physical line.
@@ -619,7 +649,7 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                 // More of this SAME physical first line can still establish
                 // type7. The ordinary fake-EOF paragraph is not a proof.
                 self.paged_html_ambiguous = true;
-                self.paged_html_opening = crate::paged::HtmlOpening::from_first_pass(&self.text[ix..], self.options, ix);
+                self.paged_html_opening = crate::paged::HtmlOpening::from_first_pass(self.text, self.options, ix);
             }
         }
 
@@ -1579,7 +1609,7 @@ impl<'a, 'b> FirstPass<'a, 'b> {
             && !self.text[start_ix..].bytes().any(|byte| matches!(byte, b'\r' | b'\n'));
         self.paged_html_ambiguous |= unfinished_type_seven;
         if unfinished_type_seven && self.tree.spine_len() == 0 {
-            self.paged_html_opening = crate::paged::HtmlOpening::from_first_pass(&self.text[start_ix..], self.options, start_ix);
+            self.paged_html_opening = crate::paged::HtmlOpening::from_first_pass(self.text, self.options, start_ix);
         }
         self.tree.append(Item {
             start: start_ix,

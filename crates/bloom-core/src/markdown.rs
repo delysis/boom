@@ -260,15 +260,21 @@ pub fn paged_spans_with_cancel(
             let definitions = context
                 .definitions_for(fragment)
                 .map_err(|error| Error(error.to_string()))?;
-            spans_from_parser_cancelled(
-                &fragment.text,
+            let parser = if fragment.inline_only {
+                Parser::new_inline_fragment(&fragment.text, context.mode.options())
+                    .ok_or_else(|| Error("Paged inline fragment exceeds its bound.".into()))?
+            } else {
                 Parser::new_ext_with_containers(
                     &fragment.text,
                     context.mode.options(),
                     &fragment.containers,
                 )
-                .with_reference_definitions(definitions)
-                .with_reference_fuel(usize::MAX),
+            };
+            spans_from_parser_cancelled(
+                &fragment.text,
+                parser
+                    .with_reference_definitions(definitions)
+                    .with_reference_fuel(usize::MAX),
                 cancelled,
                 true,
             )?
@@ -341,15 +347,21 @@ pub fn paged_media_spans_with_cancel(
         let definitions = context
             .definitions_for(fragment)
             .map_err(|error| Error(error.to_string()))?;
-        let local = media_from_parser_cancelled(
-            &fragment.text,
+        let parser = if fragment.inline_only {
+            Parser::new_inline_fragment(&fragment.text, context.mode.options())
+                .ok_or_else(|| Error("Paged inline fragment exceeds its bound.".into()))?
+        } else {
             Parser::new_ext_with_containers(
                 &fragment.text,
                 context.mode.options(),
                 &fragment.containers,
             )
-            .with_reference_definitions(definitions)
-            .with_reference_fuel(usize::MAX),
+        };
+        let local = media_from_parser_cancelled(
+            &fragment.text,
+            parser
+                .with_reference_definitions(definitions)
+                .with_reference_fuel(usize::MAX),
             cancelled,
         )?;
         for span in local {

@@ -46,15 +46,22 @@ pub enum HtmlOpeningChoice { Html(HtmlContinuation), Paragraph(OpenParagraph) }
 
 impl HtmlOpening {
     pub(crate) fn from_first_pass(text: &str, options: Options, start: usize) -> Option<Self> {
-        if start != 0 || text.is_empty() || text.len() > PROBE_BYTES || !text.starts_with('<') { return None; }
+        // The actual root first pass already classified its indentation. Keep
+        // those <=3 source spaces in the eventual paragraph/literal replay;
+        // they are not part of the Tag grammar or another container prefix.
+        // A previous completed root/block cannot be accepted as indentation.
+        if text.is_empty() || text.len() > PROBE_BYTES || start > 3
+            || !text.get(..start)?.bytes().all(|byte| byte == b' ')
+            || !text.get(start..)?.starts_with('<') { return None; }
         let mut value = Self { tag: super::angle::Tag::new(false), state: OpeningState::Tag,
-            scanned: 0, paragraph: OpenParagraph::new(0, options, BlockCarry::default()),
+            scanned: u64::try_from(start).ok()?, paragraph: OpenParagraph::new(0, options, BlockCarry::default()),
             html_at_prefix: HtmlContinuation::until_blank_line() };
-        let step = value.consume(text, false, &mut || false).ok()?;
-        if step.status != HtmlOpeningStatus::Pending || step.consumed != text.len() { return None; }
-        // Pending Tag/AfterTag proves this prefix has no real line ending and
-        // begins with the actual '<'. A later HTML choice will replay FROM
-        // this prefix endpoint, not from the scanner's distant decision point.
+        let input = text.get(start..)?;
+        let step = value.consume(input, false, &mut || false).ok()?;
+        if step.status != HtmlOpeningStatus::Pending || step.consumed != input.len() { return None; }
+        // Pending Tag/AfterTag proves the source after its captured indentation
+        // begins with '<' and has no real line ending. A later HTML choice
+        // replays FROM this prefix endpoint, not from its distant decision.
         value.html_at_prefix.blank = false;
         Some(value)
     }

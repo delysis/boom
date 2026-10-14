@@ -2279,6 +2279,9 @@ pub struct MarkupFragment {
     reference_independent: Option<bool>,
     reference_indices: Vec<u16>,
     pub inline_ready: bool,
+    /// A complete ordinary inline subtree at its actual paragraph source
+    /// point. It cannot be reparsed as a fresh block/reference definition.
+    pub inline_only: bool,
 }
 pub struct MarkupContext {
     pub source_id: Uuid,
@@ -2427,6 +2430,12 @@ pub struct MarkupQuery {
     )>,
     inline_headings: Vec<(Range<u64>, u8)>,
     inline_scans: VecDeque<InlineScan>,
+    inline_fragments: VecDeque<(
+        pulldown_cmark::paged::InlinePoint,
+        pulldown_cmark::paged::InlinePoint,
+    )>,
+    inline_fragment_bytes: usize,
+    last_inline_fragment_end: u64,
     fragment_text_bytes: usize,
     references: Vec<NeededReference>,
     reference_heads: Box<[u16; REFERENCE_BUCKETS]>,
@@ -2483,6 +2492,9 @@ impl MarkupQuery {
             inline_media: Vec::new(),
             inline_headings: Vec::new(),
             inline_scans: VecDeque::new(),
+            inline_fragments: VecDeque::new(),
+            inline_fragment_bytes: 0,
+            last_inline_fragment_end: 0,
             fragment_text_bytes: 0,
             references: Vec::new(),
             reference_heads: Box::new([NO_REFERENCE; REFERENCE_BUCKETS]),
@@ -2751,6 +2763,7 @@ impl MarkupQuery {
                 reference_independent: None,
                 reference_indices: Vec::new(),
                 inline_ready: false,
+                inline_only: false,
             });
         }
         Ok(())
@@ -2883,6 +2896,7 @@ impl MarkupQuery {
                     reference_independent: None,
                     reference_indices: Vec::new(),
                     inline_ready: false,
+                    inline_only: false,
                 });
             }
             start = end;
@@ -2902,6 +2916,67 @@ impl MarkupQuery {
         if self.complete {
             return Ok(self.progress());
         }
+        if let Some((first, last)) = self.inline_fragments.pop_front() {
+            let bytes = last
+                .bytes
+                .checked_sub(first.bytes)
+                .filter(|bytes| *bytes > 0 && *bytes <= PROBE_BYTES as u64)
+                .ok_or(Error::Invalid("markup queried inline subtree extent"))?;
+            if first.bytes < self.last_inline_fragment_end
+                || first.bytes >= self.window.end
+                || last.bytes <= self.window.start
+            {
+                return Err(Error::Invalid("markup inline subtree source order/window"));
+            }
+            let count = usize::try_from(bytes)
+                .map_err(|_| Error::Invalid("markup inline subtree address space"))?;
+            let charge = self
+                .inline_fragment_bytes
+                .checked_add(count)
+                .filter(|value| *value <= 2 * PROBE_BYTES + NATIVE_WINDOW_BYTES)
+                .ok_or(Error::Invalid("markup copied inline subtree budget"))?;
+            let text = String::from_utf8(engine.logical_read_range(
+                &self.snapshot,
+                first.bytes..last.bytes,
+                cancelled,
+            )?)
+            .map_err(|_| Error::Invalid("markup inline subtree UTF8"))?;
+            let start = engine.logical_byte_position(&self.snapshot, first.bytes)?.point();
+            let summary = TextSummary::of(&text);
+            if start.utf16 != first.utf16 || start.checked_add(summary)?.utf16 != last.utf16 {
+                return Err(Error::Invalid("markup inline subtree source counters"));
+            }
+            let proved = pulldown_cmark::paged::probe_inline_link(
+                &text,
+                self.index.mode.options(),
+                cancelled,
+            )
+            .map_err(|error| match error {
+                pulldown_cmark::paged::InlineRunError::Cancelled => Error::Cancelled,
+                pulldown_cmark::paged::InlineRunError::Invalid(value) => Error::Invalid(value),
+            })?;
+            if proved.is_none_or(|value| value.end() != text.len()) {
+                return Err(Error::Invalid("markup inline subtree proof"));
+            }
+            self.inline_fragment_bytes = charge;
+            self.last_inline_fragment_end = last.bytes;
+            self.fragment_text_bytes = self
+                .fragment_text_bytes
+                .checked_add(count)
+                .ok_or(Error::Invalid("markup inline subtree retained bytes"))?;
+            self.fragments.push(MarkupFragment {
+                start,
+                text,
+                code: None,
+                parsed: true,
+                containers: BlockCarry::default(),
+                reference_independent: Some(true),
+                reference_indices: Vec::new(),
+                inline_ready: false,
+                inline_only: true,
+            });
+            return Ok(self.progress());
+        }
         if let Some(scan) = self.inline_scans.front_mut() {
             if scan.step(
                 engine,
@@ -2909,6 +2984,7 @@ impl MarkupQuery {
                 self.index.mode,
                 &mut self.inline_styles,
                 &mut self.inline_media,
+                &mut self.inline_fragments,
             )? {
                 self.inline_scans.pop_front();
             }
