@@ -188,6 +188,31 @@ final class PagedNativeTextStorage: NSTextStorage {
   private var managedInputContext: NSTextInputContext?
   private var constructingInputContext = false
   var didRejectInput: ((Error) -> Void)?
+  weak var documentViewport: PagedDocumentViewport?
+  private var ownsDocumentMouseGesture = false
+  override func mouseDown(with event: NSEvent) {
+    ownsDocumentMouseGesture = false
+    if documentViewport?.beginDocumentMouseSelection(event, in: self) == true {
+      ownsDocumentMouseGesture = true; return
+    }
+    super.mouseDown(with: event)
+  }
+  override func mouseDragged(with event: NSEvent) {
+    if ownsDocumentMouseGesture {
+      _ = documentViewport?.continueDocumentMouseSelection(event, in: self); return
+    }
+    super.mouseDragged(with: event)
+  }
+  override func mouseUp(with event: NSEvent) {
+    if ownsDocumentMouseGesture {
+      ownsDocumentMouseGesture = false
+      _ = documentViewport?.endDocumentMouseSelection(event, in: self); return
+    }
+    super.mouseUp(with: event)
+  }
+  /// The viewport has one presentation gesture; Cocoa still supplies the
+  /// actual bounded clip scrolling, never a logical source edit/history.
+  func autoscrollDocumentMouseSelection(_ event: NSEvent) -> Bool { super.autoscroll(with: event) }
   override var undoManager: UndoManager? {
     // TextKit asks for a manager while coalescing character input even with
     // allowsUndo disabled. Our manually grouped root manager belongs to the

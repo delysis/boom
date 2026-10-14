@@ -392,7 +392,7 @@ private final class PagedNativeInputObservers {
   /// A document range is two scalar coordinates. Cocoa paints only the
   /// intersection with its bounded island; neither selection nor Undo copies
   /// the selected source bytes into memory.
-  func setDocumentSelection(_ selection: PagedNativeNavigationSelection) throws {
+  func setDocumentSelection(_ selection: PagedNativeNavigationSelection, mouseDown: NSEvent? = nil) throws {
     let coordinates = try session.documentCoordinates()
     guard selection.utf16Offset <= coordinates.projectedUTF16,
       selection.utf16Length <= coordinates.projectedUTF16 - selection.utf16Offset,
@@ -400,7 +400,15 @@ private final class PagedNativeInputObservers {
       throw BoomError.stale("Document selection falls outside the actual projected source.")
     }
     let changesLogicalSelection = try currentDocumentSelection() != selection
-    if changesLogicalSelection { try binding.requireSelectionCapacity() }
+    if let mouseDown {
+      guard mouseDown.type == .leftMouseDown, let window = view.window,
+        mouseDown.windowNumber == window.windowNumber, window.isKeyWindow,
+        window.firstResponder === view else {
+        throw BoomError.stale("The mouse selection has another actual native window or responder.")
+      }
+    }
+    let recordsSelectionIngress = changesLogicalSelection || mouseDown != nil
+    if recordsSelectionIngress { try binding.requireSelectionCapacity() }
     let beforeEpoch = binding.selectionEpoch
     let windowEnd = coordinates.utf16Start + UInt64(coordinates.localUTF16)
     let selectionEnd = selection.utf16Offset + selection.utf16Length
@@ -415,7 +423,7 @@ private final class PagedNativeInputObservers {
     view.setSelectedRange(local, affinity: selection.affinity.native, stillSelecting: false)
     // A distant logical endpoint may change while Cocoa paints the identical
     // island range. It still invalidates pending input/navigation observations.
-    if changesLogicalSelection, binding.selectionEpoch == beforeEpoch { binding.recordSelectionChange() }
+    if recordsSelectionIngress, binding.selectionEpoch == beforeEpoch { binding.recordSelectionChange() }
     notifyNativeState(from: view, edited: false)
   }
 

@@ -208,6 +208,7 @@ import XCTest
       XCTAssertEqual(joined.activeCalls, 0); XCTAssertEqual(joined.startedCalls, joined.finishedCalls)
     }
   }
+
 }
 
 @MainActor final class PagedNativeManagedNavigationTests: XCTestCase {
@@ -947,8 +948,8 @@ import XCTest
     }
   }
 
-  /// Actual NSWindow dispatch plus NSTextView's native tracking loop. The
-  /// posted SDK drag/up events are not a packaged physical-mouse acceptance.
+  /// Actual NSWindow dispatch through the managed mouse responder. These SDK
+  /// drag/up events are not a packaged physical-mouse acceptance.
   func testActualScrollMouseDownTracksDragAtNonzeroClipOriginAndKeepsOutsideShiftAnchorWithUndo() async throws {
     let line = "abcdefghijklmné🙂\n"
     try await fixture(#function, text: String(repeating: line, count: 2_000)) { f in
@@ -994,11 +995,11 @@ import XCTest
         let down = try event(.leftMouseDown, downPoint, 1)
         let dragged = try event(.leftMouseDragged, endPoint, 2)
         let up = try event(.leftMouseUp, endPoint, 3)
-        // Native mouseDown owns and consumes these actual SDK events. There
-        // is no direct global-selection substitution for the drag itself.
-        NSApplication.shared.postEvent(up, atStart: true)
-        NSApplication.shared.postEvent(dragged, atStart: true)
+        // The partial-window gesture uses actual responder dispatch for all
+        // three events. Whole-document/multiclick Cocoa tracking is separate.
         window.sendEvent(down)
+        window.sendEvent(dragged)
+        window.sendEvent(up)
         XCTAssertNil(viewport.presentationFailure)
         XCTAssertTrue(viewport.textView === view); XCTAssertTrue(input.activeView === view)
         XCTAssertTrue(window.isKeyWindow); XCTAssertTrue(window.firstResponder === view)
@@ -1035,4 +1036,131 @@ import XCTest
       XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
     }
   }
+
+  func testActualPointerAutoscrollExtendsAcrossLogicalWindowsDuringHeldSaveThenEditsAndResponderUndo() async throws {
+    let line = "abcdefghijklmné🙂\n"
+    try await fixture(#function, text: String(repeating: line, count: 3_000)) { f in
+      let input = f.input!, source = f.session!, commands = f.commands!, window = f.window!, viewport = f.scroll!
+      try viewport.enableDocumentNavigation(engine: f.engine!, publisher: f.publisher!)
+      let hold = try await f.route!.holdNext(.commitBefore)
+      f.view.setSelectedRange(NSRange(location: 4, length: 0))
+      f.view.insertText("X", replacementRange: f.view.selectedRange())
+      try await f.route!.awaitHeld(hold)
+      let generation = source.generation, before = source.sealedRootRecord, manager = commands.manager
+      let withX = NSMutableString(string: f.originalText)
+      withX.insert("X", at: 4)
+      try viewport.requestScroll(toUTF16: 12_000); try await viewport.joinPresentation()
+      let projection = try XCTUnwrap(viewport.visibleScrollWindow)
+      let surface = try XCTUnwrap(viewport.subviews.compactMap { $0 as? NSScrollView }.first { !$0.isHidden })
+      let display = try XCTUnwrap(surface.documentView as? NSTextView)
+      try XCTUnwrap(display.layoutManager).ensureLayout(for: try XCTUnwrap(display.textContainer))
+      surface.contentView.scroll(to: NSPoint(x: 0, y: max(0, display.frame.height - surface.contentSize.height)))
+      surface.reflectScrolledClipView(surface.contentView)
+      let point = NSPoint(x: display.textContainerOrigin.x + 22, y: display.visibleRect.minY + 24)
+      let downLocal = display.characterIndexForInsertion(at: point)
+      let anchor = try projection.position(localUTF16: downLocal).utf16
+      @MainActor func event(_ type: NSEvent.EventType, _ point: NSPoint, _ number: Int) throws -> NSEvent {
+        try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
+          timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+          context: nil, eventNumber: number, clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1))
+      }
+      let down = try event(.leftMouseDown, display.convert(point, to: nil), 1)
+      window.sendEvent(down)
+      XCTAssertEqual(try input.currentDocumentSelection().anchorUTF16, anchor)
+      let native = f.view, arena = source.arenaID
+      let outside = viewport.contentView.convert(NSPoint(x: 40, y: viewport.contentView.bounds.maxY + 48), to: nil)
+      let dragged = try event(.leftMouseDragged, outside, 2)
+      window.sendEvent(dragged)
+      try await viewport.joinPresentation()
+      let visible = try XCTUnwrap(viewport.visibleScrollWindow)
+      let selected = try input.currentDocumentSelection()
+      XCTAssertEqual(selected.anchorUTF16, anchor); XCTAssertTrue(selected.focusAtEnd)
+      XCTAssertGreaterThan(selected.focusUTF16, projection.start.utf16 + projection.summary.utf16)
+      XCTAssertTrue(visible.snapshot.isSame(source.logicalWindow.snapshot))
+      XCTAssertEqual(source.arenaID, arena, "Dragging does not rebind inside Cocoa's private tracking.")
+      XCTAssertEqual(source.generation, generation); XCTAssertEqual(source.sealedRootRecord, before)
+      XCTAssertTrue(f.view === native); XCTAssertTrue(window.firstResponder === native)
+      XCTAssertTrue(window.isKeyWindow); XCTAssertFalse(commands.hasPendingCommand)
+      window.sendEvent(try event(.leftMouseUp, outside, 3))
+      try await viewport.joinPresentation()
+      XCTAssertNil(viewport.visibleScrollWindow)
+      XCTAssertNotEqual(source.arenaID, arena, "Release adopts the already displayed exact focus window.")
+      let finalSelection = try input.currentDocumentSelection()
+      XCTAssertEqual(finalSelection.anchorUTF16, anchor)
+      XCTAssertGreaterThan(finalSelection.focusUTF16, projection.start.utf16 + projection.summary.utf16)
+      XCTAssertEqual(source.generation, generation); XCTAssertEqual(source.activeNavigationOperationCount, 0)
+      let expected = NSMutableString(string: withX as String)
+      expected.replaceCharacters(in: NSRange(location: Int(finalSelection.utf16Offset),
+        length: Int(finalSelection.utf16Length)), with: "Q")
+      native.insertText("Q", replacementRange: native.selectedRange())
+      try await commands.joinPendingCommand()
+      XCTAssertEqual(source.generation, generation + 1); XCTAssertEqual(source.sealedRootRecord, before)
+      XCTAssertTrue(commands.manager === manager); XCTAssertNil(input.firstRefusal)
+      try await f.route!.release(hold); try await f.assertSource(expected as String)
+      XCTAssertTrue(NSApplication.shared.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+      try await commands.joinPendingCommand(); try await f.assertSource(withX as String)
+      XCTAssertEqual(try input.currentDocumentSelection(), finalSelection)
+      XCTAssertTrue(NSApplication.shared.sendAction(NSSelectorFromString("redo:"), to: nil, from: nil))
+      try await commands.joinPendingCommand(); try await f.assertSource(expected as String)
+      XCTAssertNil(viewport.presentationFailure); XCTAssertNil(commands.firstFailure)
+    }
+  }
+
+  func testActualMouseUpAndCloseStopAutoscrollWhileOriginalWindowDeliveryIsHeldAndJoined() async throws {
+    let line = "abcdefghijklmné🙂\n"
+    try await fixture(#function, text: String(repeating: line, count: 3_000)) { f in
+      let source = f.session!, input = f.input!, commands = f.commands!, window = f.window!, viewport = f.scroll!
+      try viewport.enableDocumentNavigation(engine: f.engine!, publisher: f.publisher!)
+      @MainActor func beginHeldDrag() async throws -> (PagedNativeLogicalControlStorage.Ticket, PagedNativeNavigationSelection) {
+        let view = f.view
+        try XCTUnwrap(view.layoutManager).ensureLayout(for: try XCTUnwrap(view.textContainer))
+        viewport.contentView.scroll(to: NSPoint(x: 0, y: max(0, view.frame.height - viewport.contentSize.height)))
+        viewport.reflectScrolledClipView(viewport.contentView)
+        let point = NSPoint(x: view.textContainerOrigin.x + 22, y: view.visibleRect.minY + 24)
+        @MainActor func event(_ type: NSEvent.EventType, at location: NSPoint) throws -> NSEvent {
+          try XCTUnwrap(NSEvent.mouseEvent(with: type, location: location, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+            context: nil, eventNumber: type == .leftMouseDown ? 1 : 2, clickCount: 1, pressure: 1))
+        }
+        window.sendEvent(try event(.leftMouseDown, at: view.convert(point, to: nil)))
+        let hold = try await f.route!.holdNext(.windowAfter)
+        let outside = viewport.contentView.convert(NSPoint(x: 40, y: viewport.contentView.bounds.maxY + 48), to: nil)
+        window.sendEvent(try event(.leftMouseDragged, at: outside))
+        try await f.route!.awaitHeld(hold) // actual backend window has returned; forwarding reply still owned
+        XCTAssertTrue(viewport.hasPendingPresentationRead); XCTAssertTrue(viewport.isMouseAutoscrolling)
+        XCTAssertNil(viewport.visibleScrollWindow)
+        return (hold, try input.currentDocumentSelection())
+      }
+      let (first, selected) = try await beginHeldDrag()
+      let arena = source.arenaID, generation = source.generation
+      let outside = viewport.contentView.convert(NSPoint(x: 40, y: viewport.contentView.bounds.maxY + 48), to: nil)
+      let up = try XCTUnwrap(NSEvent.mouseEvent(with: .leftMouseUp, location: outside, modifierFlags: [],
+        timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+        context: nil, eventNumber: 3, clickCount: 1, pressure: 0))
+      window.sendEvent(up)
+      XCTAssertTrue(viewport.hasPendingPresentationRead, "Mouse release must not await the actual held reply.")
+      XCTAssertFalse(viewport.isMouseAutoscrolling); XCTAssertEqual(source.arenaID, arena)
+      XCTAssertEqual(source.generation, generation); XCTAssertEqual(try input.currentDocumentSelection(), selected)
+      f.view.insertText("Y", replacementRange: f.view.selectedRange())
+      XCTAssertEqual(source.generation, generation + 1); XCTAssertNil(input.firstRefusal)
+      try await f.route!.release(first); try await viewport.joinPresentation()
+      XCTAssertFalse(viewport.hasPendingPresentationRead); XCTAssertNil(viewport.visibleScrollWindow)
+      XCTAssertEqual(source.arenaID, arena, "The superseded actual returned window never installs at a newer source.")
+      let expected = NSMutableString(string: f.originalText)
+      expected.replaceCharacters(in: NSRange(location: Int(selected.utf16Offset), length: Int(selected.utf16Length)), with: "Y")
+      try await f.assertSource(expected as String)
+      // A second genuine entered/read-return hold keeps close asynchronous.
+      // Actual close owns/join the same task and invalidates its actual timer.
+      let (second, _) = try await beginHeldDrag()
+      let closed = Task { try await viewport.closePresentation() }
+      try await f.route!.release(second)
+      try await closed.value
+      XCTAssertFalse(viewport.isMouseAutoscrolling); XCTAssertFalse(viewport.hasPendingPresentationRead)
+      XCTAssertNil(viewport.visibleScrollWindow); XCTAssertNil(f.view.documentViewport)
+      let joined = await f.route!.snapshot
+      XCTAssertEqual(joined.activeCalls, 0); XCTAssertEqual(joined.startedCalls, joined.finishedCalls)
+      XCTAssertNil(commands.firstFailure); XCTAssertNil(input.firstRefusal)
+    }
+  }
+
 }

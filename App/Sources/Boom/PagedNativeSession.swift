@@ -158,6 +158,16 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
     return PagedNativeLogicalReadSnapshot(source: snapshot, sessionID: sessionID,
       arenaID: arenaID, generation: generation)
   }
+
+  /// Presentation borrows the same independent reader/controller lifetime as
+  /// native navigation. A later selection may supersede delivery; no save,
+  /// writer join, source installation or Foundation action belongs here.
+  func readLogicalPresentation(_ read: PagedNativeLogicalReadSnapshot, utf16Anchor: UInt64,
+    maximumBytes: Int, cancellation: CancellationFlag) async throws -> PagedNativeLogicalWindow {
+    try admitLogicalRead(read)
+    return try await storage.logicalWindow(read.source, utf16Anchor: utf16Anchor,
+      maximumBytes: maximumBytes, cancellation: cancellation)
+  }
   func isCurrent(_ captured: PagedNativeLogicalReadSnapshot) -> Bool {
     captured.sessionID == sessionID && captured.arenaID == arenaID && captured.generation == generation
       && captured.source.isSame(logicalWindow.snapshot) && !adopting

@@ -26,9 +26,20 @@ import Foundation
   private var showingScroll = false
   private var closingPresentation = false
   private var presentationClosed = false
+  private struct MouseSelectionGesture {
+    let source: PagedNativeLogicalReadSnapshot
+    let anchor: UInt64
+    let affinity: PagedSelectionAffinity
+    var event: NSEvent
+  }
+  private var mouseSelectionGesture: MouseSelectionGesture?
+  private var mouseAutoscrollTimer: Timer?
+  private var handedOffMouseDown: NSEvent?
   private(set) var presentationFailure: Error?
   var visibleScrollWindow: PagedNativeLogicalWindow? { showingScroll ? scrollProjection : nil }
   var residentScrollWindowCount: Int { scrollProjection == nil ? 0 : 1 }
+  var isMouseAutoscrolling: Bool { mouseAutoscrollTimer?.isValid == true }
+  var hasPendingPresentationRead: Bool { scrollTask != nil }
   var didRejectPresentation: ((Error) -> Void)?
 
   override init(frame: NSRect) {
@@ -137,6 +148,7 @@ import Foundation
   }
 
   private func configureManagedLayout(_ view: PagedNativeTextView) {
+    view.documentViewport = self
     view.isVerticallyResizable = true; view.isHorizontallyResizable = false
     view.autoresizingMask = [.width]
     view.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
@@ -269,7 +281,7 @@ import Foundation
     startScrollTask()
   }
   private func startScrollTask() {
-    guard scrollTask == nil, let input = managedInput, let engine = navigationEngine else { return }
+    guard scrollTask == nil, let input = managedInput, navigationEngine != nil else { return }
     scrollTask = Task { [self] in
       defer { scrollTask = nil }
       while true {
@@ -281,20 +293,23 @@ import Foundation
         requestedScroll = nil
         var captured: PagedNativeLogicalReadSnapshot?
         do {
-          let snapshot = try input.session.captureLogicalRead()
+          let snapshot = try mouseSelectionGesture?.source ?? input.session.captureLogicalRead()
           captured = snapshot
           let trace = PerformanceTrace.begin("Editor.ManagedScrollRead")
           let output: PagedNativeLogicalWindow
           do {
             defer { PerformanceTrace.end("Editor.ManagedScrollRead", trace) }
-            output = try await engine.logicalWindow(snapshot.source, utf16Anchor: request.anchor,
+            output = try await input.session.readLogicalPresentation(snapshot, utf16Anchor: request.anchor,
               maximumBytes: PagedWorkingWindow.targetBytes, cancellation: CancellationFlag())
           }
           // Saving an identical generation does not change the displayed text.
           // Actual later input or a different arena supersedes this read.
           guard displayRequest == request.id, input.session.isCurrent(snapshot) else { continue }
           scrollProjection = output; scrollSnapshot = snapshot
-          try showScrollSurface(output)
+          try showScrollSurface(output, anchor: mouseSelectionGesture == nil ? nil : request.anchor)
+          if let gesture = mouseSelectionGesture {
+            try updateMouseSelection(gesture.event)
+          }
         } catch {
           // An obsolete read cannot disable newer scrolling or native input.
           guard displayRequest == request.id, captured.map({ input.session.isCurrent($0) }) != false else { continue }
@@ -305,7 +320,7 @@ import Foundation
       }
     }
   }
-  private func showScrollSurface(_ window: PagedNativeLogicalWindow) throws {
+  private func showScrollSurface(_ window: PagedNativeLogicalWindow, anchor: UInt64? = nil) throws {
     guard window.summary.bytes <= UInt64(PagedWorkingWindow.targetBytes) else {
       throw BoomError.budget("The logical scroll window exceeds its display bound.")
     }
@@ -315,7 +330,7 @@ import Foundation
       let container = NSTextContainer(size: NSSize(width: max(1, contentSize.width), height: CGFloat.greatestFiniteMagnitude))
       storage.addLayoutManager(manager); manager.addTextContainer(container)
       let view = PagedScrollTextView(frame: NSRect(origin: .zero, size: contentSize), textContainer: container)
-      view.isEditable = false; view.isSelectable = false; view.isRichText = false
+      view.isEditable = false; view.isSelectable = true; view.isRichText = false
       view.drawsBackground = true; view.backgroundColor = textView.backgroundColor
       view.font = textView.font ?? NSFont.systemFont(ofSize: 17); view.textContainerInset = textView.textContainerInset
       view.isVerticallyResizable = true; view.isHorizontallyResizable = false
@@ -324,6 +339,13 @@ import Foundation
       container.widthTracksTextView = true; container.heightTracksTextView = false
       view.writingToolsBehavior = .none
       view.clicked = { [weak self] event in self?.selectScrollPoint(event) }
+      view.dragged = { [weak self] event in
+        self?.managedInput?.activeView?.mouseDragged(with: event)
+      }
+      view.lifted = { [weak self] event in
+        self?.managedInput?.activeView?.mouseUp(with: event)
+      }
+      view.copied = { [weak self] sender in self?.managedInput?.activeView?.copy(sender) }
       let surface = PagedScrollSurface(frame: contentView.frame)
       surface.drawsBackground = false; surface.hasVerticalScroller = false; surface.hasHorizontalScroller = false
       surface.documentView = view
@@ -342,6 +364,21 @@ import Foundation
     MarkdownStyle.apply(to: view)
     view.sizeToFit()
     surface.contentView.scroll(to: .zero); surface.isHidden = false; showingScroll = true
+    if let anchor, !window.text.isEmpty {
+      guard anchor >= window.start.utf16, anchor - window.start.utf16 <= window.summary.utf16,
+        let manager = view.layoutManager, let container = view.textContainer else {
+        throw BoomError.stale("Mouse autoscroll lost its actual displayed source anchor.")
+      }
+      let local = Int(anchor - window.start.utf16)
+      _ = try window.position(localUTF16: local)
+      manager.ensureLayout(for: container)
+      let glyph = manager.glyphIndexForCharacter(at: min(local, max(0, view.string.utf16.count - 1)))
+      let rect = manager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+      let origin = NSPoint(x: 0, y: max(0, rect.minY + view.textContainerOrigin.y))
+      surface.contentView.scroll(to: surface.contentView.constrainBoundsRect(
+        NSRect(origin: origin, size: surface.contentView.bounds.size)).origin)
+      surface.reflectScrolledClipView(surface.contentView)
+    }
     try updateDocumentScroller()
   }
   private func selectScrollPoint(_ event: NSEvent) {
@@ -360,7 +397,7 @@ import Foundation
       else { anchor = nil }
       let local = display.characterIndexForInsertion(at: display.convert(event.locationInWindow, from: nil))
       let origin = surface.contentView.bounds.origin
-      try selectVisibleUTF16(local, extending: extending, installingDisplay: true)
+      try selectVisibleUTF16(local, extending: extending, installingDisplay: true, mouseDown: event)
       // Mount exactly the window that supplied the hit, with its real clip
       // origin. No synthetic event or source authority comes from pixel identity.
       contentView.scroll(to: contentView.constrainBoundsRect(
@@ -371,7 +408,12 @@ import Foundation
         window.isKeyWindow, window.firstResponder === native else {
         throw BoomError.stale("The native mouse handoff did not preserve its displayed source geometry.")
       }
-      if let anchor {
+      handedOffMouseDown = event
+      defer { handedOffMouseDown = nil }
+      let coordinates = try input.session.documentCoordinates()
+      let usesNativeTracking = event.clickCount != 1 || !event.modifierFlags.intersection([.command, .control, .option]).isEmpty
+        || coordinates.utf16Start == 0 && UInt64(coordinates.localUTF16) == coordinates.projectedUTF16
+      if let anchor, usesNativeTracking {
         try input.withDocumentMouseSelection(anchorUTF16: anchor) { native.mouseDown(with: event) }
       } else { native.mouseDown(with: event) }
     } catch { failPresentation(error) }
@@ -379,9 +421,9 @@ import Foundation
   /// The accessibility/mouse consumer names a real scalar in this currently
   /// displayed window. It cannot authorize an earlier root or a half surrogate.
   func selectVisibleUTF16(_ local: Int, extending: Bool = false) throws {
-    try selectVisibleUTF16(local, extending: extending, installingDisplay: false)
+    try selectVisibleUTF16(local, extending: extending, installingDisplay: false, mouseDown: nil)
   }
-  private func selectVisibleUTF16(_ local: Int, extending: Bool, installingDisplay: Bool) throws {
+  private func selectVisibleUTF16(_ local: Int, extending: Bool, installingDisplay: Bool, mouseDown: NSEvent?) throws {
     guard let input = managedInput, showingScroll, let output = scrollProjection,
       let snapshot = scrollSnapshot, let owner = input.commandOwner else {
       throw BoomError.stale("The scroll projection has no current editable consumer.")
@@ -406,6 +448,12 @@ import Foundation
         utf16Length: max(fixed, absolute.partialValue) - min(fixed, absolute.partialValue),
         focusAtEnd: absolute.partialValue >= fixed, affinity: original.affinity)
     } else { selection = PagedNativeNavigationSelection(utf16Offset: absolute.partialValue, utf16Length: 0) }
+    if mouseDown != nil {
+      // This exact display/source hit is a real new pointer intent. Existing
+      // selection ingress cancels a superseded cold command; its task/events
+      // keep their old authority and join independently of this installation.
+      try input.setDocumentSelection(selection, mouseDown: mouseDown)
+    }
     let nativeEnd = current.utf16Start.addingReportingOverflow(UInt64(current.localUTF16))
     if !installingDisplay, !nativeEnd.overflow, !owner.hasPendingCommand, input.session.isCurrent(snapshot),
       selection.focusUTF16 >= current.utf16Start, selection.focusUTF16 <= nativeEnd.partialValue,
@@ -422,26 +470,183 @@ import Foundation
     if !owner.hasPendingCommand, input.session.isCurrent(snapshot) {
       // This is the exact logical window already displayed, not authority
       // reconstructed from pixels or a saved file record. Adopt without I/O.
-      let observed = try input.observeSelection()
-      let ticket = try input.session.prepareLogicalWindowInstallation(output,
-        selectingUTF16: selection, owner: input)
-      do {
-        try input.stageNavigation(ticket, observedSelection: observed)
-        _ = try input.withStagedNavigationInstallation(ticket) { [self] old, new in
-          try mountManagedView(from: old, to: new)
-        }
-      } catch {
-        let original = error
-        if !ticket.wasConsumed {
-          do { try input.cancelNavigationStage(ticket) }
-          catch { throw PagedNativeNavigationCleanupFailure(original: original, cleanup: error) }
-        }
-        throw original
-      }
+      try installDisplayedWindow(output, selecting: selection, input: input)
     } else {
       try owner.requestDocumentNavigation(toUTF16: anchor, selectingUTF16: selection, expected: current)
     }
     revealEditableWindow()
+  }
+
+  private func installDisplayedWindow(_ output: PagedNativeLogicalWindow,
+    selecting selection: PagedNativeNavigationSelection, input: PagedNativeInputOwner) throws {
+    let observed = try input.observeSelection()
+    let ticket = try input.session.prepareLogicalWindowInstallation(output,
+      selectingUTF16: selection, owner: input)
+    do {
+      try input.stageNavigation(ticket, observedSelection: observed)
+      _ = try input.withStagedNavigationInstallation(ticket) { [self] old, new in
+        try mountManagedView(from: old, to: new)
+      }
+    } catch {
+      let original = error
+      if !ticket.wasConsumed {
+        do { try input.cancelNavigationStage(ticket) }
+        catch { throw PagedNativeNavigationCleanupFailure(original: original, cleanup: error) }
+      }
+      throw original
+    }
+  }
+
+  /// A partial document has one global range on the existing InputOwner.
+  /// Actual responder events drive this bounded presentation gesture; Cocoa
+  /// keeps its ordinary whole-document and multiclick tracking behavior.
+  func beginDocumentMouseSelection(_ event: NSEvent, in view: PagedNativeTextView) -> Bool {
+    guard event.type == .leftMouseDown, event.clickCount == 1,
+      event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+      let input = managedInput, input.activeView === view, textView === view,
+      input.commandOwner?.hasPendingCommand == false,
+      let coordinates = try? input.session.documentCoordinates(),
+      coordinates.utf16Start != 0 || UInt64(coordinates.localUTF16) != coordinates.projectedUTF16 else { return false }
+    do {
+      guard let window = self.window, view.window === window,
+        event.windowNumber == window.windowNumber, window.isKeyWindow,
+        window.makeFirstResponder(view), window.firstResponder === view,
+        view.inputCommandIsClosed, !view.hasMarkedText(), !input.isAdopting else {
+        throw BoomError.stale("The document mouse gesture has another native source or focus.")
+      }
+      stopMouseSelection()
+      let original = try input.currentDocumentSelection()
+      let local = view.characterIndexForInsertion(at: view.convert(event.locationInWindow, from: nil))
+      let focus = try input.session.logicalWindow.position(localUTF16: local).utf16
+      let anchor = event.modifierFlags.contains(.shift) ? original.anchorUTF16 : focus
+      let selection = PagedNativeNavigationSelection(utf16Offset: min(anchor, focus),
+        utf16Length: max(anchor, focus) - min(anchor, focus), focusAtEnd: focus > anchor,
+        affinity: original.affinity)
+      try input.setDocumentSelection(selection, mouseDown: handedOffMouseDown === event ? nil : event)
+      mouseSelectionGesture = MouseSelectionGesture(source: try input.session.captureLogicalRead(),
+        anchor: anchor, affinity: selection.affinity, event: event)
+    } catch { stopMouseSelection(); failPresentation(error) }
+    return true
+  }
+
+  func continueDocumentMouseSelection(_ event: NSEvent, in view: PagedNativeTextView) -> Bool {
+    guard mouseSelectionGesture != nil else { return false }
+    do {
+      guard event.type == .leftMouseDragged, managedInput?.activeView === view,
+        event.windowNumber == self.window?.windowNumber else {
+        throw BoomError.stale("The document drag belongs to another physical event source.")
+      }
+      mouseSelectionGesture?.event = event
+      try advanceMouseSelection(event)
+      let (_, display, _) = try mousePresentation()
+      let outside = !display.visibleRect.contains(display.convert(event.locationInWindow, from: nil))
+      if outside, mouseAutoscrollTimer == nil {
+        let timer = Timer(timeInterval: 0.05, target: self,
+          selector: #selector(scrollMouseSelection(_:)), userInfo: nil, repeats: true)
+        mouseAutoscrollTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+      } else if !outside {
+        mouseAutoscrollTimer?.invalidate(); mouseAutoscrollTimer = nil
+      }
+    } catch { stopMouseSelection(); failPresentation(error) }
+    return true
+  }
+
+  func endDocumentMouseSelection(_ event: NSEvent, in view: PagedNativeTextView) -> Bool {
+    guard let gesture = mouseSelectionGesture else { return false }
+    defer { stopMouseSelection() }
+    do {
+      guard event.type == .leftMouseUp, let input = managedInput, input.activeView === view,
+        event.windowNumber == self.window?.windowNumber, input.session.isCurrent(gesture.source) else {
+        throw BoomError.stale("The document mouse release superseded its original logical source.")
+      }
+      try updateMouseSelection(event)
+      displayRequest = UUID(); requestedScroll = nil
+      if showingScroll, let output = scrollProjection, let surface = scrollSurface {
+        let origin = surface.contentView.bounds.origin
+        let selection = try input.currentDocumentSelection()
+        guard selection.focusUTF16 >= output.start.utf16,
+          selection.focusUTF16 - output.start.utf16 <= output.summary.utf16 else {
+          throw BoomError.stale("Mouse release lost its actual displayed selection focus.")
+        }
+        try installDisplayedWindow(output, selecting: selection, input: input)
+        contentView.scroll(to: contentView.constrainBoundsRect(
+          NSRect(origin: origin, size: contentView.bounds.size)).origin)
+        reflectScrolledClipView(contentView)
+      }
+    } catch { failPresentation(error) }
+    return true
+  }
+
+  @objc private func scrollMouseSelection(_ timer: Timer) {
+    guard mouseAutoscrollTimer === timer, let gesture = mouseSelectionGesture else { return }
+    do { try advanceMouseSelection(gesture.event) }
+    catch { stopMouseSelection(); failPresentation(error) }
+  }
+  private func stopMouseSelection() {
+    mouseAutoscrollTimer?.invalidate(); mouseAutoscrollTimer = nil
+    if mouseSelectionGesture != nil { displayRequest = UUID(); requestedScroll = nil }
+    mouseSelectionGesture = nil
+  }
+
+  private func mousePresentation() throws -> (NSScrollView, NSTextView, PagedNativeLogicalWindow) {
+    guard let gesture = mouseSelectionGesture, let input = managedInput,
+      input.session.isCurrent(gesture.source), let native = input.activeView,
+      let window = self.window, window.isKeyWindow, window.firstResponder === native,
+      native.inputCommandIsClosed, !native.hasMarkedText(), !input.isAdopting,
+      input.commandOwner?.hasPendingCommand == false,
+      !closingPresentation, !presentationClosed else {
+      throw BoomError.stale("The mouse gesture no longer owns its original logical source and native focus.")
+    }
+    if showingScroll, let surface = scrollSurface, let display = scrollText,
+      let output = scrollProjection, output.snapshot.isSame(gesture.source.source) {
+      return (surface, display, output)
+    }
+    return (self, native, input.session.logicalWindow)
+  }
+  private func updateMouseSelection(_ event: NSEvent) throws {
+    let (surface, display, output) = try mousePresentation()
+    guard let input = managedInput, let gesture = mouseSelectionGesture else { return }
+    let visible = display.visibleRect, raw = display.convert(event.locationInWindow, from: nil)
+    let point = NSPoint(x: min(max(raw.x, visible.minX), max(visible.minX, visible.maxX - 0.5)),
+      y: min(max(raw.y, visible.minY), max(visible.minY, visible.maxY - 0.5)))
+    let local = display.characterIndexForInsertion(at: point)
+    let focus = try output.position(localUTF16: local).utf16
+    let selection = PagedNativeNavigationSelection(utf16Offset: min(gesture.anchor, focus),
+      utf16Length: max(gesture.anchor, focus) - min(gesture.anchor, focus),
+      focusAtEnd: focus > gesture.anchor, affinity: gesture.affinity)
+    if try input.currentDocumentSelection() != selection { try input.setDocumentSelection(selection) }
+    if surface !== self {
+      let start = min(output.start.utf16 + output.summary.utf16, max(output.start.utf16, selection.utf16Offset))
+      let end = min(output.start.utf16 + output.summary.utf16, max(start, selection.utf16Offset + selection.utf16Length))
+      let painted = NSRange(location: Int(start - output.start.utf16), length: Int(end - start))
+      if display.selectedRange() != painted { display.setSelectedRange(painted) }
+    }
+  }
+  private func advanceMouseSelection(_ event: NSEvent) throws {
+    let (surface, display, output) = try mousePresentation()
+    let point = display.convert(event.locationInWindow, from: nil)
+    if !display.visibleRect.contains(point) {
+      if let native = display as? PagedNativeTextView { _ = native.autoscrollDocumentMouseSelection(event) }
+      else { _ = display.autoscroll(with: event) }
+    }
+    try updateMouseSelection(event)
+    // One existing read task only. Retaining the latest pointer never
+    // invalidates every in-flight read or allocates a document-sized view.
+    guard scrollTask == nil, requestedScroll == nil else { return }
+    let visible = display.visibleRect
+    let bottom = max(0, display.frame.height - surface.contentSize.height)
+    let top = output.start.utf16 + UInt64(visibleUTF16(in: display, surface: surface))
+    let span = UInt64(max(1, visibleUTF16(in: display, surface: surface, atBottom: true)
+      - visibleUTF16(in: display, surface: surface)))
+    if point.y < visible.minY, surface.contentView.bounds.minY <= 0, output.start.utf16 > 0 {
+      try requestScroll(toUTF16: top > span ? top - span : 0)
+    } else if point.y >= visible.maxY, surface.contentView.bounds.minY >= bottom,
+      top < output.snapshot.summary.utf16 {
+      let next = top.addingReportingOverflow(span)
+      guard !next.overflow, next.partialValue < output.snapshot.summary.utf16 else { return }
+      try requestScroll(toUTF16: next.partialValue)
+    }
   }
   private func moveDocument(_ selector: Selector, observed: PagedNativeSelectionObservation) throws {
     guard let input = managedInput, let owner = input.commandOwner,
@@ -576,10 +781,12 @@ import Foundation
     if presentationClosed { return }
     closingPresentation = true
     defer { closingPresentation = false }
+    stopMouseSelection()
     displayRequest = UUID(); requestedScroll = nil; hideScrollSurface()
     if let task = scrollTask { await task.value }
     scrollProjection = nil; scrollSnapshot = nil
     presentationClosed = true
+    if let native = textView as? PagedNativeTextView, native.documentViewport === self { native.documentViewport = nil }
     scrollSurface?.removeFromSuperview(); scrollSurface = nil; scrollText = nil
     didRejectPresentation = nil
   }
@@ -668,12 +875,18 @@ import Foundation
 /// mouse point is interpreted only against its retained immutable window.
 @MainActor private final class PagedScrollTextView: MarkdownTextView {
   var clicked: ((NSEvent) -> Void)?
+  var dragged: ((NSEvent) -> Void)?
+  var lifted: ((NSEvent) -> Void)?
+  var copied: ((Any?) -> Void)?
   var completeMarkupContext = false
   override var hasCompleteMarkupContext: Bool { completeMarkupContext }
   override var acceptsFirstResponder: Bool { false }
   override func mouseDown(with event: NSEvent) {
     clicked?(event)
   }
+  override func mouseDragged(with event: NSEvent) { dragged?(event) }
+  override func mouseUp(with event: NSEvent) { lifted?(event) }
+  override func copy(_ sender: Any?) { copied?(sender) }
 }
 @MainActor private final class PagedScrollSurface: NSScrollView {
   var scrolled: ((NSEvent) -> Void)?
