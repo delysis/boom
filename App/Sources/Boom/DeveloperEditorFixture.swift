@@ -782,7 +782,7 @@ private final class DeveloperBackupCopyHold: @unchecked Sendable {
           (retained as NSError).domain == (unrelatedFailure as NSError).domain,
           (retained as NSError).code == (unrelatedFailure as NSError).code,
           retained.localizedDescription == unrelatedFailure.localizedDescription,
-          try await detachedWork({ try RegularFile(sentinel, limit: 4_096).data() }) == sentinelBytes else {
+          try await detachedWork(operation: { try RegularFile(sentinel, limit: 4_096).data() }) == sentinelBytes else {
           throw BoomError.invalid("Actual backup retry differs or replaced the original retained export failure/files.")
         }
       } catch {
