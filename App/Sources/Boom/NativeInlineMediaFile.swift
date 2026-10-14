@@ -96,8 +96,11 @@ final class NativeInlineMediaFile: @unchecked Sendable {
     precondition(!Thread.isMainThread)
     try Task.checkCancellation()
     let source = vault.recordURL(.attachment, record.id)
-    let directory = try FileManager.default.url(for: .itemReplacementDirectory,
-      in: .userDomainMask, appropriateFor: source, create: true).standardizedFileURL
+    let replacement = try FileManager.default.url(for: .itemReplacementDirectory,
+      in: .userDomainMask, appropriateFor: source, create: true)
+    // Resolve Foundation's system-directory aliases before capturing ownership;
+    // the subsequent clone and reads still refuse every symbolic-link component.
+    let directory = try WorkspaceBackup.physicalDirectory(replacement)
     var info = stat()
     guard lstat(directory.path, &info) == 0, info.st_mode & S_IFMT == S_IFDIR,
       info.st_uid == getuid() else {

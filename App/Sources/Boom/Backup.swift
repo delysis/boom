@@ -287,7 +287,7 @@ enum WorkspaceBackup {
 
   // Foundation may shorten /private/var to /var while its enumerator returns
   // /private/var children. Use the kernel spelling for ancestry and rename.
-  private static func physicalDirectory(_ url: URL) throws -> URL {
+  static func physicalDirectory(_ url: URL) throws -> URL {
     let (resolved, failure) = url.path.withCString { (realpath($0, nil), errno) }
     guard let resolved else { throw POSIXError(POSIXErrorCode(rawValue: failure) ?? .EIO) }
     defer { free(resolved) }
