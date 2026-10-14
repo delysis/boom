@@ -1,5 +1,4 @@
 //! Product policy without filesystem, Keychain, network, or model authority.
-use argon2::{Algorithm, Argon2, Params, Version};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -925,10 +924,6 @@ pub enum Request {
         working_reserve_bytes: u64,
         allocation_bytes_upper_bound: u64,
     },
-    BackupKey {
-        passphrase: String,
-        salt: Vec<u8>,
-    },
 }
 
 struct ConsultationInput<'a> {
@@ -1429,18 +1424,6 @@ pub fn execute(request: Request) -> Result<Value, Error> {
             working_reserve_bytes,
             allocation_bytes_upper_bound,
         )?),
-        Request::BackupKey { passphrase, salt } => {
-            require(
-                (8..=1024).contains(&passphrase.len()) && salt.len() == 16,
-                "Use a backup passphrase of 8 to 1024 bytes and a 16-byte salt.",
-            )?;
-            let params = Params::new(65_536, 3, 1, Some(32)).map_err(|e| Error(e.to_string()))?;
-            let mut key = [0_u8; 32];
-            Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-                .hash_password_into(passphrase.as_bytes(), &salt, &mut key)
-                .map_err(|e| Error(e.to_string()))?;
-            serde_json::to_value(key.as_slice())
-        }
     }
     .map_err(|e| Error(e.to_string()))
 }

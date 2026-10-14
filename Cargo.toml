@@ -4,7 +4,6 @@ members = [
   "crates/bloom-core",
   "crates/bloom-text",
   "crates/bloom-tokenizer-reference",
-  "crates/bloom-vault-reference",
   "crates/attachment-native-document",
   "crates/attachment-native-host",
   "crates/attachment-native-inspect",
@@ -23,7 +22,6 @@ publish = false
 
 [workspace.dependencies]
 bloom-core = { path = "crates/bloom-core" }
-argon2 = "=0.5.3"
 attachment-native-document = { path = "crates/attachment-native-document" }
 attachment-native-host = { path = "crates/attachment-native-host" }
 attachment-native-inspect = { path = "crates/attachment-native-inspect" }
