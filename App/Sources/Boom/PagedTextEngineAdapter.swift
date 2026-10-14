@@ -584,11 +584,16 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
         var appended = false
         while true {
           let queryWindow = target
-          async let style = logicalMarkupMode(queryWindow, mode: 0, cancellation: cancellation,
+          async let style = logicalMarkupModeResult(queryWindow, mode: 0, cancellation: cancellation,
             token: token, lease: lease, latestWindow: latestWindow, onMode: onMode)
-          async let media = logicalMarkupMode(queryWindow, mode: 1, cancellation: cancellation,
+          async let media = logicalMarkupModeResult(queryWindow, mode: 1, cancellation: cancellation,
             token: token, lease: lease, latestWindow: latestWindow, onMode: onMode)
-          let (styled, linked) = try await (style, media)
+          let (styleResult, mediaResult) = await (style, media)
+          // Both actual commands have joined. Cancellation of a sibling is a
+          // consequence, never a replacement for the original failing mode.
+          if case .failure(let error) = styleResult, !(error is CancellationError) { throw error }
+          if case .failure(let error) = mediaResult { throw error }
+          let styled = try styleResult.get(), linked = try mediaResult.get()
           appended = appended || styled.appendedIndex || linked.appendedIndex
           try cancellation.check()
           let latest = await latestWindow?() ?? queryWindow
@@ -617,6 +622,16 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
       if try rootCustody.joinedFailure(lease, error: error) { throw PagedTextCustodyFailure(original: error, lease: lease) }
       throw error
     }
+  }
+  private func logicalMarkupModeResult(_ window: PagedNativeLogicalWindow, mode: UInt8,
+    cancellation: CancellationFlag, token: PagedTextCancellation, lease: PagedTextRootLease,
+    latestWindow: (@MainActor @Sendable () -> PagedNativeLogicalWindow?)?,
+    onMode: (@MainActor @Sendable (UInt8, PagedNativeMarkupProjection.Mode) -> Void)?) async
+    -> Result<(value: PagedNativeMarkupProjection.Mode, appendedIndex: Bool), Error> {
+    do {
+      return .success(try await logicalMarkupMode(window, mode: mode, cancellation: cancellation,
+        token: token, lease: lease, latestWindow: latestWindow, onMode: onMode))
+    } catch { return .failure(error) }
   }
   private func logicalMarkupMode(_ window: PagedNativeLogicalWindow, mode: UInt8,
     cancellation: CancellationFlag, token: PagedTextCancellation, lease: PagedTextRootLease,
@@ -731,8 +746,11 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
       try cancellation.check()
       return (value, appendedIndex)
     } catch {
-      if let retained { try await onLogicalReadQueue { retained.release() } }
       cancellation.cancel()
+      if let retained {
+        do { try await onLogicalReadQueue { retained.release() } }
+        catch let cleanup { throw PagedTextCleanupFailure(original: error, cleanup: cleanup) }
+      }
       throw error
     }
   }

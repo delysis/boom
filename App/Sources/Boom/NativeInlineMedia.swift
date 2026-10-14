@@ -7,7 +7,7 @@ private extension NSAttributedString.Key {
   static let mediaStart = Self("BloomInlineMediaStart")
 }
 
-struct InlineMediaSpan: Decodable, Sendable {
+struct InlineMediaSpan: Decodable, Sendable, Equatable {
   let id: UUID
   let location: Int
   let length: Int

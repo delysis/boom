@@ -235,8 +235,13 @@ import Foundation
             self.receiveMarkupMode(value, mode: mode, request: actual)
           }
           if let actual = activeMarkupRequest { applyMarkup(projection, request: actual) }
+        } catch is CancellationError {
+          // Intentional cancellation has no new display failure. An ordinary
+          // error may also cancel its sibling, but remains the primary error.
         } catch {
-          if !cancellation.isCancelled, !Task.isCancelled, !closingPresentation, input.session.isCurrent(request.source) {
+          let current = activeMarkupRequest ?? request
+          if !Task.isCancelled, !closingPresentation, !presentationClosed,
+            input.session.isCurrent(current.source) {
             markupFailure = error
           }
         }
@@ -279,12 +284,15 @@ import Foundation
       projection.matches(request.window) else { return }
     markupFailure = nil
     if let native = request.view as? PagedNativeTextView, native === input.activeView {
-      _ = native.installDerivedMarkup(projection, for: request.window, sourceVersion: request.version)
-      deliveredMarkup = projection
+      if native.installDerivedMarkup(projection, for: request.window, sourceVersion: request.version) {
+        deliveredMarkup = projection
+      }
     } else if let scroll = request.view as? PagedScrollTextView, scroll === scrollText,
       showingScroll, scrollProjection?.windowID == request.window.windowID {
-      scroll.installDerivedMarkup(projection, for: request.window, sourceVersion: request.version)
-      scroll.sizeToFit(); deliveredMarkup = projection
+      if scroll.installDerivedMarkup(projection, for: request.window, sourceVersion: request.version) {
+        scroll.sizeToFit()
+      }
+      deliveredMarkup = projection
     }
   }
   /// Explicit component/display admission only. Ordinary scrolling joins its
@@ -1137,13 +1145,19 @@ import Foundation
     }
     return ProductCore.MarkupProjection(markdown: [], media: [], hasWikiMarker: false, hasAttachmentMarker: false)
   }
-  func installDerivedMarkup(_ projection: PagedNativeMarkupProjection, for window: PagedNativeLogicalWindow,
-    sourceVersion: UUID) {
-    guard self.sourceVersion == sourceVersion, projection.matches(window) else { return }
+  @discardableResult func installDerivedMarkup(_ projection: PagedNativeMarkupProjection, for window: PagedNativeLogicalWindow,
+    sourceVersion: UUID) -> Bool {
+    guard self.sourceVersion == sourceVersion, projection.matches(window) else { return false }
+    let unchanged = derivedMarkup.map {
+      $0.version == sourceVersion && $0.windowID == window.windowID
+        && $0.value.matches(window) && $0.value.hasSameDisplay(as: projection)
+    } == true
     derivedMarkup = (sourceVersion, window.windowID, projection)
+    if unchanged { return false }
     derivedMarkupDidChange()
     MarkdownStyle.apply(to: self)
     mediaChanged()
+    return true
   }
   func currentDerivedMarkup(for window: PagedNativeLogicalWindow) -> PagedNativeMarkupProjection? {
     guard let derivedMarkup, derivedMarkup.version == sourceVersion,

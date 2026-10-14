@@ -5,7 +5,7 @@ import BoomCore
   var applyingExternal: Bool { get set }
 }
 
-struct MarkdownSpan: Decodable, Sendable {
+struct MarkdownSpan: Decodable, Sendable, Equatable {
   let kind: String
   let location: Int
   let length: Int

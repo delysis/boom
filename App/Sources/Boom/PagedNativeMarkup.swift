@@ -36,6 +36,14 @@ struct PagedNativeMarkupProjection: Sendable {
   /// overhead and decoded UI arrays; it is not a full 3MiB peak-memory proof.
   var trackedReferenceCapacityUpperBytes: Int { style.trackedReferencePeakBytes + media.trackedReferencePeakBytes }
   func matches(_ window: PagedNativeLogicalWindow) -> Bool { style.matches(window) && media.matches(window) }
+  /// Only actual display content participates: telemetry and global proof
+  /// progress may advance without changing any local attributes or media.
+  func hasSameDisplay(as other: Self) -> Bool {
+    let current = value, previous = other.value
+    return current.markdown == previous.markdown && current.media == previous.media
+      && current.hasWikiMarker == previous.hasWikiMarker
+      && current.hasAttachmentMarker == previous.hasAttachmentMarker
+  }
   var value: ProductCore.MarkupProjection {
     ProductCore.MarkupProjection(markdown: style.markdown, media: media.media,
       hasWikiMarker: style.complete && style.hasWikiMarker,

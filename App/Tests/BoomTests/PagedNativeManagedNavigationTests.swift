@@ -1,5 +1,6 @@
 import AppKit
 import BoomCore
+import Darwin
 import Foundation
 import XCTest
 @testable import Boom
@@ -286,6 +287,74 @@ import XCTest
       throw error
     }
   }
+  func testActualDerivedMarkupWriteOpenFailureStaysObservableAndLaterNativeTypingUndoRemainLive() async throws {
+    let text = "# Public heading 🙂\n\n" + String(repeating: "ordinary source\n\n", count: 2600)
+    try await fixture(#function, text: text) { f in
+      let session = f.session!, engine = f.engine!, view = f.view, viewport = f.scroll!
+      let before = try session.captureLogicalState(), version = view.sourceVersion
+      let custody = engine.custodySnapshot
+      let path = f.root.appendingPathComponent("documents", isDirectory: true)
+        .appendingPathComponent(session.sourceBaseRevision.documentID.uuidString.lowercased(), isDirectory: true)
+        .appendingPathComponent("pages")
+      let descriptor = Darwin.open(path.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+      guard descriptor >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+      var opened = stat(), modeToRestore: mode_t?, descriptorOwned = true
+      @MainActor func restoreMode() throws {
+        guard let mode = modeToRestore else { return }
+        var actual = stat(), named = stat()
+        guard fstat(descriptor, &actual) == 0, lstat(path.path, &named) == 0,
+          actual.st_dev == opened.st_dev, actual.st_ino == opened.st_ino,
+          named.st_dev == opened.st_dev, named.st_ino == opened.st_ino,
+          actual.st_mode & S_IFMT == S_IFREG, named.st_mode & S_IFMT == S_IFREG else {
+          throw BoomError.stale("The owned public append file changed before permission restoration.")
+        }
+        guard fchmod(descriptor, mode) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        modeToRestore = nil
+      }
+      @MainActor func closeDescriptor() throws {
+        guard descriptorOwned else { return }
+        descriptorOwned = false
+        guard Darwin.close(descriptor) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+      }
+      do {
+        var named = stat()
+        guard geteuid() != 0, fstat(descriptor, &opened) == 0, lstat(path.path, &named) == 0,
+          opened.st_uid == geteuid(), opened.st_mode & S_IFMT == S_IFREG,
+          opened.st_mode & 0o7777 == 0o600,
+          named.st_dev == opened.st_dev, named.st_ino == opened.st_ino,
+          named.st_mode & S_IFMT == S_IFREG else {
+          throw BoomError.denied("The public control requires its real owned ordinary0600 append file.")
+        }
+        modeToRestore = opened.st_mode & 0o7777
+        guard fchmod(descriptor, 0o400) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        try viewport.enableDocumentNavigation(engine: engine, publisher: f.publisher!)
+        await viewport.joinMarkup()
+        let failure = try XCTUnwrap(viewport.markupFailure, "Sibling cancellation must preserve the actual writer error.") as NSError
+        XCTAssertEqual(failure.domain, NSPOSIXErrorDomain); XCTAssertEqual(failure.code, Int(EACCES))
+        XCTAssertEqual(engine.custodySnapshot.jobs, custody.jobs)
+        XCTAssertEqual(engine.custodySnapshot.reservedPayloadBytes, custody.reservedPayloadBytes)
+        XCTAssertTrue(session.isCurrent(before)); XCTAssertEqual(view.sourceVersion, version)
+        XCTAssertNil(f.input!.firstRefusal); XCTAssertNil(f.commands!.firstFailure)
+        // Native source admission remains immediate. Restore the actual FD
+        // before yielding so the independent normal saver need not also fail.
+        view.setSelectedRange(NSRange(location: 0, length: 0))
+        view.insertText("X", replacementRange: view.selectedRange())
+        XCTAssertTrue(view.string.hasPrefix("X# Public"))
+        try restoreMode(); try closeDescriptor()
+        f.commands!.manager.undo(); try await f.commands!.joinPendingCommand()
+        await viewport.joinMarkup()
+        XCTAssertNil(viewport.markupFailure)
+        XCTAssertTrue(view.markupProjection.markdown.contains { $0.kind == "heading" })
+        XCTAssertNil(f.input!.firstRefusal); XCTAssertNil(f.commands!.firstFailure)
+        try await f.assertSource(text)
+      } catch {
+        do { try restoreMode() } catch let cleanup { f.preserve(cleanup) }
+        do { try closeDescriptor() } catch let cleanup { f.preserve(cleanup) }
+        throw error
+      }
+    }
+  }
+
   func testActualPagedMarkupSuppressesRemoteFenceAndResolvesFirstGlobalReferenceInEditingAndScroll() async throws {
     let id = UUID(uuidString: "884646c1-14b4-490d-be8c-8953af793315")!
     let later = "adfcd7f6-e0c9-4d06-a75c-f64794d7760b"

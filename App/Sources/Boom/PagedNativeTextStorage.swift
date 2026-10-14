@@ -208,7 +208,12 @@ final class PagedNativeTextStorage: NSTextStorage {
       !constructingView, inputCommandIsClosed, !boundedStorage.hasOpenCharacterTransaction,
       window.snapshot.isSame(session.logicalWindow.snapshot), window.windowID == session.logicalWindow.windowID,
       projection.matches(window) else { return false }
+    let unchanged = readyDisplay == nil && derivedMarkup.map {
+      $0.version == sourceVersion && $0.arenaID == session.arenaID
+        && $0.projection.matches(window) && $0.projection.hasSameDisplay(as: projection)
+    } == true
     derivedMarkup = (sourceVersion, session.arenaID, projection)
+    if unchanged { return true }
     derivedMarkupDidChange()
     if let readyDisplay { inlineMedia.adoptReadyDisplayItems(from: readyDisplay, ids: projection.media.media.map(\.id)) }
     if !hasMarkedText() { MarkdownStyle.apply(to: self); mediaChanged() }
