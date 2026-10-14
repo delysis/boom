@@ -886,7 +886,13 @@ import Foundation
   }
   override func mouseDragged(with event: NSEvent) { dragged?(event) }
   override func mouseUp(with event: NSEvent) { lifted?(event) }
-  override func copy(_ sender: Any?) { copied?(sender) }
+  override func copy(_ sender: Any?) {
+    // The media menu already validated this display's exact storage, version,
+    // range and item. Copy its original (or literal unavailable reference)
+    // before considering the independent editable document selection.
+    if inlineMedia.currentRanges.contains(selectedRange()) { super.copy(sender); return }
+    copied?(sender)
+  }
 }
 @MainActor private final class PagedScrollSurface: NSScrollView {
   var scrolled: ((NSEvent) -> Void)?

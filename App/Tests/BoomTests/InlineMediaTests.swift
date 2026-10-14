@@ -4,6 +4,7 @@ import XCTest
 @testable import Boom
 
 final class InlineMediaTests: XCTestCase {
+  @MainActor private static var failedDisplayCopyControls: [(WorkspaceModel, NSWindow, Error)] = []
   @MainActor private func model() async throws -> WorkspaceModel {
     _ = NSApplication.shared
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-inline-" + UUID().uuidString)
@@ -138,5 +139,92 @@ final class InlineMediaTests: XCTestCase {
     XCTAssertEqual(compiled.prompt, "<bos>🙂\n<|image|>\nLabel:")
     XCTAssertEqual(compiled.media.map(\.id), [image.id])
     try await model.shutdown()
+  }
+
+  @MainActor func testActualReadonlyAttachmentMenuCopiesDisplayedOriginalInsteadOfDifferentNativeSelection() async throws {
+    try PagedNativeFixtureApplication.bootstrap()
+    let root = try PagedNativeFixtureApplication.scratchRoot(prefix: "public-display-copy-")
+    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: root), loadModels: false)
+    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: 80, y: 80, width: 800, height: 600))
+    window.isReleasedWhenClosed = false
+    do {
+      let viewport = try XCTUnwrap(model.pagedViewport)
+      window.contentView = viewport
+      try await PagedNativeFixtureApplication.focus(try XCTUnwrap(model.pagedInput?.activeView), in: window)
+      if model.selectedChat == nil { try model.newChat() }
+      let original = try Self.image()
+      model.attachToCurrentChat([.bytes(name: "public-display.png", data: original)])
+      try await finish(model)
+      let record = try XCTUnwrap(model.state.attachments.last)
+      let documentID = try XCTUnwrap(model.selectedDocumentID)
+      let source = "Different native words.\n[Attachment: public-display.png](boom-attachment:\(record.id))\nAfter 🙂."
+      try await NativeCheckEvidence.replacePublicDocument(model, text: source, id: documentID, caret: 0)
+      let native = try XCTUnwrap(model.pagedInput?.activeView)
+      try await PagedNativeFixtureApplication.focus(native, in: window)
+      native.setSelectedRange(NSRange(location: 0, length: "Different".utf16.count))
+      let nativeSelection = native.selectedRange()
+      let session = try XCTUnwrap(model.pagedSession)
+      let generation = session.generation, arena = session.arenaID
+      let logical = try session.captureLogicalState().source
+
+      try viewport.requestScroll(toUTF16: 0)
+      try await viewport.joinPresentation()
+      let display = try XCTUnwrap(viewport.subviews.compactMap { ($0 as? NSScrollView)?.documentView as? NativeMediaTextView }
+        .first(where: { $0 !== native && !$0.acceptsFirstResponder }))
+      // Use the existing media component's real model/Vault load. No synthetic
+      // glyph/item/bytes are installed and the read surface remains unfocused.
+      display.setMedia(model: model)
+      var host: InlineMediaHost?
+      for _ in 0..<500 {
+        host = display.subviews.compactMap { $0 as? InlineMediaHost }
+          .first(where: { $0.item.record.id == record.id && $0.item.bytes != nil })
+        if host != nil { break }
+        try await Task.sleep(for: .milliseconds(10))
+      }
+      let media = try XCTUnwrap(host, "The actual readonly source did not load its verified original.")
+      let range = try XCTUnwrap(media.sourceRange)
+      let point = media.convert(NSPoint(x: 2, y: 2), to: nil)
+      let event = try XCTUnwrap(NSEvent.mouseEvent(with: .rightMouseDown, location: point,
+        modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+        windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1))
+      let menu = try XCTUnwrap(media.menu(for: event))
+      let entry = try XCTUnwrap(menu.items.first(where: { $0.title == "Copy" }))
+      let target = try XCTUnwrap(entry.target as? NSObject), action = try XCTUnwrap(entry.action)
+      XCTAssertEqual(display.selectedRange(), range)
+      XCTAssertEqual(native.selectedRange(), nativeSelection)
+      XCTAssertTrue(window.firstResponder === native)
+      NSPasteboard.general.clearContents()
+      _ = target.perform(action, with: entry)
+      guard case .bytes(let name, let copied)? = AttachmentInput.read(.general)?.first else {
+        throw BoomError.invalid("Readonly media Copy forwarded unrelated native text instead of its original.")
+      }
+      XCTAssertEqual(name, record.name); XCTAssertEqual(copied, original)
+      XCTAssertEqual(try model.store.vault.get(.attachment, id: record.id), original)
+      XCTAssertEqual(native.selectedRange(), nativeSelection)
+      XCTAssertEqual(session.generation, generation); XCTAssertEqual(session.arenaID, arena)
+      XCTAssertEqual(try session.captureLogicalState().source.rootID, logical.rootID)
+
+      // The original menu is source/version/range bound. A different local
+      // selection, then changed readonly characters, cannot reuse that entry.
+      NSPasteboard.general.clearContents(); NSPasteboard.general.setString("retained-copy-sentinel", forType: .string)
+      display.setSelectedRange(NSRange(location: 0, length: 0))
+      _ = target.perform(action, with: entry)
+      XCTAssertEqual(NSPasteboard.general.string(forType: .string), "retained-copy-sentinel")
+      display.setSelectedRange(range)
+      display.string = "Changed display only."
+      _ = target.perform(action, with: entry)
+      XCTAssertEqual(NSPasteboard.general.string(forType: .string), "retained-copy-sentinel")
+      XCTAssertEqual(native.selectedRange(), nativeSelection)
+      let unchanged = try await model.captureDocument(documentID)
+      XCTAssertEqual(unchanged.completeSnapshot?.text, source)
+      XCTAssertEqual(try model.store.vault.get(.attachment, id: record.id), original)
+      NSPasteboard.general.clearContents()
+      try await model.shutdown(); window.close()
+      try FileManager.default.removeItem(at: root)
+    } catch {
+      precondition(Self.failedDisplayCopyControls.count < 4)
+      Self.failedDisplayCopyControls.append((model, window, error))
+      throw error
+    }
   }
 }
