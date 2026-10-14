@@ -11,6 +11,7 @@ import ObjectiveC
   private var state = State.unbound
   private weak var sourceView: PagedNativeTextView?
   private var contextWasConstructed = false
+  private var preparedMarkedAttributes: [NSAttributedString.Key]?
 
   // One genuinely stable process-lifetime association key. Never replace it,
   // reuse its address, or remove the association while its context survives.
@@ -22,15 +23,30 @@ import ObjectiveC
   init(identity: PagedNativeInputIdentity) { self.identity = identity; super.init() }
 
   var isRetired: Bool { state == .retired }
+  var isAwaitingBind: Bool { state == .unbound && contextWasConstructed }
 
   func bindOnce(to view: PagedNativeTextView) {
     precondition(state == .unbound && view.inputBinding?.identity == identity)
     sourceView = view
     state = .bound
+    preparedMarkedAttributes = nil
+  }
+
+  /// Prepare the next context without granting it a source. Cocoa may ask for
+  /// declared attributes during construction; all text/command queries stay inert.
+  func makePreparedContext(markedAttributes: [NSAttributedString.Key]) -> NSTextInputContext {
+    precondition(state == .unbound && sourceView == nil && !contextWasConstructed)
+    preparedMarkedAttributes = markedAttributes
+    return constructContext()
   }
 
   func makeContext() -> NSTextInputContext {
     precondition(state == .bound && sourceView != nil && !contextWasConstructed)
+    return constructContext()
+  }
+
+  private func constructContext() -> NSTextInputContext {
+    precondition(!contextWasConstructed)
     contextWasConstructed = true
     // NSTextInputContext explicitly does not retain its client. The method's
     // receiver is alive during construction; after construction the context's
@@ -45,6 +61,7 @@ import ObjectiveC
     precondition(sourceView == nil || sourceView?.inputBinding?.state == .retired)
     state = .retired
     sourceView = nil
+    preparedMarkedAttributes = nil
   }
 
   private func activeSource() -> PagedNativeTextView? {
@@ -96,6 +113,7 @@ import ObjectiveC
   }
 
   func validAttributesForMarkedText() -> [NSAttributedString.Key] {
+    if state == .unbound { return preparedMarkedAttributes ?? [] }
     // Context initialization queries this declarative capability before a
     // stage is active. Preserve the same native view's capability list without
     // admitting staged text/range/command access or a new source destination.

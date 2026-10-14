@@ -76,18 +76,26 @@ import Foundation
   /// The existing InputOwner calls this only after consuming its real source
   /// installation. Reuse leaves this host and its actual view unchanged.
   func mountManagedView(from old: PagedNativeTextView, to new: PagedNativeTextView) throws {
-    guard let input = managedInput, old !== new, textView === old, documentView === old,
-      input.activeView === new, old.inputBinding?.owner === input,
-      old.inputBinding?.state == .retired, new.inputBinding?.owner === input,
+    guard let input = managedInput, textView === old, documentView === old,
+      input.activeView === new, new.inputBinding?.owner === input,
       new.inputBinding?.state == .active, new.inputBinding?.identity == input.activeIdentity,
       new.inputBinding?.identity.arenaID == input.session.arenaID,
       window === old.window else {
       throw BoomError.stale("The viewport replacement has another managed source or host.")
     }
+    if old === new {
+      // Only the existing lexical installation can change this stable view's
+      // projection. InputOwner already retired the actual old binding/storage.
+      guard input.isAdopting else { throw BoomError.stale("A stable view rebind has no source installation.") }
+    } else {
+      guard old.inputBinding?.owner === input, old.inputBinding?.state == .retired else {
+        throw BoomError.stale("A replaced physical view has not retired its original source.")
+      }
+    }
     let sourceWindow = old.window
     let ownsFocus = sourceWindow?.firstResponder === old
     textView = new; self.sourceWindow = nil; coordinates = nil; preview = nil
-    documentView = new
+    if documentView !== new { documentView = new }
     configureManagedLayout(new)
     observeStorage()
     revealEditableWindow()
@@ -95,7 +103,13 @@ import Foundation
       throw BoomError.stale("The managed view did not join its original physical host.")
     }
     if ownsFocus {
-      guard let sourceWindow, sourceWindow.makeFirstResponder(new), sourceWindow.firstResponder === new else {
+      guard let sourceWindow else { throw BoomError.unavailable("The managed view lost its original native window.") }
+      if sourceWindow.firstResponder !== new {
+        guard sourceWindow.makeFirstResponder(new) else {
+          throw BoomError.unavailable("The managed view could not retain its original native focus.")
+        }
+      }
+      guard sourceWindow.firstResponder === new else {
         throw BoomError.unavailable("The managed view did not retain its original native focus.")
       }
     }

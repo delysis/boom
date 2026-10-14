@@ -157,8 +157,8 @@ final class PagedNativeTextStorage: NSTextStorage {
 /// the native command owner publishes and installs file-backed history.
 @MainActor final class PagedNativeTextView: MarkdownTextView {
   let session: PagedNativeSession
-  let boundedStorage: PagedNativeTextStorage
-  let inputBinding: PagedNativeInputBinding?
+  private(set) var boundedStorage: PagedNativeTextStorage
+  private(set) var inputBinding: PagedNativeInputBinding?
   private var inputCommandDepth = 0
   private var performanceInputActive = false
   private(set) var performanceEvent: UInt64 = 0
@@ -171,7 +171,7 @@ final class PagedNativeTextStorage: NSTextStorage {
   private var typingIntent: PagedNativeInputOwner.TypingIntent?
   private var selectionMutationDepth = 0
   private var constructingView = true
-  private let managedInputClient: PagedNativeTextInputClient?
+  private var managedInputClient: PagedNativeTextInputClient?
   override var hasCompleteMarkupContext: Bool {
     guard let coordinates = try? session.documentCoordinates() else { return false }
     return coordinates.utf16Start == 0
@@ -256,23 +256,7 @@ final class PagedNativeTextStorage: NSTextStorage {
     importsGraphics = false
     isHorizontallyResizable = false; isVerticallyResizable = false
     textContainerInset = NSSize(width: 16, height: 16)
-    storage.didRejectMutation = { [weak self] error in
-      // This callback is emitted only AFTER an accepted source mutation.
-      // Ordinary rejected input uses didRejectInput's diagnostic route.
-      if let model = self?.owner { model.report(error) }
-      else { self?.didRejectInput?(error) }
-    }
-    storage.nativeSelection = { [weak self] in
-      guard let self else { throw BoomError.stale("The native selection owner has retired.") }
-      if let commandSelection = self.commandSelection {
-        // Cocoa can remove and reinsert marked text within one command. Only
-        // the first accepted primitive uses the command's before-selection;
-        // later primitives use Session's current source cursor while Cocoa
-        // is still updating its own selection.
-        return commandSelection.generation == self.session.generation ? commandSelection : nil
-      }
-      return try self.session.nativeSelection(self.selectedRange())
-    }
+    prepareProjectionCallbacks(storage)
     let selectionTrace = PerformanceTrace.begin("Editor.Update", event: 5)
     if let stagedNavigationTicket {
       super.setSelectedRange(stagedNavigationTicket.localSelection, affinity: stagedNavigationTicket.selectionAffinity, stillSelecting: false)
@@ -286,6 +270,52 @@ final class PagedNativeTextStorage: NSTextStorage {
     MarkdownStyle.apply(to: self)
   }
   required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+  func prepareProjectionCallbacks(_ storage: PagedNativeTextStorage) {
+    storage.didRejectMutation = { [weak self, weak storage] error in
+      guard let self, let storage, self.boundedStorage === storage else { return }
+      // This callback is emitted only AFTER an accepted source mutation.
+      // Ordinary rejected input uses didRejectInput's diagnostic route.
+      if let model = self.owner { model.report(error) }
+      else { self.didRejectInput?(error) }
+    }
+    storage.nativeSelection = { [weak self, weak storage] in
+      guard let self, let storage, self.boundedStorage === storage else {
+        throw BoomError.stale("The native selection storage has retired.")
+      }
+      if let commandSelection = self.commandSelection {
+        // Cocoa can remove and reinsert marked text within one command. Only
+        // the first accepted primitive uses the command's before-selection;
+        // later primitives use Session's current source cursor while Cocoa
+        // is still updating its own selection.
+        return commandSelection.generation == self.session.generation ? commandSelection : nil
+      }
+      return try self.session.nativeSelection(self.selectedRange())
+    }
+  }
+
+  /// Source/SDK admission and prepared projection allocation preceded consume.
+  /// The physical view and TextKit graph stay; old storage/binding never retarget.
+  func installPreparedProjection(storage: PagedNativeTextStorage,
+    binding: PagedNativeInputBinding, client: PagedNativeTextInputClient,
+    context: NSTextInputContext, manager: NSLayoutManager, container: NSTextContainer,
+    selection: NSRange, affinity: NSSelectionAffinity) {
+    precondition(inputBinding?.state == .retired && inputCommandIsClosed
+      && !boundedStorage.hasOpenCharacterTransaction && client.isAwaitingBind)
+    precondition(manager === layoutManager && container === textContainer
+      && manager.textStorage === boundedStorage && container.textView === self)
+    constructingView = true
+    defer { constructingView = false }
+    clearGhost(); endGhostBoundary()
+    boundedStorage = storage; inputBinding = binding
+    managedInputClient = client; managedInputContext = context
+    manager.replaceTextStorage(storage)
+    precondition(manager.textStorage === storage && container.textView === self)
+    client.bindOnce(to: self)
+    super.setSelectedRange(selection, affinity: affinity, stillSelecting: false)
+    MarkdownStyle.apply(to: self)
+    inlineMedia.layout.reconcileMediaPresence(in: storage)
+  }
 
   /// Only the immutable binding's owner may retire a managed physical client.
   /// Deactivation controls input-source activation; it is not a callback join.

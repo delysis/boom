@@ -118,9 +118,9 @@ private final class PagedNativeInputObservers {
   deinit { for token in tokens { NotificationCenter.default.removeObserver(token) } }
 }
 
-/// One binding is constructed for one physical NSTextView. It is never
-/// retargeted to another arena. AppKit callbacks carry the view's binding,
-/// rather than acquiring the owner's current storage at callback time.
+/// One binding belongs to one installed source arena and never retargets.
+/// A stable view rotates bindings; contexts retain their immutable proxy identity,
+/// and retired storage keeps its retired binding.
 @MainActor final class PagedNativeInputBinding {
   enum State: Equatable { case staged, active, retired }
   let identity: PagedNativeInputIdentity
@@ -181,18 +181,20 @@ private final class PagedNativeInputObservers {
   }
 }
 
-/// Physical clients for the file-backed editor. Keep one active view
-/// and at most one staged view; old contexts own only inert, weak-target
+/// Physical clients for the file-backed editor. Keep one stable active view
+/// and at most one staged projection/context; old contexts own inert, weak-target
 /// clients. Normal reference lifetime handles their physical reclamation.
 /// Actual source/history tasks remain owned by the session and backend.
 @MainActor final class PagedNativeInputOwner {
-  private struct PhysicalClient {
-    let view: PagedNativeTextView
-    let context: NSTextInputContext?
-  }
   private struct StagedClient {
     let ticket: PagedNativeNavigationInstallationTicket
-    let client: PhysicalClient
+    let binding: PagedNativeInputBinding
+    let storage: PagedNativeTextStorage
+    let inputClient: PagedNativeTextInputClient
+    let context: NSTextInputContext
+    let sourceStorage: PagedNativeTextStorage
+    let sourceManager: NSLayoutManager
+    let sourceContainer: NSTextContainer
     let sourceSelection: PagedNativeSelectionObservation
     let sourceKeyboardID: String?
     let sourceWindow: NSWindow?
@@ -287,10 +289,6 @@ private final class PagedNativeInputObservers {
     activeView?.owner = model
     activeView?.setMedia(model: model)
     activeView?.didRejectInput = { _ in PerformanceTrace.event("Editor.ManagedAdmission") }
-    stagedClient?.client.view.completionClient = client
-    stagedClient?.client.view.owner = model
-    stagedClient?.client.view.setMedia(model: model)
-    stagedClient?.client.view.didRejectInput = activeView?.didRejectInput
   }
 
   /// Read only the explicitly owned selection. Session's native-coordinate
@@ -607,40 +605,64 @@ private final class PagedNativeInputObservers {
   }
   private func constructStage(_ ticket: PagedNativeNavigationInstallationTicket,
     observedSelection: PagedNativeSelectionObservation) throws {
+    let trace = PerformanceTrace.begin("Editor.Update", event: 6)
+    defer { PerformanceTrace.end("Editor.Update", trace) }
     let window = try session.windowForStagedNavigationInstallation(ticket)
     let binding = makeBinding(arenaID: ticket.provisionalArenaID, windowID: window.windowID)
-    let view = try PagedNativeTextView(frame: activeView.frame, session: session,
-      inputBinding: binding, stagedNavigationTicket: ticket)
-    view.completionClient = completionClient
-    view.owner = completionClient as? WorkspaceModel
-    view.setMedia(model: completionClient as? WorkspaceModel)
-    view.didRejectInput = activeView.didRejectInput
+    guard let view = activeView, let manager = view.layoutManager, let container = view.textContainer,
+      manager.textStorage === view.boundedStorage, container.textView === view,
+      !view.boundedStorage.hasOpenCharacterTransaction,
+      manager.textContainers.count == 1, manager.textContainers.first === container,
+      view.boundedStorage.layoutManagers.count == 1,
+      view.boundedStorage.layoutManagers.first === manager else {
+      throw BoomError.stale("Native installation lost its exact current TextKit graph.")
+    }
+    let storage = try PagedNativeTextStorage(session: session,
+      attributes: [.font: MarkdownStyle.body], inputBinding: binding, stagedNavigationTicket: ticket)
+    view.prepareProjectionCallbacks(storage)
     binding.owner = self
-    let keyboardID = activeContext?.selectedKeyboardInputSource, sourceWindow = activeView.window
-    stagedClient = StagedClient(ticket: ticket, client: PhysicalClient(view: view, context: nil),
-      sourceSelection: observedSelection, sourceKeyboardID: keyboardID, sourceWindow: sourceWindow)
-    let context = view.inputContext
-    stagedClient = StagedClient(ticket: ticket, client: PhysicalClient(view: view, context: context),
-      sourceSelection: observedSelection, sourceKeyboardID: keyboardID, sourceWindow: sourceWindow)
+    let client = PagedNativeTextInputClient(identity: binding.identity)
+    let keyboardID = activeContext?.selectedKeyboardInputSource, sourceWindow = view.window
+    let context = client.makePreparedContext(markedAttributes: view.validAttributesForMarkedText())
+    stagedClient = StagedClient(ticket: ticket, binding: binding, storage: storage,
+      inputClient: client, context: context, sourceStorage: view.boundedStorage,
+      sourceManager: manager, sourceContainer: container, sourceSelection: observedSelection,
+      sourceKeyboardID: keyboardID, sourceWindow: sourceWindow)
   }
   private func requireAdoptionSource(_ stage: StagedClient) throws {
     guard !isAdopting, activeView != nil, stage.sourceSelection == (try observeSelection()),
       stage.sourceKeyboardID == activeContext?.selectedKeyboardInputSource,
       stage.sourceWindow === activeView.window, activeView.inputCommandIsClosed,
-      !activeView.hasMarkedText(), firstRefusal == nil else {
+      !activeView.hasMarkedText(), firstRefusal == nil,
+      stage.sourceStorage === activeView.boundedStorage,
+      stage.sourceManager === activeView.layoutManager, stage.sourceContainer === activeView.textContainer,
+      stage.sourceManager.textStorage === stage.sourceStorage, stage.sourceContainer.textView === activeView,
+      !stage.sourceStorage.hasOpenCharacterTransaction,
+      stage.sourceManager.textContainers.count == 1,
+      stage.sourceStorage.layoutManagers.count == 1,
+      stage.binding.state == .staged, stage.binding.owner === self,
+      stage.binding.identity.arenaID == stage.ticket.provisionalArenaID,
+      stage.inputClient.identity == stage.binding.identity, stage.inputClient.isAwaitingBind,
+      (stage.context.client as? PagedNativeTextInputClient) === stage.inputClient else {
       throw BoomError.stale("The staged client no longer owns the exact source selection/focus/keyboard.")
     }
   }
   private func adopt(_ stage: StagedClient,
     mounted: (PagedNativeTextView, PagedNativeTextView) throws -> Void) -> Error? {
     precondition(isAdopting && stagedClient != nil)
+    let trace = PerformanceTrace.begin("Editor.Update", event: 7)
+    defer { PerformanceTrace.end("Editor.Update", trace) }
     let oldView = activeView!
     let source = stage.sourceSelection.inputLease
     let ownsSourceFocus = (try? physicalInputLease(for: oldView)) == source
     oldView.inputBinding?.retire()
     oldView.retirePhysicalInputClient() // permanent old proxy is inert BEFORE framework reentrancy
-    activeView = stage.client.view; activeContext = stage.client.context
-    activeView.inputBinding?.activate(); stagedClient = nil
+    oldView.installPreparedProjection(storage: stage.storage, binding: stage.binding,
+      client: stage.inputClient, context: stage.context, manager: stage.sourceManager,
+      container: stage.sourceContainer, selection: stage.ticket.localSelection,
+      affinity: stage.ticket.selectionAffinity)
+    activeContext = stage.context
+    stage.binding.activate(); stagedClient = nil
     do {
       try mounted(oldView, activeView)
       if ownsSourceFocus, source.isFirstResponder {
@@ -655,6 +677,8 @@ private final class PagedNativeInputObservers {
             throw BoomError.unavailable("The managed mount could not restore its captured native focus.")
           }
         }
+        if source.isKeyWindow { stage.context.activate() }
+        stage.context.invalidateCharacterCoordinates()
         guard activeView.window === window, window.firstResponder === activeView else {
           throw BoomError.unavailable("The managed mount did not retain its captured native focus.")
         }
@@ -699,7 +723,7 @@ private final class PagedNativeInputObservers {
     let window = try session.withStagedNavigationInstallation(ticket, consuming: { consume in
       if let advancingFoundation { advancingFoundation(consume) } else { consume() }
     }, installing: { _, arena, _ in
-      precondition(arena == stage.client.view.inputBinding?.identity.arenaID)
+      precondition(arena == stage.binding.identity.arenaID)
       mountFailure = adopt(stage, mounted: mounted)
     })
     if let mountFailure { throw mountFailure }
@@ -710,7 +734,8 @@ private final class PagedNativeInputObservers {
   }
   private func retireConstructedStage() {
     guard let stage = stagedClient else { return }
-    stage.client.view.inputBinding?.retire(); stage.client.view.retirePhysicalInputClient()
+    stage.binding.retire(); stage.inputClient.retire()
+    stage.context.deactivate()
     stagedClient = nil
   }
   func cancelNavigationStage(_ ticket: PagedNativeNavigationInstallationTicket) throws {

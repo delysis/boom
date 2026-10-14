@@ -263,30 +263,51 @@ import XCTest
       let input = f.input!, commands = f.commands!, source = f.session!, manager = commands.manager
       let old = f.view, context = try XCTUnwrap(old.inputContext)
       let oldClient = try XCTUnwrap(context.client as? PagedNativeTextInputClient)
-      let oldIdentity = try XCTUnwrap(old.inputBinding?.identity), oldArena = source.arenaID
+      let oldBinding = try XCTUnwrap(old.inputBinding), oldStorage = old.boundedStorage
+      let oldManager = try XCTUnwrap(old.layoutManager), oldContainer = try XCTUnwrap(old.textContainer)
+      let oldIdentity = oldBinding.identity, oldArena = source.arenaID, oldText = oldStorage.string
       let top = try XCTUnwrap(manager.undoActionUserInfoValue(forKey: Self.entryKey) as? NSObject)
       let record = source.sealedRootRecord, sequence = source.generation
       old.setSelectedRange(NSRange(location: 8_000, length: 0), affinity: .upstream, stillSelecting: false)
       let task = try f.startNavigation(anchor: 17_000, caret: nil); let window = try await task.value
       XCTAssertTrue(f.input === input); XCTAssertTrue(f.commands === commands); XCTAssertTrue(f.session === source)
       XCTAssertTrue(commands.manager === manager); XCTAssertTrue(input.commandOwner === commands)
-      XCTAssertFalse(f.view === old); XCTAssertNotEqual(source.arenaID, oldArena)
+      XCTAssertTrue(f.view === old); XCTAssertNotEqual(source.arenaID, oldArena)
       XCTAssertEqual(input.activeIdentity?.arenaID, source.arenaID); XCTAssertEqual(source.generation, sequence)
       XCTAssertEqual(source.sealedRootRecord, record)
       XCTAssertTrue((manager.undoActionUserInfoValue(forKey: Self.entryKey) as? NSObject) === top)
       XCTAssertEqual(f.view.selectedRange(), NSRange(location: Int(8_000 - window.start.utf16), length: 0))
-      XCTAssertEqual(f.view.selectionAffinity, .upstream); XCTAssertEqual(old.inputBinding?.state, .retired)
+      XCTAssertEqual(f.view.selectionAffinity, .upstream); XCTAssertEqual(oldBinding.state, .retired)
+      XCTAssertTrue(f.view.layoutManager === oldManager); XCTAssertTrue(f.view.textContainer === oldContainer)
+      XCTAssertFalse(f.view.boundedStorage === oldStorage); XCTAssertTrue(oldStorage.layoutManagers.isEmpty)
+      XCTAssertFalse(f.view.inputContext === context)
+      XCTAssertTrue(oldManager.textStorage === f.view.boundedStorage)
+      XCTAssertTrue(oldContainer.textView === f.view)
+      XCTAssertTrue(oldManager.delegate === f.view.inlineMedia.layout)
+      XCTAssertThrowsError(try oldBinding.admitsInput(in: source))
+      XCTAssertEqual(try input.inputLease(for: old).identity, input.activeIdentity)
       XCTAssertEqual(oldClient.identity, oldIdentity); XCTAssertTrue(oldClient.isRetired)
+      XCTAssertTrue((context.client as? PagedNativeTextInputClient) === oldClient)
+      XCTAssertEqual(oldClient.selectedRange(), NSRange(location: NSNotFound, length: 0))
+      XCTAssertEqual(oldClient.markedRange(), NSRange(location: NSNotFound, length: 0))
+      XCTAssertFalse(oldClient.hasMarkedText())
+      var absent = NSRange(location: 0, length: 1)
+      XCTAssertNil(oldClient.attributedSubstring(forProposedRange: NSRange(location: 0, length: 1), actualRange: &absent))
+      XCTAssertEqual(absent, NSRange(location: NSNotFound, length: 0))
+      let newClient = try XCTUnwrap(f.view.inputContext?.client as? PagedNativeTextInputClient)
+      XCTAssertFalse(newClient === oldClient); XCTAssertEqual(newClient.identity, input.activeIdentity)
       let currentBytes = Data(f.view.string.utf8), count = manager.undoCount
       oldClient.insertText("OLD", replacementRange: NSRange(location: 0, length: 1))
       oldClient.setMarkedText("旧", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: 0, length: 1))
       oldClient.unmarkText(); oldClient.doCommand(by: NSSelectorFromString("undo:")); oldClient.doCommand(by: NSSelectorFromString("redo:"))
-      old.insertText("OLD", replacementRange: NSRange(location: 0, length: 1)); old.keyDown(with: try f.key())
-      old.doCommand(by: NSSelectorFromString("undo:")); old.setSelectedRange(NSRange(location: 1, length: 0))
-      old.boundedStorage.replaceCharacters(in: NSRange(location: 0, length: 1), with: "OLD")
+      oldStorage.replaceCharacters(in: NSRange(location: 0, length: 1), with: "OLD")
+      oldStorage.setAttributes([.foregroundColor: NSColor.red], range: NSRange(location: 0, length: 1))
+      XCTAssertEqual(oldStorage.string, oldText)
       XCTAssertEqual(Data(f.view.string.utf8), currentBytes); XCTAssertEqual(source.generation, sequence)
       XCTAssertEqual(manager.undoCount, count); XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
-      f.view.insertText("X", replacementRange: NSRange(location: NSNotFound, length: 0))
+      // This retained reference IS the current physical view; ordinary input
+      // must still reach its new source, unlike retired proxy/storage handles.
+      old.insertText("X", replacementRange: NSRange(location: NSNotFound, length: 0))
       var after = f.originalText; after.replaceSubrange(after.startIndex..<after.index(after.startIndex, offsetBy: 1), with: "A")
       let position = after.utf16.index(after.utf16.startIndex, offsetBy: 8_000)
       let scalar = try XCTUnwrap(String.Index(position, within: after)); after.insert("X", at: scalar)
@@ -299,6 +320,36 @@ import XCTest
       XCTAssertEqual(input.retainedClientCount, 1); XCTAssertNil(source.persistenceFailure)
     }
   }
+  func testPreparedContextCancellationKeepsLiveGraphAndRejectsCanceledTicketBeforeUnicodeInput() async throws {
+    try await fixture(#function) { f in
+      let input = f.input!, source = f.session!, commands = f.commands!
+      let view = f.view, storage = view.boundedStorage, binding = try XCTUnwrap(view.inputBinding)
+      let context = try XCTUnwrap(view.inputContext), client = try XCTUnwrap(context.client as? PagedNativeTextInputClient)
+      let manager = try XCTUnwrap(view.layoutManager), container = try XCTUnwrap(view.textContainer)
+      let observed = try input.observeSelection(), before = try source.captureLogicalState()
+      let ticket = try await source.prepareNavigationInstallation(owner: input, toUTF16: 17_000,
+        selectingUTF16: PagedNativeNavigationSelection(utf16Offset: 17_000, utf16Length: 0))
+      try input.stageNavigation(ticket, observedSelection: observed)
+      XCTAssertTrue(input.hasStagedClient); XCTAssertEqual(input.retainedClientCount, 2)
+      XCTAssertTrue(view.inputContext === context); XCTAssertTrue(view.boundedStorage === storage)
+      XCTAssertTrue(view.layoutManager === manager); XCTAssertTrue(view.textContainer === container)
+      XCTAssertEqual(try input.observeSelection(), observed); XCTAssertTrue(source.isCurrent(before))
+      XCTAssertFalse(client.isRetired); XCTAssertEqual(binding.state, .active)
+      try input.cancelNavigationStage(ticket)
+      XCTAssertFalse(input.hasStagedClient); XCTAssertEqual(input.retainedClientCount, 1)
+      XCTAssertTrue(view.inputContext === context); XCTAssertTrue(view.boundedStorage === storage)
+      XCTAssertFalse(client.isRetired); XCTAssertEqual(binding.state, .active)
+      XCTAssertThrowsError(try input.withStagedNavigationInstallation(ticket) { old, new in
+        try f.scroll!.mountManagedView(from: old, to: new)
+      })
+      XCTAssertFalse(ticket.wasConsumed); XCTAssertTrue(source.isCurrent(before))
+      view.insertText("🙂", replacementRange: NSRange(location: 0, length: 0))
+      try await f.assertSource("🙂" + f.originalText)
+      commands.manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource(f.originalText)
+      XCTAssertTrue(f.view === view); XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+    }
+  }
+
   func testTypingDuringRealWindowLoadPreservesOldViewAndRefusesStaleNavigation() async throws {
     try await fixture(#function) { f in
       let source = f.session!, old = f.view, identity = f.input!.activeIdentity, arena = source.arenaID
@@ -460,7 +511,7 @@ import XCTest
       let after = await f.route!.snapshot
       XCTAssertEqual(after.windowCalls, before.windowCalls + 1)
       XCTAssertEqual(after.startedCalls, before.startedCalls + 3); XCTAssertEqual(after.finishedCalls, before.finishedCalls + 3)
-      XCTAssertFalse(f.view === old); XCTAssertNotEqual(input.activeIdentity?.arenaID, identity?.arenaID)
+      XCTAssertTrue(f.view === old); XCTAssertNotEqual(input.activeIdentity?.arenaID, identity?.arenaID)
       XCTAssertEqual(input.activeIdentity?.arenaID, source.arenaID); XCTAssertEqual(f.mounts.count, 1)
       XCTAssertNotEqual(refilled.windowID, joined.windowID); XCTAssertEqual(refilled.text.utf8.count, PagedWorkingWindow.targetBytes)
       XCTAssertEqual(source.generation, sequence); XCTAssertEqual(source.sealedRootRecord, record)
@@ -474,6 +525,7 @@ import XCTest
     try await fixture(#function, retainedTerminal: true) { f in
       try f.replaceFirst("B"); try await f.seal()
       let old = f.view, oldIdentity = f.input!.activeIdentity, oldArena = f.session!.arenaID
+      let oldBinding = try XCTUnwrap(old.inputBinding), oldStorage = old.boundedStorage
       let client = try XCTUnwrap(old.inputContext?.client as? PagedNativeTextInputClient)
       let sequence = f.session!.generation, root = f.session!.sealedRevision
       let hold = try await f.route!.holdNext(.windowAfter), task = try f.startNavigation()
@@ -485,15 +537,17 @@ import XCTest
       catch { actualRefusal = error; f.preserve(error) }
       XCTAssertNotNil(actualRefusal)
       XCTAssertNotNil(f.input!.firstRefusal); XCTAssertNotNil(f.commands!.firstFailure)
-      XCTAssertNotEqual(f.session!.arenaID, oldArena); XCTAssertFalse(f.view === old)
+      XCTAssertNotEqual(f.session!.arenaID, oldArena); XCTAssertTrue(f.view === old)
       XCTAssertEqual(f.session!.sealedRevision, root); XCTAssertEqual(f.session!.generation, sequence)
-      XCTAssertEqual(old.inputBinding?.state, .retired); XCTAssertTrue(client.isRetired)
+      XCTAssertEqual(oldBinding.state, .retired); XCTAssertTrue(client.isRetired)
       XCTAssertEqual(client.identity, oldIdentity)
       XCTAssertEqual(f.commands!.queuedRawKeyCount, 0); XCTAssertEqual(f.commands!.unretainedRawKeyCount, 0)
       XCTAssertNil(f.input!.lastReplayTransition) // the failed physical mount supplies no replay grant
       let bytes = Data(f.view.string.utf8), errors = f.originalErrors.count
       client.insertText("OLD", replacementRange: NSRange(location: 0, length: 1))
       client.doCommand(by: NSSelectorFromString("undo:")); client.unmarkText()
+      oldStorage.replaceCharacters(in: NSRange(location: 0, length: 1), with: "OLD")
+      XCTAssertTrue(oldStorage.layoutManagers.isEmpty)
       XCTAssertEqual(Data(f.view.string.utf8), bytes); XCTAssertEqual(f.session!.generation, sequence)
       XCTAssertEqual(f.originalErrors.count, errors)
       XCTAssertThrowsError(try f.commands!.closeInput())

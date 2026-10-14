@@ -263,6 +263,9 @@ private final class LiveBackupCopyHold: @unchecked Sendable {
     XCTAssertEqual(editedSelection.utf16Offset, 3); XCTAssertEqual(editedSelection.utf16Length, 0)
     XCTAssertEqual(try model.pagedCommands?.captureLogicalHistory().undo.count, 1)
 
+    let oldBinding = try XCTUnwrap(view.inputBinding), oldStorage = view.boundedStorage
+    let oldContext = try XCTUnwrap(view.inputContext), oldClient = try XCTUnwrap(oldContext.client as? PagedNativeTextInputClient)
+    let oldManager = try XCTUnwrap(view.layoutManager), oldContainer = try XCTUnwrap(view.textContainer)
     let undoAction = NSSelectorFromString("undo:"), redoAction = NSSelectorFromString("redo:")
     let undoItem = NSMenuItem(title: "Undo", action: undoAction, keyEquivalent: "z")
     let redoItem = NSMenuItem(title: "Redo", action: redoAction, keyEquivalent: "z")
@@ -277,14 +280,19 @@ private final class LiveBackupCopyHold: @unchecked Sendable {
     XCTAssertEqual(undoneCapture.completeSnapshot?.text, "")
     XCTAssertEqual(model.pagedSelectedRecord?.document.revision, original.document.revision)
     XCTAssertEqual(try input.currentDocumentSelection(), beforeSelection)
-    XCTAssertFalse(current === view); XCTAssertEqual(view.inputBinding?.state, .retired)
+    XCTAssertTrue(current === view); XCTAssertEqual(oldBinding.state, .retired)
+    XCTAssertFalse(current.boundedStorage === oldStorage); XCTAssertTrue(oldStorage.layoutManagers.isEmpty)
+    XCTAssertTrue(current.layoutManager === oldManager); XCTAssertTrue(current.textContainer === oldContainer)
+    XCTAssertFalse(current.inputContext === oldContext); XCTAssertTrue(oldClient.isRetired)
     XCTAssertTrue(window.firstResponder === current)
     XCTAssertFalse(current.validateUserInterfaceItem(undoItem)); XCTAssertTrue(current.validateUserInterfaceItem(redoItem))
 
-    // The retired selector cannot redirect an effective Redo to its replacement.
+    // The retained view is current; the original context/proxy/storage are retired.
     let stableRecord = model.pagedSelectedRecord, stableGeneration = model.pagedSession?.generation
-    XCTAssertFalse(view.validateUserInterfaceItem(redoItem))
-    XCTAssertTrue(view.tryToPerform(redoAction, with: redoItem))
+    XCTAssertTrue(view.validateUserInterfaceItem(redoItem))
+    oldClient.doCommand(by: redoAction)
+    oldClient.setMarkedText("旧", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: 0, length: 0))
+    oldStorage.replaceCharacters(in: NSRange(location: 0, length: 0), with: "OLD")
     try await commands.joinPendingCommand()
     XCTAssertEqual(model.pagedSelectedRecord, stableRecord); XCTAssertEqual(model.pagedSession?.generation, stableGeneration)
     XCTAssertEqual(try input.currentDocumentSelection(), beforeSelection)
@@ -1221,16 +1229,19 @@ private final class LiveBackupCopyHold: @unchecked Sendable {
     XCTAssertEqual(second.completeSnapshot?.text, "ab")
     XCTAssertEqual(Optional(try commands.captureLogicalHistory().undo.count), 2)
 
+    let oldBinding = try XCTUnwrap(view.inputBinding), oldStorage = view.boundedStorage
+    let oldContext = try XCTUnwrap(view.inputContext), oldClient = try XCTUnwrap(oldContext.client as? PagedNativeTextInputClient)
     commands.manager.undo(); try await commands.joinPendingCommand(); try await model.flush()
     let undone = try await model.captureDocument(initial.document.id)
     XCTAssertEqual(undone.completeSnapshot?.text, "a")
     let current = try XCTUnwrap(input.activeView)
-    XCTAssertFalse(current === view); XCTAssertEqual(view.inputBinding?.state, .retired)
+    XCTAssertTrue(current === view); XCTAssertEqual(oldBinding.state, .retired)
+    XCTAssertFalse(current.boundedStorage === oldStorage); XCTAssertTrue(oldClient.isRetired)
     let stableRecord = try XCTUnwrap(model.pagedSelectedRecord), stableGeneration = session.generation
     let stableSelection = try input.currentDocumentSelection()
-    view.boundedStorage.replaceCharacters(in: NSRange(location: 0, length: 1), with: "z")
-    view.insertText("late", replacementRange: NSRange(location: 0, length: 0))
-    view.setMarkedText("late", selectedRange: NSRange(location: 0, length: 0),
+    oldStorage.replaceCharacters(in: NSRange(location: 0, length: 1), with: "z")
+    oldClient.insertText("late", replacementRange: NSRange(location: 0, length: 0))
+    oldClient.setMarkedText("late", selectedRange: NSRange(location: 0, length: 0),
       replacementRange: NSRange(location: NSNotFound, length: 0))
     XCTAssertEqual(model.pagedSelectedRecord, stableRecord); XCTAssertEqual(session.generation, stableGeneration)
     XCTAssertEqual(try input.currentDocumentSelection(), stableSelection)
@@ -1299,17 +1310,23 @@ private final class LiveBackupCopyHold: @unchecked Sendable {
     let edited = try await model.captureDocument(initial.document.id)
     XCTAssertEqual(edited.completeSnapshot?.text, "A😀Zx")
     XCTAssertEqual(Optional(try commands.captureLogicalHistory().undo.count), (undoCount ?? 0) + 1)
+    let oldBinding = try XCTUnwrap(view.inputBinding), oldStorage = view.boundedStorage
+    let oldContext = try XCTUnwrap(view.inputContext), oldClient = try XCTUnwrap(oldContext.client as? PagedNativeTextInputClient)
     commands.manager.undo(); try await commands.joinPendingCommand(); try await model.flush()
     let undone = try await model.captureDocument(initial.document.id)
     XCTAssertEqual(undone.completeSnapshot?.text, "A😀Z")
     let current = try XCTUnwrap(input.activeView)
-    XCTAssertFalse(current === view); XCTAssertEqual(view.inputBinding?.state, .retired)
+    XCTAssertTrue(current === view); XCTAssertEqual(oldBinding.state, .retired)
+    XCTAssertFalse(current.boundedStorage === oldStorage); XCTAssertTrue(oldClient.isRetired)
     let afterUndo = try XCTUnwrap(model.pagedSelectedRecord), afterGeneration = session.generation
     let afterSelection = try input.currentDocumentSelection()
-    view.boundedStorage.replaceCharacters(in: NSRange(location: 2, length: 0), with: "late")
+    oldStorage.replaceCharacters(in: NSRange(location: 2, length: 0), with: "late")
+    oldClient.insertText("OLD", replacementRange: NSRange(location: 0, length: 0))
+    oldClient.doCommand(by: NSSelectorFromString("undo:"))
+    XCTAssertThrowsError(try oldBinding.admitsInput(in: session))
+    // An invalid range on the CURRENT view remains an admission refusal,
+    // while this old Swift reference itself is not an earlier source handle.
     view.setSelectedRange(NSRange(location: 99, length: 0))
-    input.userSelectionDidChange(from: view, previousRange: nil, previousGeneration: generation)
-    input.notifyNativeState(from: view, edited: true)
     XCTAssertEqual(model.pagedSelectedRecord, afterUndo); XCTAssertEqual(session.generation, afterGeneration)
     XCTAssertEqual(try input.currentDocumentSelection(), afterSelection)
     XCTAssertEqual(current.string, "A😀Z"); XCTAssertNil(current.boundedStorage.mutationFailure)
