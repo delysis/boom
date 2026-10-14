@@ -387,6 +387,8 @@ struct InlineMediaSpan: Decodable {
     guard view.prepareTextLayout() else { return }
     manager.ensureLayout(for: container)
     var counts: [UUID: Int] = [:], retained = Set<String>()
+    var sourceRanges: [UUID: [NSRange]] = [:]
+    for span in spans { sourceRanges[span.id, default: []].append(span.range) }
     storage.enumerateAttribute(.mediaStart, in: NSRange(location: 0, length: storage.length)) { value, range, _ in
       guard value != nil, let item = storage.attribute(.mediaItem, at: range.location, effectiveRange: nil) as? InlineMediaItem else { return }
       let occurrence = counts[item.record.id, default: 0]; counts[item.record.id] = occurrence + 1
@@ -399,7 +401,9 @@ struct InlineMediaSpan: Decodable {
         host = InlineMediaHost(item: item, owner: view)
         hosts[key] = host; view.addSubview(host)
       }
-      host.sourceRange = spans.filter { $0.id == item.record.id }.dropFirst(occurrence).first?.range
+      if let ranges = sourceRanges[item.record.id], ranges.indices.contains(occurrence) {
+        host.sourceRange = ranges[occurrence]
+      } else { host.sourceRange = nil }
       let glyph = manager.glyphIndexForCharacter(at: range.location)
       let line = manager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
       let position = manager.location(forGlyphAt: glyph)
