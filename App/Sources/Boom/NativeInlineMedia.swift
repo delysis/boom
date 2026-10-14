@@ -459,22 +459,53 @@ struct InlineMediaSpan: Decodable {
     if item.kind == .image { return bounds.contains(convert(point, from: superview)) ? self : nil }
     return super.hitTest(point)
   }
+  private struct MenuSource {
+    let ownerID: ObjectIdentifier
+    let storageID: ObjectIdentifier
+    let version: UUID
+    let range: NSRange
+  }
+  private var liveSource: (owner: NativeMediaTextView, storage: NSTextStorage, range: NSRange)? {
+    guard let owner, superview === owner, let range = sourceRange, let storage = owner.textStorage,
+      range.location >= 0, range.location < storage.length, range.length > 0,
+      range.length <= storage.length - range.location,
+      owner.inlineMedia.spans.contains(where: { $0.id == item.record.id && $0.range == range }),
+      (storage.attribute(.mediaItem, at: range.location, effectiveRange: nil) as? InlineMediaItem) === item,
+      (storage.attribute(.mediaItem, at: NSMaxRange(range) - 1, effectiveRange: nil) as? InlineMediaItem) === item else { return nil }
+    return (owner, storage, range)
+  }
+  private func menuOwner(_ sender: Any?) -> NativeMediaTextView? {
+    guard let entry = sender as? NSMenuItem, let captured = entry.representedObject as? MenuSource,
+      let source = liveSource, ObjectIdentifier(source.owner) == captured.ownerID,
+      ObjectIdentifier(source.storage) == captured.storageID, source.owner.sourceVersion == captured.version,
+      source.range == captured.range, source.owner.selectedRange() == captured.range else { return nil }
+    return source.owner
+  }
   override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
   override func mouseDown(with event: NSEvent) {
-    if let owner, let sourceRange { owner.window?.makeFirstResponder(owner); owner.setSelectedRange(sourceRange) }
+    guard let source = liveSource else { return }
+    source.owner.window?.makeFirstResponder(source.owner)
+    source.owner.setSelectedRange(source.range)
   }
   override func menu(for event: NSEvent) -> NSMenu? {
+    guard let source = liveSource else { return nil }
     mouseDown(with: event)
+    let captured = MenuSource(ownerID: ObjectIdentifier(source.owner),
+      storageID: ObjectIdentifier(source.storage), version: source.owner.sourceVersion, range: source.range)
     let menu = NSMenu()
     var actions = [("Copy", #selector(copyReference(_:))), ("Export original…", #selector(exportOriginal(_:)))]
     if owner?.isEditable == true { actions.insert(("Cut", #selector(cutReference(_:))), at: 1) }
     for (title, action) in actions {
-      let entry = NSMenuItem(title: title, action: action, keyEquivalent: ""); entry.target = self; menu.addItem(entry)
+      let entry = NSMenuItem(title: title, action: action, keyEquivalent: "")
+      entry.target = self; entry.representedObject = captured; menu.addItem(entry)
     }
     return menu
   }
-  @objc private func copyReference(_ sender: Any?) { owner?.copy(sender) }
-  @objc private func cutReference(_ sender: Any?) { if owner?.isEditable == true { owner?.cut(sender) } }
+  @objc private func copyReference(_ sender: Any?) { menuOwner(sender)?.copy(sender) }
+  @objc private func cutReference(_ sender: Any?) {
+    guard let owner = menuOwner(sender), owner.isEditable else { return }
+    owner.cut(sender)
+  }
   @objc private func exportOriginal(_ sender: Any?) {
     guard let bytes = item.bytes, let model = owner?.inlineMedia.model else { return }
     let panel = NSSavePanel(); panel.nameFieldStringValue = item.record.name

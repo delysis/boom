@@ -53,4 +53,60 @@ final class AuditMarkdownLiteralTests: XCTestCase {
     XCTAssertGreaterThan(try XCTUnwrap(storage.attribute(.font, at: 2, effectiveRange: nil) as? NSFont).pointSize, 10)
     XCTAssertEqual(view.string, source)
   }
+
+  @MainActor private func mediaActionFixture() throws -> (NativeMediaTextView, InlineMediaHost, NSEvent) {
+    _ = NSApplication.shared
+    let id = UUID(), marker = "[Attachment: public](boom-attachment:\(id.uuidString))"
+    let view = NativeMediaTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 200))
+    view.isEditable = true; view.isSelectable = true; view.isRichText = false
+    view.string = marker; view.inlineMedia.refresh()
+    let record = AttachmentRecord(id: id, name: "public", rootDigest: Digest.sha256("public"),
+      text: "", coverage: "", transform: nil, presentation: .unavailable)
+    let item = InlineMediaItem(record), host = InlineMediaHost(item: item, owner: view)
+    let range = try XCTUnwrap(view.inlineMedia.spans.first(where: { $0.id == id })?.range)
+    let storage = try XCTUnwrap(view.textStorage)
+    storage.addAttribute(NSAttributedString.Key("BloomInlineMedia"), value: item, range: range)
+    host.sourceRange = range; view.addSubview(host); view.setSelectedRange(range)
+    let event = try XCTUnwrap(NSEvent.mouseEvent(with: .rightMouseDown, location: .zero,
+      modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil,
+      eventNumber: 1, clickCount: 1, pressure: 1))
+    return (view, host, event)
+  }
+  @MainActor func testRetainedMediaMenuDoesNotCutReboundStorageButFreshMenuStillCuts() throws {
+    let (view, host, event) = try mediaActionFixture()
+    let menu = try XCTUnwrap(host.menu(for: event)), cut = try XCTUnwrap(menu.items.first(where: { $0.title == "Cut" }))
+    let marker = view.string, manager = try XCTUnwrap(view.layoutManager)
+    let originalStorage = try XCTUnwrap(view.textStorage), originalVersion = view.sourceVersion
+    // The exact native view and even the media host survive; its occurrence
+    // moves in a genuinely replaced TextKit source, as on logical adoption.
+    let next = NSTextStorage(string: "NEW\n" + marker)
+    manager.replaceTextStorage(next); view.inlineMedia.refresh()
+    let range = try XCTUnwrap(view.inlineMedia.spans.first(where: { $0.id == host.item.record.id })?.range)
+    next.addAttribute(NSAttributedString.Key("BloomInlineMedia"), value: host.item, range: range)
+    host.sourceRange = range; view.setSelectedRange(range)
+    XCTAssertTrue(host.superview === view); XCTAssertTrue(manager.textStorage === next)
+    XCTAssertTrue(originalStorage.layoutManagers.isEmpty); XCTAssertNotEqual(view.sourceVersion, originalVersion)
+    let selection = view.selectedRange(), source = view.string
+    XCTAssertTrue(host.tryToPerform(try XCTUnwrap(cut.action), with: cut))
+    XCTAssertEqual(view.string, source); XCTAssertEqual(view.selectedRange(), selection)
+    // A new menu owns this actual source/range; stable view identity itself
+    // does not make current actions stale or disable normal native Cut.
+    let fresh = try XCTUnwrap(host.menu(for: event))
+    let currentCut = try XCTUnwrap(fresh.items.first(where: { $0.title == "Cut" }))
+    XCTAssertTrue(host.tryToPerform(try XCTUnwrap(currentCut.action), with: currentCut))
+    XCTAssertEqual(view.string, "NEW\n")
+  }
+  @MainActor func testRemovedMediaHostCannotSelectOrCutTheStableCurrentView() throws {
+    let (view, host, event) = try mediaActionFixture()
+    let menu = try XCTUnwrap(host.menu(for: event)), cut = try XCTUnwrap(menu.items.first(where: { $0.title == "Cut" }))
+    host.removeFromSuperview()
+    try XCTUnwrap(view.layoutManager).replaceTextStorage(NSTextStorage(string: "current"))
+    view.setSelectedRange(NSRange(location: 2, length: 1))
+    let selection = view.selectedRange(), source = view.string
+    host.mouseDown(with: event)
+    XCTAssertEqual(view.selectedRange(), selection)
+    XCTAssertTrue(host.tryToPerform(try XCTUnwrap(cut.action), with: cut))
+    XCTAssertEqual(view.string, source); XCTAssertEqual(view.selectedRange(), selection)
+    XCTAssertNil(host.menu(for: event))
+  }
 }
