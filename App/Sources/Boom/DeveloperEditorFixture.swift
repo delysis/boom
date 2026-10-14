@@ -46,6 +46,24 @@ private final class DeveloperBackupCopyHold: @unchecked Sendable {
   }
 }
 
+/// Ordinary AppKit interpretation supplies the Tab oracle; it owns no product
+/// source, input context or canonical history.
+@MainActor private final class DeveloperInputReferenceView: NSTextView {
+  private let referenceUndo = UndoManager()
+  override var undoManager: UndoManager? { referenceUndo }
+  private(set) var interpretedCommands = 0
+  override func doCommand(by selector: Selector) {
+    precondition(interpretedCommands < 16)
+    interpretedCommands += 1; super.doCommand(by: selector)
+  }
+}
+
+private struct DeveloperInputControlFailure: Error, LocalizedError {
+  let original: Error
+  let cleanup: Error
+  var errorDescription: String? { "\(original.localizedDescription); actual input-owner join: \(cleanup.localizedDescription)" }
+}
+
 @MainActor enum DeveloperEditorFixture {
   // Preserve the actual partial Model/window/source on any failed cleanup.
   // This is the existing fixture receiver, not another lifetime or root owner.
@@ -170,6 +188,10 @@ private final class DeveloperBackupCopyHold: @unchecked Sendable {
     private var backupRestoreCloseAttempted = false
     private var heldWriterVerified = false
     private var heldWriterFailureState: [String: Any]?
+    private var documentInputStage = "unentered"
+    private var documentContextVerified = false, adoptingFinalVerified = false, tabPointerVerified = false
+    private var adoptingFinalQueuedAtFocus: Int?
+    private var nativeTabObservations: [[String: Any]] = []
     private var warmMarkedStates: [[String: Any]] = []
     private var heldSave: Task<Void, Error>?
     var memorySamplesURL: URL { root.appendingPathComponent("memory-samples.jsonl") }
@@ -352,8 +374,319 @@ private final class DeveloperBackupCopyHold: @unchecked Sendable {
       try await verifyOrdinaryExport(named: "prepared-export.txt"); preparationExportJoined = true
       if plan.isMixed || normalMemory { try await verifyHeldWriterEditing() }
       if plan.utf8Bytes == 72_196 && (plan.isMixed || normalMemory) { try await verifyLiveBackupControls() }
+      if plan.utf8Bytes == 72_196 && (plan.isMixed || normalMemory) { try await verifyDocumentInputControls() }
       _ = try diskExtent(reservingReceipt: true)
       vmBefore = currentVMCategories()
+    }
+
+    // These functional controls use the already-open public short document and
+    // actual App.run/key window, before any measured/donated operation. They
+    // exercise protocol callbacks and synthesized native events, not hardware
+    // keyboard or an external input-method service.
+    private func verifyDocumentInputControls() async throws {
+      guard plan.utf8Bytes == 72_196, NSApp.isRunning, NSApp.isActive,
+        let model = workspace, let session = model.pagedSession else {
+        throw BoomError.invalid("Document input controls require the actual public short App route.")
+      }
+      _ = try currentMixedView()
+      let original = try session.captureLogicalState().source
+      let bytes = try await documentInputBytes()
+      guard UInt64(bytes.count) == plan.utf8Bytes else {
+        throw BoomError.invalid("Document input controls lost their exact short baseline.")
+      }
+      documentInputStage = "document-context"
+      try await verifyDocumentContext(original: original, bytes: bytes)
+      documentContextVerified = true
+      documentInputStage = "adopting-final"
+      try await verifyAdoptingFinal(original: original, bytes: bytes)
+      adoptingFinalVerified = true
+      documentInputStage = "tab-pointer"
+      try await verifyTabPointer(original: original, bytes: bytes)
+      tabPointerVerified = true
+      try await mixedCaret(0, event: 0, measured: false)
+      try await model.flush()
+      try await requireDocumentInputSource(bytes, root: original)
+      _ = try currentMixedView()
+      documentInputStage = "complete"
+    }
+
+    private func documentInputBytes() async throws -> Data {
+      guard let model = workspace, let session = model.pagedSession, let engine = model.pagedEngine else {
+        throw BoomError.stale("The public context reader lost its actual source.")
+      }
+      let read = try session.captureLogicalRead()
+      guard read.source.summary.bytes <= UInt64(PagedTextWindow.maximumBytes) else {
+        throw BoomError.budget("Complete context-control readback is limited to the public short source.")
+      }
+      let bytes = try await engine.logicalBytes(read.source, byteRange: 0..<read.source.summary.bytes)
+      try session.admitLogicalRead(read)
+      guard UInt64(bytes.count) == read.source.summary.bytes else {
+        throw BoomError.invalid("The context control did not read the whole captured short source.")
+      }
+      return bytes
+    }
+    private func requireDocumentInputSource(_ expected: Data, root: PagedNativeLogicalSnapshot? = nil) async throws {
+      let bytes = try await documentInputBytes()
+      guard bytes == expected, let session = workspace?.pagedSession else {
+        throw BoomError.invalid("Actual context input/SDK Undo changed the exact public source or root.")
+      }
+      if let root {
+        let current = try session.captureLogicalState()
+        guard current.source.isSame(root) else {
+          throw BoomError.invalid("Actual responder Undo did not restore its original logical root.")
+        }
+      }
+    }
+    private func joinedDocumentInputFailure(_ original: Error) async -> Error {
+      var failure = original
+      // Temporary reference controls/mount hooks remain alive until every
+      // entered owner task has joined. A failed close still retains Prepared.
+      if let commands = workspace?.pagedCommands {
+        do { try await commands.joinPendingCommand() }
+        catch { failure = DeveloperInputControlFailure(original: failure, cleanup: error) }
+      }
+      if let viewport = workspace?.pagedViewport {
+        do { try await viewport.joinPresentation() }
+        catch { failure = DeveloperInputControlFailure(original: failure, cleanup: error) }
+      }
+      return failure
+    }
+
+    private func verifyDocumentContext(original: PagedNativeLogicalSnapshot, bytes: Data) async throws {
+      guard let model = workspace, let input = model.pagedInput, let commands = model.pagedCommands,
+        let session = model.pagedSession else { throw BoomError.stale("Document context control lost its actual owner.") }
+      do {
+        try await mixedCaret(0, event: 0, measured: false)
+        let view = try currentMixedView()
+        guard let context = view.inputContext, let client = context.client as? PagedNativeTextInputClient,
+          let binding = view.inputBinding else { throw BoomError.invalid("The actual document context is absent.") }
+        let storage = view.boundedStorage, oldText = storage.string, arena = session.arenaID
+        let generation = session.generation
+        let projected = try await commands.navigate(toUTF16: 48_000,
+          selectingUTF16: PagedNativeNavigationSelection(utf16Offset: 50_000, utf16Length: 0))
+        try await commands.joinPendingCommand()
+        guard try currentMixedView() === view, view.inputContext === context, !client.isRetired,
+          session.arenaID != arena, binding.state == .retired, session.generation == generation,
+          client.selectedRange() == NSRange(location: 50_000, length: 0) else {
+          throw BoomError.invalid("Far navigation did not retain the live document context across its actual arena mount.")
+        }
+        storage.replaceCharacters(in: NSRange(location: 0, length: 1), with: "OLD")
+        guard storage.string == oldText, session.generation == generation, projected.start.utf16 >= 10 else {
+          throw BoomError.invalid("Retired storage changed the current document or the far read was not genuine.")
+        }
+        var actual = NSRange(location: NSNotFound, length: 0)
+        let requested = NSRange(location: Int(projected.start.utf16) - 10, length: 30)
+        guard let bounded = client.attributedSubstring(forProposedRange: requested, actualRange: &actual),
+          actual == NSRange(location: Int(projected.start.utf16), length: 20),
+          bounded.string == String(projected.text.prefix(20)),
+          client.attributedSubstring(forProposedRange: NSRange(location: 0, length: 1), actualRange: &actual) == nil,
+          actual == NSRange(location: NSNotFound, length: 0) else {
+          throw BoomError.invalid("The document context did not expose its exact bounded global substring.")
+        }
+        let published = session.sealedRootRecord, sealedGeneration = session.sealedGeneration
+        client.setMarkedText("に", selectedRange: NSRange(location: 1, length: 0),
+          replacementRange: NSRange(location: 50_000, length: 0))
+        guard view.hasMarkedText(), session.isPinned,
+          client.markedRange() == NSRange(location: 50_000, length: 1),
+          session.sealedRootRecord == published, session.sealedGeneration == sealedGeneration else {
+          throw BoomError.invalid("The real marked document context lost its global range/pin or published prematurely.")
+        }
+        client.insertText("日本", replacementRange: NSRange(location: NSNotFound, length: 0))
+        try await commands.joinPendingCommand()
+        let expected = (String(decoding: bytes, as: UTF8.self) as NSString)
+          .replacingCharacters(in: NSRange(location: 50_000, length: 0), with: "日本")
+        guard !view.hasMarkedText(), !session.isPinned, view.inputContext === context,
+          client.selectedRange() == NSRange(location: 50_002, length: 0) else {
+          throw BoomError.invalid("Final native text did not replace its actual marked global range.")
+        }
+        try await requireDocumentInputSource(Data(expected.utf8))
+        try await mixedResponder(false, event: 0, measured: false)
+        try await requireDocumentInputSource(bytes, root: original)
+        try await mixedResponder(true, event: 0, measured: false)
+        try await requireDocumentInputSource(Data(expected.utf8))
+        try await mixedResponder(false, event: 0, measured: false)
+        try await requireDocumentInputSource(bytes, root: original)
+        guard input.firstRefusal == nil, commands.firstFailure == nil, view.inputContext === context,
+          !client.isRetired else { throw BoomError.invalid("Actual context/SDK history did not remain live.") }
+      } catch { let failure = await joinedDocumentInputFailure(error); throw failure }
+    }
+
+    private func verifyAdoptingFinal(original: PagedNativeLogicalSnapshot, bytes: Data) async throws {
+      guard let model = workspace, let input = model.pagedInput, let commands = model.pagedCommands,
+        let session = model.pagedSession, let window, let mount = commands.mountView else {
+        throw BoomError.stale("Adopting final control lost its actual graph/mount.")
+      }
+      let view = try currentMixedView()
+      guard let context = view.inputContext, let client = context.client as? PagedNativeTextInputClient else {
+        throw BoomError.invalid("Adopting final control has no live document context.")
+      }
+      let other = NSTextField(frame: NSRect(x: 800, y: 0, width: 200, height: 24))
+      window.contentView!.addSubview(other)
+      defer { other.removeFromSuperview(); commands.mountView = mount }
+      var entered = false
+      var acceptedResponder: NSResponder?
+      let final = NSMutableAttributedString(string: "X", attributes: [.markedClauseSegment: NSNumber(value: 3)])
+      let retained = commands.retainedInputBytes, generation = session.generation
+      do {
+        try await mixedCaret(0, event: 0, measured: false)
+        view.setSelectedRange(NSRange(location: 8, length: 0))
+        client.withNativeEvent { _ = client.selectedRange() }
+        commands.mountView = { old, new in
+          try mount(old, new)
+          guard !entered else { return }; entered = true
+          guard input.isAdopting, new.inputContext === context else {
+            throw BoomError.invalid("Final callback was not held by an actual arena adoption.")
+          }
+          client.insertText(final, replacementRange: NSRange(location: NSNotFound, length: 0))
+          client.insertText("Y", replacementRange: NSRange(location: NSNotFound, length: 0))
+          guard commands.queuedNativeContinuationCount == 2, commands.retainedRefusedInputCount == 0,
+            commands.retainedInputBytes > retained, session.generation == generation else {
+            throw BoomError.invalid("Adopting final callbacks were lost, applied early or retained as refusals.")
+          }
+          final.replaceCharacters(in: NSRange(location: 0, length: 1), with: "WRONG")
+        }
+        _ = try await commands.navigate(toUTF16: 48_000,
+          selectingUTF16: PagedNativeNavigationSelection(utf16Offset: 50_000, utf16Length: 0))
+        guard entered else { throw BoomError.invalid("Final callback control never entered the actual adoption.") }
+        // Adoption first completes its captured-focus restoration. Record the
+        // actual queue at this later focus move rather than claiming a race.
+        adoptingFinalQueuedAtFocus = commands.queuedNativeContinuationCount
+        guard window.makeFirstResponder(other), window.firstResponder !== view else {
+          throw BoomError.invalid("The actual later focus move was not admitted.")
+        }
+        acceptedResponder = window.firstResponder
+        try await commands.joinPendingCommand()
+        guard entered, acceptedResponder != nil, window.firstResponder === acceptedResponder,
+          window.firstResponder !== view,
+          commands.queuedNativeContinuationCount == 0, commands.retainedRefusedInputCount == 0,
+          commands.retainedInputBytes == retained, session.generation == generation + 2 else {
+          throw BoomError.invalid("Accepted final text did not join exactly once without stealing actual focus.")
+        }
+        let originalText = String(decoding: bytes, as: UTF8.self)
+        let expected = (originalText as NSString).replacingCharacters(in: NSRange(location: 8, length: 0), with: "XY")
+        try await requireDocumentInputSource(Data(expected.utf8))
+        guard window.makeFirstResponder(view), window.firstResponder === view else {
+          throw BoomError.unavailable("The actual editor could not resume its responder Undo control.")
+        }
+        commands.mountView = mount
+        try await mixedResponder(false, event: 0, measured: false)
+        let beforeY = (originalText as NSString).replacingCharacters(in: NSRange(location: 8, length: 0), with: "X")
+        try await requireDocumentInputSource(Data(beforeY.utf8))
+        try await mixedResponder(false, event: 0, measured: false)
+        try await requireDocumentInputSource(bytes, root: original)
+        guard view.inputContext === context, !client.isRetired, input.firstRefusal == nil,
+          commands.firstFailure == nil else { throw BoomError.invalid("Adopting final delivery poisoned later input/Undo.") }
+      } catch { let failure = await joinedDocumentInputFailure(error); throw failure }
+    }
+
+    private func verifyTabPointer(original: PagedNativeLogicalSnapshot, bytes: Data) async throws {
+      guard let model = workspace, let input = model.pagedInput, let session = model.pagedSession,
+        let commands = model.pagedCommands, let viewport = model.pagedViewport, let window else {
+        throw BoomError.stale("Tab pointer control lost its actual graph.")
+      }
+      for shifting in [false, true] {
+        documentInputStage = shifting ? "backtab-pointer" : "tab-pointer"
+        let view = try currentMixedView(), previousNext = view.nextKeyView
+        let reference = DeveloperInputReferenceView(frame: NSRect(x: 800, y: 40, width: 280, height: 48))
+        reference.isRichText = false; reference.string = "ab"
+        let before = NSTextField(frame: NSRect(x: 800, y: 0, width: 100, height: 24))
+        let after = NSTextField(frame: NSRect(x: 920, y: 0, width: 100, height: 24))
+        window.contentView!.addSubview(reference); window.contentView!.addSubview(before); window.contentView!.addSubview(after)
+        defer {
+          view.nextKeyView = previousNext
+          reference.removeFromSuperview(); before.removeFromSuperview(); after.removeFromSuperview()
+        }
+        before.nextKeyView = reference; reference.nextKeyView = after
+        after.nextKeyView = view; view.nextKeyView = before
+        @MainActor func key(_ tab: Bool) throws -> NSEvent {
+          let characters = tab ? (shifting ? "\u{19}" : "\t") : "Y"
+          guard let event = NSEvent.keyEvent(with: .keyDown, location: .zero,
+            modifierFlags: tab && shifting ? [.shift] : [], timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber, context: nil, characters: characters,
+            charactersIgnoringModifiers: tab ? "\t" : "Y", isARepeat: false, keyCode: tab ? 48 : 16) else {
+            throw BoomError.invalid("The public native key event is unavailable.")
+          }
+          return event
+        }
+        do {
+          try await mixedCaret(0, event: 0, measured: false)
+          reference.setSelectedRange(NSRange(location: 1, length: 0))
+          guard window.makeFirstResponder(reference), window.firstResponder === reference else {
+            throw BoomError.unavailable("The actual ordinary Tab reference could not receive focus.")
+          }
+          window.sendEvent(try key(true))
+          let ordinary = reference.string, ordinaryFocus = window.firstResponder === reference
+          guard reference.interpretedCommands > 0, ordinary.hasPrefix("a"), ordinary.hasSuffix("b"),
+            ordinary.utf16.count <= 34 else {
+            throw BoomError.invalid("The ordinary native Tab/Backtab reference produced no supported actual interpretation.")
+          }
+          let inserted = String(ordinary.dropFirst().dropLast())
+          guard window.makeFirstResponder(view), window.firstResponder === view else {
+            throw BoomError.unavailable("The actual document could not receive the queued Tab control.")
+          }
+          try viewport.requestScroll(toUTF16: 40_000); try await viewport.joinPresentation()
+          guard let projection = viewport.visibleScrollWindow,
+            let surface = viewport.subviews.compactMap({ $0 as? NSScrollView }).first(where: { !$0.isHidden }),
+            let display = surface.documentView as? NSTextView else {
+            throw BoomError.invalid("The actual readonly pointer target was not installed.")
+          }
+          let point = NSPoint(x: display.textContainerOrigin.x + 22, y: display.textContainerOrigin.y + 10)
+          let caret = try projection.position(localUTF16: display.characterIndexForInsertion(at: point)).utf16
+          let navigationCaret: UInt64 = 12_001, generation = session.generation
+          guard caret > navigationCaret else { throw BoomError.invalid("Pointer chronology requires the real distant target.") }
+          let location = display.convert(point, to: nil)
+          @MainActor func mouse(_ type: NSEvent.EventType) throws -> NSEvent {
+            guard let event = NSEvent.mouseEvent(with: type, location: location, modifierFlags: [],
+              timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+              context: nil, eventNumber: type == .leftMouseDown ? 1 : 2, clickCount: 1,
+              pressure: type == .leftMouseUp ? 0 : 1) else { throw BoomError.invalid("The public pointer event is unavailable.") }
+            return event
+          }
+          // No await occurs between request and the four original events.
+          // The existing MainActor owner has the real navigation Task before
+          // its worker can return; no synthetic window/ACK or storage gate.
+          try commands.requestDocumentNavigation(toUTF16: 12_000,
+            selectingUTF16: PagedNativeNavigationSelection(utf16Offset: navigationCaret, utf16Length: 0),
+            expected: try session.documentCoordinates())
+          window.sendEvent(try key(true))
+          guard commands.queuedRawKeyCount == 1, commands.canOrderPointerAfterNavigation else {
+            throw BoomError.invalid("Actual Tab/Backtab was not held ahead of the real pointer intent.")
+          }
+          window.sendEvent(try mouse(.leftMouseDown)); window.sendEvent(try mouse(.leftMouseUp))
+          window.sendEvent(try key(false))
+          guard commands.queuedRawKeyCount == 2, commands.retainedRefusedInputCount == 0 else {
+            throw BoomError.invalid("Tab, pointer and later typing did not retain their actual chronological input.")
+          }
+          try await commands.joinPendingCommand(); try await viewport.joinPresentation()
+          let mappedCaret = caret + UInt64(inserted.utf16.count)
+          let expected = NSMutableString(string: String(decoding: bytes, as: UTF8.self))
+          expected.insert(inserted, at: Int(navigationCaret)); expected.insert("Y", at: Int(mappedCaret))
+          try await requireDocumentInputSource(Data((expected as String).utf8))
+          guard try input.currentDocumentSelection().utf16Offset == mappedCaret + 1,
+            session.generation == generation + (inserted.isEmpty ? 1 : 2), window.firstResponder === view,
+            commands.queuedRawKeyCount == 0, commands.retainedInputBytes == 0,
+            commands.retainedRefusedInputCount == 0, viewport.presentationFailure == nil else {
+            throw BoomError.invalid("Actual Tab/pointer replay lost its mapped source, caret or physical focus.")
+          }
+          try await mixedResponder(false, event: 0, measured: false)
+          let beforeY = NSMutableString(string: String(decoding: bytes, as: UTF8.self))
+          beforeY.insert(inserted, at: Int(navigationCaret))
+          try await requireDocumentInputSource(Data((beforeY as String).utf8))
+          guard try input.currentDocumentSelection().utf16Offset == mappedCaret else {
+            throw BoomError.invalid("Responder Undo did not restore the actual pointer caret.")
+          }
+          try await mixedResponder(true, event: 0, measured: false)
+          try await requireDocumentInputSource(Data((expected as String).utf8))
+          try await mixedResponder(false, event: 0, measured: false)
+          if !inserted.isEmpty { try await mixedResponder(false, event: 0, measured: false) }
+          try await requireDocumentInputSource(bytes, root: original)
+          guard input.firstRefusal == nil, commands.firstFailure == nil, nativeTabObservations.count < 2 else {
+            throw BoomError.invalid("Actual Tab/pointer history left a refusal or exceeded its two native oracles.")
+          }
+          nativeTabObservations.append(["backtab": shifting, "reference_inserted_utf16": inserted.utf16.count,
+            "reference_kept_focus": ordinaryFocus, "captured_pointer_utf16": caret, "mapped_pointer_utf16": mappedCaret])
+        } catch { let failure = await joinedDocumentInputFailure(error); throw failure }
+      }
     }
 
     private func applicationState(_ window: NSWindow) -> [String: Any] {
@@ -1550,6 +1883,13 @@ private final class DeveloperBackupCopyHold: @unchecked Sendable {
         "offscreen_sdk_diagnostic": !(plan.isMixed || normalMemory), "normal_release_memory_observation": normalMemory,
         "bitmap_raster_exercised": !normalMemory, "actual_held_writer_control_passed": heldWriterVerified,
         "held_writer_failure_state": heldWriterFailureState ?? ["available": false],
+        "document_input_control_stage": documentInputStage,
+        "actual_document_context_control_passed": documentContextVerified,
+        "actual_adopting_final_control_passed": adoptingFinalVerified,
+        "adopting_final_queued_at_focus_move": adoptingFinalQueuedAtFocus.map { $0 as Any } ?? NSNull(),
+        "actual_tab_pointer_control_passed": tabPointerVerified,
+        "native_tab_oracles": nativeTabObservations,
+        "document_input_control_scope": "Public72K App-run preparation only; actual Session/context/adoption/SDK Undo and programmatic native events. No hardware keyboard or input-method-service acceptance.",
         "actual_live_backup_control_passed": liveBackupVerified,
         "actual_backup_cancel_retry_control_passed": cancelledBackupVerified,
         "actual_backup_cold_restore_control_passed": backupColdRestoreVerified,
