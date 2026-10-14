@@ -117,6 +117,7 @@ import SwiftUI
     private var applicationBeforeFocus: [String: Any]?, applicationAfterFocus: [String: Any]?
     private var normalTimings: [[String: Any]] = []
     private var heldWriterVerified = false
+    private var warmMarkedStates: [[String: Any]] = []
     private var heldSave: Task<Void, Error>?
     var memorySamplesURL: URL { root.appendingPathComponent("memory-samples.jsonl") }
 
@@ -642,10 +643,39 @@ import SwiftUI
       try await joinMixedInput(event, measured: measured)
     }
 
-    private func mixedRestoreEdit(event: UInt64, measured: Bool) async throws {
+    private func recordWarmMarkedState(_ label: String) {
+      guard warmMarkedStates.count < 11, let model = workspace,
+        let view = model.pagedInput?.activeView, let commands = model.pagedCommands else { return }
+      var value: [String: Any] = ["step": label, "generation": view.session.generation,
+        "pinned": view.session.isPinned, "marked": view.hasMarkedText(),
+        "storage_group": view.boundedStorage.currentNativeGroupID.uuidString,
+        "native_selection_location": view.selectedRange().location,
+        "native_selection_length": view.selectedRange().length]
+      do {
+        let history = try commands.captureLogicalHistory()
+        value["root"] = history.snapshot.rootID.uuidString
+        value["bytes"] = history.snapshot.summary.bytes; value["utf16"] = history.snapshot.summary.utf16
+        value["active_group"] = history.activeGroup?.uuidString ?? "nil"
+        value["undo_count"] = history.undo.count; value["redo_count"] = history.redo.count
+        func entries(_ values: [PagedNativeLogicalHistoryEntry]) -> [[String: Any]] {
+          values.suffix(2).map { ["group": $0.groupID.uuidString, "root": $0.snapshot.rootID.uuidString,
+            "bytes": $0.snapshot.summary.bytes, "utf16": $0.snapshot.summary.utf16] }
+        }
+        value["undo_tail"] = entries(history.undo); value["redo_tail"] = entries(history.redo)
+      } catch {
+        value["observation_error"] = String(decoding: error.localizedDescription.utf8.prefix(512), as: UTF8.self)
+      }
+      warmMarkedStates.append(value)
+    }
+
+    private func mixedRestoreEdit(event: UInt64, measured: Bool, observeMarkedWarm: Bool = false) async throws {
+      if observeMarkedWarm { recordWarmMarkedState("before-undo") }
       try await mixedResponder(false, event: event, measured: measured)
+      if observeMarkedWarm { recordWarmMarkedState("after-undo") }
       try await mixedResponder(true, event: event, measured: measured)
+      if observeMarkedWarm { recordWarmMarkedState("after-redo") }
       try await mixedResponder(false, event: event, measured: measured)
+      if observeMarkedWarm { recordWarmMarkedState("after-final-undo") }
     }
 
     private func performMixedOperation(_ index: UInt32, measured: Bool) async throws {
@@ -680,25 +710,31 @@ import SwiftUI
           view.insertText("e\u{301}👩🏽‍💻", replacementRange: view.selectedRange())
         }
         try await joinMixedInput(event, measured: measured)
+        if !measured { recordWarmMarkedState("after-nfd-zwj-insert") }
         try renderMixedSurface(event: event, measured: measured)
-        for _ in 0..<2 {
+        for deletion in 0..<2 {
           try mixedCPU(event, measured: measured) {
             try currentMixedView().doCommand(by: NSSelectorFromString("deleteBackward:"))
           }
           try await joinMixedInput(event, measured: measured)
+          if !measured { recordWarmMarkedState(deletion == 0 ? "after-zwj-delete" : "after-nfd-delete") }
         }
       case 7:
+        if !measured { recordWarmMarkedState("before-marked") }
         try mixedCPU(event, measured: measured) {
           let view = try currentMixedView(), unspecified = NSRange(location: NSNotFound, length: 0)
           view.setMarkedText("に", selectedRange: NSRange(location: 1, length: 0), replacementRange: unspecified)
           guard view.hasMarkedText() else { throw BoomError.invalid("The native marked-text input was not pinned.") }
+          if !measured { recordWarmMarkedState("after-first-marked") }
           view.setMarkedText("日本", selectedRange: NSRange(location: 2, length: 0), replacementRange: unspecified)
+          if !measured { recordWarmMarkedState("after-marked-update") }
           view.unmarkText()
+          if !measured { recordWarmMarkedState("after-unmark") }
           guard !view.hasMarkedText() else { throw BoomError.invalid("The native marked-text input did not commit.") }
         }
         try await joinMixedInput(event, measured: measured)
         try renderMixedSurface(event: event, measured: measured)
-        try await mixedRestoreEdit(event: event, measured: measured)
+        try await mixedRestoreEdit(event: event, measured: measured, observeMarkedWarm: !measured)
       case 8, 9:
         try mixedCPU(event, measured: measured) {
           let view = try currentMixedView(), start = view.selectedRange().location
@@ -1035,7 +1071,7 @@ import SwiftUI
         "operation_program": plan.isMixed ? "mixed-v1" : "head-paired-v1",
         "mixed_slots": plan.isMixed ? Self.mixedSlots : [],
         "mixed_warmed_before_donation": plan.isMixed && completedWarmSlots == 20,
-        "mixed_warm_completed": completedWarmSlots,
+        "mixed_warm_completed": completedWarmSlots, "warm_marked_states": warmMarkedStates,
         "mixed_warm_last_slot": lastWarmSlot.map { $0 as Any } ?? NSNull(),
         "startup_input_before": startupBefore ?? ["available": false],
         "startup_input_after": startupAfter ?? ["available": false],
