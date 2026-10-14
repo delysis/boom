@@ -611,11 +611,13 @@ struct Gemma4IndependentBatchTests {
                         }
                     }
                 }
+                session.discardStagedAnchors()
                 manager.clear(reason: "homogeneous_roots_joined")
                 await manager.joinPendingDiskCleanup()
             } catch {
                 Stream.defaultStream.synchronize()
                 await session.joinPendingSpill(cancelled: true)
+                session.discardStagedAnchors()
                 manager.clear(reason: "homogeneous_roots_failed_join")
                 await manager.joinPendingDiskCleanup()
                 throw error
