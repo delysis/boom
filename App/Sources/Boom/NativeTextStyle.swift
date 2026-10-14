@@ -24,14 +24,47 @@ struct MarkdownSpan: Decodable, Sendable, Equatable {
     let title: NSRange
     let hidden: [NSRange]
   }
+  private struct LiteralRanges {
+    let ranges: [Range<Int>]
+    init(_ source: [NSRange]) {
+      let sorted = source.compactMap { value -> Range<Int>? in
+        guard value.location >= 0, value.length > 0 else { return nil }
+        let end = value.location.addingReportingOverflow(value.length)
+        guard !end.overflow else { return nil }
+        return value.location..<end.partialValue
+      }.sorted { $0.lowerBound < $1.lowerBound }
+      var merged: [Range<Int>] = []
+      for range in sorted {
+        if let last = merged.last, range.lowerBound <= last.upperBound {
+          merged[merged.count - 1] = last.lowerBound..<max(last.upperBound, range.upperBound)
+        } else { merged.append(range) }
+      }
+      ranges = merged
+    }
+    func overlaps(_ range: NSRange) -> Bool {
+      guard range.location >= 0, range.length > 0 else { return false }
+      let end = range.location.addingReportingOverflow(range.length)
+      guard !end.overflow else { return false }
+      var low = 0, high = ranges.count
+      while low < high {
+        let middle = low + (high - low) / 2
+        if ranges[middle].upperBound <= range.location { low = middle + 1 }
+        else { high = middle }
+      }
+      return low < ranges.count && ranges[low].lowerBound < end.partialValue
+    }
+  }
   static func wikiDisplays(in source: String, excluding literalRanges: [NSRange] = [], hasMarker: Bool? = nil) -> [WikiDisplay] {
+    wikiDisplays(in: source, excluding: LiteralRanges(literalRanges), hasMarker: hasMarker)
+  }
+  private static func wikiDisplays(in source: String, excluding literalRanges: LiteralRanges, hasMarker: Bool?) -> [WikiDisplay] {
     guard let pattern = wikiPattern
     else { return [] }
     let text = source as NSString
     guard hasMarker ?? (text.range(of: "[[", options: .literal).location != NSNotFound) else { return [] }
     return pattern.matches(in: source, range: NSRange(location: 0, length: text.length))
       .compactMap { match in
-        guard !literalRanges.contains(where: { NSIntersectionRange($0, match.range).length > 0 }) else {
+        guard !literalRanges.overlaps(match.range) else {
           return nil
         }
         let body = text.substring(with: match.range(at: 1))
@@ -83,13 +116,15 @@ struct MarkdownSpan: Decodable, Sendable, Equatable {
       defer { PerformanceTrace.end("Editor.MarkdownParse", trace) }
       spans = (try? ProductCore.markdownSpans(source)) ?? []
     }
-    let literalRanges = spans.filter { $0.kind == "code" || $0.kind == "literal" }
-      .map { NSRange(location: $0.location, length: $0.length) }
+    // Build once for both extension passes. Dense source must not compare
+    // every marker with every literal span on the main thread.
+    let literalRanges = LiteralRanges(spans.filter { $0.kind == "code" || $0.kind == "literal" }
+      .map { NSRange(location: $0.location, length: $0.length) })
     let wikis = wikiDisplays(in: source, excluding: literalRanges, hasMarker: projection?.hasWikiMarker)
     let hasAttachment = projection?.hasAttachmentMarker
       ?? (text.range(of: "[Attachment: ", options: .literal).location != NSNotFound)
     let attachments = hasAttachment ? (attachmentPattern?.matches(in: source, range: full) ?? []).filter { match in
-      !literalRanges.contains { NSIntersectionRange($0, match.range).length > 0 }
+      !literalRanges.overlaps(match.range)
     } : []
     view.typingAttributes = base
     defer {
