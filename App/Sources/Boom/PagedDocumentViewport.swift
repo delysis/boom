@@ -19,6 +19,7 @@ import Foundation
   private var scrollProjection: PagedNativeLogicalWindow?
   private var scrollSnapshot: PagedNativeLogicalReadSnapshot?
   private var scrollTask: Task<Void, Never>?
+  private var scrollReadCancellation: CancellationFlag?
   private var requestedScroll: (id: UUID, anchor: UInt64)?
   private var displayRequest = UUID()
   private var scrollSurface: PagedScrollSurface?
@@ -288,12 +289,13 @@ import Foundation
     presentationFailure = nil
     displayRequest = UUID()
     requestedScroll = (displayRequest, min(requested, extent))
+    scrollReadCancellation?.cancel()
     startScrollTask()
   }
   private func startScrollTask() {
     guard scrollTask == nil, let input = managedInput, navigationEngine != nil else { return }
     scrollTask = Task { [self] in
-      defer { scrollTask = nil }
+      defer { scrollTask = nil; scrollReadCancellation = nil }
       while true {
         if scrollProjection != nil, !showingScroll || requestedScroll != nil {
           hideScrollSurface()
@@ -308,9 +310,12 @@ import Foundation
           let trace = PerformanceTrace.begin("Editor.ManagedScrollRead")
           let output: PagedNativeLogicalWindow
           do {
+            let cancellation = CancellationFlag()
+            scrollReadCancellation = cancellation
+            defer { scrollReadCancellation = nil }
             defer { PerformanceTrace.end("Editor.ManagedScrollRead", trace) }
             output = try await input.session.readLogicalPresentation(snapshot, utf16Anchor: request.anchor,
-              maximumBytes: PagedWorkingWindow.targetBytes, cancellation: CancellationFlag())
+              maximumBytes: PagedWorkingWindow.targetBytes, cancellation: cancellation)
           }
           // Saving an identical generation does not change the displayed text.
           // Actual later input or a different arena supersedes this read.
@@ -649,6 +654,7 @@ import Foundation
       }
       try updateMouseSelection(event)
       displayRequest = UUID(); requestedScroll = nil
+      scrollReadCancellation?.cancel()
       if showingScroll, let output = scrollProjection, let surface = scrollSurface {
         let origin = surface.contentView.bounds.origin
         let selection = try input.currentDocumentSelection()
@@ -672,7 +678,10 @@ import Foundation
   }
   private func stopMouseSelection() {
     mouseAutoscrollTimer?.invalidate(); mouseAutoscrollTimer = nil
-    if mouseSelectionGesture != nil { displayRequest = UUID(); requestedScroll = nil }
+    if mouseSelectionGesture != nil {
+      displayRequest = UUID(); requestedScroll = nil
+      scrollReadCancellation?.cancel()
+    }
     mouseSelectionGesture = nil
   }
 
@@ -851,6 +860,7 @@ import Foundation
     // erase that presentation or manufacture a newer source hit.
     guard orderedMousePointer == nil else { return }
     displayRequest = UUID(); requestedScroll = nil
+    scrollReadCancellation?.cancel()
     hideScrollSurface()
     if scrollProjection != nil { startScrollTask() }
   }
@@ -879,6 +889,7 @@ import Foundation
     }
     stopMouseSelection()
     displayRequest = UUID(); requestedScroll = nil; hideScrollSurface()
+    scrollReadCancellation?.cancel()
     if let task = scrollTask { await task.value }
     scrollProjection = nil; scrollSnapshot = nil
     presentationClosed = true
