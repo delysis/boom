@@ -34,7 +34,7 @@ exec > >(tee "$OUT/build.log") 2>&1
 source_inventory() {
   (
     cd "$HERE"
-    { find App/Sources App/Tests Core/Sources Core/Tests RustBridge/src RustBridge/tests crates scripts patches licenses -type f; printf '%s\n' App/Package.swift Core/Package.swift RustBridge/Cargo.toml Cargo.toml Info.plist Entitlements.plist LICENSE LICENSE-MIT LICENSE-APACHE NOTICE.md; } | LC_ALL=C sort | while IFS= read -r path; do shasum -a 256 "$path"; done
+    { find App/Sources App/Tests Core/Sources Core/Tests RustBridge/src RustBridge/tests crates vendor scripts patches licenses -type f; printf '%s\n' App/Package.swift Core/Package.swift RustBridge/Cargo.toml Cargo.toml Info.plist Entitlements.plist LICENSE LICENSE-MIT LICENSE-APACHE NOTICE.md; } | LC_ALL=C sort | while IFS= read -r path; do shasum -a 256 "$path"; done
   )
 }
 source_inventory > "$OUT/source-files-before.sha256"
