@@ -4328,3 +4328,59 @@ fn actual_reference_pass_cancellation_and_ambiguous_long_definition_never_forge_
     assert!(source.capture().same(&snapshot));
     Ok(())
 }
+
+#[test]
+fn actual_collapsed_media_full_marker_ranges_survive_paged_projection_deletion_and_logical_undo()
+-> TestResult {
+    let id = "884646c1-14b4-490d-be8c-8953af793315";
+    for marker in ["[asset][]", "![asset][]"] {
+        let prefix = format!("ordinary {} e\u{301}🙂 ", "plain ".repeat(7000));
+        let tail = format!(" **After**\n\n[asset]: boom-attachment:{id}\n");
+        let text = format!("{prefix}{marker}{tail}");
+        let anchor = prefix.encode_utf16().count() as u64;
+        let ordinary = media_spans(&text)?;
+        assert_eq!(ordinary.len(), 1, "marker={marker:?}");
+        assert_eq!(ordinary[0].location as u64, anchor);
+        assert_eq!(
+            ordinary[0].length,
+            marker.encode_utf16().count(),
+            "marker={marker:?}: independent whole-marker expectation, not parity to a short event"
+        );
+        let (mut engine, mut source, _) = self::source(&text)?;
+        let snapshot = source.capture_for_publication()?;
+        let (media, progress) = index(&mut engine, &snapshot, MarkupMode::Media)?;
+        assert!(media.complete() && !progress.incomplete_block, "marker={marker:?}");
+        let view = context(&mut engine, &snapshot, Arc::clone(&media), anchor, 256)?;
+        let actual = paged_media_spans(&view)?;
+        assert_eq!(actual.len(), 1, "marker={marker:?}");
+        assert_eq!(actual[0].id.to_string(), id);
+        assert_eq!(view.window_start.utf16 + actual[0].location as u64, anchor);
+        assert_eq!(
+            actual[0].length,
+            marker.encode_utf16().count(),
+            "marker={marker:?}: paged media includes the entire actual collapsed source"
+        );
+        assert_oracle(&text, &mut engine, &snapshot, anchor, 256)?;
+        let window = engine.logical_window(&snapshot, anchor, 256, &mut || false)?;
+        let local = window
+            .text()
+            .find(marker)
+            .expect("the actual complete media marker is resident");
+        source.replace_window(&window, local..local + marker.len(), "")?;
+        let deleted = source.capture_for_publication()?;
+        let deleted_text = format!("{prefix}{tail}");
+        assert_logical_source_bytes(&mut engine, &deleted, &deleted_text)?;
+        let (after, progress) = index(&mut engine, &deleted, MarkupMode::Media)?;
+        assert!(after.complete() && !progress.incomplete_block, "marker={marker:?}");
+        assert!(paged_media_spans(&context(&mut engine, &deleted, after, anchor, 256)?)?.is_empty());
+        source.restore(&snapshot)?;
+        assert!(source.capture().same(&snapshot));
+        let writes = engine.stats().page_writes;
+        let (restored, _) = index(&mut engine, &source.capture(), MarkupMode::Media)?;
+        assert!(Arc::ptr_eq(&restored, &media));
+        assert_eq!(engine.stats().page_writes, writes);
+        assert_oracle(&text, &mut engine, &snapshot, anchor, 256)?;
+        assert_logical_source_bytes(&mut engine, &snapshot, &text)?;
+    }
+    Ok(())
+}

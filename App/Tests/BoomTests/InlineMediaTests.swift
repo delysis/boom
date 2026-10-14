@@ -230,6 +230,88 @@ final class InlineMediaTests: XCTestCase {
     }
   }
 
+  @MainActor func testActualCollapsedAttachmentCutRemovesWholeMarkerAndResponderUndoRestoresSourceAndSelection() async throws {
+    try PagedNativeFixtureApplication.bootstrap()
+    let failures = testRun?.failureCount ?? 0
+    let root = try PagedNativeFixtureApplication.scratchRoot(prefix: "public-collapsed-media-cut-")
+    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: root), loadModels: false)
+    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: 80, y: 80, width: 800, height: 600))
+    window.isReleasedWhenClosed = false
+    do {
+      let viewport = try XCTUnwrap(model.pagedViewport)
+      window.contentView = viewport
+      try await PagedNativeFixtureApplication.focus(try XCTUnwrap(model.pagedInput?.activeView), in: window)
+      if model.selectedChat == nil { try model.newChat() }
+      let original = try Self.image()
+      model.attachToCurrentChat([.bytes(name: "public-collapsed.png", data: original)])
+      try await finish(model)
+      let record = try XCTUnwrap(model.state.attachments.last)
+      let documentID = try XCTUnwrap(model.selectedDocumentID)
+      let input = try XCTUnwrap(model.pagedInput), commands = try XCTUnwrap(model.pagedCommands)
+      let session = try XCTUnwrap(model.pagedSession)
+      for marker in ["[asset][]", "![asset][]"] {
+        let prefix = "Before e\u{301}🙂\n"
+        let tail = "\nAfter\n\n[asset]: boom-attachment:\(record.id.uuidString)\n"
+        let source = prefix + marker + tail, deleted = prefix + tail
+        try await NativeCheckEvidence.replacePublicDocument(model, text: source, id: documentID, caret: 0)
+        let view = try XCTUnwrap(input.activeView)
+        try await PagedNativeFixtureApplication.focus(view, in: window)
+        await viewport.joinMarkup()
+        XCTAssertNil(viewport.markupFailure)
+        view.setMedia(model: model); MarkdownStyle.apply(to: view)
+        await view.inlineMedia.joinPendingLoads()
+        let range = (source as NSString).range(of: marker)
+        XCTAssertEqual(view.inlineMedia.currentRanges, [range],
+          "\(marker): native media attributes must cover both collapsed brackets, not just the short parser event.")
+        view.setSelectedRange(range, affinity: .upstream, stillSelecting: false)
+        XCTAssertEqual(view.selectedRange(), range)
+        let beforeSelection = try input.currentDocumentSelection()
+        let beforeSource = try session.captureLogicalState().source
+        XCTAssertTrue(window.isKeyWindow); XCTAssertTrue(window.firstResponder === view)
+        NSPasteboard.general.clearContents()
+        view.cut(nil)
+        XCTAssertEqual(Data(view.string.utf8), Data(deleted.utf8),
+          "\(marker): actual native Cut must remove the entire marker and retain its definition and Unicode neighbors.")
+        guard case .bytes(let name, let copied)? = AttachmentInput.read(.general)?.first else {
+          throw BoomError.invalid("Actual collapsed attachment Cut lost its original pasteboard representation.")
+        }
+        XCTAssertEqual(name, record.name); XCTAssertEqual(copied, original)
+        XCTAssertEqual(try model.store.vault.get(.attachment, id: record.id), original)
+        try await commands.joinPendingCommand()
+        let cutSource = try session.captureLogicalState().source
+        let cutCapture = try await model.captureDocument(documentID)
+        XCTAssertEqual(cutCapture.completeSnapshot?.text, deleted)
+        XCTAssertTrue(commands.manager.canUndo)
+        XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("undo:"),
+          to: try XCTUnwrap(window.firstResponder), from: nil))
+        try await commands.joinPendingCommand()
+        XCTAssertTrue(try session.captureLogicalState().source.isSame(beforeSource))
+        XCTAssertEqual(try input.currentDocumentSelection(), beforeSelection)
+        XCTAssertTrue(window.firstResponder === input.activeView)
+        let undone = try await model.captureDocument(documentID)
+        XCTAssertEqual(Data(try XCTUnwrap(undone.completeSnapshot).text.utf8), Data(source.utf8))
+        XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("redo:"),
+          to: try XCTUnwrap(window.firstResponder), from: nil))
+        try await commands.joinPendingCommand()
+        XCTAssertTrue(try session.captureLogicalState().source.isSame(cutSource))
+        let redone = try await model.captureDocument(documentID)
+        XCTAssertEqual(Data(try XCTUnwrap(redone.completeSnapshot).text.utf8), Data(deleted.utf8))
+        XCTAssertEqual(try model.store.vault.get(.attachment, id: record.id), original)
+        XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+      }
+      guard (testRun?.failureCount ?? 0) == failures else {
+        throw BoomError.invalid("Actual collapsed media source/Cut/Undo assertions failed; the native graph is retained.")
+      }
+      NSPasteboard.general.clearContents()
+      try await model.shutdown(); window.close()
+      try FileManager.default.removeItem(at: root)
+    } catch {
+      precondition(Self.failedDisplayCopyControls.count < 4)
+      Self.failedDisplayCopyControls.append((model, window, error))
+      throw error
+    }
+  }
+
   @MainActor func testOriginalPNGCopyPublishesExactHeaderTypeDespiteMisleadingFilename() throws {
     _ = NSApplication.shared
     let bytes = try Self.image()

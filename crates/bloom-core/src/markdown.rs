@@ -1,6 +1,6 @@
 //! Source-preserving CommonMark styling, shared by native editors and readers.
 use super::{Error, TEXT_LIMIT, require};
-use pulldown_cmark::{BrokenLinkCallback, Event, Options, Parser, Tag};
+use pulldown_cmark::{BrokenLinkCallback, Event, LinkType, Options, Parser, Tag};
 use serde::Serialize;
 use std::ops::Range;
 use uuid::Uuid;
@@ -50,7 +50,10 @@ fn media_from_parser_cancelled<'a, F: BrokenLinkCallback<'a>>(
         else {
             break;
         };
-        let Event::Start(Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. }) = event else {
+        let Event::Start(
+            Tag::Link { dest_url, link_type, .. }
+            | Tag::Image { dest_url, link_type, .. },
+        ) = event else {
             continue;
         };
         let Some(identity) = dest_url.strip_prefix("boom-attachment:") else {
@@ -62,6 +65,22 @@ fn media_from_parser_cancelled<'a, F: BrokenLinkCallback<'a>>(
         if identity.len() != 36 {
             continue;
         }
+        let range = if link_type == LinkType::Collapsed {
+            // The actual Collapsed decision consumes adjacent [] while the
+            // ordinary event ends at its first label. Media is one source
+            // object; keep the complete marker selectable/deletable. A
+            // clipped or unexpected suffix stays literal, without widening
+            // any parser event or ordinary style range.
+            let Some(end) = range.end.checked_add(2) else {
+                continue;
+            };
+            if text.as_bytes().get(range.end..end) != Some(b"[]".as_slice()) {
+                continue;
+            }
+            range.start..end
+        } else {
+            range
+        };
         require(
             result.len() < 4096,
             "Document exceeds 4096 media references.",
@@ -407,6 +426,66 @@ mod tests {
             link
         );
         assert_eq!(span.id.to_string(), id);
+        Ok(())
+    }
+    #[test]
+    fn collapsed_media_covers_the_complete_marker_without_widening_parser_or_style_events()
+    -> Result<(), Error> {
+        let id = "884646c1-14b4-490d-be8c-8953af793315";
+        let prefix = "Before e\u{301}🙂 ";
+        for marker in ["[asset][]", "![asset][]"] {
+            let tail = format!(" After\n\n[asset]: boom-attachment:{id}\n");
+            let text = format!("{prefix}{marker}{tail}");
+            let (event, event_range) = Parser::new(&text)
+                .into_offset_iter()
+                .find(|(event, _)| {
+                    matches!(event, Event::Start(Tag::Link { .. } | Tag::Image { .. }))
+                })
+                .expect("actual ordinary collapsed Link/Image");
+            assert!(
+                matches!(event, Event::Start(Tag::Link { link_type: LinkType::Collapsed, .. }
+                    | Tag::Image { link_type: LinkType::Collapsed, .. })),
+                "marker={marker:?}"
+            );
+            assert_eq!(
+                event_range,
+                prefix.len()..prefix.len() + marker.len() - 2,
+                "marker={marker:?}: pinned event extent stays unchanged"
+            );
+            let actual = media_spans(&text)?;
+            assert_eq!(actual.len(), 1, "marker={marker:?}");
+            assert_eq!(actual[0].id.to_string(), id);
+            assert_eq!(actual[0].location, prefix.encode_utf16().count());
+            assert_eq!(
+                actual[0].length,
+                marker.encode_utf16().count(),
+                "marker={marker:?}: media must include its actual collapsed []"
+            );
+            let units: Vec<_> = text.encode_utf16().collect();
+            assert_eq!(
+                String::from_utf16_lossy(
+                    &units[actual[0].location..actual[0].location + actual[0].length]
+                ),
+                marker
+            );
+            if !marker.starts_with('!') {
+                let style = spans(&text)?;
+                let link = style.iter().find(|span| span.kind == "link").expect("ordinary Link style");
+                assert_eq!(
+                    link.length,
+                    marker.encode_utf16().count() - 2,
+                    "style still represents the original ordinary event range"
+                );
+            }
+        }
+        let separate = format!("{prefix}[asset] [] After\n\n[asset]: boom-attachment:{id}\n");
+        let actual = media_spans(&separate)?;
+        assert_eq!(actual.len(), 1);
+        assert_eq!(
+            actual[0].length,
+            "[asset]".encode_utf16().count(),
+            "a distinct literal [] following a Shortcut must not be consumed"
+        );
         Ok(())
     }
     #[test]
