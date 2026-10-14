@@ -728,9 +728,15 @@ import SwiftUI
           if !measured { recordWarmMarkedState("after-first-marked") }
           view.setMarkedText("日本", selectedRange: NSRange(location: 2, length: 0), replacementRange: unspecified)
           if !measured { recordWarmMarkedState("after-marked-update") }
+          let marked = view.markedRange()
           view.unmarkText()
           if !measured { recordWarmMarkedState("after-unmark") }
-          guard !view.hasMarkedText() else { throw BoomError.invalid("The native marked-text input did not commit.") }
+          let text = view.boundedStorage.string as NSString
+          guard !view.hasMarkedText(), marked.location != NSNotFound,
+            marked.length == 2, NSMaxRange(marked) <= text.length,
+            text.substring(with: marked) == "日本" else {
+            throw BoomError.invalid("The native marked-text input did not retain its committed characters.")
+          }
         }
         try await joinMixedInput(event, measured: measured)
         try renderMixedSurface(event: event, measured: measured)

@@ -19,7 +19,7 @@ final class PagedNativeTextStorage: NSTextStorage {
   fileprivate var performanceEvent: UInt64 = 0
   private(set) var mutationFailure: Error?
   var didRejectMutation: (@MainActor (Error) -> Void)?
-  var nativeSelection: (@MainActor () throws -> PagedWorkingSelection)?
+  var nativeSelection: (@MainActor () throws -> PagedWorkingSelection?)?
 
   @MainActor init(session: PagedNativeSession, attributes: [NSAttributedString.Key: Any] = [:],
     inputBinding: PagedNativeInputBinding? = nil,
@@ -254,7 +254,13 @@ final class PagedNativeTextStorage: NSTextStorage {
     }
     storage.nativeSelection = { [weak self] in
       guard let self else { throw BoomError.stale("The native selection owner has retired.") }
-      if let commandSelection = self.commandSelection { return commandSelection }
+      if let commandSelection = self.commandSelection {
+        // Cocoa can remove and reinsert marked text within one command. Only
+        // the first accepted primitive uses the command's before-selection;
+        // later primitives use Session's current source cursor while Cocoa
+        // is still updating its own selection.
+        return commandSelection.generation == self.session.generation ? commandSelection : nil
+      }
       return try self.session.nativeSelection(self.selectedRange())
     }
     if let stagedNavigationTicket {
