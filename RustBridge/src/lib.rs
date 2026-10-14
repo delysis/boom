@@ -137,6 +137,12 @@ pub unsafe extern "C" fn bloom_core_request(
                     } | bloom_core::Request::CompileConsultationCompact {
                         working_text_bytes: Some(_),
                         ..
+                    } | bloom_core::Request::CompileConsultation {
+                        working_request_bytes: Some(_),
+                        ..
+                    } | bloom_core::Request::CompileConsultationCompact {
+                        working_request_bytes: Some(_),
+                        ..
                     }
                 );
                 if length > 16 * 1024 * 1024 && !windowed {

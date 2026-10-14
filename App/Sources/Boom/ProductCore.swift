@@ -142,7 +142,7 @@ enum ProductCore {
     // A fitting request still carries immutable original prose for validation.
     // Only this explicit windowed operation may use the bridge's bounded 64 MiB input.
     let windowed = ["compile_consultation", "compile_consultation_compact"].contains(request["op"] as? String ?? "")
-      && request["workingTextBytes"] is Int
+      && (request["workingTextBytes"] is Int || request["workingRequestBytes"] is Int)
     let limit = windowed ? 67_108_864 : 16_777_216
     guard data.count <= limit else { throw BoomError.budget("Product request exceeds its bounded wire capacity.") }
     let buffer = {
@@ -194,19 +194,20 @@ enum ProductCore {
     voice: Voice?, history: [ChatMessage], instructions: String, context: String, request: String, routing: [String], authority: CapturedDocumentAuthority = .readOnly,
     promptContract: ConsultationPromptContract = .referenceHistoryV2,
     renderedContext: RenderedReferenceContext? = nil, capturedSources: [SourceReference] = [],
-    workingTextBytes: Int? = nil
+    workingTextBytes: Int? = nil, workingRequestBytes: Int? = nil
   ) throws -> ConsultationPlan {
     guard let plan = try consultationRound(voices: [voice], history: history, instructions: instructions,
       context: context, request: request, routing: routing, authority: authority,
       promptContract: promptContract, renderedContext: renderedContext,
-      capturedSources: capturedSources, workingTextBytes: workingTextBytes).first else { throw BoomError.invalid("Empty consultation round.") }
+      capturedSources: capturedSources, workingTextBytes: workingTextBytes,
+      workingRequestBytes: workingRequestBytes).first else { throw BoomError.invalid("Empty consultation round.") }
     return plan
   }
   static func consultationRound(
     voices: [Voice?], history: [ChatMessage], instructions: String, context: String, request: String, routing: [String], authority: CapturedDocumentAuthority = .readOnly,
     promptContract: ConsultationPromptContract = .referenceHistoryV2,
     renderedContext: RenderedReferenceContext? = nil, capturedSources: [SourceReference] = [],
-    workingTextBytes: Int? = nil
+    workingTextBytes: Int? = nil, workingRequestBytes: Int? = nil
   ) throws -> [ConsultationPlan] {
     let turns = history.filter { $0.state == .complete }.map { message in
       PromptTurn(role: message.role.rawValue, text: message.text,
@@ -220,7 +221,8 @@ enum ProductCore {
       "history": object(turns), "instructions": instructions, "context": context, "request": request,
       "routing": routing, "promptContract": promptContract.rawValue,
       "renderedContext": try renderedContext.map { try object($0) } ?? NSNull(),
-      "capturedSources": try object(capturedSources), "workingTextBytes": workingTextBytes.map { $0 as Any } ?? NSNull()])
+      "capturedSources": try object(capturedSources), "workingTextBytes": workingTextBytes.map { $0 as Any } ?? NSNull(),
+      "workingRequestBytes": workingRequestBytes.map { $0 as Any } ?? NSNull()])
     let expectedContract: ConsultationPromptContract? = promptContract == .textHistoryV1 ? nil : promptContract
     guard compiled.schema == 1, compiled.plans.count == voices.count,
       compiled.promptContract == expectedContract else {

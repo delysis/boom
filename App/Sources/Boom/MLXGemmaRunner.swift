@@ -825,7 +825,7 @@ actor MLXGemmaRunner {
     promptContract: ConsultationPromptContract = .referenceHistoryV2,
     renderedContext: RenderedReferenceContext? = nil, capturedSources: [SourceReference] = []
   ) async throws -> (plans: [ConsultationPlan], history: [ChatMessage], omittedHistory: Int,
-    context: String, renderedContext: RenderedReferenceContext?, capturedSources: [SourceReference], workingTextBytes: Int?) {
+    context: String, renderedContext: RenderedReferenceContext?, capturedSources: [SourceReference], workingTextBytes: Int?, workingRequestBytes: Int?) {
     let trace = PerformanceTrace.begin("Request.ContextFit")
     defer { PerformanceTrace.end("Request.ContextFit", trace) }
     guard voices.count == reserves.count else { throw BoomError.invalid("Every participant needs an output reservation.") }
@@ -838,13 +838,14 @@ actor MLXGemmaRunner {
     }
     recent.reverse()
     var workingContext = context, workingRendered = renderedContext, workingSources = capturedSources
-    var workingBytes: Int?, maximumSources = 32
+    var workingBytes: Int?, requestBytes: Int?, maximumSources = 32
     func compile(_ turns: [ChatMessage]) async throws -> [ConsultationPlan] {
       try flag.check()
       let plans = try ProductCore.consultationRound(voices: voices, history: turns,
         instructions: instructions, context: workingContext, request: request, routing: routing,
         authority: authority, promptContract: promptContract,
-        renderedContext: workingRendered, capturedSources: workingSources, workingTextBytes: workingBytes)
+        renderedContext: workingRendered, capturedSources: workingSources, workingTextBytes: workingBytes,
+        workingRequestBytes: requestBytes)
       for (plan, reserve) in zip(plans, reserves) {
         _ = try await preflight(plan, images: images, media: media, maxTokens: reserve,
           flag: flag, cacheOwner: cacheOwner, pairedAdmission: pairedAdmission)
@@ -853,7 +854,7 @@ actor MLXGemmaRunner {
     }
     do {
       let plans = try await compile(recent)
-      return (plans, recent, complete.count - recent.count, workingContext, workingRendered, workingSources, workingBytes)
+      return (plans, recent, complete.count - recent.count, workingContext, workingRendered, workingSources, workingBytes, requestBytes)
     } catch BoomError.budget { /* Slide whole older turns before reducing current text. */ }
 
     var best: [ConsultationPlan]
@@ -864,9 +865,15 @@ actor MLXGemmaRunner {
           if bytes > 0 { workingBytes = bytes / 2 }
           else if maximumSources > 0 { maximumSources /= 2 }
           else {
-            // Text and optional source metadata are already absent. This is a
-            // real model/media/output reservation failure, not a text limit.
-            throw BoomError.unavailable("The model cannot reserve this output and media on this Mac. \(reason)")
+            // Keep the complete current question ahead of optional prose and
+            // source headers. Only now slide its recent Unicode-safe suffix.
+            if let bytes = requestBytes {
+              guard bytes > 0 else {
+                throw BoomError.unavailable("The model cannot reserve this output and media on this Mac. \(reason)")
+              }
+              requestBytes = bytes / 2
+            } else { requestBytes = 32_768 }
+            continue // Reference selection is unchanged; do not reread/revalidate it.
           }
         } else { workingBytes = 32_768 }
         if let original = renderedContext {
@@ -890,7 +897,7 @@ actor MLXGemmaRunner {
       } catch BoomError.budget { upper = count - 1 }
     }
     let retained = Array(recent.suffix(lower))
-    return (best, retained, complete.count - retained.count, workingContext, workingRendered, workingSources, workingBytes)
+    return (best, retained, complete.count - retained.count, workingContext, workingRendered, workingSources, workingBytes, requestBytes)
   }
   func completionRecipe(document: DocumentSnapshot, caret: Int, sources: [SourceReference],
     examples: [String], profile: SamplingProfile, maxTokens: Int, flag: CancellationFlag,

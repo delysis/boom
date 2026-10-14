@@ -1426,7 +1426,8 @@ private struct BoundedConsultationContext: Sendable {
             plan = try ProductCore.prompt(voice: voice, history: fitted.history + round,
               instructions: instructions, context: context, request: request, routing: slugs,
               authority: authority, promptContract: promptContract,
-              renderedContext: renderedContext, capturedSources: workingSources, workingTextBytes: fitted.workingTextBytes)
+              renderedContext: renderedContext, capturedSources: workingSources, workingTextBytes: fitted.workingTextBytes,
+              workingRequestBytes: fitted.workingRequestBytes)
           } else { plan = plans[offset] }
           var responseAuthority = authority
           responseAuthority.targetWindow = renderedContext?.bindings.first {

@@ -190,6 +190,14 @@ fn user_body(pool: &mut TextPool, context: &str, request: &str, routing: &[Strin
     }
 }
 
+#[derive(Default)]
+pub(super) struct CompileOptions {
+    pub prompt_contract: Option<ConsultationPromptContract>,
+    pub working_text_bytes: Option<usize>,
+    pub working_request_bytes: Option<usize>,
+    pub instructions_window: Option<crate::hashline::ContextTextWindow>,
+}
+
 pub(super) fn compile_with_contract(
     voices: &[Option<&Voice>],
     history: &[PromptTurn],
@@ -206,9 +214,7 @@ pub(super) fn compile_with_contract(
         context,
         request,
         routing,
-        prompt_contract,
-        None,
-        None,
+        CompileOptions { prompt_contract, ..CompileOptions::default() },
     )
 }
 
@@ -219,12 +225,12 @@ pub(super) fn compile_with_window(
     context: &str,
     request: &str,
     routing: &[String],
-    prompt_contract: Option<ConsultationPromptContract>,
-    working_text_bytes: Option<usize>,
-    instructions_window: Option<crate::hashline::ContextTextWindow>,
+    options: CompileOptions,
 ) -> Result<CompactConsultation, ConsultationError> {
+    let CompileOptions { prompt_contract, working_text_bytes, working_request_bytes, instructions_window } = options;
     require(
-        working_text_bytes.is_none_or(|n| n <= TEXT_LIMIT),
+        working_text_bytes.is_none_or(|n| n <= TEXT_LIMIT)
+            && working_request_bytes.is_none_or(|n| n <= TEXT_LIMIT),
         "Invalid working prose bound.",
     )?;
     let prompt_contract =
@@ -315,7 +321,7 @@ pub(super) fn compile_with_window(
             }
         })
         .collect();
-    let (working_request, request_window) = match working_text_bytes {
+    let (working_request, request_window) = match working_request_bytes {
         Some(bytes) => crate::hashline::window_text(request, bytes, true)?,
         None => (request.to_owned(), None),
     };
@@ -374,14 +380,14 @@ pub(super) fn compile_with_window(
                 let assistant = pool.intern(safe(&assistant));
                 plan.append(&mut pool, "user", &[user])?;
                 plan.append(&mut pool, "assistant", &[assistant])?;
-                if let Some(value) = &mut voice_window {
-                    if user_window.is_some() || assistant_window.is_some() {
-                        value.examples.push(ExampleWorkingWindow {
-                            index,
-                            user: user_window,
-                            assistant: assistant_window,
-                        });
-                    }
+                if let Some(value) = &mut voice_window
+                    && (user_window.is_some() || assistant_window.is_some())
+                {
+                    value.examples.push(ExampleWorkingWindow {
+                        index,
+                        user: user_window,
+                        assistant: assistant_window,
+                    });
                 }
             }
         }
@@ -418,7 +424,7 @@ pub(super) fn compile_with_window(
         prompt_contract,
         texts: pool.finish(),
         plans,
-        working_window: working_text_bytes.map(|_| ConsultationWorkingWindow {
+        working_window: (working_text_bytes.is_some() || working_request_bytes.is_some()).then_some(ConsultationWorkingWindow {
             request: request_window,
             instructions: instructions_window,
             voices: voice_windows,

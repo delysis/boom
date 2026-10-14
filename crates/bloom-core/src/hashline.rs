@@ -500,10 +500,10 @@ pub fn context_v3_window(
     if let Some(target) = &target {
         selected.insert(target.document_id);
     }
-    if selected.len() < maximum_sources {
-        if let Some(id) = preferred_document_id {
-            selected.insert(id);
-        }
+    if selected.len() < maximum_sources
+        && let Some(id) = preferred_document_id
+    {
+        selected.insert(id);
     }
     for id in ids.iter().rev() {
         if selected.len() >= maximum_sources.max(usize::from(target.is_some())) {
@@ -1215,6 +1215,7 @@ mod tests {
                 rendered_context: Some(context),
                 captured_sources: &sources,
                 working_text_bytes: None,
+                working_request_bytes: None,
             },
         )
         .expect("public v3 request")
@@ -1307,6 +1308,7 @@ mod tests {
                     rendered_context: Some(&rendered),
                     captured_sources: &sources,
                     working_text_bytes: None,
+                working_request_bytes: None,
                 },
             )
             .is_err()
@@ -1325,6 +1327,7 @@ mod tests {
                     rendered_context: None,
                     captured_sources: &sources,
                     working_text_bytes: None,
+                working_request_bytes: None,
                 },
             )
             .is_err()

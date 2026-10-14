@@ -366,7 +366,7 @@ final class DocumentToolsTests: XCTestCase {
     let plan = try ProductCore.prompt(voice: nil, history: [],
       instructions: String(repeating: "Authored guidance. ", count: 2_000), context: windowed.prompt,
       request: question, routing: [], promptContract: .referenceBindingsV3,
-      renderedContext: windowed, capturedSources: windowed.bindings.map(\.source), workingTextBytes: 96)
+      renderedContext: windowed, capturedSources: windowed.bindings.map(\.source), workingTextBytes: 96, workingRequestBytes: 96)
     let requestWindow = try XCTUnwrap(plan.workingWindow?.request)
     XCTAssertEqual(requestWindow.digest, Digest.sha256(question))
     XCTAssertEqual(requestWindow.bytes, question.utf8.count)
@@ -419,6 +419,31 @@ final class DocumentToolsTests: XCTestCase {
     XCTAssertTrue(changed.text.hasPrefix("Visible edit "))
     XCTAssertTrue(changed.text.contains("Line05"))
     XCTAssertEqual(document.text, text)
+  }
+
+  func testCurrentQuestionPrecedesOptionalReferenceAndInstructionProse() throws {
+    let document = DocumentSnapshot(title: "Optional reference", text: String(repeating: "Older source text. ", count: 2_000))
+    let captured = try DocumentTools.renderedContext([document], attachments: [], authority: .readOnly,
+      preferredDocumentID: document.id)
+    let omitted = try DocumentTools.windowedContext(captured, authority: .readOnly,
+      capturedSources: captured.bindings.map(\.source), bodyBytes: 0, maximumSources: 0)
+    let question = "Keep this complete e\u{301}👩‍💻 current question about the harbor."
+    let full = try ProductCore.prompt(voice: nil, history: [],
+      instructions: String(repeating: "Optional instructions. ", count: 2_000), context: omitted.prompt,
+      request: question, routing: [], promptContract: .referenceBindingsV3,
+      renderedContext: omitted, capturedSources: [], workingTextBytes: 0)
+    XCTAssertTrue(omitted.bindings.isEmpty)
+    XCTAssertTrue(full.rawPrompt.contains(question))
+    XCTAssertNil(full.workingWindow?.request)
+    XCTAssertNotNil(full.workingWindow?.instructions)
+    let clipped = try ProductCore.prompt(voice: nil, history: [], instructions: "", context: omitted.prompt,
+      request: question, routing: [], promptContract: .referenceBindingsV3,
+      renderedContext: omitted, capturedSources: [], workingTextBytes: 0, workingRequestBytes: 24)
+    let scope = try XCTUnwrap(clipped.workingWindow?.request)
+    XCTAssertEqual(scope.digest, Digest.sha256(question))
+    XCTAssertEqual(scope.ranges.last?.end, question.utf8.count)
+    XCTAssertFalse(clipped.rawPrompt.contains(question))
+    XCTAssertTrue(clipped.rawPrompt.contains("about the harbor."))
   }
 
 }

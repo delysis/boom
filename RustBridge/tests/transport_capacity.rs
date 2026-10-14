@@ -331,7 +331,7 @@ fn explicitly_windowed_original_prose_can_cross_the_old_wire_limit() {
     )
     .unwrap();
     let mut request = json!({"op":"compile_consultation_compact", "voices":[voice], "history":[],
-        "instructions":"", "context":"", "request":"\u{1}".repeat(MIB), "routing":[], "workingTextBytes":0});
+        "instructions":"", "context":"", "request":"\u{1}".repeat(MIB), "routing":[], "workingTextBytes":0, "workingRequestBytes":0});
     let bytes = serde_json::to_vec(&request).unwrap();
     assert!(bytes.len() > 16 * MIB && bytes.len() < 64 * MIB);
     let value = call_bytes(&bytes);
@@ -343,5 +343,6 @@ fn explicitly_windowed_original_prose_can_cross_the_old_wire_limit() {
     );
     assert!(serde_json::to_vec(&value).unwrap().len() < 4_096);
     request.as_object_mut().unwrap().remove("workingTextBytes");
+    request.as_object_mut().unwrap().remove("workingRequestBytes");
     assert_eq!(call(&request)["error"]["code"], "input_limit");
 }

@@ -830,6 +830,8 @@ pub enum Request {
         captured_sources: Vec<hashline::ReferenceIdentity>,
         #[serde(default)]
         working_text_bytes: Option<usize>,
+        #[serde(default)]
+        working_request_bytes: Option<usize>,
     },
     CompileConsultationCompact {
         #[serde(default)]
@@ -848,6 +850,8 @@ pub enum Request {
         captured_sources: Vec<hashline::ReferenceIdentity>,
         #[serde(default)]
         working_text_bytes: Option<usize>,
+        #[serde(default)]
+        working_request_bytes: Option<usize>,
     },
     AuthoredPrefix {
         text: String,
@@ -956,6 +960,7 @@ struct ConsultationInput<'a> {
     rendered_context: Option<&'a hashline::RenderedReferenceContext>,
     captured_sources: &'a [hashline::ReferenceIdentity],
     working_text_bytes: Option<usize>,
+    working_request_bytes: Option<usize>,
 }
 
 fn compact_with_authority(
@@ -989,9 +994,12 @@ fn compact_with_authority(
         input.context,
         input.request,
         input.routing,
-        input.prompt_contract,
-        input.working_text_bytes,
-        instructions_window,
+        consultation::CompileOptions {
+            prompt_contract: input.prompt_contract,
+            working_text_bytes: input.working_text_bytes,
+            working_request_bytes: input.working_request_bytes,
+            instructions_window,
+        },
     )
 }
 
@@ -1011,6 +1019,7 @@ pub fn execute_for_transport(request: Request) -> Result<Value, ConsultationErro
             rendered_context,
             captured_sources,
             working_text_bytes,
+            working_request_bytes,
         } => {
             let round = compact_with_authority(
                 &authority,
@@ -1025,6 +1034,7 @@ pub fn execute_for_transport(request: Request) -> Result<Value, ConsultationErro
                     rendered_context: rendered_context.as_ref(),
                     captured_sources: &captured_sources,
                     working_text_bytes,
+                    working_request_bytes,
                 },
             )?;
             serde_json::to_value(round).map_err(|error| Error(error.to_string()).into())
@@ -1280,6 +1290,7 @@ pub fn execute(request: Request) -> Result<Value, Error> {
             rendered_context,
             captured_sources,
             working_text_bytes,
+            working_request_bytes,
         } => serde_json::to_value(
             compact_with_authority(
                 &authority,
@@ -1294,6 +1305,7 @@ pub fn execute(request: Request) -> Result<Value, Error> {
                     rendered_context: rendered_context.as_ref(),
                     captured_sources: &captured_sources,
                     working_text_bytes,
+                    working_request_bytes,
                 },
             )
             .map_err(ConsultationError::into_legacy)?
@@ -1311,6 +1323,7 @@ pub fn execute(request: Request) -> Result<Value, Error> {
             rendered_context,
             captured_sources,
             working_text_bytes,
+            working_request_bytes,
         } => serde_json::to_value(
             compact_with_authority(
                 &authority,
@@ -1325,6 +1338,7 @@ pub fn execute(request: Request) -> Result<Value, Error> {
                     rendered_context: rendered_context.as_ref(),
                     captured_sources: &captured_sources,
                     working_text_bytes,
+                    working_request_bytes,
                 },
             )
             .map_err(ConsultationError::into_legacy)?,
@@ -1885,7 +1899,7 @@ mod tests {
         let compile = |bytes| {
             let value = serde_json::json!({"op":"compile_consultation_compact", "authority":{"mode":"Ask","target":null},
                 "voices":[voice.clone()], "history":[], "instructions":instructions, "context":"", "request":request,
-                "routing":[], "workingTextBytes":bytes});
+                "routing":[], "workingTextBytes":bytes, "workingRequestBytes":bytes});
             let request = serde_json::from_value(value).map_err(|e| Error(e.to_string()))?;
             execute_for_transport(request).map_err(ConsultationError::into_legacy)
         };
@@ -1920,4 +1934,32 @@ mod tests {
         assert_eq!(instructions.len(), "Authored instructions ".len() * 3_000);
         Ok(())
     }
+    #[test]
+    fn optional_prose_budget_does_not_discard_the_current_question() -> Result<(), Error> {
+        let question = "Preserve this current e\u{301}👩‍💻 question about the harbor.";
+        let instructions = "Optional older guidance. ".repeat(2_000);
+        let mut request = serde_json::json!({"op":"compile_consultation_compact", "voices":[null],
+            "history":[], "instructions":instructions, "context":"", "request":question,
+            "routing":[], "workingTextBytes":0});
+        let compile = |request: Value| {
+            execute_for_transport(serde_json::from_value(request).map_err(|e| Error(e.to_string()))?)
+                .map_err(ConsultationError::into_legacy)
+        };
+        let full = compile(request.clone())?;
+        let joined = full["texts"].as_array().ok_or_else(|| Error("Missing prompt text.".into()))?
+            .iter().filter_map(Value::as_str).collect::<String>();
+        assert!(joined.contains(question));
+        assert!(full["workingWindow"]["request"].is_null());
+        assert_eq!(full["workingWindow"]["instructions"]["bytes"], instructions.len());
+        request["workingRequestBytes"] = serde_json::json!(24);
+        let clipped = compile(request)?;
+        let joined = clipped["texts"].as_array().ok_or_else(|| Error("Missing prompt text.".into()))?
+            .iter().filter_map(Value::as_str).collect::<String>();
+        assert!(!joined.contains(question));
+        assert!(joined.contains("about the harbor."));
+        assert_eq!(clipped["workingWindow"]["request"]["digest"], digest(question.as_bytes()));
+        assert_eq!(clipped["workingWindow"]["request"]["ranges"][0]["end"], question.len());
+        Ok(())
+    }
+
 }
