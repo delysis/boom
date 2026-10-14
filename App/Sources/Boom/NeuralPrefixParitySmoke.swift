@@ -8,12 +8,42 @@ import MLXLMCommon
 enum NeuralPrefixParitySmoke {
   enum Kind: String, Codable, Hashable, Sendable { case consultationInterior, writingLateDivergence }
   struct Reference: Codable, Sendable { let path: String; let sha256: String }
+  enum SourceStage: String, Codable, Sendable { case sharedDecode, anchorPrefill }
+  struct SourceRun: Decodable, Sendable {
+    let status: String
+    let joined: Bool
+    let runtime_revision: String
+    let source_inventory_sha256: String
+    let writing_identity: String
+    let consultation_identity: String
+    let writing_model_manifest_sha256: String
+    let consultation_model_manifest_sha256: String
+  }
+  struct CapturedForward: Codable, Sendable {
+    let start: Int
+    let end: Int
+    let evaluatedEnd: Int
+    let origin: String
+    let width: Int
+    let row: Int?
+    let originalInput: ForwardOperandBinding?
+  }
+  struct CapturedHistory: Codable, Sendable {
+    let promptTokens: Int
+    let decodeRow: Int
+    let decodeWidth: Int
+    let blockers: [String]
+    let forwards: [CapturedForward]
+  }
   struct Declaration: Codable, Sendable {
     let kind: Kind
     let namespace: UUID
     let sharedSource: Reference
     let anchorSource: Reference?
     let currentQuery: Reference
+    let modelManifest: Reference?
+    let sourceStage: SourceStage?
+    let sharedSourceRow: Int?
     let sharedProcessedDecodeTokens: Int
     let sharedDeliveredLedgerTokens: Int
     let sharedWidth: Int
@@ -30,6 +60,7 @@ enum NeuralPrefixParitySmoke {
     let scope: String
     let runtimeRevision: String
     let originatingSourceInventory: String
+    let sourceRun: Reference?
     let declarations: [Declaration]
   }
   struct CapturedOutput: Codable, Sendable {
@@ -49,9 +80,13 @@ enum NeuralPrefixParitySmoke {
     let settings: SamplingSettings
     let outputs: [CapturedOutput]
     let status: String
+    let expected_cached_tokens_at_snapshot: Int?
+    let seeds: [UInt64]?
+    let output_history_evidence: [CapturedHistory]?
   }
   struct Request: Sendable {
     let declaration: Declaration
+    let schema: Int
     let shared: CapturedInput
     let anchor: CapturedInput?
     let query: CapturedInput
@@ -98,20 +133,24 @@ enum NeuralPrefixParitySmoke {
     }
   }
 
-  static func decodeFixture(_ data: Data) throws -> Fixture {
-    guard data.count <= 1_048_576 else { throw BoomError.invalid("Oversized parity manifest.") }
-    let fixture = try JSONDecoder().decode(Fixture.self, from: data)
-    guard fixture.schema == 1, fixture.scope == "public_completed_trial_inputs_v1",
-      fixture.runtimeRevision == ModelPacks.runtimeRevision,
-      fixture.originatingSourceInventory.count == 64, fixture.declarations.count == 2,
-      Set(fixture.declarations.map(\.kind)) == [.consultationInterior, .writingLateDivergence] else {
-      throw BoomError.invalid("Require the two registered public parity controls and exact runtime.")
+  private static func validReference(_ value: Reference) -> Bool {
+    value.path.hasPrefix("/") && ForwardOperandBinding.isDigest(value.sha256)
+  }
+
+  static func validateDeclaration(_ d: Declaration, schema: Int) throws {
+    guard d.seed == 42, d.decodeControlTokens == 16,
+      validReference(d.sharedSource), validReference(d.currentQuery),
+      (0...255).contains(d.sharedProcessedDecodeTokens),
+      (1...256).contains(d.sharedDeliveredLedgerTokens), (1...3).contains(d.sharedWidth),
+      (1...4_609).contains(d.sourceNativeBoundary), (1...4_352).contains(d.cachedPrefix),
+      (1...4_352).contains(d.coldNativeBoundary), d.warmSuffixPartitions.count == 2,
+      d.warmSuffixPartitions.allSatisfy({ (1...512).contains($0) }) else {
+      throw BoomError.invalid("Require bounded seeded controls and source-bound public receipts.")
     }
-    for d in fixture.declarations {
-      guard d.seed == 42, d.decodeControlTokens == 16,
-        d.sharedSource.path.hasPrefix("/"), d.currentQuery.path.hasPrefix("/"),
-        d.sharedSource.sha256.count == 64, d.currentQuery.sha256.count == 64 else {
-        throw BoomError.invalid("Require bounded seeded controls and source-bound public receipts.")
+    if schema == 1 {
+      // Preserve the original registered scope and refusal behavior.
+      guard d.modelManifest == nil, d.sourceStage == nil, d.sharedSourceRow == nil else {
+        throw BoomError.invalid("Version-one parity cannot declare a new source geometry.")
       }
       switch d.kind {
       case .consultationInterior:
@@ -122,24 +161,99 @@ enum NeuralPrefixParitySmoke {
           throw BoomError.invalid("Changed consultation parity scope.")
         }
       case .writingLateDivergence:
-        guard let anchor = d.anchorSource, anchor.path.hasPrefix("/"), anchor.sha256.count == 64,
+        guard let anchor = d.anchorSource, validReference(anchor),
           d.sharedWidth == 3, d.sharedProcessedDecodeTokens == 85, d.sharedDeliveredLedgerTokens == 86,
           d.anchorCachedPrefix == 4181, d.sourceNativeBoundary == 4352,
           d.cachedPrefix == 4349, d.coldNativeBoundary == 4352, d.warmSuffixPartitions == [3, 1] else {
           throw BoomError.invalid("Changed mixed writing parity scope.")
         }
       }
+    } else {
+      guard schema == 2, let manifest = d.modelManifest, validReference(manifest),
+        let row = d.sharedSourceRow, (0..<d.sharedWidth).contains(row) else {
+        throw BoomError.invalid("Version-two parity requires an exact model and original native row.")
+      }
+      switch d.kind {
+      case .consultationInterior:
+        guard d.anchorSource == nil, d.anchorCachedPrefix == nil, d.sharedWidth == 1, row == 0,
+          d.sharedProcessedDecodeTokens == 16, d.sharedDeliveredLedgerTokens == 16,
+          d.sourceStage == .sharedDecode, d.sourceNativeBoundary == 4112,
+          d.cachedPrefix == 4112, d.coldNativeBoundary == 4128, d.warmSuffixPartitions == [16, 1] else {
+          throw BoomError.invalid("Changed completed-decode consultation parity scope.")
+        }
+      case .writingLateDivergence:
+        guard let anchor = d.anchorSource, validReference(anchor), let prefix = d.anchorCachedPrefix,
+          (4_097...4_351).contains(prefix), d.sharedWidth == 3,
+          d.sharedProcessedDecodeTokens == prefix - 4096,
+          d.sharedDeliveredLedgerTokens == d.sharedProcessedDecodeTokens + 1,
+          d.cachedPrefix == 4349, d.coldNativeBoundary == 4352, d.warmSuffixPartitions == [3, 1],
+          (d.sourceStage == .anchorPrefill && d.sourceNativeBoundary == 4352)
+            || (d.sourceStage == .sharedDecode && d.sourceNativeBoundary == 4349
+              && d.sourceNativeBoundary <= prefix) else {
+          throw BoomError.invalid("Changed receipt-bound writing parity scope.")
+        }
+      }
     }
+  }
+
+  static func decodeFixture(_ data: Data) throws -> Fixture {
+    guard data.count <= 1_048_576 else { throw BoomError.invalid("Oversized parity manifest.") }
+    let fixture = try JSONDecoder().decode(Fixture.self, from: data)
+    guard (fixture.schema == 1 && fixture.scope == "public_completed_trial_inputs_v1"
+        && fixture.sourceRun == nil)
+        || (fixture.schema == 2 && fixture.scope == "public_completed_trial_inputs_v2"
+          && fixture.sourceRun.map(validReference) == true) else {
+      throw BoomError.invalid("Unknown public parity fixture version.")
+    }
+    guard fixture.runtimeRevision == ModelPacks.runtimeRevision,
+      ForwardOperandBinding.isDigest(fixture.originatingSourceInventory), fixture.declarations.count == 2,
+      Set(fixture.declarations.map(\.kind)) == [.consultationInterior, .writingLateDivergence] else {
+      throw BoomError.invalid("Require the two registered public parity controls and exact runtime.")
+    }
+    for declaration in fixture.declarations { try validateDeclaration(declaration, schema: fixture.schema) }
     return fixture
   }
 
-  static func captured(_ reference: Reference) throws -> CapturedInput {
-    let bytes = try RegularFile(URL(fileURLWithPath: reference.path), limit: 4_194_304).data()
+  private static func referencedData(_ reference: Reference, limit: Int64) throws -> Data {
+    guard validReference(reference) else { throw BoomError.invalid("Invalid parity source reference.") }
+    let bytes = try RegularFile(URL(fileURLWithPath: reference.path), limit: limit).data()
     guard Digest.sha256(bytes) == reference.sha256 else { throw BoomError.stale("A declared public receipt changed.") }
+    return bytes
+  }
+
+  static func validateSourceRun(_ fixture: Fixture, requests: [Request]) throws -> SourceRun? {
+    guard fixture.schema == 2, let reference = fixture.sourceRun else { return nil }
+    let run = try JSONDecoder().decode(SourceRun.self, from: referencedData(reference, limit: 1_048_576))
+    guard run.joined, ["qualification_open", "passed"].contains(run.status),
+      run.runtime_revision == fixture.runtimeRevision,
+      run.source_inventory_sha256 == fixture.originatingSourceInventory else {
+      throw BoomError.invalid("Parity inputs are not bound to the declared completed source run.")
+    }
+    struct Manifest: Decodable { let identity: String; let purpose: String; let runtimeRevision: String }
+    for item in requests {
+      let writing = item.declaration.kind == .writingLateDivergence
+      guard let manifest = item.declaration.modelManifest,
+        manifest.sha256 == (writing ? run.writing_model_manifest_sha256 : run.consultation_model_manifest_sha256),
+        item.query.model == (writing ? run.writing_identity : run.consultation_identity) else {
+        throw BoomError.invalid("Source run model identity or manifest differs from its parity inputs.")
+      }
+      let declared = try JSONDecoder().decode(Manifest.self, from: referencedData(manifest, limit: 1_048_576))
+      guard declared.identity == item.query.model, declared.purpose == (writing ? "writing" : "consultation"),
+        declared.runtimeRevision == fixture.runtimeRevision else {
+        throw BoomError.invalid("Changed public parity model manifest.")
+      }
+    }
+    return run
+  }
+
+  static func captured(_ reference: Reference, schema: Int = 1) throws -> CapturedInput {
+    // Current host-operand receipts contain up to 11 MiB of bounded history metadata.
+    // Legacy manifests retain their original 4 MiB input admission.
+    let bytes = try referencedData(reference, limit: schema == 2 ? 16_777_216 : 4_194_304)
     let input = try JSONDecoder().decode(CapturedInput.self, from: bytes)
     let promptDigest = Digest.sha256(try JSONEncoder().encode(input.prepared_token_ids))
     guard input.status == "passed", !input.prepared_token_ids.isEmpty,
-      input.prepared_token_ids.count <= 4_353, !input.outputs.isEmpty,
+      input.prepared_token_ids.count <= 4_353, (1...3).contains(input.outputs.count),
       input.generation_policy.prefill == PrefillGeometry(chunking: "fixed_v1", tokenCeiling: 512),
       input.outputs.allSatisfy({ $0.prompt_tokens == input.prepared_token_ids.count
         && $0.prompt_digest == promptDigest }) else {
@@ -148,11 +262,82 @@ enum NeuralPrefixParitySmoke {
     return input
   }
 
-  static func request(_ declaration: Declaration) throws -> Request {
-    let shared = try captured(declaration.sharedSource)
-    let anchor = try declaration.anchorSource.map(captured)
-    let query = try captured(declaration.currentQuery)
-    let request = Request(declaration: declaration, shared: shared, anchor: anchor, query: query)
+  private static func validateCurrentInput(_ input: CapturedInput) throws {
+    guard (1...Int(Int32.max)).contains(input.generation_policy.vocabularySize),
+      input.prepared_token_ids.allSatisfy({ (0..<input.generation_policy.vocabularySize).contains($0) }),
+      input.outputs.allSatisfy({ (1...256).contains($0.token_ids.count)
+        && $0.token_ids.allSatisfy { (0..<input.generation_policy.vocabularySize).contains($0) } }),
+      let histories = input.output_history_evidence, histories.count == input.outputs.count,
+      let seeds = input.seeds, seeds == input.outputs.indices.map({ UInt64(42 + $0) }),
+      let cached = input.expected_cached_tokens_at_snapshot, (0..<input.prepared_token_ids.count).contains(cached)
+    else { throw BoomError.invalid("Malformed current public token, row or source history bounds.") }
+    for (row, history) in histories.enumerated() {
+      guard history.promptTokens == input.prepared_token_ids.count, history.decodeRow == row,
+        history.decodeWidth == input.outputs.count, history.blockers.isEmpty,
+        (1...1_024).contains(history.forwards.count), history.forwards.allSatisfy({ f in
+          (0...4_609).contains(f.start) && (1...4_609).contains(f.end)
+            && (1...4_609).contains(f.evaluatedEnd) && f.start < f.end && f.end <= f.evaluatedEnd
+            && (1...3).contains(f.width) && (f.width == 1 || f.row != nil)
+            && f.row.map({ (0..<f.width).contains($0) }) != false
+        }) else { throw BoomError.invalid("Unbounded or incomplete current source forward history.") }
+    }
+  }
+
+  private static func sameForward(_ f: CapturedForward, _ start: Int, _ end: Int,
+    origin: String, width: Int, row: Int? = nil) -> Bool {
+    f.start == start && f.end == end && f.evaluatedEnd == end
+      && f.origin == origin && f.width == width && f.row == row
+  }
+
+  private static func sourcePrefill(_ input: CapturedInput) throws -> [CapturedForward] {
+    guard let history = input.output_history_evidence?.first else { throw BoomError.invalid("Missing original source history.") }
+    let ranges = stride(from: 0, to: 3_584, by: 512).map { $0..<($0 + 512) } + [3_584..<4_095, 4_095..<4_096]
+    guard history.forwards.count >= ranges.count,
+      zip(history.forwards, ranges).allSatisfy({ sameForward($0.0, $0.1.lowerBound, $0.1.upperBound,
+        origin: "prefill", width: 1) }) else {
+      throw BoomError.invalid("The original fixed source prefill partitions changed.")
+    }
+    return history.forwards
+  }
+
+  private static func validateDecodeHistory(_ input: CapturedInput, shared: CapturedInput,
+    processed: Int, width: Int, row: Int) throws {
+    // processed/width/row are checked before forming ranges or indexing supplied rows.
+    guard (0...255).contains(processed), (1...3).contains(width), (0..<width).contains(row),
+      shared.outputs.count == width, shared.outputs.allSatisfy({ $0.token_ids.count >= processed }) else {
+      throw BoomError.invalid("Invalid captured decode-matrix bounds.")
+    }
+    let forwards = try sourcePrefill(input)
+    guard forwards.count >= 9 + processed else { throw BoomError.invalid("Truncated source decode history.") }
+    for position in 0..<processed {
+      let f = forwards[9 + position], start = 4096 + position
+      let matrix = shared.outputs.map { [$0.token_ids[position]] }
+      guard sameForward(f, start, start + 1, origin: width == 1 ? "singleDecode" : "batchDecode",
+          width: width, row: width == 1 ? nil : row),
+        let original = f.originalInput, original.phase == .decode,
+        original.covers(start: start, end: start + 1, evaluatedEnd: start + 1,
+          width: width, row: width == 1 ? nil : row),
+        original.tokenMatrixDigest == ForwardOperandBinding.tokenDigest(matrix),
+        original.generationActive.allSatisfy({ $0 }) else {
+        throw BoomError.invalid("The original selected row, completed decode operands or partitions changed.")
+      }
+    }
+  }
+
+  private static func validatePrefillTail(_ input: CapturedInput, after processed: Int,
+    start: Int, middle: Int, end: Int) throws {
+    guard let forwards = input.output_history_evidence?.first?.forwards,
+      forwards.count == 9 + processed + 2,
+      sameForward(forwards[9 + processed], start, middle, origin: "prefill", width: 1),
+      sameForward(forwards[10 + processed], middle, end, origin: "prefill", width: 1) else {
+      throw BoomError.invalid("The original source suffix prefill partitions changed.")
+    }
+  }
+
+  static func validateRequest(_ declaration: Declaration, schema: Int, shared: CapturedInput,
+    anchor: CapturedInput?, query: CapturedInput) throws -> Request {
+    try validateDeclaration(declaration, schema: schema)
+    let request = Request(declaration: declaration, schema: schema, shared: shared, anchor: anchor, query: query)
     guard shared.prepared_token_ids.count == 4096, shared.outputs.count == declaration.sharedWidth,
       query.outputs.count == 1, query.outputs[0].token_ids.count == 16,
       request.inputs.allSatisfy({ $0.model == shared.model && $0.settings == query.settings
@@ -160,24 +345,70 @@ enum NeuralPrefixParitySmoke {
       shared.outputs.allSatisfy({ $0.token_ids.count >= declaration.sharedDeliveredLedgerTokens }) else {
       throw BoomError.invalid("Public source, rows, policies or sampling settings changed.")
     }
+    if schema == 2 { for input in request.inputs { try validateCurrentInput(input) } }
     switch declaration.kind {
     case .consultationInterior:
       guard query.prepared_token_ids.count == 4129,
         request.inputs.allSatisfy({ $0.prompt == nil && $0.plan != nil }),
-        query.prepared_token_ids.prefix(4092).elementsEqual(shared.prepared_token_ids.prefix(4092)) else {
+        query.prepared_token_ids.prefix(declaration.cachedPrefix).elementsEqual(
+          (shared.prepared_token_ids + shared.outputs[0].token_ids).prefix(declaration.cachedPrefix)) else {
         throw BoomError.invalid("The public next-turn integer prefix is not the declared consultation.")
+      }
+      if schema == 2 {
+        guard shared.expected_cached_tokens_at_snapshot == 0,
+          query.expected_cached_tokens_at_snapshot == declaration.cachedPrefix else {
+          throw BoomError.invalid("Changed actual consultation cache selection.")
+        }
+        _ = try sourcePrefill(shared)
+        try validateDecodeHistory(query, shared: shared, processed: 16, width: 1, row: 0)
+        try validatePrefillTail(query, after: 16, start: 4112, middle: 4128, end: 4129)
       }
     case .writingLateDivergence:
       guard let anchor, anchor.prepared_token_ids.count == 4353, anchor.outputs.count == 1,
         anchor.outputs[0].token_ids.count == 16, query.prepared_token_ids.count == 4353,
         request.inputs.allSatisfy({ $0.prompt != nil && $0.plan == nil }),
-        anchor.prepared_token_ids.prefix(4181).elementsEqual(shared.prepared_token_ids
-          + Array(shared.outputs[2].token_ids.prefix(85))),
-        query.prepared_token_ids.prefix(4349).elementsEqual(anchor.prepared_token_ids.prefix(4349)) else {
+        let prefix = declaration.anchorCachedPrefix else {
+        throw BoomError.invalid("Changed public width-three source geometry.")
+      }
+      guard let row = schema == 1 ? 2 : declaration.sharedSourceRow else {
+        throw BoomError.invalid("Missing original shared row.")
+      }
+      guard anchor.prepared_token_ids.prefix(prefix).elementsEqual(shared.prepared_token_ids
+          + Array(shared.outputs[row].token_ids.prefix(declaration.sharedProcessedDecodeTokens))),
+        query.prepared_token_ids.prefix(declaration.cachedPrefix).elementsEqual(
+          anchor.prepared_token_ids.prefix(declaration.cachedPrefix)) else {
         throw BoomError.invalid("The public width-three row/late-anchor integer prefixes changed.")
+      }
+      if schema == 2 {
+        guard shared.expected_cached_tokens_at_snapshot == 4095,
+          anchor.expected_cached_tokens_at_snapshot == prefix,
+          query.expected_cached_tokens_at_snapshot == declaration.cachedPrefix else {
+          throw BoomError.invalid("Changed actual writing cache selection.")
+        }
+        _ = try sourcePrefill(shared)
+        try validateDecodeHistory(anchor, shared: shared,
+          processed: declaration.sharedProcessedDecodeTokens, width: 3, row: row)
+        try validatePrefillTail(anchor, after: declaration.sharedProcessedDecodeTokens,
+          start: prefix, middle: 4352, end: 4353)
+        if declaration.sourceStage == .sharedDecode {
+          try validateDecodeHistory(query, shared: shared,
+            processed: declaration.sourceNativeBoundary - 4096, width: 3, row: row)
+          try validatePrefillTail(query, after: declaration.sourceNativeBoundary - 4096,
+            start: declaration.sourceNativeBoundary, middle: 4352, end: 4353)
+          guard query.prepared_token_ids.prefix(declaration.cachedPrefix).elementsEqual(
+            (shared.prepared_token_ids + shared.outputs[row].token_ids).prefix(declaration.cachedPrefix)) else {
+            throw BoomError.invalid("Changed selected-row source at the actual query boundary.")
+          }
+        }
       }
     }
     return request
+  }
+
+  static func request(_ declaration: Declaration, schema: Int = 1) throws -> Request {
+    try validateRequest(declaration, schema: schema, shared: captured(declaration.sharedSource, schema: schema),
+      anchor: declaration.anchorSource.map { try captured($0, schema: schema) },
+      query: captured(declaration.currentQuery, schema: schema))
   }
 
   private static func write<T: Encodable>(_ value: T, _ name: String, _ evidence: URL) throws {
@@ -251,7 +482,7 @@ enum NeuralPrefixParitySmoke {
   private static func produce(_ input: CapturedInput, model: any LanguageModel,
     manager: PromptPrefixCache, owner: PromptCacheOwner, prefill: PrefillParameters,
     policy: ModelGenerationPolicy, expectedCached: Int, width: Int, processed: Int, delivered: Int,
-    captureAt: Int?, label: String, flag: CancellationFlag,
+    captureAt: Int?, captureRow: Int = 0, expectedSourceRow: Int? = nil, label: String, flag: CancellationFlag,
     allowSnapshot: @escaping @Sendable (UInt64) -> Bool, fence: () -> Void, evidence: URL) async throws -> Prepared {
     let parameters = GenerateParameters(maxTokens: 16, temperature: input.settings.temperature,
       topP: input.settings.topP, topK: input.settings.topK, minP: input.settings.minP,
@@ -264,11 +495,23 @@ enum NeuralPrefixParitySmoke {
     guard session.cachedTokenCount == expectedCached else {
       throw BoomError.invalid("The declared source's actual manager selection changed.")
     }
-    let prepared = try await prepare(model: model, session: session, captureAt: captureAt,
-      label: label, flag: flag, evidence: evidence)
+    if let row = expectedSourceRow {
+      let originalBatch = session.observation.cachedForwardHistory.filter { $0.origin == .batchDecode }
+      guard !originalBatch.isEmpty, originalBatch.allSatisfy({ $0.row == row && $0.batchWidth == 3 }) else {
+        throw BoomError.invalid("The actual manager selected a different original batch row.")
+      }
+    }
+    let decodeCapture = captureAt.map { $0 > input.prepared_token_ids.count } == true
+    let prepared = try await prepare(model: model, session: session,
+      captureAt: decodeCapture ? nil : captureAt, label: label, flag: flag, evidence: evidence)
+    var snapshot = prepared.snapshot
+    guard (1...3).contains(width), (0...255).contains(processed), (1...256).contains(delivered),
+      (0..<width).contains(captureRow), input.outputs.count == width,
+      processed <= delivered, width == 1 || processed < delivered else {
+      throw BoomError.invalid("Invalid public teacher-forced ledger dimensions.")
+    }
     let ledgers = input.outputs.map { Array($0.token_ids.prefix(delivered)) }
-    guard ledgers.count == width, processed <= delivered, width == 1 || processed < delivered,
-      ledgers.allSatisfy({ $0.count == delivered && $0.allSatisfy { !policy.controlTokenIDs.contains($0)
+    guard ledgers.allSatisfy({ $0.count == delivered && $0.allSatisfy { !policy.controlTokenIDs.contains($0)
         && $0 >= 0 && $0 < policy.vocabularySize } }) else {
       throw BoomError.invalid("Invalid public teacher-forced ledger bounds.")
     }
@@ -302,6 +545,18 @@ enum NeuralPrefixParitySmoke {
       eval(output.logits); session.markCacheSubmitted()
       session.observeReadySpill(); await session.joinPendingSpill(cancelled: false)
       processedMatrices.append(column)
+      let absolute = input.prepared_token_ids.count + position + 1
+      if captureAt == absolute {
+        // This exact forward has submitted AND completed all owning cache layers.
+        // No iterator lookahead, delivered-only token or synthetic ring rewind.
+        let captured = try NativePrefixParityProbe.captureNative(nativeBases(session.cache),
+          evaluatedPrefix: absolute, selectedRow: captureRow)
+        snapshot = captured
+        try write(captured.source, label + "-native-source.json", evidence)
+      }
+    }
+    guard captureAt == nil || snapshot != nil else {
+      throw BoomError.invalid("The declared native capture was not an actual completed producer boundary.")
     }
     if width > 1 {
       for row in 0 ..< width {
@@ -317,6 +572,8 @@ enum NeuralPrefixParitySmoke {
     })
     try object(["method": "teacher_force_exact_public_receipt_ledger",
       "original_receipt_emitted_counts": input.outputs.map { $0.token_ids.count },
+      "original_receipt_stop_reasons": input.outputs.map(\.stop_reason),
+      "original_receipt_stop_token_ids": input.outputs.map { $0.stop_token_id.map { $0 as Any } ?? NSNull() },
       "declared_supplied_ledger_counts": ledgers.map(\.count),
       "processed_decode_positions": processed, "processed_row_matrix": processedMatrices,
       "unprocessed_supplied_ledger_suffixes": ledgers.map { Array($0.dropFirst(processed)) },
@@ -326,7 +583,7 @@ enum NeuralPrefixParitySmoke {
       "source_is_autonomous_generation": false], label + "-producer.json", evidence)
     try write(manager.retainedSnapshotObservations, label + "-manager-snapshots.json", evidence)
     guard published else { throw BoomError.invalid("The bounded normal manager did not retain the declared source.") }
-    return prepared
+    return Prepared(session: session, logits: prepared.logits, snapshot: snapshot, ranges: prepared.ranges)
   }
 
   private static func naturalSamples(model: any LanguageModel, cache: [any KVCache], logits initial: MLXArray,
@@ -419,22 +676,28 @@ enum NeuralPrefixParitySmoke {
     flag: CancellationFlag, allowSnapshot: @escaping @Sendable (UInt64) -> Bool, fence: () -> Void,
     evidence: URL) async throws -> CaseSummary {
     let d = request.declaration
+    try validateDeclaration(d, schema: request.schema)
     let owner = PromptCacheOwner(namespace: d.namespace, entity: d.namespace,
       route: d.kind == .consultationInterior ? .consultation : .writing)
+    let sharedCapture = request.schema == 1 ? d.kind == .consultationInterior : d.sourceStage == .sharedDecode
     let shared = try await produce(request.shared, model: model, manager: manager, owner: owner,
       prefill: prefill, policy: policy, expectedCached: 0, width: d.sharedWidth,
       processed: d.sharedProcessedDecodeTokens, delivered: d.sharedDeliveredLedgerTokens,
-      captureAt: d.kind == .consultationInterior ? d.sourceNativeBoundary : nil,
+      captureAt: sharedCapture ? d.sourceNativeBoundary : nil,
+      captureRow: request.schema == 2 && sharedCapture ? (d.sharedSourceRow ?? 0) : 0,
       label: "shared-source", flag: flag, allowSnapshot: allowSnapshot, fence: fence, evidence: evidence)
     let anchor: Prepared?
     if let input = request.anchor {
       guard let cached = d.anchorCachedPrefix else { throw BoomError.invalid("Missing declared anchor admission.") }
       anchor = try await produce(input, model: model, manager: manager, owner: owner, prefill: prefill,
         policy: policy, expectedCached: cached, width: 1, processed: 16, delivered: 16,
-        captureAt: d.sourceNativeBoundary, label: "late-anchor", flag: flag,
+        captureAt: sharedCapture ? nil : d.sourceNativeBoundary,
+        expectedSourceRow: request.schema == 2 ? d.sharedSourceRow : nil,
+        label: "late-anchor", flag: flag,
         allowSnapshot: allowSnapshot, fence: fence, evidence: evidence)
     } else { anchor = nil }
-    guard let sourceSnapshot = (anchor ?? shared).snapshot else { throw BoomError.invalid("Original native source was not captured.") }
+    let capturedSource: Prepared? = sharedCapture ? shared : anchor
+    guard let sourceSnapshot = capturedSource?.snapshot else { throw BoomError.invalid("Original native source was not captured.") }
     // Hold both original producer sessions, source tensors and model lease until
     // after all comparisons; snapshots are bounded to these declared cases.
     defer { withExtendedLifetime((shared, anchor)) {} }
@@ -465,6 +728,12 @@ enum NeuralPrefixParitySmoke {
       useActiveNative: true, outputTokens: 16, batchWidth: 1, makeCache: { try model.newCache(parameters: parameters) })
     defer { withExtendedLifetime((warm, coldPrepared)) {} }
     try write(warm.observation, "actual-warm-lookup.json", evidence)
+    if request.schema == 2, d.kind == .writingLateDivergence, let row = d.sharedSourceRow {
+      let originalBatch = warm.observation.cachedForwardHistory.filter { $0.origin == .batchDecode }
+      guard !originalBatch.isEmpty, originalBatch.allSatisfy({ $0.row == row && $0.batchWidth == 3 }) else {
+        throw BoomError.invalid("The warm query selected a different original decoded row.")
+      }
+    }
     guard warm.cachedTokenCount == d.cachedPrefix,
       warm.fullPromptTokenCount - warm.cachedTokenCount == d.warmSuffixPartitions.reduce(0, +) else {
       throw BoomError.invalid("The actual bounded manager did not select the declared parity prefix.")
@@ -481,6 +750,8 @@ enum NeuralPrefixParitySmoke {
       "comparison_B": "retained_original_native_history_vs_independently_cold_full_current_query_native_history",
       "warm_suffix_partitions": ranges, "source_native_boundary": d.sourceNativeBoundary,
       "cold_native_boundary": d.coldNativeBoundary, "prefix": d.cachedPrefix,
+      "fixture_schema": request.schema, "source_stage": d.sourceStage?.rawValue ?? "legacy_prefill",
+      "original_shared_row": d.sharedSourceRow.map { $0 as Any } ?? NSNull(),
       "same_integer_prefix_proved": true, "unavailable_oracle_fallback": false,
       "full_query_cold_history_is_primary": true, "historical_native_tensors_recreated_from_receipts": false],
       "comparison-scope.json", evidence)
@@ -554,7 +825,12 @@ enum NeuralPrefixParitySmoke {
     let observation = MemoryObservation(); defer { observation.stop() }
     do {
       let bytes = try RegularFile(fixtureURL, limit: 1_048_576).data()
-      let fixture = try decodeFixture(bytes), requests = try fixture.declarations.map(request)
+      let fixture = try decodeFixture(bytes)
+      let requests = try fixture.declarations.map { try request($0, schema: fixture.schema) }
+      let sourceRun = try validateSourceRun(fixture, requests: requests)
+      receipt["fixture_schema"] = fixture.schema
+      receipt["source_run_sha256"] = fixture.sourceRun?.sha256
+      receipt["source_run_status"] = sourceRun?.status
       receipt["fixture_sha256"] = Digest.sha256(bytes)
       receipt["originating_source_inventory"] = fixture.originatingSourceInventory
       let budget = min(try ModelResidency.budget(), UInt64(24) << 30)
@@ -563,6 +839,13 @@ enum NeuralPrefixParitySmoke {
       for (name, admission, purpose) in [("writing", wa, ModelPurpose.writing),
         ("consultation", ca, ModelPurpose.consultation)] {
         let manifest = try ModelPacks.evidenceManifest(admission, purpose: purpose)
+        if fixture.schema == 2 {
+          let kind: Kind = purpose == .writing ? .writingLateDivergence : .consultationInterior
+          guard let declared = requests.first(where: { $0.declaration.kind == kind })?.declaration.modelManifest,
+            Digest.sha256(manifest) == declared.sha256 else {
+            throw BoomError.stale("The actual admitted model differs from the source receipt's exact manifest.")
+          }
+        }
         try manifest.write(to: evidence.appendingPathComponent(name + "-model-manifest.json"))
         receipt[name + "_model_manifest_sha256"] = Digest.sha256(manifest)
       }
