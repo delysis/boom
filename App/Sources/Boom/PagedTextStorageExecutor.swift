@@ -77,7 +77,14 @@ final class PagedTextStorageExecutor: @unchecked Sendable {
         self.finished(priority)
         continuation.resume(with: result)
       }
+      var refusal: String?
       let result = state.withLock { s -> (Bool, Bool) in
+        var admitted = false
+        defer {
+          if !admitted {
+            refusal = "Source queue is full or closing. Priority: \(priority); closing: \(s.closing); queued: \(s.jobs.count); foreground: \(s.foreground); background: \(s.background); cleanup: \(s.cleanup); lifecycle: \(s.lifecycle)."
+          }
+        }
         guard (!s.closing || priority == .cleanup || priority == .lifecycle), s.jobs.count < 64 else { return (false, false) }
         switch priority {
         case .foreground: guard s.foreground < 32 else { return (false, false) }; s.foreground += 1
@@ -85,11 +92,12 @@ final class PagedTextStorageExecutor: @unchecked Sendable {
         case .cleanup: guard s.cleanup < 16 else { return (false, false) }; s.cleanup += 1
         case .lifecycle: guard s.lifecycle < 1 else { return (false, false) }; s.lifecycle += 1
         }
+        admitted = true
         s.jobs.append(job)
         if s.draining { return (true, false) }
         s.draining = true; return (true, true)
       }
-      if !result.0 { continuation.resume(throwing: BoomError.unavailable("Source queue is full or closing.")) }
+      if !result.0 { continuation.resume(throwing: BoomError.unavailable(refusal ?? "Source queue admission failed.")) }
       else if result.1 { queue.async { self.drain() } }
     }
   }
