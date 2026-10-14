@@ -62,10 +62,16 @@ final class PagedTextColdReclamationTests: XCTestCase {
       let files = try PagedTextFileStore(root: store.root, ownerID: identity.ownerID, storeID: identity.storeID, queue: queue)
       let pages = try files.documentPages(id), historyStore = try PagedRootHistoryStore(pages: pages)
       let cursor = PagedSealedCursor(byteOffset: 0, utf16Offset: 0)
-      var history = try PagedRootHistory(revision: savedRevisions[0], cursor: cursor)
-      let retained = manyHistory ? Array(savedRevisions.dropFirst()) : Array(savedRevisions[1...2])
-      for revision in retained { try history.record(revision, cursor: cursor, beforeCursor: cursor, groupID: UUID()) }
-      _ = try history.stepUndo(expected: retained.last!)
+      // Materialize the exact saved projection directly. Foundation owns
+      // history movement; the persistence value has no second Undo machine.
+      let last = manyHistory ? savedRevisions.count - 1 : 2
+      let firstRetained = max(0, last - PagedRootHistory.maximumEntries)
+      let undo = (firstRetained..<(last - 1)).map {
+        PagedRootHistoryEntry(revision: savedRevisions[$0], cursor: cursor, groupID: UUID())
+      }
+      let history = try PagedRootHistory(materializedCurrent: savedRevisions[last - 1], cursor: cursor,
+        undo: undo, redo: [PagedRootHistoryEntry(revision: savedRevisions[last], cursor: cursor, groupID: UUID())],
+        activeGroup: nil, generation: UInt64(last + 1))
       let current = try historyStore.writeNew(history, document: PagedDocumentDescriptor(id: id, title: "Public", revision: history.current))
       try files.publishDocument(current, expected: first)
       func captured(_ revision: PagedTextRevision, _ window: PagedTextWindow) throws -> BoundedDocumentCapture {

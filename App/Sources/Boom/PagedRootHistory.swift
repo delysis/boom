@@ -62,12 +62,12 @@ struct PagedRootHistory: Codable, Equatable, Sendable {
   let purpose: String
   let ownerID: UUID
   let documentID: UUID
-  private(set) var generation: UInt64
-  private(set) var current: PagedTextRevision
-  private(set) var currentCursor: PagedSealedCursor
-  private(set) var undo: [PagedRootHistoryEntry]
-  private(set) var redo: [PagedRootHistoryEntry]
-  private(set) var activeGroup: UUID?
+  let generation: UInt64
+  let current: PagedTextRevision
+  let currentCursor: PagedSealedCursor
+  let undo: [PagedRootHistoryEntry]
+  let redo: [PagedRootHistoryEntry]
+  let activeGroup: UUID?
 
   init(revision: PagedTextRevision, cursor: PagedSealedCursor) throws {
     try revision.validate(); try cursor.validate(in: revision)
@@ -106,71 +106,11 @@ struct PagedRootHistory: Codable, Equatable, Sendable {
     }
     return data
   }
-  /// A new group's before cursor comes from its admitted native selection,
-  /// rather than a persisted endpoint from a previous, unrelated edit.
-  mutating func record(_ after: PagedTextRevision, cursor: PagedSealedCursor,
-    beforeCursor: PagedSealedCursor, groupID: UUID) throws {
-    try admit(after); try cursor.validate(in: after); try beforeCursor.validate(in: current)
-    let next = try nextGeneration()
-    // A joined native batch can have no net source change. Its head/history
-    // epoch still advances, preventing an old full-record CAS from succeeding
-    // after that accepted batch. It creates no empty Undo group.
-    if after == current { currentCursor = cursor; generation = next; return }
-    if activeGroup != groupID {
-      undo.append(PagedRootHistoryEntry(revision: current, cursor: beforeCursor, groupID: groupID))
-    }
-    redo.removeAll(keepingCapacity: true)
-    if undo.count > Self.maximumEntries { undo.removeFirst(undo.count - Self.maximumEntries) }
-    current = after; currentCursor = cursor; generation = next; activeGroup = groupID
-  }
-  /// Genuine transient native edits can end at the same bytes. They invalidate
-  /// older full-record captures without replacing source or retained history.
-  mutating func advanceNativeEpoch(cursor: PagedSealedCursor) throws {
-    try cursor.validate(in: current)
-    let next = try nextGeneration()
-    currentCursor = cursor; generation = next
-  }
-  mutating func stepUndo(expected: PagedTextRevision) throws -> PagedTextRevision {
-    try validate(expected: expected)
-    guard let previous = undo.last else { throw BoomError.unavailable("No retained root to undo.") }
-    let next = try nextGeneration()
-    _ = undo.removeLast()
-    redo.append(PagedRootHistoryEntry(revision: current, cursor: currentCursor, groupID: previous.groupID))
-    current = previous.revision; currentCursor = previous.cursor
-    generation = next; activeGroup = nil
-    return current
-  }
-  mutating func stepRedo(expected: PagedTextRevision) throws -> PagedTextRevision {
-    try validate(expected: expected)
-    guard let following = redo.last else { throw BoomError.unavailable("No retained root to redo.") }
-    let next = try nextGeneration()
-    _ = redo.removeLast()
-    undo.append(PagedRootHistoryEntry(revision: current, cursor: currentCursor, groupID: following.groupID))
-    current = following.revision; currentCursor = following.cursor
-    generation = next; activeGroup = nil
-    return current
-  }
-  /// Used only when >100 distinct accepted native groups were queued before a
-  /// seal. It advances to the bounded checkpoint preceding the oldest retained
-  /// native group; the next 100 group roots rebuild that same UI history. This
-  /// does not remove disk recipe/receipt pins or authorize their collection.
-  mutating func advanceExpiredNativeGroups(to baseline: PagedTextRevision,
-    cursor: PagedSealedCursor) throws {
-    try admit(baseline); try cursor.validate(in: baseline)
-    let next = try nextGeneration()
-    current = baseline; currentCursor = cursor; undo.removeAll(keepingCapacity: true)
-    redo.removeAll(keepingCapacity: true); activeGroup = nil; generation = next
-  }
   private func admit(_ revision: PagedTextRevision) throws {
     try revision.validate()
     guard revision.ownerID == ownerID, revision.documentID == documentID else {
       throw BoomError.denied("Root history crosses private document ownership.")
     }
-  }
-  private func nextGeneration() throws -> UInt64 {
-    let next = generation.addingReportingOverflow(1)
-    guard !next.overflow else { throw BoomError.budget("Root history generation is exhausted.") }
-    return next.partialValue
   }
 }
 
