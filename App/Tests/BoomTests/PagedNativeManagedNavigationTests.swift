@@ -427,6 +427,33 @@ import XCTest
       XCTAssertNil(commands.firstFailure); XCTAssertNil(f.input!.firstRefusal); XCTAssertTrue(commands.manager === manager)
       // The requested navigation mounts first, then genuine Undo restores its own seed.
       XCTAssertEqual(f.mounts.count, 2); XCTAssertEqual(f.session!.generation, 3)
+      // A later genuine read owns the chronological menu command and two
+      // physical keys. Select All changes selection without a mount; the first
+      // key then replaces the global range through a real resident mount.
+      let beforeGlobal = "z" + f.originalText
+      let nextHold = try await f.route!.holdNext(.windowAfter)
+      let nextNavigation = try f.startNavigation(anchor: 36_000, caret: 40_000)
+      try await f.route!.awaitHeld(nextHold)
+      let queuedView = f.view, generation = f.session!.generation
+      queuedView.selectAll(nil)
+      queuedView.keyDown(with: try f.key())
+      let q = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+        windowNumber: f.window!.windowNumber, context: nil, characters: "q", charactersIgnoringModifiers: "q",
+        isARepeat: false, keyCode: 12))
+      queuedView.keyDown(with: q)
+      XCTAssertEqual(commands.queuedRawKeyCount, 2)
+      XCTAssertEqual(f.session!.generation, generation)
+      try await f.route!.release(nextHold); _ = try await nextNavigation.value
+      try await commands.joinPendingCommand(); try await f.assertSource("zq")
+      XCTAssertEqual(commands.queuedRawKeyCount, 0); XCTAssertEqual(commands.retainedRefusedInputCount, 0)
+      XCTAssertEqual(commands.unretainedRawKeyCount, 0)
+      XCTAssertNil(commands.firstFailure); XCTAssertNil(f.input!.firstRefusal)
+      XCTAssertTrue(commands.manager === manager)
+      manager.undo(); try await commands.joinPendingCommand(); try await f.assertSource(beforeGlobal)
+      let restored = try f.input!.currentDocumentSelection()
+      XCTAssertEqual(restored.utf16Offset, 0); XCTAssertEqual(restored.utf16Length, UInt64(beforeGlobal.utf16.count))
+      XCTAssertTrue(restored.focusAtEnd)
+      manager.redo(); try await commands.joinPendingCommand(); try await f.assertSource("zq")
     }
   }
   func testRequestedScalarInteriorCannotAdoptNewViewOrChangeCanonicalSource() async throws {
@@ -863,6 +890,8 @@ import XCTest
       XCTAssertEqual(commands.queuedRawKeyCount, 0); XCTAssertEqual(commands.unretainedRawKeyCount, 0)
       XCTAssertNil(commands.firstFailure); XCTAssertNil(input.firstRefusal)
       XCTAssertLessThanOrEqual(f.view.boundedStorage.string.utf8.count, PagedWorkingWindow.hardBytes)
+      XCTAssertLessThanOrEqual(source.logicalWindow.summary.bytes, UInt64(PagedWorkingWindow.hardBytes))
+      XCTAssertEqual(commands.retainedRefusedInputCount, 0)
       let record = source.sealedRevision
       oldClient.insertText("OLD", replacementRange: NSRange(location: 0, length: 0))
       XCTAssertEqual(source.sealedRevision, record); XCTAssertTrue(oldClient.isRetired)

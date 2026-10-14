@@ -469,6 +469,7 @@ import Foundation
       firstFailure == nil,
       let view = input.activeView, view.inputCommandIsClosed, !view.hasMarkedText() else { return }
     do {
+      if queue.isEmpty { try finishOrderedInput(); return }
       if case .rawKey? = queue.first {
         try replayOriginalKeys()
         if case .rawKey? = queue.first { resumeQueuedInput(); return }
@@ -495,7 +496,10 @@ import Foundation
             suffix: suffix, toggles: toggles, actionName: name)
         }
         queue.removeFirst(); rawKeyBytes -= command.chargedBytes
-        if phase == .idle { resumeQueuedInput() }
+        if phase == .idle {
+          try finishOrderedInput(after: command.replayLease)
+          resumeQueuedInput()
+        }
         return
       }
       guard case .history(let request)? = queue.first else { return }
@@ -672,6 +676,28 @@ import Foundation
     replayObservation = try input.observeSelection()
   }
 
+  /// Only a just-delivered chronological command/key supplies this lease.
+  /// Its real mount rebases later input; a neutral command must retain exact
+  /// physical focus/keyboard ownership before advancing selection observation.
+  private func finishOrderedInput(after delivered: PagedNativeReplayInputLease? = nil) throws {
+    if let delivered, !queue.isEmpty {
+      if input.activeIdentity != delivered.identity {
+        try transferRawInputAfterMount()
+      } else {
+        guard let view = input.activeView, try input.inputLease(for: view) == delivered else {
+          throw BoomError.stale("Delivered ordered input lost its original physical focus or keyboard.")
+        }
+      }
+      replayObservation = try input.observeSelection()
+    } else if queue.isEmpty { replayObservation = nil }
+    // The final replay closes before trimming. An entered reader/task or IME
+    // still owns its join; ordinary file saving is unrelated to this local trim.
+    guard phase == .idle, queue.isEmpty, commandTask == nil,
+      navigationTask == nil, capturedEditTask == nil, !input.session.isPinned,
+      input.session.activeNavigationOperationCount == 0 else { return }
+    try input.recenterResidentWindowIfNeeded()
+  }
+
   /// Existing selection/focus ingress may call this after its real epoch
   /// advances. Cancellation retains the entered Task until its read joins.
   func inputSelectionDidChange() {
@@ -734,7 +760,8 @@ import Foundation
       if let error = view.boundedStorage.mutationFailure { throw error }
       if currentRawKeyAwaitingSource { return }
       queue.removeFirst(); queuedRawKeyCount -= 1; rawKeyBytes -= key.chargedBytes
-      replayObservation = try input.observeSelection()
+      if phase == .idle { try finishOrderedInput(after: key.replayLease) }
+      else { replayObservation = try input.observeSelection() }
       delivered += 1
       if hasPendingCommand && (navigationTask != nil || capturedEditTask != nil) { return }
     }
@@ -1029,7 +1056,7 @@ import Foundation
       return
     }
     let selected = try input.currentDocumentSelection()
-    _ = try beginLogicalEdit(actionName: "Format", reportFailure: true) { [self] in
+    _ = try beginLogicalEdit(actionName: "Format", reportFailure: true, related: replayingRawKeys) { [self] in
       try await input.session.prepareLogicalLinePrefix(selection: selected, prefix: prefix, owner: input)
     }
   }
@@ -1045,7 +1072,7 @@ import Foundation
         chargedBytes: prefix.utf8.count + suffix.utf8.count + actionName.utf8.count + 512)
       return
     }
-    _ = try beginLogicalEdit(actionName: actionName, reportFailure: true) { [self] in
+    _ = try beginLogicalEdit(actionName: actionName, reportFailure: true, related: replayingRawKeys) { [self] in
       try await input.session.prepareLogicalWrapping(selection: selected,
         prefix: prefix, suffix: suffix, toggles: toggles, owner: input)
     }
