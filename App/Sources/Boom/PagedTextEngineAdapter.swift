@@ -586,7 +586,12 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
       try cancellation.check()
       let end = at + min(65_536, range.upperBound - at)
       let bytes = try await logicalBytes(snapshot, byteRange: at..<end, cancellation: cancellation)
-      try await detachedWork { try cancellation.check(); try file.write(contentsOf: bytes) }
+      try await detachedWork {
+        try autoreleasepool {
+          try cancellation.check()
+          try file.write(contentsOf: bytes)
+        }
+      }
       at = end; await Task.yield()
     }
     try cancellation.check()
