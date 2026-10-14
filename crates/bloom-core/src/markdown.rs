@@ -1,6 +1,6 @@
 //! Source-preserving CommonMark styling, shared by native editors and readers.
 use super::{Error, TEXT_LIMIT, require};
-use pulldown_cmark::{Event, Options, Parser, Tag};
+use pulldown_cmark::{BrokenLinkCallback, Event, Options, Parser, Tag};
 use serde::Serialize;
 use std::ops::Range;
 use uuid::Uuid;
@@ -16,7 +16,7 @@ fn byte_to_utf16_offsets(text: &str) -> Vec<usize> {
     offsets
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct MediaSpan {
     pub id: Uuid,
     pub location: usize,
@@ -27,9 +27,29 @@ pub struct MediaSpan {
 /// remote URLs remain prose; the original UTF-16 positions never change.
 pub fn media_spans(text: &str) -> Result<Vec<MediaSpan>, Error> {
     require(text.len() <= TEXT_LIMIT, "Markdown exceeds 2 MiB.")?;
+    media_from_parser(text, Parser::new(text))
+}
+fn media_from_parser<'a, F: BrokenLinkCallback<'a>>(
+    text: &'a str,
+    parser: Parser<'a, F>,
+) -> Result<Vec<MediaSpan>, Error> {
+    media_from_parser_cancelled(text, parser, &mut || false)
+}
+fn media_from_parser_cancelled<'a, F: BrokenLinkCallback<'a>>(
+    text: &'a str,
+    parser: Parser<'a, F>,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<MediaSpan>, Error> {
     let mut offsets = None;
     let mut result = Vec::new();
-    for (event, range) in Parser::new(text).into_offset_iter() {
+    let mut parser = parser.into_offset_iter();
+    loop {
+        let Some((event, range)) = parser
+            .next_with_check(cancelled)
+            .map_err(|_| Error("Paged Markdown projection was cancelled.".into()))?
+        else {
+            break;
+        };
         let Event::Start(Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. }) = event else {
             continue;
         };
@@ -56,7 +76,7 @@ pub fn media_spans(text: &str) -> Result<Vec<MediaSpan>, Error> {
     Ok(result)
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Span {
     kind: &'static str,
     location: usize,
@@ -66,6 +86,26 @@ pub struct Span {
 
 pub fn spans(text: &str) -> Result<Vec<Span>, Error> {
     require(text.len() <= TEXT_LIMIT, "Markdown exceeds 2 MiB.")?;
+    spans_from_parser(
+        text,
+        Parser::new_ext(
+            text,
+            Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS,
+        ),
+    )
+}
+fn spans_from_parser<'a, F: BrokenLinkCallback<'a>>(
+    text: &'a str,
+    parser: Parser<'a, F>,
+) -> Result<Vec<Span>, Error> {
+    spans_from_parser_cancelled(text, parser, &mut || false, false)
+}
+fn spans_from_parser_cancelled<'a, F: BrokenLinkCallback<'a>>(
+    text: &'a str,
+    parser: Parser<'a, F>,
+    cancelled: &mut impl FnMut() -> bool,
+    include_html: bool,
+) -> Result<Vec<Span>, Error> {
     let mut offsets = None;
     let mut result = Vec::new();
     let mut add = |kind, range: Range<usize>, level| {
@@ -79,12 +119,14 @@ pub fn spans(text: &str) -> Result<Vec<Span>, Error> {
             });
         }
     };
-    for (event, range) in Parser::new_ext(
-        text,
-        Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS,
-    )
-    .into_offset_iter()
-    {
+    let mut parser = parser.into_offset_iter();
+    loop {
+        let Some((event, range)) = parser
+            .next_with_check(cancelled)
+            .map_err(|_| Error("Paged Markdown projection was cancelled.".into()))?
+        else {
+            break;
+        };
         let source = &text[range.clone()];
         match event {
             Event::Start(tag) => {
@@ -127,6 +169,9 @@ pub fn spans(text: &str) -> Result<Vec<Span>, Error> {
                     add("syntax", range.start + end..range.end, 0);
                 }
             }
+            Event::Html(_) if include_html => {
+                add("literal", range, 0);
+            }
             Event::Code(_) => {
                 add("code", range.clone(), 0);
                 let ticks = source.len() - source.trim_start_matches('`').len();
@@ -142,6 +187,192 @@ pub fn spans(text: &str) -> Result<Vec<Span>, Error> {
         result.len() < 20_000,
         "Markdown styling exceeds 20000 spans.",
     )?;
+    Ok(result)
+}
+
+/// The range belongs to the exact logical window in the captured context.
+/// Unknown blocks stay literal; independent completed blocks may render before
+/// global EOF without acquiring any proof about unsearched references.
+pub fn paged_spans(context: &bloom_text::MarkupContext) -> Result<Vec<Span>, Error> {
+    paged_spans_with_cancel(context, &mut || false)
+}
+pub fn paged_spans_with_cancel(
+    context: &bloom_text::MarkupContext,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<Span>, Error> {
+    require(
+        context.mode == bloom_text::MarkupMode::Style,
+        "Styling context has different parser options.",
+    )?;
+    let mut result = Vec::new();
+    for (range, level) in &context.inline_headings {
+        require(!cancelled(), "Paged Markdown projection was cancelled.")?;
+        let first = range.start.max(context.window_start.utf16);
+        let last = range.end.min(context.window_end.utf16);
+        if first >= last {
+            continue;
+        }
+        require(result.len() < 20_000, "Window styling exceeds 20000 spans.")?;
+        result.push(Span {
+            kind: "heading",
+            location: usize::try_from(first - context.window_start.utf16)
+                .map_err(|_| Error("Window heading position overflow.".into()))?,
+            length: usize::try_from(last - first)
+                .map_err(|_| Error("Window heading length overflow.".into()))?,
+            level: *level,
+        });
+    }
+    for style in &context.inline_styles {
+        require(!cancelled(), "Paged Markdown projection was cancelled.")?;
+        let first = style.start.utf16.max(context.window_start.utf16);
+        let last = style.end.utf16.min(context.window_end.utf16);
+        if first >= last {
+            continue;
+        }
+        require(result.len() < 20_000, "Window styling exceeds 20000 spans.")?;
+        let kind = match style.kind {
+            pulldown_cmark::paged::InlineStyleKind::Strong => "strong",
+            pulldown_cmark::paged::InlineStyleKind::Emphasis => "emphasis",
+            pulldown_cmark::paged::InlineStyleKind::Strike => "strike",
+            pulldown_cmark::paged::InlineStyleKind::Syntax => "syntax",
+            pulldown_cmark::paged::InlineStyleKind::Code => "code",
+            pulldown_cmark::paged::InlineStyleKind::Link => "link",
+        };
+        result.push(Span {
+            kind,
+            location: usize::try_from(first - context.window_start.utf16)
+                .map_err(|_| Error("Window inline position overflow.".into()))?,
+            length: usize::try_from(last - first)
+                .map_err(|_| Error("Window inline length overflow.".into()))?,
+            level: 0,
+        });
+    }
+    for fragment in &context.fragments {
+        require(!cancelled(), "Paged Markdown projection was cancelled.")?;
+        let local = if let Some(code) = &fragment.code {
+            vec![Span {
+                kind: "code",
+                location: fragment.text[..code.start].encode_utf16().count(),
+                length: fragment.text[code.clone()].encode_utf16().count(),
+                level: 0,
+            }]
+        } else if fragment.inline_ready {
+            let definitions = context
+                .definitions_for(fragment)
+                .map_err(|error| Error(error.to_string()))?;
+            spans_from_parser_cancelled(
+                &fragment.text,
+                Parser::new_ext_with_containers(
+                    &fragment.text,
+                    context.mode.options(),
+                    &fragment.containers,
+                )
+                .with_reference_definitions(definitions)
+                .with_reference_fuel(usize::MAX),
+                cancelled,
+                true,
+            )?
+        } else {
+            Vec::new()
+        };
+        for span in local {
+            let start = fragment
+                .start
+                .utf16
+                .checked_add(span.location as u64)
+                .ok_or_else(|| Error("Paged style coordinate overflow.".into()))?;
+            let end = start
+                .checked_add(span.length as u64)
+                .ok_or_else(|| Error("Paged style extent overflow.".into()))?;
+            let first = start.max(context.window_start.utf16);
+            let last = end.min(context.window_end.utf16);
+            if first < last {
+                require(result.len() < 20_000, "Window styling exceeds 20000 spans.")?;
+                result.push(Span {
+                    kind: span.kind,
+                    location: usize::try_from(first - context.window_start.utf16)
+                        .map_err(|_| Error("Window style position overflow.".into()))?,
+                    length: usize::try_from(last - first)
+                        .map_err(|_| Error("Window style length overflow.".into()))?,
+                    level: span.level,
+                });
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Media syntax must fit entirely in this actual window and have complete
+/// block/reference context; a partial link never acquires a media capability.
+pub fn paged_media_spans(context: &bloom_text::MarkupContext) -> Result<Vec<MediaSpan>, Error> {
+    paged_media_spans_with_cancel(context, &mut || false)
+}
+pub fn paged_media_spans_with_cancel(
+    context: &bloom_text::MarkupContext,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<MediaSpan>, Error> {
+    require(
+        context.mode == bloom_text::MarkupMode::Media,
+        "Media context has different parser options.",
+    )?;
+    let mut result = Vec::new();
+    for (id, start, end) in &context.inline_media {
+        require(!cancelled(), "Paged Markdown projection was cancelled.")?;
+        require(
+            start.bytes < end.bytes && start.utf16 < end.utf16,
+            "Invalid paged media source extent.",
+        )?;
+        if start.utf16 >= context.window_start.utf16 && end.utf16 <= context.window_end.utf16 {
+            require(result.len() < 4096, "Window exceeds 4096 media references.")?;
+            result.push(MediaSpan {
+                id: *id,
+                location: usize::try_from(start.utf16 - context.window_start.utf16)
+                    .map_err(|_| Error("Window media position overflow.".into()))?,
+                length: usize::try_from(end.utf16 - start.utf16)
+                    .map_err(|_| Error("Window media extent overflow.".into()))?,
+            });
+        }
+    }
+    for fragment in &context.fragments {
+        require(!cancelled(), "Paged Markdown projection was cancelled.")?;
+        if !fragment.inline_ready {
+            continue;
+        }
+        let definitions = context
+            .definitions_for(fragment)
+            .map_err(|error| Error(error.to_string()))?;
+        let local = media_from_parser_cancelled(
+            &fragment.text,
+            Parser::new_ext_with_containers(
+                &fragment.text,
+                context.mode.options(),
+                &fragment.containers,
+            )
+            .with_reference_definitions(definitions)
+            .with_reference_fuel(usize::MAX),
+            cancelled,
+        )?;
+        for span in local {
+            let start = fragment
+                .start
+                .utf16
+                .checked_add(span.location as u64)
+                .ok_or_else(|| Error("Paged media coordinate overflow.".into()))?;
+            let end = start
+                .checked_add(span.length as u64)
+                .ok_or_else(|| Error("Paged media extent overflow.".into()))?;
+            if start >= context.window_start.utf16 && end <= context.window_end.utf16 {
+                require(result.len() < 4096, "Window exceeds 4096 media references.")?;
+                result.push(MediaSpan {
+                    id: span.id,
+                    location: usize::try_from(start - context.window_start.utf16)
+                        .map_err(|_| Error("Window media position overflow.".into()))?,
+                    length: span.length,
+                });
+            }
+        }
+    }
+    result.sort_by_key(|span| span.location);
     Ok(result)
 }
 
@@ -213,3 +444,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "markdown_paged_tests.rs"]
+mod paged_controls;

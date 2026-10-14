@@ -20,6 +20,19 @@ import Foundation
   private var scrollSnapshot: PagedNativeLogicalReadSnapshot?
   private var scrollTask: Task<Void, Never>?
   private var scrollReadCancellation: CancellationFlag?
+  private struct MarkupRequest: Sendable {
+    let window: PagedNativeLogicalWindow
+    let source: PagedNativeLogicalReadSnapshot
+    let view: NativeMediaTextView
+    let version: UUID
+  }
+  private var requestedMarkup: MarkupRequest?
+  private var markupTask: Task<Void, Never>?
+  private var markupCancellation: CancellationFlag?
+  private var activeMarkupRequest: MarkupRequest?
+  private var deliveredMarkup: PagedNativeMarkupProjection?
+  private var markupScheduled = false
+  private(set) var markupFailure: Error?
   private var requestedScroll: (id: UUID, anchor: UInt64)?
   private var displayRequest = UUID()
   private var scrollSurface: PagedScrollSurface?
@@ -48,6 +61,7 @@ import Foundation
   private var handedOffMouseDown: NSEvent?
   private(set) var presentationFailure: Error?
   var visibleScrollWindow: PagedNativeLogicalWindow? { showingScroll ? scrollProjection : nil }
+  var visibleScrollMarkup: ProductCore.MarkupProjection? { showingScroll ? scrollText?.markupProjection : nil }
   var residentScrollWindowCount: Int { scrollProjection == nil ? 0 : 1 }
   var isMouseAutoscrolling: Bool { mouseAutoscrollTimer?.isValid == true }
   var hasPendingPresentationRead: Bool { scrollTask != nil }
@@ -118,6 +132,15 @@ import Foundation
     let ownsFocus = sourceWindow?.firstResponder === old
     textView = new; self.sourceWindow = nil; coordinates = nil; preview = nil
     if documentView !== new { documentView = new }
+    if let display = scrollText, let projection = display.currentDerivedMarkup(for: input.session.logicalWindow) {
+      // The existing ticket installed this EXACT already-visible source
+      // window. Reuse its proved arrays and ready immutable media metrics
+      // before sizing/hit checks; no reader/save/parse await occurs at mount.
+      guard new.installDerivedMarkup(projection, for: input.session.logicalWindow,
+        sourceVersion: new.sourceVersion, readyDisplay: display.inlineMedia) else {
+        throw BoomError.stale("The adopted native window did not receive its exact displayed Markdown context.")
+      }
+    }
     configureManagedLayout(new)
     observeStorage()
     revealEditableWindow()
@@ -156,6 +179,123 @@ import Foundation
     navigationEngine = engine; navigationPublisher = publisher
     verticalScroller?.target = self; verticalScroller?.action = #selector(scrollDocument(_:))
     try updateDocumentScroller()
+    requestMarkup()
+  }
+
+  /// Source notification precedes the actual outer Cocoa close. Capture on
+  /// its following Main turn, never inside a character/adoption primitive.
+  /// New keys coalesce only derived requests; native edits are never queued.
+  private func requestMarkup() {
+    guard !markupScheduled, !closingPresentation, !presentationClosed else { return }
+    markupScheduled = true
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      self.markupScheduled = false
+      guard !self.closingPresentation, !self.presentationClosed,
+        let input = self.managedInput, self.navigationEngine != nil,
+        let native = input.activeView, native.inputCommandIsClosed,
+        !native.boundedStorage.hasOpenCharacterTransaction else { return }
+      do {
+        let captured = try input.session.captureLogicalState()
+        let window: PagedNativeLogicalWindow
+        let view: NativeMediaTextView
+        if self.showingScroll, let visible = self.scrollProjection, let scroll = self.scrollText {
+          window = visible; view = scroll
+        } else { window = input.session.logicalWindow; view = native }
+        guard window.snapshot.isSame(captured.source) else { return }
+        if let active = self.activeMarkupRequest, active.window.snapshot.rootID != window.snapshot.rootID {
+          // Stop obsolete-source indexing at its next bounded step. Its proved
+          // prefix already resides in the same two-slot convergence memo.
+          self.markupCancellation?.cancel()
+        }
+        self.requestedMarkup = MarkupRequest(window: window, source: captured, view: view, version: view.sourceVersion)
+        self.startMarkupTask()
+      } catch { self.markupFailure = error }
+    }
+  }
+  private func startMarkupTask() {
+    guard markupTask == nil, let engine = navigationEngine, let input = managedInput else { return }
+    markupTask = Task { [self] in
+      defer { markupTask = nil; markupCancellation = nil; activeMarkupRequest = nil }
+      while let request = requestedMarkup, !Task.isCancelled, !closingPresentation, !presentationClosed {
+        requestedMarkup = nil
+        let cancellation = CancellationFlag()
+        markupCancellation = cancellation
+        activeMarkupRequest = request
+        do {
+          // Pending requests retain cheap logical handles only. Seal the one
+          // current tail only when this worker actually accepts its handoff,
+          // never for every notification while an older index is running.
+          guard input.session.isCurrent(request.source) else { continue }
+          let frozen = try input.session.captureLogicalRead()
+          guard frozen.source.isSame(request.window.snapshot) else { continue }
+          let projection = try await engine.logicalMarkup(request.window, cancellation: cancellation,
+            latestWindow: { [weak self] in self?.latestMarkupWindow() }) { [weak self] mode, value in
+            guard let self, let actual = self.activeMarkupRequest else { return }
+            self.receiveMarkupMode(value, mode: mode, request: actual)
+          }
+          if let actual = activeMarkupRequest { applyMarkup(projection, request: actual) }
+        } catch {
+          if !cancellation.isCancelled, !Task.isCancelled, !closingPresentation, input.session.isCurrent(request.source) {
+            markupFailure = error
+          }
+        }
+      }
+    }
+  }
+  /// Main only: accept one latest target of the SAME source. The producer's
+  /// next joined quantum rebinds its derived query and retains its builder.
+  private func latestMarkupWindow() -> PagedNativeLogicalWindow? {
+    guard !closingPresentation, !presentationClosed, let input = managedInput,
+      let active = activeMarkupRequest else { markupCancellation?.cancel(); return nil }
+    if let requested = requestedMarkup {
+      guard requested.window.snapshot.isSame(active.window.snapshot) else {
+        markupCancellation?.cancel(); return nil
+      }
+      guard input.session.isCurrent(requested.source) else { requestedMarkup = nil; return active.window }
+      do {
+        let frozen = try input.session.captureLogicalRead()
+        guard frozen.source.isSame(requested.window.snapshot) else { markupCancellation?.cancel(); return nil }
+        activeMarkupRequest = requested; requestedMarkup = nil
+        return requested.window
+      } catch {
+        markupFailure = error; markupCancellation?.cancel(); return nil
+      }
+    }
+    guard input.session.isCurrent(active.source) else { markupCancellation?.cancel(); return nil }
+    return active.window
+  }
+  private func receiveMarkupMode(_ value: PagedNativeMarkupProjection.Mode, mode: UInt8, request: MarkupRequest) {
+    guard value.matches(request.window), mode <= 1 else { return }
+    let prior = deliveredMarkup.flatMap { $0.matches(request.window) ? $0 : nil }
+    let literal = PagedNativeMarkupProjection.Mode.literal(request.window)
+    let projection = PagedNativeMarkupProjection(style: mode == 0 ? value : (prior?.style ?? literal),
+      media: mode == 1 ? value : (prior?.media ?? literal))
+    applyMarkup(projection, request: request)
+  }
+  private func applyMarkup(_ projection: PagedNativeMarkupProjection, request: MarkupRequest) {
+    guard !Task.isCancelled, !closingPresentation, !presentationClosed, let input = managedInput,
+      input.session.isCurrent(request.source), request.view.sourceVersion == request.version,
+      projection.matches(request.window) else { return }
+    markupFailure = nil
+    if let native = request.view as? PagedNativeTextView, native === input.activeView {
+      _ = native.installDerivedMarkup(projection, for: request.window, sourceVersion: request.version)
+      deliveredMarkup = projection
+    } else if let scroll = request.view as? PagedScrollTextView, scroll === scrollText,
+      showingScroll, scrollProjection?.windowID == request.window.windowID {
+      scroll.installDerivedMarkup(projection, for: request.window, sourceVersion: request.version)
+      scroll.sizeToFit(); deliveredMarkup = projection
+    }
+  }
+  /// Explicit component/display admission only. Ordinary scrolling joins its
+  /// independent copied window and never waits for a cold annotation scan.
+  func joinMarkup() async {
+    if markupScheduled {
+      await withCheckedContinuation { continuation in
+        DispatchQueue.main.async { continuation.resume() }
+      }
+    }
+    if let task = markupTask { await task.value }
   }
 
   private func configureManagedLayout(_ view: PagedNativeTextView) {
@@ -377,6 +517,7 @@ import Foundation
     guard let surface = scrollSurface, let view = scrollText else { throw BoomError.unavailable("Bounded scroll surface could not be constructed.") }
     view.completeMarkupContext = window.start.utf16 == 0 && window.summary.utf16 == window.snapshot.summary.utf16
     view.string = window.text
+    view.setMedia(model: (textView as? NativeMediaTextView)?.inlineMedia.model)
     view.setFrameSize(NSSize(width: max(1, contentSize.width), height: max(1, contentSize.height)))
     // Share the editor's bounded paragraph metrics and wrapping. A partial
     // source remains explicitly partial; it is never parsed as a full file.
@@ -399,6 +540,7 @@ import Foundation
       surface.reflectScrolledClipView(surface.contentView)
     }
     try updateDocumentScroller()
+    requestMarkup()
   }
   private func selectScrollPoint(_ event: NSEvent) {
     do {
@@ -890,8 +1032,11 @@ import Foundation
     stopMouseSelection()
     displayRequest = UUID(); requestedScroll = nil; hideScrollSurface()
     scrollReadCancellation?.cancel()
+    requestedMarkup = nil; markupCancellation?.cancel(); markupTask?.cancel()
     if let task = scrollTask { await task.value }
+    if let task = markupTask { await task.value }
     scrollProjection = nil; scrollSnapshot = nil
+    deliveredMarkup = nil
     presentationClosed = true
     if let native = textView as? PagedNativeTextView, native.documentViewport === self { native.documentViewport = nil }
     scrollSurface?.removeFromSuperview(); scrollSurface = nil; scrollText = nil
@@ -969,24 +1114,46 @@ import Foundation
       NotificationCenter.default.addObserver(self, selector: #selector(storageChanged(_:)),
         name: NSTextStorage.didProcessEditingNotification, object: storage)
     }
+    requestMarkup()
   }
   @objc private func storageChanged(_ notification: Notification) {
     guard let storage = notification.object as? NSTextStorage, storage === observedStorage,
       storage.editedMask.contains(.editedCharacters) else { return }
     characterVersion = UUID()
     if managedInput != nil { revealEditableWindow() }
+    requestMarkup()
   }
 }
 
 /// Physical read-only presentation never becomes the keyboard source. Its
 /// mouse point is interpreted only against its retained immutable window.
 @MainActor private final class PagedScrollTextView: MarkdownTextView {
+  private var derivedMarkup: (version: UUID, windowID: UUID, value: PagedNativeMarkupProjection)?
+  var completeMarkupContext = false
+  override var hasCompleteMarkupContext: Bool { completeMarkupContext }
+  override var markupProjection: ProductCore.MarkupProjection {
+    if let derivedMarkup, derivedMarkup.version == sourceVersion {
+      return derivedMarkup.value.value
+    }
+    return ProductCore.MarkupProjection(markdown: [], media: [], hasWikiMarker: false, hasAttachmentMarker: false)
+  }
+  func installDerivedMarkup(_ projection: PagedNativeMarkupProjection, for window: PagedNativeLogicalWindow,
+    sourceVersion: UUID) {
+    guard self.sourceVersion == sourceVersion, projection.matches(window) else { return }
+    derivedMarkup = (sourceVersion, window.windowID, projection)
+    derivedMarkupDidChange()
+    MarkdownStyle.apply(to: self)
+    mediaChanged()
+  }
+  func currentDerivedMarkup(for window: PagedNativeLogicalWindow) -> PagedNativeMarkupProjection? {
+    guard let derivedMarkup, derivedMarkup.version == sourceVersion,
+      derivedMarkup.windowID == window.windowID, derivedMarkup.value.matches(window) else { return nil }
+    return derivedMarkup.value
+  }
   var clicked: ((NSEvent) -> Void)?
   var dragged: ((NSEvent) -> Void)?
   var lifted: ((NSEvent) -> Void)?
   var copied: ((Any?) -> Void)?
-  var completeMarkupContext = false
-  override var hasCompleteMarkupContext: Bool { completeMarkupContext }
   override var acceptsFirstResponder: Bool { false }
   override func mouseDown(with event: NSEvent) {
     clicked?(event)

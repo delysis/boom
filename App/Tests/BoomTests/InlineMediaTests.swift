@@ -169,6 +169,8 @@ final class InlineMediaTests: XCTestCase {
 
       try viewport.requestScroll(toUTF16: 0)
       try await viewport.joinPresentation()
+      await viewport.joinMarkup()
+      XCTAssertNil(viewport.markupFailure)
       let display = try XCTUnwrap(viewport.subviews.compactMap { ($0 as? NSScrollView)?.documentView as? NativeMediaTextView }
         .first(where: { $0 !== native && !$0.acceptsFirstResponder }))
       // Use the existing media component's real model/Vault load. No synthetic

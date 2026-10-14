@@ -29,6 +29,10 @@ mod storyboard;
 mod writing;
 
 pub use consultation::CompactConsultation;
+pub use markdown::{
+    MediaSpan, Span, paged_media_spans, paged_media_spans_with_cancel, paged_spans,
+    paged_spans_with_cancel,
+};
 pub use media::{MediaContainer, admit_media, caf_wave};
 
 #[derive(Debug, thiserror::Error)]

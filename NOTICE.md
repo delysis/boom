@@ -7,6 +7,7 @@ Newly authored product source is provided under the adjacent MIT license. This d
 | Authority | Pinned source | Use |
 | --- | --- | --- |
 | `delysis/native-platform` | Commit `d6915bad3ca7fa68ed483acff82ae86313934fd1`, attachment subtree `a610874342ad36aefa2908bfdd38367fd3f6bde0` | Five attachment crates in `crates/`; their original notices are retained. |
+| `pulldown-cmark` | Crates.io `0.13.4`, published archive SHA256 `e9f068eba8e7071c5f9511831b44f32c740d5adf574e990f946ddb53db2f314e` | Local MIT-licensed parser in `vendor/pulldown-cmark`, extended with bounded resumable parsing. Original LICENSE is retained; this modified path dependency is not byte-identical to the registry release. |
 | `ml-explore/mlx-swift-lm` | Commit `9afc3b55f75a0d41a3d0c11330b9df6a036d24e4` | Native Swift Gemma 4 runtime, developer conversion, and sampling. |
 | Google Gemma 4 | Base `023679ed352de9bb66cc873c9009ce3482585c08`; instruction/QAT `b6ed86275a6a5735884e208bfed95b445a684ca2` | Separately acquired official checkpoints; converted pack manifests retain upstream and output hashes, settings, runtime identity, and licenses. |
 | MLX Community Gemma 4 | Base `7d7c99c4d1b1d2ec2b52e2c46821cef2fa22ce0c`; instruction/QAT `e70c6b3ba0979b3357dcd2f223ad8bde7787a6b6` | Separately downloaded public artifacts with pinned file hashes and configuration. Exact upstream conversion lineage is not independently established. Model cards and upstream license references accompany the catalog; app distribution does not include these weights. |

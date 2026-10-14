@@ -473,6 +473,10 @@ struct Snapshot {
     id: Uuid,
     origin: Arc<Revision>,
     root: Option<Link>,
+    // Two small derived index handles, not another source/Undo timeline.
+    // Main only shares the Arc when editing; it never locks this memo.
+    markup_memo: Arc<crate::markup::MarkupMemo>,
+    markup: [OnceLock<Arc<crate::markup::MarkupIndex>>; 2],
 }
 #[derive(Clone)]
 pub struct LogicalSnapshot(Arc<Snapshot>);
@@ -493,6 +497,8 @@ impl LogicalSnapshot {
             id: Uuid::new_v4(),
             origin,
             root,
+            markup_memo: Arc::new(crate::markup::MarkupMemo::default()),
+            markup: [OnceLock::new(), OnceLock::new()],
         })))
     }
     pub fn id(&self) -> Uuid {
@@ -525,7 +531,207 @@ impl LogicalSnapshot {
             id: Uuid::new_v4(),
             origin: Arc::clone(&self.0.origin),
             root: collapse(root),
+            markup_memo: Arc::clone(&self.0.markup_memo),
+            markup: [OnceLock::new(), OnceLock::new()],
         }))
+    }
+
+    pub(super) fn markup_source(&self) -> MarkupSource {
+        MarkupSource {
+            id: self.id(),
+            root: self.0.root.clone(),
+            summary: self.summary(),
+        }
+    }
+    pub fn markup_index(
+        &self,
+        mode: crate::markup::MarkupMode,
+    ) -> Option<Arc<crate::markup::MarkupIndex>> {
+        self.0.markup[mode.slot()].get().cloned()
+    }
+    pub(super) fn previous_markup(
+        &self,
+        mode: crate::markup::MarkupMode,
+    ) -> Result<Option<Arc<crate::markup::MarkupIndex>>> {
+        self.0.markup_memo.latest(mode)
+    }
+    pub(super) fn progressed_markup(&self, value: Arc<crate::markup::MarkupIndex>) -> Result<()> {
+        if value.source.id != self.id() || value.source.summary != self.summary() {
+            return Err(Error::Stale);
+        }
+        // Only a completed index enters the exact-snapshot OnceLock. A cold
+        // cancelled worker may leave its proved prefix in the same two-slot
+        // convergence memo, without claiming that the tail was examined.
+        self.0.markup_memo.completed(value)
+    }
+    pub(super) fn completed_markup(&self, value: Arc<crate::markup::MarkupIndex>) -> Result<()> {
+        if value.source.id != self.id() || value.source.summary != self.summary() {
+            return Err(Error::Stale);
+        }
+        let mode = value.mode;
+        let _ = self.0.markup[mode.slot()].set(Arc::clone(&value));
+        self.0.markup_memo.completed(value)
+    }
+}
+
+/// Only the derived index retains this immutable shape for convergence. There
+/// is no source mutation, scalar scan or I/O while comparing shared pieces.
+pub(super) struct MarkupSource {
+    pub id: Uuid,
+    root: Option<Link>,
+    pub summary: TextSummary,
+}
+impl MarkupSource {
+    pub fn common_edges(&self, other: &LogicalSnapshot) -> Result<(TextSummary, TextSummary)> {
+        #[derive(Clone)]
+        enum Part<'a> {
+            Node(&'a SequenceNode),
+            Piece(Span),
+        }
+        impl Part<'_> {
+            fn summary(&self) -> TextSummary {
+                match self {
+                    Self::Node(node) => node.summary,
+                    Self::Piece(span) => span.summary,
+                }
+            }
+        }
+        fn frontier(root: &Option<Link>) -> Vec<Part<'_>> {
+            root.as_ref()
+                .map_or_else(Vec::new, |node| vec![Part::Node(node.as_ref())])
+        }
+        fn expand<'a>(parts: &mut Vec<Part<'a>>, reverse: bool) {
+            let Some(Part::Node(node)) = parts.pop() else {
+                unreachable!("node frontier");
+            };
+            match &node.items {
+                Items::Leaf(spans) => {
+                    if reverse {
+                        parts.extend(spans.iter().cloned().map(Part::Piece));
+                    } else {
+                        parts.extend(spans.iter().rev().cloned().map(Part::Piece));
+                    }
+                }
+                Items::Branch(children) => {
+                    if reverse {
+                        parts.extend(children.iter().map(|node| Part::Node(node.as_ref())));
+                    } else {
+                        parts.extend(children.iter().rev().map(|node| Part::Node(node.as_ref())));
+                    }
+                }
+            }
+        }
+        let compare = |reverse: bool, bound: TextSummary| -> Result<TextSummary> {
+            let mut a = frontier(&self.root);
+            let mut b = frontier(&other.0.root);
+            let mut common = TextSummary::EMPTY;
+            while let (Some(left), Some(right)) = (a.last().cloned(), b.last().cloned()) {
+                let remaining = difference(bound, common)?;
+                if remaining.bytes == 0 {
+                    break;
+                }
+                match (&left, &right) {
+                    (Part::Node(x), Part::Node(y)) if std::ptr::eq(*x, *y) => {
+                        if x.summary.bytes >= remaining.bytes {
+                            common = bound;
+                            break;
+                        }
+                        common = common.checked_add(x.summary)?;
+                        a.pop();
+                        b.pop();
+                        continue;
+                    }
+                    (Part::Node(_), Part::Node(_)) => {
+                        // Descend the larger unmatched interval first. Shared
+                        // children survive path copying and are skipped whole,
+                        // even when an edit changed the opposite tree's height.
+                        let x = left.summary().bytes;
+                        let y = right.summary().bytes;
+                        if x >= y {
+                            expand(&mut a, reverse);
+                        }
+                        if y >= x {
+                            expand(&mut b, reverse);
+                        }
+                        continue;
+                    }
+                    (Part::Node(_), _) => {
+                        expand(&mut a, reverse);
+                        continue;
+                    }
+                    (_, Part::Node(_)) => {
+                        expand(&mut b, reverse);
+                        continue;
+                    }
+                    _ => {}
+                }
+                let (Part::Piece(mut x), Part::Piece(mut y)) = (left, right) else {
+                    unreachable!("piece frontier");
+                };
+                let same_backing = match (&x.backing, &y.backing) {
+                    (Backing::File(a), Backing::File(b)) => a == b,
+                    (Backing::Insert(a), Backing::Insert(b)) => Arc::ptr_eq(a, b),
+                    _ => false,
+                };
+                let edge_x = if reverse {
+                    x.start.checked_add(x.summary)?
+                } else {
+                    x.start
+                };
+                let edge_y = if reverse {
+                    y.start.checked_add(y.summary)?
+                } else {
+                    y.start
+                };
+                if !same_backing || edge_x != edge_y {
+                    break;
+                }
+                let take = if x.summary.bytes <= y.summary.bytes {
+                    x.summary
+                } else {
+                    y.summary
+                };
+                if take.bytes >= remaining.bytes {
+                    common = bound;
+                    break;
+                }
+                take.validate()?;
+                common = common.checked_add(take)?;
+                let x_done = x.summary == take;
+                let y_done = y.summary == take;
+                if !x_done {
+                    x.summary = difference(x.summary, take)?;
+                    if !reverse {
+                        x.start = x.start.checked_add(take)?;
+                    }
+                }
+                if !y_done {
+                    y.summary = difference(y.summary, take)?;
+                    if !reverse {
+                        y.start = y.start.checked_add(take)?;
+                    }
+                }
+                if x_done {
+                    a.pop();
+                } else {
+                    *a.last_mut().expect("piece frontier") = Part::Piece(x);
+                }
+                if y_done {
+                    b.pop();
+                } else {
+                    *b.last_mut().expect("piece frontier") = Part::Piece(y);
+                }
+            }
+            Ok(common)
+        };
+        let shorter = if self.summary.bytes <= other.summary().bytes {
+            self.summary
+        } else {
+            other.summary()
+        };
+        let prefix = compare(false, shorter)?;
+        let suffix = compare(true, difference(shorter, prefix)?)?;
+        Ok((prefix, suffix))
     }
 }
 

@@ -23,6 +23,7 @@ import XCTest
   var window: NSWindow?
   var scroll: PagedDocumentViewport?
   var sourceFile: FileHandle?
+  var markupTarget: PagedNativeLogicalWindow?
   private var outputs: [PagedTextRootLease] = []
   private var enteredNavigation: [Task<PagedNativeLogicalWindow, Error>] = []
   private(set) var originalErrors: [Error] = []
@@ -285,6 +286,218 @@ import XCTest
       throw error
     }
   }
+  func testActualPagedMarkupSuppressesRemoteFenceAndResolvesFirstGlobalReferenceInEditingAndScroll() async throws {
+    let id = UUID(uuidString: "884646c1-14b4-490d-be8c-8953af793315")!
+    let later = "adfcd7f6-e0c9-4d06-a75c-f64794d7760b"
+    let definition = "[First]: boom-attachment:\(id.uuidString)\n\n"
+    let body = "# fake **bold** [fake](boom-attachment:\(later))\n"
+    let text = definition + "```\n" + String(repeating: body, count: 650)
+      + "```\n\n[real][FIRST]\n\n[first]: boom-attachment:\(later)\n\n# Tail 🙂\n"
+    try await fixture(#function, text: text) { f in
+      let source = f.session!, input = f.input!, commands = f.commands!, view = f.view
+      let version = view.sourceVersion, generation = source.generation, arena = source.arenaID
+      try f.scroll!.enableDocumentNavigation(engine: f.engine!, publisher: f.publisher!)
+      await f.scroll!.joinMarkup()
+      XCTAssertNil(f.scroll!.markupFailure)
+      XCTAssertTrue(view.markupProjection.media.isEmpty)
+      XCTAssertTrue(view.markupProjection.markdown.contains { $0.kind == "code" })
+      XCTAssertFalse(view.markupProjection.markdown.contains { $0.kind == "heading" || $0.kind == "strong" })
+      XCTAssertEqual(view.sourceVersion, version)
+      XCTAssertEqual(source.generation, generation); XCTAssertEqual(source.arenaID, arena)
+      try f.scroll!.requestScroll(toUTF16: UInt64(text.utf16.count))
+      try await f.scroll!.joinPresentation(); await f.scroll!.joinMarkup()
+      let visible = try XCTUnwrap(f.scroll!.visibleScrollWindow)
+      let projection = try XCTUnwrap(f.scroll!.visibleScrollMarkup)
+      XCTAssertEqual(projection.media.map(\.id), [id])
+      let span = try XCTUnwrap(projection.media.first)
+      XCTAssertEqual((visible.text as NSString).substring(with: span.range), "[real][FIRST]")
+      XCTAssertTrue(projection.markdown.contains { $0.kind == "heading" })
+      XCTAssertTrue(f.view === view); XCTAssertTrue(input.commandOwner === commands)
+      XCTAssertEqual(source.generation, generation); XCTAssertEqual(source.arenaID, arena)
+      XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+    }
+  }
+
+  func testActualColdMarkupDeliversLocalHeadingThenCancellationJoinsItsSameSourceJob() async throws {
+    let text = "# **Ready 🙂**\n\n```\n" + String(repeating: "unread distant code\n", count: 3000) + "```\n"
+    try await fixture(#function, text: text) { f in
+      let source = f.session!, engine = f.engine!, view = f.view
+      let generation = source.generation, arena = source.arenaID, version = view.sourceVersion
+      let baseline = engine.custodySnapshot
+      let delivered = expectation(description: "actual early local parser proof")
+      let cancellation = CancellationFlag()
+      do {
+        _ = try await engine.logicalMarkup(source.logicalWindow, cancellation: cancellation) { mode, value in
+          guard mode == 0 && value.complete else { return }
+          XCTAssertTrue(value.matches(source.logicalWindow))
+          XCTAssertTrue(value.markdown.contains { $0.kind == "heading" })
+          XCTAssertTrue(value.markdown.contains { $0.kind == "strong" })
+          delivered.fulfill()
+          cancellation.cancel()
+        }
+        XCTFail("A cancelled actual builder unexpectedly finished its distant index.")
+      } catch is CancellationError { }
+      guard await XCTWaiter.fulfillment(of: [delivered], timeout: 5) == .completed else {
+        throw BoomError.unavailable("The actual cold operation failed to deliver its local proof.")
+      }
+      XCTAssertEqual(engine.custodySnapshot.jobs, baseline.jobs)
+      XCTAssertEqual(engine.custodySnapshot.reservedPayloadBytes, baseline.reservedPayloadBytes)
+      XCTAssertTrue(f.view === view)
+      XCTAssertEqual(source.generation, generation); XCTAssertEqual(source.arenaID, arena)
+      XCTAssertEqual(view.sourceVersion, version)
+      XCTAssertNil(f.input!.firstRefusal); XCTAssertNil(f.commands!.firstFailure)
+      // The actual source and Foundation owner remain usable after the joined
+      // cancellation; derived work never adopted or persisted a source root.
+      view.setSelectedRange(NSRange(location: 0, length: 0))
+      view.insertText("X", replacementRange: view.selectedRange())
+      f.commands!.manager.undo(); try await f.commands!.joinPendingCommand()
+      XCTAssertEqual(view.string.hasPrefix("# **Ready"), true)
+      try await f.assertSource(text)
+    }
+  }
+
+  func testActualColdMarkupRebindsSameSourceWindowWithoutRestartingItsEnteredBuilder() async throws {
+    let prefix = "# First\n\n" + String(repeating: "plain paragraph\n\n", count: 1000)
+    let text = prefix + "# **Second 🙂**\n\n```\n" + String(repeating: "code tail\n", count: 4000) + "```\n"
+    try await fixture(#function, text: text) { f in
+      let source = f.session!, engine = f.engine!, view = f.view
+      let original = source.logicalWindow
+      let captured = try source.captureLogicalRead()
+      let second = try await engine.logicalWindow(captured.source, utf16Anchor: UInt64(prefix.utf16.count), maximumBytes: 128)
+      XCTAssertFalse(second.windowID == original.windowID)
+      f.markupTarget = original
+      let changed = expectation(description: "actual first local proof")
+      let rebound = expectation(description: "actual same-builder query of second heading")
+      let cancellation = CancellationFlag()
+      let before = engine.custodySnapshot
+      let generation = source.generation, arena = source.arenaID, version = view.sourceVersion
+      do {
+        _ = try await engine.logicalMarkup(original, cancellation: cancellation,
+          latestWindow: { f.markupTarget }) { mode, value in
+          guard mode == 0 && value.complete else { return }
+          if value.matches(original), f.markupTarget?.windowID == original.windowID {
+            XCTAssertTrue(value.markdown.contains { $0.kind == "heading" })
+            f.markupTarget = second; changed.fulfill()
+          } else if value.matches(second) {
+            XCTAssertTrue(value.markdown.contains { $0.kind == "heading" })
+            XCTAssertTrue(value.markdown.contains { $0.kind == "strong" })
+            rebound.fulfill(); cancellation.cancel()
+          }
+        }
+        XCTFail("The actual rebound operation ignored cancellation.")
+      } catch is CancellationError { }
+      guard await XCTWaiter.fulfillment(of: [changed, rebound], timeout: 5, enforceOrder: true) == .completed else {
+        throw BoomError.unavailable("The actual cold builder failed its ordered same-source query replacement.")
+      }
+      XCTAssertEqual(engine.custodySnapshot.jobs, before.jobs)
+      XCTAssertEqual(engine.custodySnapshot.reservedPayloadBytes, before.reservedPayloadBytes)
+      XCTAssertTrue(f.view === view)
+      XCTAssertEqual(source.generation, generation); XCTAssertEqual(source.arenaID, arena)
+      XCTAssertEqual(view.sourceVersion, version)
+      XCTAssertNil(f.input!.firstRefusal); XCTAssertNil(f.commands!.firstFailure)
+      f.markupTarget = nil
+      try await f.assertSource(text)
+    }
+  }
+
+  func testActualTwoModeReferenceCapacityAndRefusalStayBoundedWithoutChangingNativeSource() async throws {
+    let labels: (Range<Int>) -> String = { range in
+      let alphabet = Array("0123456789abcdefghijklmnopqrstuvwxyz")
+      return range.map { value in "[\(alphabet[value / 1296])\(alphabet[(value / 36) % 36])\(alphabet[value % 36])] " }.joined() + "\n\n"
+    }
+    let first = labels(0..<5000)
+    let text = first + labels(5000..<9000)
+      + "# [after]\n\n[after]: boom-attachment:884646c1-14b4-490d-be8c-8953af793315\n"
+    try await fixture(#function, text: text) { f in
+      let engine = f.engine!, source = f.session!, view = f.view
+      let captured = try source.captureLogicalRead()
+      let window = try await engine.logicalWindow(captured.source, utf16Anchor: UInt64(first.utf16.count + 6_000),
+        maximumBytes: PagedWorkingWindow.hardBytes)
+      XCTAssertLessThan(window.start.bytes, UInt64(first.utf8.count), "The actual window overlaps both complete label blocks.")
+      XCTAssertGreaterThan(window.start.bytes + window.summary.bytes,
+        UInt64(first.utf8.count + labels(5000..<9000).utf8.count + "# [after]\n".utf8.count))
+      let before = engine.custodySnapshot
+      let generation = source.generation, arena = source.arenaID, version = view.sourceVersion
+      let actual = try await engine.logicalMarkup(window)
+      XCTAssertTrue(actual.matches(window))
+      XCTAssertFalse(actual.style.complete); XCTAssertFalse(actual.media.complete)
+      XCTAssertEqual(actual.style.maxReferenceCount, 8192); XCTAssertEqual(actual.media.maxReferenceCount, 8192)
+      XCTAssertLessThanOrEqual(actual.style.maxReferenceProbes, 64)
+      XCTAssertLessThanOrEqual(actual.media.maxReferenceProbes, 64)
+      XCTAssertGreaterThan(actual.trackedReferenceCapacityUpperBytes, 8192 * 3 * 2)
+      XCTAssertLessThan(actual.trackedReferenceCapacityUpperBytes, 3_145_728)
+      print("Actual two-mode retained-reference-capacity upper: \(actual.trackedReferenceCapacityUpperBytes); excludes temporary parser/host/decoder/allocator peak.")
+      XCTAssertFalse(actual.style.markdown.contains { $0.kind == "heading" })
+      XCTAssertTrue(actual.media.media.isEmpty)
+      XCTAssertEqual(engine.custodySnapshot.jobs, before.jobs)
+      XCTAssertEqual(engine.custodySnapshot.reservedPayloadBytes, before.reservedPayloadBytes)
+      XCTAssertEqual(source.generation, generation); XCTAssertEqual(source.arenaID, arena)
+      XCTAssertEqual(view.sourceVersion, version); XCTAssertTrue(f.view === view)
+      XCTAssertNil(f.input!.firstRefusal); XCTAssertNil(f.commands!.firstFailure)
+      try await f.assertSource(text)
+    }
+  }
+
+  func testActualCachedMarkupReadCompletesUnderEnteredWriterAndStaleTypingConvergesAfterRelease() async throws {
+    let text = "# Head 🙂\n\n" + String(repeating: "ordinary paragraph\n\n", count: 2600) + "# Tail\n"
+    try await fixture(#function, text: text) { f in
+      let engine = f.engine!, source = f.session!, view = f.view, commands = f.commands!
+      let original = try source.captureLogicalRead()
+      _ = try await engine.logicalMarkup(source.logicalWindow)
+      try f.scroll!.enableDocumentNavigation(engine: engine, publisher: f.publisher!)
+      await f.scroll!.joinMarkup()
+      let tail = try await engine.logicalWindow(original.source, utf16Anchor: original.source.summary.utf16,
+        maximumBytes: PagedWorkingWindow.targetBytes)
+      let release = DispatchSemaphore(value: 0)
+      let entered = expectation(description: "actual writer executor entered")
+      let writer = Task { try await engine.storageExecutorForTesting.run {
+        entered.fulfill()
+        guard release.wait(timeout: .now() + 10) == .success else {
+          throw BoomError.unavailable("Actual writer hold exceeded its bounded deadline.")
+        }
+      } }
+      defer { release.signal() }
+      guard await XCTWaiter.fulfillment(of: [entered], timeout: 5) == .completed else {
+        release.signal(); _ = await writer.result
+        throw BoomError.unavailable("Actual writer did not enter.")
+      }
+      let completed = expectation(description: "real cached-context query returned under held writer")
+      let reader = Task { defer { completed.fulfill() }; return try await engine.logicalMarkup(tail) }
+      do {
+        guard await XCTWaiter.fulfillment(of: [completed], timeout: 5) == .completed else {
+          throw BoomError.unavailable("Cached Markdown query remained coupled to writer/finalization.")
+        }
+        let result = try await reader.value
+        XCTAssertTrue(result.matches(tail)); XCTAssertTrue(result.style.complete && result.media.complete)
+        XCTAssertTrue(result.style.markdown.contains { $0.kind == "heading" })
+        let generation = source.generation
+        view.setSelectedRange(NSRange(location: 0, length: 0))
+        view.insertText("X", replacementRange: view.selectedRange())
+        XCTAssertEqual(source.generation, generation + 1)
+        // This derived request waits behind the actual writer. A later edit
+        // supersedes it while the same real view/native history remain live.
+        await Task.yield()
+        view.insertText("Y", replacementRange: view.selectedRange())
+        XCTAssertEqual(source.generation, generation + 2)
+        commands.manager.undo(); try await commands.joinPendingCommand()
+        XCTAssertEqual(source.generation, generation + 3)
+        commands.manager.redo(); try await commands.joinPendingCommand()
+        XCTAssertEqual(source.generation, generation + 4)
+        XCTAssertTrue(view.string.hasPrefix("XY# Head"))
+        XCTAssertFalse(source.isCurrent(original))
+        release.signal(); try await writer.value
+        await f.scroll!.joinMarkup()
+        XCTAssertNil(f.scroll!.markupFailure)
+        XCTAssertFalse(view.markupProjection.markdown.contains { $0.kind == "heading" })
+        XCTAssertTrue(f.view === view); XCTAssertNil(f.input!.firstRefusal); XCTAssertNil(commands.firstFailure)
+        try await f.assertSource("XY" + text)
+      } catch {
+        release.signal(); _ = await reader.result; _ = await writer.result
+        throw error
+      }
+    }
+  }
+
   func testManagedRecenterKeepsDocumentContextAndAllowsTypingUndoRedoWithInertOldStorage() async throws {
     try await fixture(#function) { f in
       try f.replaceFirst("A"); try await f.seal()

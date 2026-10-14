@@ -192,6 +192,28 @@ final class PagedNativeTextStorage: NSTextStorage {
   private var selectionMutationDepth = 0
   private var constructingView = true
   private var managedInputClient: PagedNativeTextInputClient?
+  private var derivedMarkup: (version: UUID, arenaID: UUID, projection: PagedNativeMarkupProjection)?
+  override var markupProjection: ProductCore.MarkupProjection {
+    if let derivedMarkup, derivedMarkup.version == sourceVersion,
+      derivedMarkup.arenaID == session.arenaID, inputBinding?.state != .retired,
+      textStorage?.editedMask.contains(.editedCharacters) != true,
+      derivedMarkup.projection.matches(session.logicalWindow) {
+      return derivedMarkup.projection.value
+    }
+    return super.markupProjection
+  }
+  func installDerivedMarkup(_ projection: PagedNativeMarkupProjection, for window: PagedNativeLogicalWindow,
+    sourceVersion: UUID, readyDisplay: NativeInlineMedia? = nil) -> Bool {
+    guard self.sourceVersion == sourceVersion, inputBinding?.state == .active,
+      !constructingView, inputCommandIsClosed, !boundedStorage.hasOpenCharacterTransaction,
+      window.snapshot.isSame(session.logicalWindow.snapshot), window.windowID == session.logicalWindow.windowID,
+      projection.matches(window) else { return false }
+    derivedMarkup = (sourceVersion, session.arenaID, projection)
+    derivedMarkupDidChange()
+    if let readyDisplay { inlineMedia.adoptReadyDisplayItems(from: readyDisplay, ids: projection.media.media.map(\.id)) }
+    if !hasMarkedText() { MarkdownStyle.apply(to: self); mediaChanged() }
+    return true
+  }
   override var hasCompleteMarkupContext: Bool {
     guard let coordinates = try? session.documentCoordinates() else { return false }
     return coordinates.utf16Start == 0

@@ -5,7 +5,7 @@ import BoomCore
   var applyingExternal: Bool { get set }
 }
 
-struct MarkdownSpan: Decodable {
+struct MarkdownSpan: Decodable, Sendable {
   let kind: String
   let location: Int
   let length: Int
@@ -83,7 +83,7 @@ struct MarkdownSpan: Decodable {
       defer { PerformanceTrace.end("Editor.MarkdownParse", trace) }
       spans = (try? ProductCore.markdownSpans(source)) ?? []
     }
-    let literalRanges = spans.filter { $0.kind == "code" }
+    let literalRanges = spans.filter { $0.kind == "code" || $0.kind == "literal" }
       .map { NSRange(location: $0.location, length: $0.length) }
     let wikis = wikiDisplays(in: source, excluding: literalRanges, hasMarker: projection?.hasWikiMarker)
     let hasAttachment = projection?.hasAttachmentMarker

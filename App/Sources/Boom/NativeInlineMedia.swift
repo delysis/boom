@@ -7,7 +7,7 @@ private extension NSAttributedString.Key {
   static let mediaStart = Self("BloomInlineMediaStart")
 }
 
-struct InlineMediaSpan: Decodable {
+struct InlineMediaSpan: Decodable, Sendable {
   let id: UUID
   let location: Int
   let length: Int
@@ -179,6 +179,11 @@ struct InlineMediaSpan: Decodable {
     characterVersion = UUID()
     cachedMarkup = nil
   }
+  /// New proved display context does not change any character/source epoch.
+  func derivedMarkupDidChange() {
+    cachedMarkup = nil
+    inlineMedia.invalidateMarkup()
+  }
   deinit { NotificationCenter.default.removeObserver(self) }
   private var deferredLayout = false
   private var nativeEditDepth = 0
@@ -301,6 +306,19 @@ struct InlineMediaSpan: Decodable {
     if self.model !== model { stop() }
     self.model = model
     refresh()
+  }
+  func invalidateMarkup() { parsedSourceVersion = nil }
+  /// Both views belong to the same workspace and exact displayed source.
+  /// Share already immutable, verified presentation bytes so the adopted
+  /// editor has the same media glyph metrics before original mouse tracking.
+  func adoptReadyDisplayItems(from other: NativeInlineMedia, ids: [UUID]) {
+    guard model === other.model else { return }
+    let wanted = Set(ids)
+    for (id, item) in other.items where wanted.contains(id) {
+      guard item.bytes != nil || item.failure != nil else { continue }
+      tasks.removeValue(forKey: id)?.cancel()
+      items[id] = item
+    }
   }
   func refresh() {
     let trace = PerformanceTrace.begin("Editor.MediaRefresh")

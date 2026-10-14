@@ -163,6 +163,25 @@ int32_t bloom_logical_command_finish(const BloomLogicalCommand *command, const B
     BoomAttachmentBuffer *output, BoomAttachmentBuffer *error);
 void bloom_logical_command_free(BloomLogicalCommand *command);
 
+/* Root/window-bound derived Markdown. Begin/append steps use the existing
+ * writer engine with immutable source claims; only index pages are written.
+ * Query steps use the existing independent readonly host. Every step joins
+ * before free; no source adoption, durable publication, or fsync occurs. */
+typedef struct BloomLogicalMarkup BloomLogicalMarkup;
+int32_t bloom_logical_markup_begin(const BloomLogicalWindow *window,
+  uint8_t mode, BloomLogicalMarkup **output, BoomAttachmentBuffer *error);
+int32_t bloom_logical_markup_bind_window(const BloomLogicalMarkup *command,
+  const BloomLogicalWindow *window, BoomAttachmentBuffer *output, BoomAttachmentBuffer *error);
+int32_t bloom_logical_markup_writer_step(uint64_t handle, const BloomLogicalMarkup *command,
+  BloomTextOperation operation, BoomAttachmentBuffer *output, BoomAttachmentBuffer *error);
+int32_t bloom_logical_markup_step(BloomTextHost host, const BloomLogicalMarkup *command,
+  BloomTextOperation operation, BoomAttachmentBuffer *output, BoomAttachmentBuffer *error);
+/* Complete progress means a bounded window result is ready; final additionally
+   means indexing joined. Taking an early result retains the SAME builder. */
+int32_t bloom_logical_markup_finish(const BloomLogicalMarkup *command,
+  BloomTextOperation operation, BoomAttachmentBuffer *output, BoomAttachmentBuffer *error);
+void bloom_logical_markup_free(BloomLogicalMarkup *command);
+
 BoomAttachmentBuffer bloom_text_materialize_logical(uint64_t, const BloomLogicalSnapshot *, BloomTextOperation);
 int32_t bloom_logical_release_synced_insertions(const BloomLogicalSnapshot *, BoomAttachmentBuffer *);
 #ifdef __cplusplus

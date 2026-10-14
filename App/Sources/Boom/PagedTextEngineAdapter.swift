@@ -555,6 +555,188 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
     controller: PagedTextRootLease, sessionID: UUID) throws -> () -> Void {
     try rootCustody.prepareImportedSourceTransfer(imported, controller: controller, sessionID: sessionID)
   }
+  /// One captured derived operation. Index append quanta yield the existing
+  /// background writer lane; cached-index queries use independent reads only.
+  /// No fsync, native source adoption, or durable current-record CAS occurs.
+  func logicalMarkup(_ window: PagedNativeLogicalWindow,
+    cancellation: CancellationFlag = CancellationFlag(),
+    latestWindow: (@MainActor @Sendable () -> PagedNativeLogicalWindow?)? = nil,
+    onMode: (@MainActor @Sendable (UInt8, PagedNativeMarkupProjection.Mode) -> Void)? = nil) async throws -> PagedNativeMarkupProjection {
+    let snapshot = window.snapshot
+    guard snapshot.engineIncarnation == custodyIncarnation, snapshot.sourceRevision.ownerID == ownerID,
+      window.summary.bytes <= UInt64(PagedWorkingWindow.hardBytes) else {
+      throw BoomError.stale("Derived Markdown belongs to another source or window.")
+    }
+    try cancellation.check()
+    let claims: [PagedTextRootClaim] = [.source(snapshot.sourceRevision), .writerDocument(snapshot.sourceRevision.documentID)]
+    // One shared operation pin, not two maximum-sized independent reservations.
+    // Both option modes retain bounded prefixes; all actual callbacks still run
+    // on the existing serial queues, under this same entered source job.
+    let lease = try rootCustody.reserve(engine: self, purpose: .operation(UUID()), claims: claims,
+      payloadBytes: 3_145_728)
+    let token = PagedTextCancellation()
+    let registration = cancellation.onCancel { token.cancel() }
+    defer { cancellation.removeCancellationHandler(registration) }
+    do {
+      try rootCustody.start(lease)
+      let (value, appendedIndex) = try await withTaskCancellationHandler {
+        var target = window
+        var appended = false
+        while true {
+          let queryWindow = target
+          async let style = logicalMarkupMode(queryWindow, mode: 0, cancellation: cancellation,
+            token: token, lease: lease, latestWindow: latestWindow, onMode: onMode)
+          async let media = logicalMarkupMode(queryWindow, mode: 1, cancellation: cancellation,
+            token: token, lease: lease, latestWindow: latestWindow, onMode: onMode)
+          let (styled, linked) = try await (style, media)
+          appended = appended || styled.appendedIndex || linked.appendedIndex
+          try cancellation.check()
+          let latest = await latestWindow?() ?? queryWindow
+          guard latest.snapshot.isSame(snapshot) else { throw CancellationError() }
+          if styled.value.matches(latest) && linked.value.matches(latest) {
+            return (PagedNativeMarkupProjection(style: styled.value, media: linked.value), appended)
+          }
+          // A mode may have already joined before a new same-source target.
+          // Its exact index is now cached; requery under this SAME source pin.
+          target = latest
+          await Task.yield()
+        }
+      } onCancel: { cancellation.cancel() }
+      try cancellation.check()
+      // Structured children have joined every entered callback and freed both
+      // commands before the sole source pin is released.
+      if appendedIndex {
+        try await onQueue(priority: .cleanup, custody: lease) {
+          try self.rootCustody.finishOutput(lease, claims: claims, payloadBytes: 0, inFlightWitness: self.inFlightWitness)
+          try self.rootCustody.abandonJoined(lease)
+        }
+      } else { try rootCustody.finishRead(lease) }
+      return value
+    } catch {
+      cancellation.cancel()
+      if try rootCustody.joinedFailure(lease, error: error) { throw PagedTextCustodyFailure(original: error, lease: lease) }
+      throw error
+    }
+  }
+  private func logicalMarkupMode(_ window: PagedNativeLogicalWindow, mode: UInt8,
+    cancellation: CancellationFlag, token: PagedTextCancellation, lease: PagedTextRootLease,
+    latestWindow: (@MainActor @Sendable () -> PagedNativeLogicalWindow?)?,
+    onMode: (@MainActor @Sendable (UInt8, PagedNativeMarkupProjection.Mode) -> Void)?) async throws -> (value: PagedNativeMarkupProjection.Mode, appendedIndex: Bool) {
+    let snapshot = window.snapshot
+    var retained: PagedLogicalMarkupHandle?
+    do {
+      let command: PagedLogicalMarkupHandle = try await onLogicalReadQueue {
+        try cancellation.check()
+        var pointer: OpaquePointer?, error = BoomAttachmentBuffer(data: nil, length: 0)
+        try pagedLogicalResult(bloom_logical_markup_begin(window.pointer, mode, &pointer, &error), error)
+        guard let pointer else { throw BoomError.invalid("Derived Markdown returned no continuation.") }
+        return PagedLogicalMarkupHandle(pointer)
+      }
+      retained = command
+      struct Progress: Decodable, Sendable { let complete: Bool; let final: Bool; let needsWriter: Bool; let bufferedBytes: Int }
+      var writer = true
+      var appendedIndex = false
+      // A ready cached index needs no writer. Querying first returns only the
+      // current immutable progress when a cold builder has not yet entered.
+      let initial: Progress = try await logicalRead(snapshot, payloadBytes: 0, cancellation: cancellation) { host, operation in
+        var output = BoomAttachmentBuffer(data: nil, length: 0), error = BoomAttachmentBuffer(data: nil, length: 0)
+        defer { if output.data != nil { boom_attachment_free(output) } }
+        try pagedLogicalResult(bloom_logical_markup_step(host, command.pointer, operation, &output, &error), error)
+        guard let bytes = output.data, (1...4096).contains(output.length) else { throw BoomError.invalid("Invalid derived Markdown progress.") }
+        return try JSONDecoder().decode(Progress.self, from: Data(bytes: bytes, count: output.length))
+      }
+      writer = initial.needsWriter
+      var complete = initial.complete
+      var final = initial.final
+      var value: PagedNativeMarkupProjection.Mode?
+      var currentWindow = window
+      while true {
+        if let latest = await latestWindow?(), latest.windowID != currentWindow.windowID {
+          try cancellation.check()
+          guard latest.snapshot.isSame(snapshot), latest.summary.bytes <= UInt64(PagedWorkingWindow.hardBytes) else {
+            throw CancellationError()
+          }
+          let rebound: Progress = try await onLogicalReadQueue {
+            try cancellation.check()
+            var output = BoomAttachmentBuffer(data: nil, length: 0), error = BoomAttachmentBuffer(data: nil, length: 0)
+            defer { if output.data != nil { boom_attachment_free(output) } }
+            let status = withExtendedLifetime(latest) {
+              bloom_logical_markup_bind_window(command.pointer, latest.pointer, &output, &error)
+            }
+            try pagedLogicalResult(status, error)
+            guard let bytes = output.data, (1...4096).contains(output.length) else { throw BoomError.invalid("Invalid derived-window rebind progress.") }
+            return try JSONDecoder().decode(Progress.self, from: Data(bytes: bytes, count: output.length))
+          }
+          currentWindow = latest
+          complete = rebound.complete; final = rebound.final; writer = rebound.needsWriter
+        }
+        let queryWindow = currentWindow
+        if complete {
+          let delivered: PagedNativeMarkupProjection.Mode = try await logicalRead(snapshot, payloadBytes: 0, cancellation: cancellation) { _, operation in
+            try cancellation.check()
+            var output = BoomAttachmentBuffer(data: nil, length: 0), error = BoomAttachmentBuffer(data: nil, length: 0)
+            defer { if output.data != nil { boom_attachment_free(output) } }
+            try pagedLogicalResult(bloom_logical_markup_finish(command.pointer, operation, &output, &error), error)
+            guard let bytes = output.data, (1...2_097_152).contains(output.length) else { throw BoomError.invalid("Invalid derived Markdown projection.") }
+            let value = try JSONDecoder().decode(PagedNativeMarkupProjection.Mode.self, from: Data(bytes: bytes, count: output.length))
+            guard value.matches(queryWindow) else { throw BoomError.stale("Derived Markdown changed its actual window.") }
+            return value
+          }
+          try cancellation.check()
+          if let onMode { await onMode(mode, delivered) }
+          if final { value = delivered; break }
+          // Taking a prefix result leaves the original builder in this SAME
+          // command. Continue it only while its captured source is requested.
+          complete = false; writer = true
+        }
+        let progress: Progress
+        if writer {
+          appendedIndex = true
+          progress = try await onQueue(priority: .background, cancellation: token, custody: lease) {
+            try cancellation.check()
+            let context = try PagedTextOperationContext(cancellation: token)
+            try self.router.begin(document: snapshot.sourceRevision.documentID, writes: true,
+              beforeWrite: { try self.willWrite(snapshot.sourceRevision.documentID) })
+            defer { self.router.end() }
+            let operation = BloomTextOperation(context: Unmanaged.passUnretained(context).toOpaque(),
+              read_stream: nil, write_stream: nil, is_cancelled: pagedCancelled)
+            var output = BoomAttachmentBuffer(data: nil, length: 0), error = BoomAttachmentBuffer(data: nil, length: 0)
+            defer { if output.data != nil { boom_attachment_free(output) } }
+            let status = withExtendedLifetime((queryWindow, context)) {
+              bloom_logical_markup_writer_step(self.handle, command.pointer, operation, &output, &error)
+            }
+            if let failure = self.router.failure ?? context.failure {
+              if error.data != nil { boom_attachment_free(error) }; throw failure
+            }
+            try pagedLogicalResult(status, error)
+            guard let bytes = output.data, (1...4096).contains(output.length) else { throw BoomError.invalid("Invalid derived index append progress.") }
+            return try JSONDecoder().decode(Progress.self, from: Data(bytes: bytes, count: output.length))
+          }
+        } else {
+          progress = try await logicalRead(snapshot, payloadBytes: 0, cancellation: cancellation) { host, operation in
+            var output = BoomAttachmentBuffer(data: nil, length: 0), error = BoomAttachmentBuffer(data: nil, length: 0)
+            defer { if output.data != nil { boom_attachment_free(output) } }
+            try pagedLogicalResult(bloom_logical_markup_step(host, command.pointer, operation, &output, &error), error)
+            guard let bytes = output.data, (1...4096).contains(output.length) else { throw BoomError.invalid("Invalid derived window query progress.") }
+            return try JSONDecoder().decode(Progress.self, from: Data(bytes: bytes, count: output.length))
+          }
+        }
+        guard (0...393_216).contains(progress.bufferedBytes) else { throw BoomError.budget("Derived Markdown exceeded its bounded buffers.") }
+        complete = progress.complete; final = progress.final; writer = progress.needsWriter
+        await Task.yield()
+      }
+      guard let value else { throw BoomError.invalid("Derived Markdown lost its joined final projection.") }
+      try await onLogicalReadQueue { command.release() }
+      retained = nil
+      try cancellation.check()
+      return (value, appendedIndex)
+    } catch {
+      if let retained { try await onLogicalReadQueue { retained.release() } }
+      cancellation.cancel()
+      throw error
+    }
+  }
+
   func logicalCommand(_ snapshot: PagedNativeLogicalSnapshot, command request: PagedNativeLogicalCommand,
     cancellation: CancellationFlag) async throws -> PagedNativeLogicalCommandResult {
     guard snapshot.engineIncarnation == custodyIncarnation, snapshot.sourceRevision.ownerID == ownerID else {

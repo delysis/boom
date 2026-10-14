@@ -1050,3 +1050,412 @@ pub unsafe extern "C" fn bloom_logical_command_free(command: *mut BloomLogicalCo
         }
     }
 }
+
+/// Derived context retains the same immutable source/window. It has no source
+/// mutation, durable-root publication, or model authority. Writer steps append
+/// index pages only; query steps borrow the independent immutable reader.
+pub struct BloomLogicalMarkup {
+    value: Mutex<Option<LogicalMarkup>>,
+}
+struct LogicalMarkup {
+    window: LogicalWindow,
+    mode: bloom_text::MarkupMode,
+    builder: Option<bloom_text::MarkupIndexBuilder>,
+    indexed: Option<std::sync::Arc<bloom_text::MarkupIndex>>,
+    query: Option<bloom_text::MarkupQuery>,
+    result: Option<bloom_text::MarkupContext>,
+    queried_prefix: bool,
+    tracked_reference_peak_bytes: usize,
+    max_reference_count: usize,
+    max_reference_probes: usize,
+}
+impl LogicalMarkup {
+    fn progress(&self) -> Value {
+        let bytes = self
+            .builder
+            .as_ref()
+            .map_or(0, |builder| builder.progress().buffered_bytes)
+            + self
+                .query
+                .as_ref()
+                .map_or(0, |query| query.progress().buffered_bytes);
+        json!({"complete":self.result.is_some(),"final":self.builder.is_none() && (self.query.is_some() || self.result.is_some()),
+            "needsWriter":self.query.is_none() && self.result.is_none(),"bufferedBytes":bytes,
+            "trackedReferencePeakBytes":self.tracked_reference_peak_bytes,"maxReferenceCount":self.max_reference_count,
+            "maxReferenceProbes":self.max_reference_probes})
+    }
+    fn step_index(
+        &mut self,
+        engine: &mut TextEngine<CallbackPages>,
+        operation: BloomTextOperation,
+    ) -> bloom_text::Result<Value> {
+        if self.query.is_some() || self.result.is_some() {
+            return Err(Error::Invalid("markup requires readonly query"));
+        }
+        if self.builder.is_none() {
+            if self.query.is_some() || self.result.is_some() {
+                return Err(Error::Invalid("markup requires readonly query"));
+            }
+            self.builder = Some(bloom_text::MarkupIndexBuilder::new(
+                engine,
+                self.window.snapshot().clone(),
+                self.mode,
+            )?);
+        }
+        let builder = self
+            .builder
+            .as_mut()
+            .ok_or(Error::Invalid("markup requires readonly query"))?;
+        let progress = builder.step(engine, &mut || {
+            operation
+                .is_cancelled
+                .is_some_and(|callback| unsafe { callback(operation.context) != 0 })
+        })?;
+        if progress.complete {
+            let index = self
+                .builder
+                .take()
+                .ok_or(Error::Invalid("markup producer consumed"))?
+                .finish()?;
+            self.query = Some(bloom_text::MarkupQuery::new(
+                &self.window,
+                std::sync::Arc::clone(&index),
+            )?);
+            self.indexed = Some(index);
+        } else if !self.queried_prefix
+            && progress.indexed_bytes
+                >= self
+                    .window
+                    .start()
+                    .bytes
+                    .checked_add(self.window.local_summary().bytes)
+                    .ok_or(Error::Invalid("markup window endpoint"))?
+        {
+            // Keep this same entered builder. The copied prefix query does
+            // not adopt source or pretend the distant tail was indexed.
+            let index = self
+                .builder
+                .as_ref()
+                .ok_or(Error::Invalid("markup prefix producer"))?
+                .captured_index();
+            self.query = Some(bloom_text::MarkupQuery::new(
+                &self.window,
+                std::sync::Arc::clone(&index),
+            )?);
+            self.indexed = Some(index);
+            self.queried_prefix = true;
+        }
+        Ok(self.progress())
+    }
+    fn bind_window(&mut self, window: &LogicalWindow) -> bloom_text::Result<Value> {
+        if window.snapshot().id() != self.window.snapshot().id()
+            || window.snapshot().summary() != self.window.snapshot().summary()
+        {
+            return Err(Error::Stale);
+        }
+        if window.text().len() > bloom_text::NATIVE_WINDOW_BYTES {
+            return Err(Error::Invalid("markup window budget"));
+        }
+        if window.id() == self.window.id() {
+            return Ok(self.progress());
+        }
+        let end = window
+            .start()
+            .bytes
+            .checked_add(window.local_summary().bytes)
+            .ok_or(Error::Invalid("markup window endpoint"))?;
+        let index = if let Some(builder) = &self.builder {
+            (builder.progress().indexed_bytes >= end).then(|| builder.captured_index())
+        } else {
+            self.indexed.clone()
+        };
+        // Prepare the new exact query before changing this derived target.
+        // No IO, source adoption, root publication, or builder restart occurs.
+        let query = index
+            .as_ref()
+            .map(|index| bloom_text::MarkupQuery::new(window, std::sync::Arc::clone(index)))
+            .transpose()?;
+        self.window = window.clone();
+        self.query = query;
+        self.result = None;
+        self.queried_prefix = self.query.is_some();
+        self.indexed = index;
+        Ok(self.progress())
+    }
+    fn step_query(
+        &mut self,
+        engine: &mut TextEngine<CallbackPages>,
+        operation: BloomTextOperation,
+    ) -> bloom_text::Result<Value> {
+        if self.builder.is_some() && self.query.is_none() && self.result.is_none() {
+            return Err(Error::Invalid("markup requires index writer"));
+        }
+        if let Some(query) = &mut self.query {
+            let progress = query.step(engine, &mut || {
+                operation
+                    .is_cancelled
+                    .is_some_and(|callback| unsafe { callback(operation.context) != 0 })
+            })?;
+            self.tracked_reference_peak_bytes = self
+                .tracked_reference_peak_bytes
+                .max(progress.retained_reference_bytes);
+            self.max_reference_count = self.max_reference_count.max(progress.unique_references);
+            self.max_reference_probes =
+                self.max_reference_probes.max(progress.max_reference_probes);
+            if progress.complete {
+                self.result = Some(
+                    self.query
+                        .take()
+                        .ok_or(Error::Invalid("markup query consumed"))?
+                        .finish()?,
+                );
+            }
+        }
+        Ok(self.progress())
+    }
+}
+fn markup_writer<T>(
+    handle: u64,
+    body: impl FnOnce(&mut TextEngine<CallbackPages>) -> bloom_text::Result<T>,
+) -> bloom_text::Result<T> {
+    let slot = engines()
+        .lock()
+        .map_err(|_| Error::Invalid("writer registry lock"))?
+        .get(&handle)
+        .cloned()
+        .ok_or(Error::Invalid("writer closed"))?;
+    let mut guard = slot.try_lock().map_err(|_| Error::Invalid("writer busy"))?;
+    body(guard.as_mut().ok_or(Error::Invalid("writer closed"))?)
+}
+/// # Safety
+/// Window was frozen before the worker handoff. Construction only retains
+/// immutable state; a cached index goes directly to readonly query steps.
+/// Mode0=style, mode1=media.
+#[no_mangle]
+pub unsafe extern "C" fn bloom_logical_markup_begin(
+    window: *const BloomLogicalWindow,
+    mode: u8,
+    output: *mut *mut BloomLogicalMarkup,
+    error: *mut BoomAttachmentBuffer,
+) -> i32 {
+    unsafe {
+        call(error, || {
+            if output.is_null() {
+                return Err(Error::Invalid("markup output"));
+            }
+            *output = ptr::null_mut();
+            let window = window.as_ref().ok_or(Error::Invalid("markup window"))?;
+            let mode = match mode {
+                0 => bloom_text::MarkupMode::Style,
+                1 => bloom_text::MarkupMode::Media,
+                _ => return Err(Error::Invalid("markup options")),
+            };
+            if window.value.text().len() > bloom_text::NATIVE_WINDOW_BYTES {
+                return Err(Error::Invalid("markup window budget"));
+            }
+            let indexed = window.value.snapshot().markup_index(mode);
+            let query = indexed
+                .as_ref()
+                .map(|index| {
+                    bloom_text::MarkupQuery::new(&window.value, std::sync::Arc::clone(index))
+                })
+                .transpose()?;
+            *output = Box::into_raw(Box::new(BloomLogicalMarkup {
+                value: Mutex::new(Some(LogicalMarkup {
+                    window: window.value.clone(),
+                    mode,
+                    builder: None,
+                    indexed,
+                    query,
+                    result: None,
+                    queried_prefix: false,
+                    tracked_reference_peak_bytes: 0,
+                    max_reference_count: 0,
+                    max_reference_probes: 0,
+                })),
+            }));
+            Ok(())
+        })
+    }
+}
+/// # Safety
+/// Only between joined quanta on this same operation. Both windows retain the
+/// identical immutable logical source; an obsolete source is rejected. This
+/// changes a derived read target, never the physical/native source owner.
+#[no_mangle]
+pub unsafe extern "C" fn bloom_logical_markup_bind_window(
+    command: *const BloomLogicalMarkup,
+    window: *const BloomLogicalWindow,
+    output: *mut BoomAttachmentBuffer,
+    error: *mut BoomAttachmentBuffer,
+) -> i32 {
+    unsafe {
+        call(error, || {
+            if output.is_null() {
+                return Err(Error::Invalid("markup bind progress"));
+            }
+            let command = command.as_ref().ok_or(Error::Invalid("markup command"))?;
+            let window = window
+                .as_ref()
+                .ok_or(Error::Invalid("markup bind window"))?;
+            let mut guard = command
+                .value
+                .try_lock()
+                .map_err(|_| Error::Invalid("markup reentry"))?;
+            let command = guard.as_mut().ok_or(Error::Invalid("markup consumed"))?;
+            *output = owned_reply(&command.bind_window(&window.value)?);
+            Ok(())
+        })
+    }
+}
+/// # Safety
+/// Join this bounded append step before free. The actual writer/operation
+/// callbacks are borrowed only for the call, and no fsync occurs here.
+#[no_mangle]
+pub unsafe extern "C" fn bloom_logical_markup_writer_step(
+    handle: u64,
+    command: *const BloomLogicalMarkup,
+    operation: BloomTextOperation,
+    output: *mut BoomAttachmentBuffer,
+    error: *mut BoomAttachmentBuffer,
+) -> i32 {
+    unsafe {
+        call(error, || {
+            if output.is_null() {
+                return Err(Error::Invalid("markup progress"));
+            }
+            let command = command.as_ref().ok_or(Error::Invalid("markup command"))?;
+            let mut guard = command
+                .value
+                .try_lock()
+                .map_err(|_| Error::Invalid("markup reentry"))?;
+            let command = guard.as_mut().ok_or(Error::Invalid("markup consumed"))?;
+            let progress = markup_writer(handle, |engine| command.step_index(engine, operation))?;
+            *output = owned_reply(&progress);
+            Ok(())
+        })
+    }
+}
+/// # Safety
+/// The actual readonly host is borrowed for one bounded query step. It cannot
+/// publish or append pages and never acquires the writer EngineSlot.
+#[no_mangle]
+pub unsafe extern "C" fn bloom_logical_markup_step(
+    host: BloomTextHost,
+    command: *const BloomLogicalMarkup,
+    operation: BloomTextOperation,
+    output: *mut BoomAttachmentBuffer,
+    error: *mut BoomAttachmentBuffer,
+) -> i32 {
+    unsafe {
+        call(error, || {
+            if output.is_null() {
+                return Err(Error::Invalid("markup progress"));
+            }
+            let command = command.as_ref().ok_or(Error::Invalid("markup command"))?;
+            let mut guard = command
+                .value
+                .try_lock()
+                .map_err(|_| Error::Invalid("markup reentry"))?;
+            let command = guard.as_mut().ok_or(Error::Invalid("markup consumed"))?;
+            let mut reader = read_engine(host, operation)?;
+            *output = owned_reply(&command.step_query(&mut reader, operation)?);
+            Ok(())
+        })
+    }
+}
+/// # Safety
+/// Finish only after actual complete progress. This returns bounded derived
+/// arrays for the retained window. A prefix result consumes only the query;
+/// its same entered builder remains until final finish/cancellation and free.
+#[no_mangle]
+pub unsafe extern "C" fn bloom_logical_markup_finish(
+    command: *const BloomLogicalMarkup,
+    operation: BloomTextOperation,
+    output: *mut BoomAttachmentBuffer,
+    error: *mut BoomAttachmentBuffer,
+) -> i32 {
+    unsafe {
+        call(error, || {
+            if output.is_null() {
+                return Err(Error::Invalid("markup projection"));
+            }
+            let command = command.as_ref().ok_or(Error::Invalid("markup command"))?;
+            let mut guard = command
+                .value
+                .try_lock()
+                .map_err(|_| Error::Invalid("markup reentry"))?;
+            if guard.as_ref().is_none_or(|value| value.result.is_none()) {
+                return Err(Error::Invalid("markup not complete"));
+            }
+            let command = guard.as_mut().ok_or(Error::Invalid("markup consumed"))?;
+            let context = command
+                .result
+                .take()
+                .ok_or(Error::Invalid("markup lost context"))?;
+            let mut cancelled = || {
+                operation
+                    .is_cancelled
+                    .is_some_and(|callback| callback(operation.context) != 0)
+            };
+            let markdown = if command.mode == bloom_text::MarkupMode::Style {
+                bloom_core::paged_spans_with_cancel(&context, &mut cancelled).map_err(|error| {
+                    if cancelled() {
+                        Error::Cancelled
+                    } else {
+                        Error::Storage(error.to_string())
+                    }
+                })?
+            } else {
+                Vec::new()
+            };
+            let media = if command.mode == bloom_text::MarkupMode::Media {
+                bloom_core::paged_media_spans_with_cancel(&context, &mut cancelled).map_err(
+                    |error| {
+                        if cancelled() {
+                            Error::Cancelled
+                        } else {
+                            Error::Storage(error.to_string())
+                        }
+                    },
+                )?
+            } else {
+                Vec::new()
+            };
+            let complete = context.complete_blocks && context.reference_budget_proven;
+            let value = json!({"rootID":command.window.snapshot().id(),"windowID":command.window.id(),
+            "start":command.window.start(),"summary":command.window.local_summary(),
+            "complete":complete,"markdown":markdown,"media":media,
+            "trackedReferencePeakBytes":command.tracked_reference_peak_bytes,
+            "maxReferenceCount":command.max_reference_count,"maxReferenceProbes":command.max_reference_probes,
+            "hasWikiMarker":complete && command.window.text().contains("[["),
+            "hasAttachmentMarker":complete && command.window.text().contains("[Attachment: ")});
+            let bytes =
+                serde_json::to_vec(&value).map_err(|_| Error::Invalid("markup projection JSON"))?;
+            if bytes.len() > 2 * 1024 * 1024 {
+                return Err(Error::Invalid("markup projection reply bound"));
+            }
+            let mut bytes = bytes.into_boxed_slice();
+            *output = BoomAttachmentBuffer {
+                data: bytes.as_mut_ptr(),
+                length: bytes.len(),
+            };
+            std::mem::forget(bytes);
+            if command.builder.is_none() {
+                guard.take();
+            }
+            Ok(())
+        })
+    }
+}
+/// # Safety
+/// Only after every entered callback/step has joined. Frees derived state and
+/// immutable values; it never discards native input or publishes a text root.
+#[no_mangle]
+pub unsafe extern "C" fn bloom_logical_markup_free(command: *mut BloomLogicalMarkup) {
+    if !command.is_null() {
+        unsafe {
+            drop(Box::from_raw(command));
+        }
+    }
+}

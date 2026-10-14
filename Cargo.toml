@@ -11,6 +11,10 @@ members = [
   "crates/attachment-native-types",
 ]
 resolver = "3"
+exclude = ["vendor/pulldown-cmark"]
+
+[patch.crates-io]
+pulldown-cmark = { path = "vendor/pulldown-cmark" }
 
 [workspace.package]
 version = "0.1.0"

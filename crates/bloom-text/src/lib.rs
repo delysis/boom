@@ -29,6 +29,12 @@ pub use logical::{
 mod logical_commands;
 pub use logical_commands::{LogicalCommand, LogicalCommandRequest, LogicalCommandResult};
 
+mod markup;
+pub use markup::{
+    MarkupContext, MarkupFragment, MarkupIndex, MarkupIndexBuilder, MarkupMode, MarkupProgress,
+    MarkupQuery, MarkupQueryProgress,
+};
+
 pub const TEXT_PAGE_BYTES: usize = 64 * 1024;
 pub const INDEX_PAGE_BYTES: usize = 16 * 1024;
 pub const WINDOW_BYTES: usize = 128 * 1024;
