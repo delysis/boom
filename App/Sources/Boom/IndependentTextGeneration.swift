@@ -44,7 +44,7 @@ extension MLXGemmaRunner {
         seed: requests[row].identity.seed, outputLimit: requests[row].identity.maxTokens,
         samplingDigest: Digest.sha256(try encoder.encode(requests[row].settings)),
         cacheParentID: cohort.parentIDs[row],
-        cacheHistoryDigest: Digest.sha256(try encoder.encode(cohort.rows[row].observation.cachedForwardHistory)),
+        cacheHistoryDigest: try PromptPrefixCache.operandHistoryDigest(cohort.rows[row].observation.cachedForwardHistory),
         cacheLengths: cohort.cacheLengths[row],
         cachePadding: zip(cohort.cacheWidths, cohort.cacheLengths[row]).map { $0 - $1 })
     }
@@ -55,7 +55,7 @@ extension MLXGemmaRunner {
         independentCohort: IndependentTextCohortOrigin(schema: 1, cohortID: cohortID,
           row: row, rows: lineage, policyDigest: policyDigest, promptWidth: cohort.input.text.tokens.dim(1),
           maskDigest: cohort.maskDigest, cacheWidths: cohort.cacheWidths,
-          prefill: PromptCacheGeometry(promptTokens: cohort.input.text.tokens.dim(1), prefill: cohort.prefill)))
+          prefill: PromptCacheGeometry(promptTokens: cohort.input.text.tokens.dim(1), prefill: cohort.observedPrefill)))
     }
   }
 
@@ -116,7 +116,7 @@ extension MLXGemmaRunner {
         _ = cohort.captureLane(row, emitted: tokens[row], stop: stops[row], finished: true)
       }
     }
-    var prefill = cohort.prefill
+    var prefill = cohort.observedPrefill
     let originalProgress = prefill.progress
     prefill.progress = { processed, total in
       // Pinned Gemma text forEachChunk explicitly submits the complete cache
@@ -197,6 +197,7 @@ extension MLXGemmaRunner {
           continue
         }
         logits = try autoreleasepool {
+          cohort.observeDecodeOperands(sampled, active: reasons.map { $0 == nil })
           let output = model(LMInput.Text(tokens: MLXArray(sampled).reshaped([width, 1])),
             cache: cohort.cache, state: nil)
           guard output.state == nil else { throw BoomError.invalid("Unexpected independent decode state.") }

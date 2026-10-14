@@ -71,6 +71,114 @@ final class PromptPrefixCache: @unchecked Sendable {
     let geometry: PromptCacheGeometry?
     // A prefix inside a forward still came from the complete original forward.
     var evaluatedEndTokenCount: Int? = nil
+    var originalInput: OperandWitness? = nil
+  }
+  /// Immutable shared metadata; the existing backing lease charges its bounded
+  /// host bytes until every entry, borrowed history and observation releases it.
+  final class OperandWitness: Codable, Equatable, @unchecked Sendable {
+    let binding: ForwardOperandBinding
+    let identity: String
+    private let lease: PrefixKVDependencyLease?
+    init(_ binding: ForwardOperandBinding, lease: PrefixKVDependencyLease? = nil) {
+      self.binding = binding; self.lease = lease
+      identity = (try? Digest.identity(binding)) ?? ""
+    }
+    required init(from decoder: Decoder) throws {
+      binding = try ForwardOperandBinding(from: decoder); lease = nil
+      identity = (try? Digest.identity(binding)) ?? ""
+    }
+    func encode(to encoder: Encoder) throws { try binding.encode(to: encoder) }
+    func committed() -> OperandWitness? {
+      guard let value = binding.committed(allOwningLayersComplete: true, actuallySubmitted: true) else { return nil }
+      return OperandWitness(value, lease: lease)
+    }
+    static func == (lhs: OperandWitness, rhs: OperandWitness) -> Bool { lhs.binding == rhs.binding }
+  }
+  /// One immutable host context per operation. Slices share the already-owned
+  /// prepared token arrays; each forward retains only a bounded digest, never a
+  /// repeated copy of the full prompt or any tensor/embedding contents.
+  fileprivate final class OperandContext: @unchecked Sendable {
+    let model: String
+    let suffixes: [ArraySlice<Int>]
+    let cached: [Int]
+    let prefillMembers: [ForwardOperandBinding.Member]
+    let decodeMembers: [ForwardOperandBinding.Member]
+    private let lease: PrefixKVDependencyLease
+    init?(model: String, tokenRows: [[Int]], cached: [Int], requests: [[String]],
+      histories: [[ForwardSegment]], cacheLengths: [[Int]], cacheWidths: [Int],
+      sharedDecodeRequests: [String]?, lease: PrefixKVDependencyLease) {
+      guard ForwardOperandBinding.isDigest(model), (1...4).contains(tokenRows.count),
+        cached.count == tokenRows.count, requests.count == tokenRows.count,
+        histories.count == tokenRows.count, cacheLengths.count == tokenRows.count,
+        !cacheWidths.isEmpty, cacheWidths.count <= 128,
+        cacheWidths.allSatisfy({ (0...16_384).contains($0) }),
+        cacheLengths.allSatisfy({ $0.count == cacheWidths.count
+          && zip($0, cacheWidths).allSatisfy({ (0...$0.1).contains($0.0) }) }),
+        tokenRows.indices.allSatisfy({ !tokenRows[$0].isEmpty && tokenRows[$0].count <= 16_384
+          && (0..<tokenRows[$0].count).contains(cached[$0]) }) else { return nil }
+      struct Padding: Encodable { let lengths: [Int]; let widths: [Int] }
+      var members: [ForwardOperandBinding.Member] = []
+      for row in tokenRows.indices {
+        guard let full = ForwardOperandBinding.tokenDigest([tokenRows[row]]),
+          let prefix = cached[row] == 0 ? Digest.sha256("Boom.empty-token-prefix.v1")
+            : ForwardOperandBinding.tokenDigest([Array(tokenRows[row].prefix(cached[row]))]),
+          let source = try? PromptPrefixCache.operandHistoryDigest(histories[row]),
+          let padding = try? Digest.identity(Padding(lengths: cacheLengths[row], widths: cacheWidths)) else { return nil }
+        members.append(.init(logicalRequests: requests[row], preparedTokenDigest: full,
+          preparedTokenCount: tokenRows[row].count, cachedTokenCount: cached[row],
+          cachedTokenDigest: prefix, cachedSourceDigest: source, cachePaddingDigest: padding))
+      }
+      self.model = model; self.cached = cached; self.lease = lease
+      suffixes = tokenRows.indices.map { tokenRows[$0][cached[$0]...] }
+      prefillMembers = members
+      if let sharedDecodeRequests {
+        guard tokenRows.count == 1, (1...4).contains(sharedDecodeRequests.count) else { return nil }
+        let base = members[0]
+        decodeMembers = sharedDecodeRequests.map {
+          .init(logicalRequests: [$0], preparedTokenDigest: base.preparedTokenDigest,
+            preparedTokenCount: base.preparedTokenCount, cachedTokenCount: base.cachedTokenCount,
+            cachedTokenDigest: base.cachedTokenDigest, cachedSourceDigest: base.cachedSourceDigest,
+            cachePaddingDigest: base.cachePaddingDigest)
+        }
+      } else { decodeMembers = members }
+    }
+    func prefill(_ range: Range<Int>, physicalWidth: Int, actualLengths: [Int]) -> ForwardOperandBinding? {
+      guard physicalWidth == suffixes.count, actualLengths == suffixes.map(\.count),
+        range.lowerBound >= 0, range.upperBound <= (actualLengths.max() ?? 0), !range.isEmpty else { return nil }
+      let valid = suffixes.map { max(0, min(range.count, $0.count - range.lowerBound)) }
+      let rows = suffixes.indices.map { row -> [Int] in
+        let lower = min(range.lowerBound, suffixes[row].count)
+        let begin = suffixes[row].index(suffixes[row].startIndex, offsetBy: lower)
+        return Array(suffixes[row][begin..<suffixes[row].index(begin, offsetBy: valid[row])])
+          + Array(repeating: 0, count: range.count - valid[row])
+      }
+      return ForwardOperandBinding.candidate(phase: .prefill, modelBinding: model, members: prefillMembers,
+        inputRangeStart: range.lowerBound, tokenRows: rows,
+        logicalStarts: suffixes.indices.map { cached[$0] + min(range.lowerBound, suffixes[$0].count) },
+        validLengths: valid, generationActive: Array(repeating: true, count: physicalWidth))
+    }
+    func decode(_ sampled: [Int], logicalStarts: [Int], active: [Bool], step: Int) -> ForwardOperandBinding? {
+      guard sampled.count == decodeMembers.count, logicalStarts.count == sampled.count,
+        active.count == sampled.count else { return nil }
+      // The real decode call has no prompt padding mask. Inert rows still are
+      // actual physical operands; semantic activity is recorded separately.
+      return ForwardOperandBinding.candidate(phase: .decode, modelBinding: model, members: decodeMembers,
+        inputRangeStart: step, tokenRows: sampled.map { [$0] }, logicalStarts: logicalStarts,
+        validLengths: Array(repeating: 1, count: sampled.count), generationActive: active)
+    }
+  }
+  static func operandHistoryDigest(_ history: [ForwardSegment]) throws -> String {
+    struct Segment: Encodable {
+      let origin: Origin; let start: Int; let end: Int; let evaluatedEnd: Int?
+      let width: Int; let row: Int?; let prompt: Int?; let geometry: PromptCacheGeometry?
+      let operand: String?
+    }
+    guard history.count <= 16_384 else { throw BoomError.invalid("Unbounded forward metadata.") }
+    // Linear metadata only: the original matrix digest/context is shared and
+    // hashed once per actual forward, not serialized again per history prefix.
+    return try Digest.identity(history.map { Segment(origin: $0.origin, start: $0.startTokenCount,
+      end: $0.endTokenCount, evaluatedEnd: $0.evaluatedEndTokenCount, width: $0.batchWidth,
+      row: $0.row, prompt: $0.promptTokenCount, geometry: $0.geometry, operand: $0.originalInput?.identity) })
   }
   struct Completion: Sendable {
     let row: Int
@@ -166,6 +274,22 @@ final class PromptPrefixCache: @unchecked Sendable {
       await capture.joinSpill()
       if !cancelled { await capture.drainReadySpills(cache.map { PrefixKVStorage.unwrap($0) }) }
     }
+    /// Only the verified text route installs this observer. Its pinned prepare
+    /// helper confirms the actual physical width/valid lengths at each call.
+    func bindForwardOperands(model: String, requests: [String])
+      -> (@Sendable (Range<Int>, Int, [Int]) -> Void)? {
+      guard let capture, let lease = capture.makeContextLease(16_384),
+        let context = OperandContext(model: model, tokenRows: [capture.tokens], cached: [cachedTokenCount],
+          requests: [requests], histories: [observation.cachedForwardHistory],
+          cacheLengths: [cache.map { $0.offset }], cacheWidths: cache.map { $0.offset },
+          sharedDecodeRequests: requests, lease: lease) else { return nil }
+      capture.installOperandContext(context)
+      return { [weak capture] range, width, lengths in
+        guard let capture else { return }
+        capture.beginOperand(capture.prepareOperand(context.prefill(range, physicalWidth: width, actualLengths: lengths)))
+      }
+    }
+    func observeDecodeOperands(_ sampled: [Int], active: [Bool]) { capture?.observeDecodeOperands(sampled, active: active) }
     var retentionObservation: RetentionObservation? { capture?.observation }
     func discardStagedAnchors() { capture?.discard() }
     var didSample: (@Sendable (MLXArray) -> Void)? {
@@ -399,6 +523,13 @@ final class PromptPrefixCache: @unchecked Sendable {
     private var lastCompleteTokenCount = 0
     private var refusalReason: ReservationDecision?
     private var history: [ForwardSegment] = []
+    private var currentOperand: OperandWitness?
+    private var operandCandidates: [Int: OperandWitness] = [:]
+    private var scalarOperandMembers: [ForwardOperandBinding.Member] = []
+    private var operandModelBinding: String?
+    private let makeOperandWitness: @Sendable (ForwardOperandBinding) -> OperandWitness?
+    let makeContextLease: @Sendable (UInt64) -> PrefixKVDependencyLease?
+    private var operandContext: OperandContext?
     private var samples: [MLXArray] = []
     private var singleValid = true
     private var lanes: [Int: Lane] = [:]
@@ -417,7 +548,10 @@ final class PromptPrefixCache: @unchecked Sendable {
       closeRawLease: @escaping @Sendable (UUID) -> Void, disk: PrefixKVDiskStore,
       spillIsLive: @escaping @Sendable () -> Bool,
       reclaimDiskEntry: @escaping @Sendable () -> Bool, nativeGlobals: Bool = false,
-      independentRow: Int? = nil, independentWidth: Int? = nil) {
+      independentRow: Int? = nil, independentWidth: Int? = nil,
+      makeOperandWitness: @escaping @Sendable (ForwardOperandBinding) -> OperandWitness? = { _ in nil },
+      makeContextLease: @escaping @Sendable (UInt64) -> PrefixKVDependencyLease? = { _ in nil }) {
+      self.makeOperandWitness = makeOperandWitness; self.makeContextLease = makeContextLease
       self.independentRow = independentRow; self.independentWidth = independentWidth
       self.layouts = layouts; self.nativeGlobals = nativeGlobals
       self.tokens = tokens; self.cachedCount = cachedCount
@@ -463,6 +597,63 @@ final class PromptPrefixCache: @unchecked Sendable {
       lock.lock(); defer { lock.unlock() }
       guard !discarded else { return }
       submittedEnd = max(submittedEnd, end); workingGraphSubmitted = true
+      commitOperands(through: submittedEnd)
+    }
+    func installOperandContext(_ context: OperandContext) {
+      lock.lock(); defer { lock.unlock() }
+      operandContext = context; operandModelBinding = context.model; scalarOperandMembers = context.decodeMembers
+    }
+    func observeDecodeOperands(_ sampled: [Int], active: [Bool]) {
+      lock.lock(); let context = operandContext; let start = end; lock.unlock()
+      guard let context else { return }
+      let step = max(0, start - tokens.count)
+      beginOperand(prepareOperand(context.decode(sampled,
+        logicalStarts: Array(repeating: start, count: sampled.count), active: active, step: step)))
+    }
+    func prepareOperand(_ candidate: ForwardOperandBinding?) -> OperandWitness? {
+      candidate.flatMap(makeOperandWitness)
+    }
+    func beginOperand(_ candidate: OperandWitness?) {
+      lock.lock(); defer { lock.unlock() }
+      currentOperand = candidate
+    }
+    private func appendHistory(_ segment: ForwardSegment) {
+      let index = history.count; history.append(segment)
+      defer { currentOperand = nil }
+      let row = independentRow ?? segment.row ?? 0
+      if let value = currentOperand,
+        value.binding.phase == (segment.origin == .prefill ? .prefill : .decode),
+        value.binding.describes(start: segment.startTokenCount,
+        end: segment.endTokenCount,
+        evaluatedEnd: segment.evaluatedEndTokenCount ?? segment.endTokenCount,
+        width: segment.batchWidth, row: segment.batchWidth > 1 ? row : nil) {
+        operandCandidates[index] = value
+      }
+    }
+    private func commitOperands(through submitted: Int) {
+      for index in operandCandidates.keys.sorted() where history[index].endTokenCount <= submitted {
+        // appendHistory runs only after every owning layer supplied the same
+        // shape. The caller separately proves actual submission/join.
+        history[index].originalInput = operandCandidates.removeValue(forKey: index)?.committed()
+      }
+    }
+    private func bindJoinedScalarOperands(_ actual: [Int], through count: Int) {
+      guard let model = operandModelBinding, scalarOperandMembers.count == 1 else { return }
+      for index in history.indices {
+        let segment = history[index]
+        guard segment.originalInput == nil, segment.origin == .singleDecode, segment.batchWidth == 1,
+          segment.endTokenCount == segment.startTokenCount + 1,
+          segment.endTokenCount <= count, segment.startTokenCount >= tokens.count,
+          actual.indices.contains(segment.startTokenCount - tokens.count) else { continue }
+        let offset = segment.startTokenCount - tokens.count
+        let candidate = ForwardOperandBinding.candidate(phase: .decode, modelBinding: model,
+          members: scalarOperandMembers, inputRangeStart: offset,
+          tokenRows: [[actual[offset]]], logicalStarts: [segment.startTokenCount],
+          validLengths: [1], generationActive: [true])
+        if let value = candidate?.committed(allOwningLayersComplete: true, actuallySubmitted: true) {
+          history[index].originalInput = makeOperandWitness(value)
+        }
+      }
     }
     var coveredEnd: Int { lock.lock(); defer { lock.unlock() }; return end }
     var stagedBytes: UInt64 { lock.lock(); defer { lock.unlock() }; return novelBytes }
@@ -525,7 +716,7 @@ final class PromptPrefixCache: @unchecked Sendable {
         end = forward.end; lastCompleteTokenCount = end; pending = nil
         let origin: Origin = forward.start < tokens.count ? .prefill
           : forward.width == 1 ? .singleDecode : .batchDecode
-        history.append(ForwardSegment(origin: origin, startTokenCount: forward.start,
+        appendHistory(ForwardSegment(origin: origin, startTokenCount: forward.start,
           endTokenCount: forward.end, batchWidth: forward.width, row: nil,
           promptTokenCount: origin == .prefill ? tokens.count : nil,
           geometry: origin == .prefill ? suffixGeometry : nil,
@@ -551,7 +742,7 @@ final class PromptPrefixCache: @unchecked Sendable {
       if forward.layers.count == layouts.count {
         end = forward.end; lastCompleteTokenCount = end; pending = nil
         let origin: Origin = forward.start < tokens.count ? .prefill : .batchDecode
-        history.append(ForwardSegment(origin: origin, startTokenCount: forward.start,
+        appendHistory(ForwardSegment(origin: origin, startTokenCount: forward.start,
           endTokenCount: forward.end, batchWidth: width, row: row,
           promptTokenCount: origin == .prefill ? tokens.count : nil,
           geometry: origin == .prefill ? suffixGeometry : nil,
@@ -605,7 +796,7 @@ final class PromptPrefixCache: @unchecked Sendable {
         end = forward.end; lastCompleteTokenCount = end; pending = nil
         let origin: Origin = forward.start < tokens.count ? .prefill
           : forward.width == 1 ? .singleDecode : .batchDecode
-        history.append(ForwardSegment(origin: origin, startTokenCount: forward.start,
+        appendHistory(ForwardSegment(origin: origin, startTokenCount: forward.start,
           endTokenCount: forward.end, batchWidth: forward.width, row: nil,
           promptTokenCount: origin == .prefill ? tokens.count : nil,
           geometry: origin == .prefill ? suffixGeometry : nil, evaluatedEndTokenCount: forward.end))
@@ -878,7 +1069,10 @@ final class PromptPrefixCache: @unchecked Sendable {
         // Pinned Gemma4 text prepare's intermediate callback runs only AFTER
         // asyncEval(cache). Its terminal callback runs BEFORE final submission.
         let (full, overflow) = cachedCount.addingReportingOverflow(processed)
-        if !overflow, full <= end { submittedEnd = max(submittedEnd, full); workingGraphSubmitted = true }
+        if !overflow, full <= end {
+          submittedEnd = max(submittedEnd, full); workingGraphSubmitted = true
+          commitOperands(through: submittedEnd)
+        }
       }
     }
     func observeSample(_ token: MLXArray) {
@@ -909,6 +1103,7 @@ final class PromptPrefixCache: @unchecked Sendable {
       spillCancellation.cancel()
       lock.lock(); defer { lock.unlock() }
       discarded = true; accepting = false; spans.removeAll(); samples.removeAll(); lanes.removeAll()
+      currentOperand = nil; operandCandidates.removeAll(); history.removeAll(); operandContext = nil
       spanCharges.removeAll(); novelBytes = 0; end = 0; pending = nil
       closeLease()
     }
@@ -918,17 +1113,16 @@ final class PromptPrefixCache: @unchecked Sendable {
       lock.lock(); defer { lock.unlock() }
       guard !discarded, complete, pending == nil, end > 0,
         Set(completions.map(\.row)).count == completions.count else { return [] }
-      let fullHistory = inheritedHistory + history
       func entry(ledger: [Int], processed: Int, width: Int, row: Int?, frozenLocal: [[PrefixKVSpan]]? = nil) -> Entry? {
         let count = min(nativeGlobals ? submittedEnd : end, min(end, min(processed, tokens.count + ledger.count)))
         guard count > 0 else { return nil }
         let ids = Array(tokens.prefix(count)) + Array(ledger.prefix(max(0, count - tokens.count)))
-        let selectedHistory = PromptPrefixCache.clippedHistory(fullHistory, through: count).map { segment in
+        let selectedHistory = PromptPrefixCache.clippedHistory(inheritedHistory + history, through: count).map { segment in
           ForwardSegment(origin: segment.origin, startTokenCount: segment.startTokenCount,
             endTokenCount: segment.endTokenCount, batchWidth: segment.batchWidth,
             row: segment.row ?? (segment.origin == .batchDecode && segment.startTokenCount >= tokens.count ? row : nil),
             promptTokenCount: segment.promptTokenCount, geometry: segment.geometry,
-            evaluatedEndTokenCount: segment.evaluatedEndTokenCount)
+            evaluatedEndTokenCount: segment.evaluatedEndTokenCount, originalInput: segment.originalInput)
         }
         let value = Entry(id: UUID(), owner: owner, tokens: ids, layouts: layouts,
           spans: layouts.indices.map { layer in
@@ -968,6 +1162,7 @@ final class PromptPrefixCache: @unchecked Sendable {
           let needed = min(samples.count, min(observed.count, max(0, end - tokens.count)))
           let actual = samples.prefix(needed).flatMap { $0.asArray(Int.self) }
           matching = Array(zip(actual, observed).prefix(while: { $0.0 == $0.1 }).map { $0.1 })
+          bindJoinedScalarOperands(actual, through: min(submittedEnd, tokens.count + matching.count))
         }
         if let value = entry(ledger: matching, processed: tokens.count + matching.count, width: 1, row: nil) { result.append(value) }
       }
@@ -985,7 +1180,6 @@ final class PromptPrefixCache: @unchecked Sendable {
       // advanced exclusively by the all-owning-layer cohort at update's end.
       // Removing that pending cohort never changes the native working cache.
       removeIncomplete()
-      let fullHistory = inheritedHistory + history
       func entry(ledger: [Int], processed: Int, width: Int, row: Int?,
         frozenLocal: [[PrefixKVSpan]]? = nil) -> Entry? {
         let cap = min(submittedEnd, min(end, min(processed, tokens.count + ledger.count)))
@@ -1003,12 +1197,12 @@ final class PromptPrefixCache: @unchecked Sendable {
           batchWidth: width, row: row, history: [], nativeGlobalPrefix: nativeGlobals ? cap : nil,
           nativeCurrentPrefix: nativeGlobals && cap == end ? cap : nil)
         guard let count = candidate.maximumSupportedPrefix(upTo: cap) else { return nil }
-        let selectedHistory = PromptPrefixCache.clippedHistory(fullHistory, through: count).map { segment in
+        let selectedHistory = PromptPrefixCache.clippedHistory(inheritedHistory + history, through: count).map { segment in
           ForwardSegment(origin: segment.origin, startTokenCount: segment.startTokenCount,
             endTokenCount: segment.endTokenCount, batchWidth: segment.batchWidth,
             row: segment.row ?? (segment.origin == .batchDecode && segment.startTokenCount >= tokens.count ? row : nil),
             promptTokenCount: segment.promptTokenCount, geometry: segment.geometry,
-            evaluatedEndTokenCount: segment.evaluatedEndTokenCount)
+            evaluatedEndTokenCount: segment.evaluatedEndTokenCount, originalInput: segment.originalInput)
         }
         let source = selectedHistory.last
         let sourceRow = independentRow ?? (source?.origin == .batchDecode ? source?.row ?? row : nil)
@@ -1037,6 +1231,7 @@ final class PromptPrefixCache: @unchecked Sendable {
         // Same lazy sample validation as normal publication, after its fence.
         let actual = samples.prefix(needed).flatMap { $0.asArray(Int.self) }
         let matching = Array(zip(actual, known).prefix(while: { $0.0 == $0.1 }).map { $0.1 })
+        bindJoinedScalarOperands(actual, through: min(submittedEnd, tokens.count + matching.count))
         if let value = entry(ledger: matching, processed: tokens.count + matching.count,
           width: 1, row: nil) { result.append(value) }
       }
@@ -1082,13 +1277,14 @@ final class PromptPrefixCache: @unchecked Sendable {
     lock.lock(); defer { lock.unlock() }; return publicationTicket == ticket
   }
   func clear(reason: String? = nil) {
+    var retiredEntries: [Stored] = []
     lock.lock()
     let retired = activeNative; activeNative = nil
-    for id in Array(entries.keys) { remove(id) }
+    for id in Array(entries.keys) { remove(id, retiring: &retiredEntries) }
     indices.removeAll(); storageEpoch = UUID()
     // Live capture/lookup/hydration/native owners keep their true charges.
     publicationTicket = nil; pendingMissReason = reason
-    lock.unlock(); withExtendedLifetime(retired) {}
+    lock.unlock(); withExtendedLifetime((retired, retiredEntries)) {}
   }
   /// Explicit close/eviction joins producers first, then clears and awaits the
   /// cleanup already queued by last file owners. Escaped spans remain owned.
@@ -1159,6 +1355,9 @@ final class PromptPrefixCache: @unchecked Sendable {
     let cacheWidths: [Int]
     let maskDigest: String
     let prefill: PrefillParameters
+    private let preparedIDs: [[Int]]
+    private var operandContext: OperandContext?
+    private var decodeForwards = 0
     fileprivate let resources: [PrefixKVNativeOwnership]
     fileprivate let captures: [Capture]
     private var preparing = true
@@ -1169,13 +1368,42 @@ final class PromptPrefixCache: @unchecked Sendable {
     private let spill: (TextCohort, Bool) -> (accepted: Bool, quotaRefused: Bool)
     fileprivate init(input: LMInput, rows: [Session], parentIDs: [UUID?],
       cacheLengths: [[Int]], cacheWidths: [Int], maskDigest: String,
-      prefill: PrefillParameters, resources: [PrefixKVNativeOwnership], captures: [Capture],
+      prefill: PrefillParameters, preparedIDs: [[Int]], resources: [PrefixKVNativeOwnership], captures: [Capture],
       spill: @escaping (TextCohort, Bool) -> (accepted: Bool, quotaRefused: Bool)) {
       self.input = input; self.rows = rows; self.parentIDs = parentIDs
       self.cacheLengths = cacheLengths; self.cacheWidths = cacheWidths; self.maskDigest = maskDigest
-      self.prefill = prefill; self.resources = resources; self.captures = captures; self.spill = spill
+      self.prefill = prefill; self.preparedIDs = preparedIDs
+      self.resources = resources; self.captures = captures; self.spill = spill
       processedByLayer = Array(repeating: 0, count: resources.count)
       active = Array(repeating: true, count: rows.count)
+    }
+    func bindForwardOperands(model: String, requests: [String]) {
+      guard requests.count == rows.count, let first = captures.first,
+        let lease = first.makeContextLease(16_384),
+        let context = OperandContext(model: model, tokenRows: preparedIDs,
+          cached: rows.map(\.cachedTokenCount), requests: requests.map { [$0] },
+          histories: rows.map { $0.observation.cachedForwardHistory },
+          cacheLengths: cacheLengths, cacheWidths: cacheWidths,
+          sharedDecodeRequests: nil, lease: lease) else { return }
+      operandContext = context
+      for capture in captures { capture.installOperandContext(context) }
+    }
+    var observedPrefill: PrefillParameters {
+      var value = prefill
+      guard let context = operandContext else { return value }
+      value.observeTextForward = { [weak self] range, width, lengths in
+        guard let self, let first = self.captures.first else { return }
+        let witness = first.prepareOperand(context.prefill(range, physicalWidth: width, actualLengths: lengths))
+        for capture in self.captures { capture.beginOperand(witness) }
+      }
+      return value
+    }
+    func observeDecodeOperands(_ sampled: [Int], active: [Bool]) {
+      guard let context = operandContext, let first = captures.first else { return }
+      let starts = rows.map { $0.fullPromptTokenCount + decodeForwards }
+      let witness = first.prepareOperand(context.decode(sampled, logicalStarts: starts, active: active, step: decodeForwards))
+      for capture in captures { capture.beginOperand(witness) }
+      decodeForwards += 1
     }
     fileprivate func installObservers() {
       cache = resources.enumerated().map { layer, resource in
@@ -1347,7 +1575,9 @@ final class PromptPrefixCache: @unchecked Sendable {
         spillIsLive: { [weak self] in self?.spillTicketIsLive(ticket) ?? false },
         reclaimDiskEntry: { [weak self] in self?.retireOldestDiskEntry(epoch: ticket) ?? false },
         nativeGlobals: true,
-        independentRow: row, independentWidth: inputs.count)
+        independentRow: row, independentWidth: inputs.count,
+        makeOperandWitness: { [weak self] in self?.makeOperandWitness($0, epoch: ticket) },
+        makeContextLease: { [weak self] in self?.makeMetadataLease($0, epoch: ticket) })
       let history = inherited.map { Self.clippedHistory($0.history, through: counts[row]) } ?? []
       let observation = Observation(algorithm: Self.activeAlgorithm, originalGeometry: capture.geometry,
         suffixGeometry: commonGeometry, fullPromptTokens: inputs[row].tokens.count,
@@ -1365,7 +1595,7 @@ final class PromptPrefixCache: @unchecked Sendable {
     }
     let cohort = TextCohort(input: input, rows: sessions, parentIDs: choices.map { $0?.1.id },
       cacheLengths: lengths, cacheWidths: (0..<layerCount).map { layer in lengths.map { $0[layer] }.max()! },
-      maskDigest: Digest.sha256(try JSONEncoder().encode(masks)), prefill: prefill,
+      maskDigest: Digest.sha256(try JSONEncoder().encode(masks)), prefill: prefill, preparedIDs: inputs.map(\.tokens),
       resources: resources, captures: captures, spill: { [weak self] value, finalizing in
         self?.observeTextCohortSpill(value, ticket: ticket, allowSnapshot: allowSnapshot,
           finalizing: finalizing) ?? (false, false)
@@ -1484,6 +1714,8 @@ final class PromptPrefixCache: @unchecked Sendable {
   /// it cannot cancel, publish or mint another row's receiving result.
   @discardableResult func publishTextCohort(_ cohort: TextCohort,
     retention: [TextCohortRetention?]) -> Bool {
+    var retiredEntries: [Stored] = []
+    defer { withExtendedLifetime(retiredEntries) {} }
     guard retention.count == cohort.rows.count, let epoch = cohort.rows.first?.epoch else { return false }
     lock.lock(); let current = publicationTicket == epoch; lock.unlock()
     guard current else { return false }
@@ -1545,7 +1777,7 @@ final class PromptPrefixCache: @unchecked Sendable {
     var rows: [Entry] = [], diskAdded = false
     for (value, disposition, binding, hot) in candidates {
       let install = {
-        diskAdded = self.retainDiskRows([value]) || diskAdded // strips ALL native coverage witnesses
+        diskAdded = self.retainDiskRows([value], retiring: &retiredEntries) || diskAdded // strips ALL native coverage witnesses
         if hot { rows.append(value) }
       }
       if let authorization = disposition.authorization, let binding {
@@ -1873,7 +2105,9 @@ final class PromptPrefixCache: @unchecked Sendable {
       releaseRawBacking: { [weak self] lease, id in self?.releaseLeaseBacking(lease, id: id) },
       closeRawLease: { [self] lease in releaseLease(lease) }, disk: disk,
       spillIsLive: { [weak self] in self?.spillTicketIsLive(ticket) ?? false },
-      reclaimDiskEntry: { [weak self] in self?.retireOldestDiskEntry(epoch: ticket) ?? false }, nativeGlobals: true)
+      reclaimDiskEntry: { [weak self] in self?.retireOldestDiskEntry(epoch: ticket) ?? false }, nativeGlobals: true,
+      makeOperandWitness: { [weak self] in self?.makeOperandWitness($0, epoch: ticket) },
+        makeContextLease: { [weak self] in self?.makeMetadataLease($0, epoch: ticket) })
     let cache: [KVCache] = owners.enumerated().map { layer, resource in
       PrefixKVCache(layer: layer, ownership: resource) {
         if $0 == 0 { capture.observeReadySpill(owners.map { $0.native }) }
@@ -1913,6 +2147,8 @@ final class PromptPrefixCache: @unchecked Sendable {
   }
   private func adoptNative(_ session: Session, values: [Entry], completions: [Completion],
     acknowledged: [Completion], authorization: JoinedKVRetentionAuthorization? = nil, binding: JoinedKVRetentionBinding? = nil) -> Bool {
+    var retiredEntries: [Stored] = []
+    defer { withExtendedLifetime(retiredEntries) {} }
     guard let capture = session.capture, let resources = session.nativeOwners, !values.isEmpty,
       resources.count == values[0].layouts.count else { return false }
     // Unsubmitted lazy suffixes cannot be adopted by offset trim: innerState()
@@ -1955,7 +2191,7 @@ final class PromptPrefixCache: @unchecked Sendable {
     guard publicationTicket == session.epoch else { lock.unlock(); return false }
     let retired = activeNative
     let install = {
-      self.retainDiskRows(rows)
+      self.retainDiskRows(rows, retiring: &retiredEntries)
       self.activeNative = ActiveNativeRecord(owners: resources, rows: rows, localLease: localLease)
       self.publicationTicket = nil
       return true
@@ -1978,7 +2214,7 @@ final class PromptPrefixCache: @unchecked Sendable {
   /// Called only in the existing authorized joined publication, with the index
   /// lock held. Metadata/files survive hot-cache switching; no native array,
   /// unverified global witness or second RAM archive enters this index.
-  @discardableResult private func retainDiskRows(_ rows: [Entry]) -> Bool {
+  @discardableResult private func retainDiskRows(_ rows: [Entry], retiring retiredEntries: inout [Stored]) -> Bool {
     var added = false
     for original in rows {
       var available = original
@@ -1999,12 +2235,12 @@ final class PromptPrefixCache: @unchecked Sendable {
         joinedAcknowledgedRow: original.joinedAcknowledgedRow,
         joinedRetentionProvenance: original.joinedRetentionProvenance)
       for old in entries.values.filter({ $0.entry.owner.namespace == archived.owner.namespace
-        && $0.entry.tokens == archived.tokens }).map({ $0.entry.id }) { remove(old) }
+        && $0.entry.tokens == archived.tokens }).map({ $0.entry.id }) { remove(old, retiring: &retiredEntries) }
       insert(archived); added = true
     }
     while entries.count > 128 {
       guard let oldest = entries.min(by: { $0.value.touched < $1.value.touched })?.key else { break }
-      remove(oldest) // final file owners unlink on the existing utility queue
+      remove(oldest, retiring: &retiredEntries) // final file owners unlink on the existing utility queue
     }
     return added
   }
@@ -2014,6 +2250,8 @@ final class PromptPrefixCache: @unchecked Sendable {
   @discardableResult func publishJoinedValidPrefix(_ session: Session,
     proof: JoinedKVRetentionProof, authorization: JoinedKVRetentionAuthorization,
     acknowledged: [Completion] = []) -> Bool {
+    var retiredEntries: [Stored] = []
+    defer { withExtendedLifetime(retiredEntries) {} }
     let trace = PerformanceTrace.begin("Model.KVRetentionPublish")
     defer { PerformanceTrace.end("Model.KVRetentionPublish", trace) }
     guard proof.permitsRetention,
@@ -2047,7 +2285,7 @@ final class PromptPrefixCache: @unchecked Sendable {
       lock.lock(); defer { lock.unlock() }
       guard publicationTicket == session.epoch else { return false }
       return authorization.withAuthorization(binding: binding) {
-        let added = retainDiskRows(values) // clears every native coverage witness
+        let added = retainDiskRows(values, retiring: &retiredEntries) // clears every native coverage witness
         if added { publicationTicket = nil }
         return added
       } ?? false
@@ -2059,18 +2297,20 @@ final class PromptPrefixCache: @unchecked Sendable {
       var added = false
       for value in values {
         for old in entries.values.filter({ $0.entry.owner.namespace == owner.namespace
-          && $0.entry.tokens == value.tokens }).map({ $0.entry.id }) { remove(old) }
+          && $0.entry.tokens == value.tokens }).map({ $0.entry.id }) { remove(old, retiring: &retiredEntries) }
         insert(value); added = true
       }
       while bytes > byteLimit || entries.count > 128 {
         guard let oldest = entries.min(by: { $0.value.touched < $1.value.touched })?.key else { break }
-        remove(oldest)
+        remove(oldest, retiring: &retiredEntries)
       }
       return added && values.contains { entries[$0.id] != nil }
     } ?? false
   }
   @discardableResult func publish(_ session: Session, completions: [Completion] = [],
     acknowledged: [Completion] = []) -> Bool {
+    var retiredEntries: [Stored] = []
+    defer { withExtendedLifetime(retiredEntries) {} }
     let trace = PerformanceTrace.begin("Model.KVRetentionPublish")
     defer { PerformanceTrace.end("Model.KVRetentionPublish", trace) }
     guard let owner = session.owner, session.capture?.independentRow == nil else { return false }
@@ -2090,13 +2330,13 @@ final class PromptPrefixCache: @unchecked Sendable {
     for value in values {
       // Replace only identical ledgers. Other resident branches remain eligible.
       for old in entries.values.filter({ $0.entry.owner.namespace == owner.namespace && $0.entry.tokens == value.tokens }).map({ $0.entry.id }) {
-        remove(old)
+        remove(old, retiring: &retiredEntries)
       }
       insert(value); added = true
     }
     while bytes > byteLimit || entries.count > 128 {
       guard let oldest = entries.min(by: { $0.value.touched < $1.value.touched })?.key else { break }
-      remove(oldest)
+      remove(oldest, retiring: &retiredEntries)
     }
     return added && values.contains { entries[$0.id] != nil }
   }
@@ -2104,6 +2344,8 @@ final class PromptPrefixCache: @unchecked Sendable {
   /// current rows; quota credit is exclusively the store's completed unlink.
   /// Called from the joined finalizer, never from an active decode update.
   private func retireOldestDiskEntry(epoch: UUID) -> Bool {
+    var retiredEntries: [Stored] = []
+    defer { withExtendedLifetime(retiredEntries) {} }
     lock.lock(); defer { lock.unlock() }
     guard publicationTicket == epoch else { return false }
     let historical = entries.filter { pair in
@@ -2111,13 +2353,32 @@ final class PromptPrefixCache: @unchecked Sendable {
         && pair.value.entry.spans.flatMap({ $0 }).allSatisfy { $0.diskFileID != nil }
     }
     guard let oldest = historical.min(by: { $0.value.touched < $1.value.touched })?.key else { return false }
-    remove(oldest)
+    remove(oldest, retiring: &retiredEntries)
     return true
+  }
+  private func makeOperandWitness(_ binding: ForwardOperandBinding, epoch: UUID) -> OperandWitness? {
+    guard binding.wellFormed,
+      let lease = makeMetadataLease(ForwardOperandBinding.metadataBytesUpperBound, epoch: epoch) else { return nil }
+    return OperandWitness(binding, lease: lease)
+  }
+  private func makeMetadataLease(_ amount: UInt64, epoch: UUID) -> PrefixKVDependencyLease? {
+    guard amount > 0, amount <= 16_384 else { return nil }
+    lock.lock()
+    // Missing diagnostic metadata never evicts a useful KV row or changes its
+    // automatic admission. Use the same existing pool, without eviction.
+    guard publicationTicket == epoch, Self.adding(bytes, amount) <= byteLimit else {
+      lock.unlock(); return nil
+    }
+    let leaseID = UUID(), backingID = UUID()
+    retainLeaseLocked(leaseID, id: backingID, bytes: amount)
+    lock.unlock()
+    return PrefixKVDependencyLease { [weak self] in self?.releaseLease(leaseID) }
   }
   private func reserve(incoming: UInt64, epoch: UUID,
     allow: (@Sendable (UInt64) -> Bool)?) -> ReservationDecision {
     let trace = PerformanceTrace.begin("Model.KVRetentionReserve")
     defer { PerformanceTrace.end("Model.KVRetentionReserve", trace) }
+    var retiredEntries: [Stored] = []
     lock.lock()
     guard publicationTicket == epoch else { lock.unlock(); return .staleTicket }
     while Self.adding(bytes, incoming) > byteLimit {
@@ -2127,7 +2388,13 @@ final class PromptPrefixCache: @unchecked Sendable {
       guard let oldest = resident.min(by: { $0.value.touched < $1.value.touched })?.key else { break }
       // Disk-only metadata cannot free GPU/RAM bytes. Genuine escaped capture
       // and hydration leases keep resident backing charged after retirement.
-      remove(oldest)
+      remove(oldest, retiring: &retiredEntries)
+      lock.unlock()
+      // Dispose the retired references before deciding whether another real
+      // row must be evicted. Escaped observations keep their actual charges.
+      retiredEntries.removeAll()
+      lock.lock()
+      guard publicationTicket == epoch else { lock.unlock(); return .staleTicket }
     }
     let withinPool = Self.adding(bytes, incoming) <= byteLimit
     lock.unlock()
@@ -2191,20 +2458,22 @@ final class PromptPrefixCache: @unchecked Sendable {
       }
     }
   }
-  private func remove(_ id: UUID) {
+  private func remove(_ id: UUID, retiring: inout [Stored]) {
     guard let stored = entries.removeValue(forKey: id) else { return }
     indices[stored.entry.owner.namespace]?.remove(id: id)
     var seen: Set<UUID> = []
     for span in stored.entry.spans.flatMap({ $0 }) where span.backingBytesUpperBound > 0 && seen.insert(span.id).inserted {
       releaseBackingLocked(span.id)
     }
+    retiring.append(stored)
   }
   fileprivate static func clippedHistory(_ history: [ForwardSegment], through count: Int) -> [ForwardSegment] {
     history.filter { $0.startTokenCount < count }.map { segment in
       ForwardSegment(origin: segment.origin, startTokenCount: segment.startTokenCount,
         endTokenCount: min(segment.endTokenCount, count), batchWidth: segment.batchWidth,
         row: segment.row, promptTokenCount: segment.promptTokenCount, geometry: segment.geometry,
-        evaluatedEndTokenCount: segment.evaluatedEndTokenCount ?? segment.endTokenCount)
+        evaluatedEndTokenCount: segment.evaluatedEndTokenCount ?? segment.endTokenCount,
+        originalInput: segment.originalInput)
     }
   }
   /// Admission and execution must use the identical selected stride. A preserved

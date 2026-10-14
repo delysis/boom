@@ -1,3 +1,4 @@
+import BoomCore
 import Foundation
 import MLX
 import MLXLMCommon
@@ -257,4 +258,29 @@ final class PromptPrefixCacheTests: XCTestCase {
       XCTAssertEqual(try session(store, Array(0..<9), owner: scope).cachedTokenCount, 0)
     }
   }
+  func testAdmissionInvalidationCannotPublishAndLaterRequestRemainsLive() async throws {
+    try await Device.withDefaultDevice(.cpu) {
+      let store = PromptPrefixCache(), scope = owner(), ids = Array(0..<9)
+      let entered = CancellationFlag()
+      let invalidated = try session(store, ids, owner: scope, allow: { _ in
+        entered.cancel()
+        store.clear(reason: "actual_admission_callback_invalidated_ticket")
+        return true
+      })
+      try await prefill(invalidated)
+      XCTAssertTrue(entered.isCancelled, "The actual ready-parent admission callback must enter")
+      XCTAssertFalse(store.publish(invalidated))
+      XCTAssertFalse(store.hasAnchors)
+      let next = try session(store, ids, owner: scope)
+      XCTAssertEqual(next.cachedTokenCount, 0)
+      try await prefill(next)
+      XCTAssertTrue(store.publish(next))
+      let reused = try session(store, ids, owner: scope)
+      XCTAssertEqual(reused.cachedTokenCount, 8)
+      reused.discardStagedAnchors()
+      store.clear(reason: "actual_admission_control_joined")
+      await store.joinPendingDiskCleanup()
+    }
+  }
+
 }

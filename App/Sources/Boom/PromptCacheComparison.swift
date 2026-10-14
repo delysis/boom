@@ -1,9 +1,11 @@
+import BoomCore
 import Foundation
 
 extension PromptCacheReuseSmoke {
   enum OutputHistoryRelation: String, Codable, Sendable {
     case sameObservedPartitions = "same_observed_partitions"
     case differentObservedPartitions = "different_observed_partitions"
+    case differentObservedInputs = "different_observed_inputs"
     case unknown
     case incompatibleRequest = "incompatible_request"
   }
@@ -14,6 +16,11 @@ extension PromptCacheReuseSmoke {
     let evaluatedEnd: Int?
     let width: Int
     let row: Int?
+    var originalInput: PromptPrefixCache.OperandWitness? = nil
+    func hasSamePartition(as other: Self) -> Bool {
+      origin == other.origin && start == other.start && end == other.end
+        && evaluatedEnd == other.evaluatedEnd && width == other.width && row == other.row
+    }
   }
   struct OutputHistoryEvidence: Encodable, Equatable, Sendable {
     let requestBinding: String
@@ -30,7 +37,7 @@ extension PromptCacheReuseSmoke {
     let differences: [String]
     var requiresExactOutput: Bool { relation == .sameObservedPartitions }
     var requiredComparisonAdmitted: Bool {
-      relation == .sameObservedPartitions || relation == .differentObservedPartitions
+      relation == .sameObservedPartitions || relation == .differentObservedPartitions || relation == .differentObservedInputs
     }
   }
 
@@ -51,7 +58,8 @@ extension PromptCacheReuseSmoke {
         forward.width > 0,
         (forward.width == 1 ? forward.row == nil : forward.row.map({ (0..<forward.width).contains($0) }) == true)
       else { problems.append("forward_history_gap_or_metadata_missing"); return problems }
-      let widthMatchesOrigin = forward.origin == .batchDecode ? forward.width > 1 : forward.width == 1
+      let widthMatchesOrigin = forward.origin == .singleDecode ? forward.width == 1
+        : (forward.origin == .batchDecode ? forward.width > 1 : (1...4).contains(forward.width))
       if !widthMatchesOrigin {
         problems.append("forward_origin_width_invalid")
       }
@@ -80,35 +88,52 @@ extension PromptCacheReuseSmoke {
     guard comparisonBindingsMatch(lhs, rhs) else {
       return .init(relation: .incompatibleRequest, differences: ["request_binding"])
     }
-    var shapeDifferences: [String] = [], blockers: [String] = [], inputLimitations: [String] = []
+    var shapeDifferences: [String] = [], inputDifferences: [String] = []
+    var blockers: [String] = [], inputLimitations: [String] = []
     for row in lhs.indices {
       let a = lhs[row], b = rhs[row], label = "lane_\(row)."
       blockers += comparisonHistoryProblems(a).map { label + "first." + $0 }
       blockers += comparisonHistoryProblems(b).map { label + "second." + $0 }
-      for value in [a, b] {
-        if value.forwards.contains(where: { ($0.evaluatedEnd ?? $0.end) > $0.end }) {
-          inputLimitations.append(label + "original_evaluated_input_beyond_prefix_unrecorded")
-        }
-        if value.forwards.contains(where: { $0.width > 1 }) {
-          inputLimitations.append(label + "original_batch_operand_matrix_unrecorded")
+      for (side, value) in [("first", a), ("second", b)] {
+        for (index, forward) in value.forwards.enumerated() {
+          let key = label + side + ".forward_\(index)."
+          let required = forward.width > 1 || (forward.evaluatedEnd ?? forward.end) > forward.end
+          if let binding = forward.originalInput?.binding {
+            guard let evaluated = forward.evaluatedEnd,
+              binding.phase == (forward.origin == .prefill ? .prefill : .decode),
+              binding.covers(start: forward.start, end: forward.end, evaluatedEnd: evaluated,
+                width: forward.width, row: forward.row) else {
+              inputLimitations.append(key + "original_operand_binding_invalid_or_unsupported"); continue
+            }
+          } else if required {
+            inputLimitations.append(key + (forward.width > 1
+              ? "original_batch_operand_matrix_unrecorded" : "original_evaluated_input_beyond_prefix_unrecorded"))
+          }
         }
       }
       if a.preparePath != b.preparePath { shapeDifferences.append(label + "prepare_path") }
       if a.forwards.count != b.forwards.count { shapeDifferences.append(label + "forward_count") }
       for index in 0..<min(a.forwards.count, b.forwards.count) {
         let x = a.forwards[index], y = b.forwards[index]
-        // Missing geometry is not a measured geometry difference. Even when
-        // another complete descriptor proves a difference, blockers stay visible.
-        if x.evaluatedEnd != nil, y.evaluatedEnd != nil, x != y {
-          shapeDifferences.append(label + "forward_\(index)")
+        if x.evaluatedEnd != nil, y.evaluatedEnd != nil, !x.hasSamePartition(as: y) {
+          shapeDifferences.append(label + "forward_\(index).partition")
+        }
+        if let first = x.originalInput, let second = y.originalInput, first != second {
+          inputDifferences.append(label + "forward_\(index).original_operands_or_membership")
         }
       }
     }
-    if !blockers.isEmpty { return .init(relation: .unknown, differences: blockers + shapeDifferences + inputLimitations) }
-    if !shapeDifferences.isEmpty {
-      return .init(relation: .differentObservedPartitions, differences: shapeDifferences + inputLimitations)
+    // A known shape difference never recovers missing original peer operands
+    // or input positions beyond a retained prefix.
+    if !blockers.isEmpty || !inputLimitations.isEmpty {
+      return .init(relation: .unknown, differences: blockers + inputLimitations + shapeDifferences + inputDifferences)
     }
-    if !inputLimitations.isEmpty { return .init(relation: .unknown, differences: inputLimitations) }
+    if !inputDifferences.isEmpty {
+      return .init(relation: .differentObservedInputs, differences: inputDifferences + shapeDifferences)
+    }
+    if !shapeDifferences.isEmpty {
+      return .init(relation: .differentObservedPartitions, differences: shapeDifferences)
+    }
     return .init(relation: .sameObservedPartitions, differences: [])
   }
 
@@ -144,7 +169,7 @@ extension PromptCacheReuseSmoke {
           forwards = metrics.cachedForwardHistory.map {
             ComparisonForward(origin: $0.origin, start: $0.startTokenCount,
               end: $0.endTokenCount, evaluatedEnd: $0.evaluatedEndTokenCount,
-              width: $0.batchWidth, row: $0.row)
+              width: $0.batchWidth, row: $0.row, originalInput: $0.originalInput)
           }
           if forwards.last?.end != cached { blockers.append("cached_forward_boundary_missing") }
         } else { blockers.append("cached_forward_history_missing") }

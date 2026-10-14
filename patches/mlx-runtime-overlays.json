@@ -3,7 +3,7 @@
     "directory": ".deps/MLXSwiftLM",
     "revision": "9afc3b55f75a0d41a3d0c11330b9df6a036d24e4",
     "patch": "patches/mlx-swift-lm-cohorts.patch",
-    "patchSHA256": "457cb4b9258cf26da3e6e0b17165108736d51e67eb2748511f0860630998768b",
+    "patchSHA256": "b181cf5e3ee38b191ceb4b3edc3e3b7806d81047261485eaf7f6e4e199e1d05b",
     "files": [
       {
         "path": "Libraries/MLXLMCommon/BatchKVCache.swift",
@@ -15,11 +15,15 @@
       },
       {
         "path": "Libraries/MLXVLM/Models/Gemma4.swift",
-        "sha256": "928858c80e0d70edc31aabb0e983ec7da09740112b617e202c5d68880ef3c6ff"
+        "sha256": "7e19f05a13532a1b022e870fad5a840837ffda33e263818f9c7e90225d211a1f"
       },
       {
         "path": "Libraries/MLXVLM/Models/Gemma4Assistant.swift",
         "sha256": "bb78f07687e106a40bbcf7870f3387356d4678a40b0420fc84422147ff55564c"
+      },
+      {
+        "path": "Libraries/MLXLMCommon/PrefillParameters.swift",
+        "sha256": "c7f6a341fe21d7c3604ded6ab463efa6ebcd76a93df70826859a7c40822a467c"
       }
     ]
   },

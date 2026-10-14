@@ -1,3 +1,5 @@
+import BoomCore
+import Foundation
 import MLXLMCommon
 import XCTest
 @testable import Boom
@@ -29,7 +31,7 @@ final class PromptCacheComparisonTests: XCTestCase {
     let retained = evidence([prefill(0, 4), prefill(4, 7, evaluated: 8)], prompt: 7)
     let cold = evidence([prefill(0, 4), prefill(4, 7, evaluated: 7)], prompt: 7)
     let changed = PromptCacheReuseSmoke.classifyOutputHistories([retained], [cold])
-    XCTAssertEqual(changed.relation, .differentObservedPartitions)
+    XCTAssertEqual(changed.relation, .unknown, "A shape change cannot recover absent original input positions.")
     XCTAssertTrue(changed.differences.contains(where: { $0.contains("beyond_prefix_unrecorded") }))
     let sameShape = PromptCacheReuseSmoke.classifyOutputHistories([retained], [retained])
     XCTAssertEqual(sameShape.relation, .unknown,
@@ -46,9 +48,9 @@ final class PromptCacheComparisonTests: XCTestCase {
     }
     let row0 = history(width: 3, row: 0), row2 = history(width: 3, row: 2)
     XCTAssertEqual(PromptCacheReuseSmoke.classifyOutputHistories([row0], [row2]).relation,
-      .differentObservedPartitions)
+      .unknown)
     XCTAssertEqual(PromptCacheReuseSmoke.classifyOutputHistories([row0], [history(width: 1, row: nil)]).relation,
-      .differentObservedPartitions)
+      .unknown)
     XCTAssertEqual(PromptCacheReuseSmoke.classifyOutputHistories([row2], [row2]).relation, .unknown,
       "The complete original batch operand matrix is not present in selected-row metadata.")
   }
@@ -200,4 +202,71 @@ final class PromptCacheComparisonTests: XCTestCase {
         inputExact: flags.1, comparisons: [observation, observation, observation]), .failed)
     }
   }
+  private func boundForward(_ matrix: [[Int]], start: Int = 4, end: Int = 5,
+    row: Int? = 0, memberIDs: [Int]? = nil, padding: String = "same-padding") throws -> Forward {
+    let ids = memberIDs ?? Array(matrix.indices)
+    let members = ids.map { value in ForwardOperandBinding.Member(
+      logicalRequests: [Digest.sha256("logical-request-\(value)")],
+      preparedTokenDigest: Digest.sha256("prepared-\(value)"), preparedTokenCount: 8,
+      cachedTokenCount: 4, cachedTokenDigest: Digest.sha256("cached-\(value)"),
+      cachedSourceDigest: Digest.sha256("source-\(value)"), cachePaddingDigest: Digest.sha256(padding)) }
+    let candidate = try XCTUnwrap(ForwardOperandBinding.candidate(phase: .decode,
+      modelBinding: Digest.sha256("pinned-text-model"), members: members, inputRangeStart: 0,
+      tokenRows: matrix, logicalStarts: Array(repeating: start, count: matrix.count),
+      validLengths: matrix.map(\.count), generationActive: Array(repeating: true, count: matrix.count)))
+    let committed = try XCTUnwrap(candidate.committed(allOwningLayersComplete: true, actuallySubmitted: true))
+    return .init(origin: matrix.count > 1 ? .batchDecode : .singleDecode,
+      start: start, end: end, evaluatedEnd: start + matrix[0].count, width: matrix.count,
+      row: matrix.count > 1 ? row : nil, originalInput: .init(committed))
+  }
+
+  func testActualPeerMatrixMembershipAndPaddingDifferencesAreInputObservations() throws {
+    let original = try boundForward([[11], [22]])
+    let variants = [try boundForward([[11], [23]]),
+      try boundForward([[11], [22]], memberIDs: [0, 2]),
+      try boundForward([[11], [22]], padding: "different-actual-padding")]
+    let a = evidence([prefill(0, 4), original], prompt: 5)
+    XCTAssertTrue(PromptCacheReuseSmoke.classifyOutputHistories([a], [a]).requiresExactOutput)
+    for variant in variants {
+      let b = evidence([prefill(0, 4), variant], prompt: 5)
+      let actual = PromptCacheReuseSmoke.classifyOutputHistories([a], [b])
+      XCTAssertEqual(actual.relation, .differentObservedInputs)
+      XCTAssertTrue(actual.requiredComparisonAdmitted)
+      XCTAssertFalse(actual.requiresExactOutput)
+      XCTAssertTrue(actual.differences.contains { $0.contains("original_operands_or_membership") })
+      XCTAssertFalse(actual.differences.contains { $0.contains(".partition") })
+    }
+  }
+
+  func testFullOriginalBindingAdmitsClippedGeometryWithoutInventingScalarReconstruction() throws {
+    let retained = evidence([prefill(0, 4), try boundForward([[11, 12], [21, 22]])], prompt: 5)
+    let fresh = evidence([prefill(0, 4), prefill(4, 5)], prompt: 5)
+    let actual = PromptCacheReuseSmoke.classifyOutputHistories([retained], [fresh])
+    XCTAssertEqual(actual.relation, .differentObservedPartitions)
+    XCTAssertTrue(actual.requiredComparisonAdmitted)
+    XCTAssertFalse(actual.requiresExactOutput)
+    let encoded = try JSONEncoder().encode(retained.forwards)
+    let restored = try JSONDecoder().decode([Forward].self, from: encoded)
+    XCTAssertEqual(restored, retained.forwards)
+    XCTAssertEqual(PromptCacheReuseSmoke.classifyOutputHistories([retained],
+      [evidence(restored, prompt: 5)]).relation, .sameObservedPartitions)
+  }
+
+  func testMissingOrUnsubmittedBatchEvidenceStaysUnknownDespiteKnownGeometryChange() throws {
+    let valid = try boundForward([[11], [22]])
+    var missing = valid; missing.originalInput = nil
+    let a = evidence([prefill(0, 4), valid], prompt: 5)
+    let b = evidence([prefill(0, 4), missing], prompt: 5)
+    XCTAssertEqual(PromptCacheReuseSmoke.classifyOutputHistories([a], [b]).relation, .unknown)
+    let fresh = evidence([prefill(0, 4), prefill(4, 5)], prompt: 5)
+    XCTAssertEqual(PromptCacheReuseSmoke.classifyOutputHistories([b], [fresh]).relation, .unknown)
+    var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(valid.originalInput)) as? [String: Any])
+    json["submittedAndCompleted"] = false
+    var unsubmitted = valid
+    unsubmitted.originalInput = try JSONDecoder().decode(PromptPrefixCache.OperandWitness.self,
+      from: JSONSerialization.data(withJSONObject: json))
+    XCTAssertEqual(PromptCacheReuseSmoke.classifyOutputHistories([a],
+      [evidence([prefill(0, 4), unsubmitted], prompt: 5)]).relation, .unknown)
+  }
+
 }

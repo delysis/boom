@@ -398,4 +398,156 @@ struct Gemma4IndependentBatchTests {
             }
         }
     }
+    @Test("Actual submitted peer matrices survive clipped published disk hydration unchanged")
+    func submittedOperandBindingsSurviveClippingAndDiskHydration() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let model = try Self.model()
+            let prompts = [7, 9].enumerated().map { Self.tokens($0.element, row: $0.offset).map(Int.init) }
+            let namespace = UUID(), owners = prompts.indices.map { _ in
+                PromptCacheOwner(namespace: namespace, entity: UUID(), route: .writing)
+            }
+            let parent = ProcessInfo.processInfo.environment["TMPDIR"].flatMap {
+                $0.hasPrefix("/") ? URL(fileURLWithPath: $0, isDirectory: true) : nil
+            }
+            let manager = PromptPrefixCache(temporaryParent: parent)
+            let cohort = try manager.makeTextCohort(prompts.indices.map {
+                .init(owner: owners[$0], tokens: prompts[$0], joinedBinding: nil)
+            }, prefill: .init(stepSize: 4), allowSnapshot: nil, admit: { _ in },
+                outputLimits: [2, 2], makeCache: { try model.newCache(parameters: nil) })
+            defer { cohort.discard(); manager.clear(reason: "operand_test_joined") }
+            cohort.bindForwardOperands(model: Digest.sha256("tiny-local-real-text-forward"),
+                requests: prompts.indices.map { Digest.sha256("actual-request-\($0)") })
+            let prepared = try model.prepare(cohort.input, cache: cohort.cache, state: nil, prefill: cohort.observedPrefill)
+            guard case .logits(let output) = prepared else { throw TestFailure.notLogits }
+            eval(output.logits, cohort.cache)
+            cohort.finishedPreparation(); cohort.markCacheSubmitted()
+            Stream.defaultStream.synchronize()
+            await manager.joinTextCohortSpill(cohort, cancelled: false)
+            #expect(manager.publishTextCohort(cohort, retention: prompts.indices.map {
+                .init(completion: .init(row: $0, emittedTokenIDs: []), acknowledged: nil, proof: nil, authorization: nil)
+            }))
+            let original = try #require(manager.retainedLookupSnapshotObservations.first {
+                $0.namespace == namespace && $0.row == 0 && $0.tokenIDs.count == 7
+            })
+            let frame = try #require(original.forwardHistory.first { $0.startTokenCount == 4 })
+            let binding = try #require(frame.originalInput?.binding)
+            #expect(binding.submittedAndCompleted && binding.physicalWidth == 2)
+            #expect(binding.validLengths == [3, 4] && binding.logicalStarts == [4, 4])
+            let physical = [Array(prompts[0][4..<7]) + [0], Array(prompts[1][4..<8])]
+            #expect(binding.tokenMatrixDigest == ForwardOperandBinding.tokenDigest(physical))
+            #expect(frame.endTokenCount == 7 && frame.evaluatedEndTokenCount == 8)
+            let expected = try cohort.cache.map { value in
+                try #require(value as? any BatchKVCacheProtocol).extract(row: 0, through: 6).state.filter { $0.ndim == 4 }
+            }
+            eval(expected.flatMap { $0 })
+            cohort.discard()
+            // Select old row one into new physical row zero. Historical frames
+            // must keep their original row even after a real new cohort forward.
+            let reversedQueries = [Array(prompts[1].prefix(8)) + [30], Array(prompts[0].prefix(6)) + [30]]
+            let reversedOwners = [owners[1], owners[0]]
+            let reversed = try manager.makeTextCohort(reversedQueries.indices.map {
+                .init(owner: reversedOwners[$0], tokens: reversedQueries[$0], joinedBinding: nil)
+            }, prefill: .init(stepSize: 4), allowSnapshot: nil, admit: { _ in },
+                outputLimits: [2, 2], makeCache: { try model.newCache(parameters: nil) })
+            defer { reversed.discard() }
+            #expect(reversed.rows.map(\.cachedTokenCount) == [8, 6])
+            reversed.bindForwardOperands(model: Digest.sha256("tiny-local-real-text-forward"),
+                requests: reversedQueries.indices.map { Digest.sha256("reversed-request-\($0)") })
+            let second = try model.prepare(reversed.input, cache: reversed.cache, state: nil, prefill: reversed.observedPrefill)
+            guard case .logits(let secondOutput) = second else { throw TestFailure.notLogits }
+            eval(secondOutput.logits, reversed.cache)
+            reversed.finishedPreparation(); reversed.markCacheSubmitted()
+            Stream.defaultStream.synchronize()
+            await manager.joinTextCohortSpill(reversed, cancelled: false)
+            #expect(manager.publishTextCohort(reversed, retention: reversedQueries.indices.map {
+                .init(completion: .init(row: $0, emittedTokenIDs: []), acknowledged: nil, proof: nil, authorization: nil)
+            }))
+            let moved = try #require(manager.retainedSnapshotObservations.first { $0.row == 0 })
+            let inherited = try #require(moved.forwardHistory.first { $0.startTokenCount == 4 })
+            #expect(inherited.row == 1 && inherited.batchWidth == 2)
+            #expect(inherited.originalInput?.binding == binding)
+            #expect(inherited.originalInput?.binding.covers(start: 4, end: 8, evaluatedEnd: 8, width: 2, row: 1) == true)
+            reversed.discard()
+            // Consume the sole hot owner under an unrelated namespace. Existing
+            // published ready bytes remain indexed; no extra KV archive is made.
+            let unrelated = try manager.makeSession(owner: .init(namespace: UUID(), entity: UUID(), route: .writing),
+                input: LMInput(tokens: MLXArray([Int32(2), 3])), promptTokenIDs: [2, 3],
+                prefill: .init(stepSize: 4), useActiveNative: true, makeCache: { try model.newCache(parameters: nil) })
+            defer { unrelated.discardStagedAnchors() }
+            let query = Array(prompts[0].prefix(6)) + [30]
+            let warm = try manager.makeSession(owner: owners[0], input: LMInput(tokens: MLXArray(query.map(Int32.init))),
+                promptTokenIDs: query, prefill: .init(stepSize: 4), useActiveNative: true,
+                makeCache: { try model.newCache(parameters: nil) })
+            defer { warm.discardStagedAnchors() }
+            #expect(warm.cachedTokenCount == 6)
+            #expect(!warm.observation.cachedCurrentHotPrefix)
+            let clipped = try #require(warm.observation.cachedForwardHistory.last)
+            #expect(clipped.startTokenCount == 4 && clipped.endTokenCount == 6 && clipped.evaluatedEndTokenCount == 8)
+            #expect(clipped.originalInput?.binding == binding)
+            let decoded = try JSONDecoder().decode(PromptPrefixCache.ForwardSegment.self, from: JSONEncoder().encode(clipped))
+            #expect(decoded.originalInput?.binding == binding && decoded.evaluatedEndTokenCount == 8)
+            for layer in warm.cache.indices {
+                let actual = PrefixKVStorage.unwrap(warm.cache[layer]).state.filter { $0.ndim == 4 }
+                #expect(actual.count == expected[layer].count)
+                for pair in zip(actual, expected[layer]) {
+                    eval(pair.0, pair.1)
+                    #expect(pair.0.shape == pair.1.shape)
+                    #expect(pair.0.asArray(Float.self).map(\.bitPattern) == pair.1.asArray(Float.self).map(\.bitPattern))
+                }
+            }
+            manager.clear(reason: "operand_test_joined")
+            await manager.joinPendingDiskCleanup()
+        }
+    }
+
+    @Test("Cancellation before the actual prepare cannot publish predicted forward operands")
+    func cancelledBeforePrepareHasNoSubmittedOperandBinding() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let model = try Self.model()
+            let prompts = [7, 9].enumerated().map { Self.tokens($0.element, row: $0.offset).map(Int.init) }
+            let policy = ModelGenerationPolicy(schema: 1, vocabularySize: 32, eosTokenIDs: [31],
+                suppressedTokenIDs: [], controlTokenIDs: [31], textDecoding: "checkpoint_raw_v1",
+                prefill: .init(chunking: "fixed_v1", tokenCeiling: 4))
+            let parent = ProcessInfo.processInfo.environment["TMPDIR"].flatMap {
+                $0.hasPrefix("/") ? URL(fileURLWithPath: $0, isDirectory: true) : nil
+            }
+            let manager = PromptPrefixCache(temporaryParent: parent)
+            let requests = prompts.indices.map { row in
+                let flag = CancellationFlag(), record = UUID()
+                let identity = GenerationIdentity(kind: .consultation, operationID: flag.operationID,
+                    recordID: record, attemptID: UUID(), model: "tiny-local-gemma4", seed: UInt64(row + 1),
+                    requestDigest: Digest.sha256("cancelled-question-\(row)"), maxTokens: 2, generationPolicy: policy)
+                return MLXGemmaRunner.IndependentTextRequest(identity: identity,
+                    owner: .init(namespace: UUID(), entity: record, route: .consultation), input: .raw("unused"),
+                    settings: .init(temperature: 0, topP: 1, topK: 1, minP: 0), flag: flag,
+                    policy: policy, onText: { _ in })
+            }
+            let cohort = try manager.makeTextCohort(prompts.indices.map {
+                .init(owner: requests[$0].owner, tokens: prompts[$0], joinedBinding: nil)
+            }, prefill: .init(stepSize: 4), allowSnapshot: nil, admit: { _ in },
+                outputLimits: [2, 2], makeCache: { try model.newCache(parameters: nil) })
+            defer { cohort.discard(); manager.clear(reason: "cancel_before_actual_prepare") }
+            cohort.bindForwardOperands(model: Digest.sha256("tiny-local-real-text-forward"),
+                requests: prompts.indices.map { Digest.sha256("actual-cancel-request-\($0)") })
+            let origins = try MLXGemmaRunner.independentOrigins(requests: requests, preparedIDs: prompts,
+                cohort: cohort, policy: policy)
+            let cancelled = CancellationFlag(); cancelled.cancel()
+            do {
+                _ = try await MLXGemmaRunner.decodeIndependentText(requests: requests, model: model,
+                    tokenizer: IDTokenizer(), cohort: cohort, origins: origins, policy: policy, flag: cancelled)
+                Issue.record("A cancelled producer entered actual text preparation")
+            } catch { #expect(error is CancellationError) }
+            Stream.defaultStream.synchronize()
+            await manager.joinTextCohortSpill(cohort, cancelled: true)
+            #expect(cohort.rows.allSatisfy { $0.submittedTokenCount == 0 })
+            #expect(cohort.cache.flatMap { $0.innerState() }.filter { $0.ndim == 4 && $0.dim(2) > 0 }.isEmpty)
+            #expect(!manager.publishTextCohort(cohort, retention: prompts.indices.map {
+                .init(completion: .init(row: $0, emittedTokenIDs: []), acknowledged: nil, proof: nil, authorization: nil)
+            }))
+            #expect(manager.retainedLookupSnapshotObservations.isEmpty)
+            manager.clear(reason: "cancel_before_actual_prepare")
+            await manager.joinPendingDiskCleanup()
+        }
+    }
+
 }

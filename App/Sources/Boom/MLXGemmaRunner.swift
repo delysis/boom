@@ -374,6 +374,27 @@ actor MLXGemmaRunner {
     let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
     return Digest.sha256(try encoder.encode(policy))
   }
+  private nonisolated func forwardOperandModelBinding(_ policy: ModelGenerationPolicy) throws -> String {
+    struct Binding: Encodable {
+      let scope: String; let model: String; let processor: String; let configuration: String
+      let policy: String; let cacheAlgorithm: String
+    }
+    return try Digest.identity(Binding(scope: ForwardOperandBinding.scope, model: identity,
+      processor: processorIdentity, configuration: Digest.sha256(cacheConfiguration),
+      policy: Self.policyDigest(policy), cacheAlgorithm: PromptPrefixCache.activeAlgorithm))
+  }
+  private nonisolated static func forwardOperandRequest(owner: PromptCacheOwner?, prepared: [Int],
+    seed: UInt64, output: Int, settings: SamplingSettings, row: Int, request: String? = nil) throws -> String {
+    struct Request: Encodable {
+      let owner: PromptCacheOwner?; let tokens: String; let seed: UInt64
+      let output: Int; let sampling: String; let row: Int; let request: String?
+    }
+    guard let tokens = ForwardOperandBinding.tokenDigest([prepared]) else {
+      throw BoomError.invalid("Invalid original text operands.")
+    }
+    return try Digest.identity(Request(owner: owner, tokens: tokens, seed: seed, output: output,
+      sampling: Digest.identity(settings), row: row, request: request))
+  }
   nonisolated func joinedRetentionBinding(owner: PromptCacheOwner, workspaceEpoch: UUID,
     operationID: UUID, policy: ModelGenerationPolicy) throws -> JoinedKVRetentionBinding? {
     guard verifiedStatelessTextKV else { return nil }
@@ -1159,6 +1180,11 @@ actor MLXGemmaRunner {
         catch BoomError.budget(let message) { throw IndependentCohortDoesNotFit(message: message) }
       }, outputLimits: outputLimits,
       makeCache: { try context.model.newCache(parameters: GenerateParameters(prefill: prefill)) })
+    cohort.bindForwardOperands(model: try forwardOperandModelBinding(policy), requests: try requests.indices.map { row in
+      try Self.forwardOperandRequest(owner: requests[row].owner, prepared: preparedIDs[row],
+        seed: requests[row].identity.seed, output: requests[row].identity.maxTokens,
+        settings: requests[row].settings, row: row, request: requests[row].identity.requestDigest)
+    })
     defer { cohort.discard() }
     let origins = try Self.independentOrigins(requests: requests, preparedIDs: preparedIDs,
       cohort: cohort, policy: policy)
@@ -1346,6 +1372,13 @@ actor MLXGemmaRunner {
           cachedPromptTokens: cacheSession.cachedTokenCount,
           cacheMissReason: cacheSession.observation.missReason)
         parameters.prefill = cacheSession.prefill
+        if nativeReuse {
+          parameters.prefill.observeTextForward = cacheSession.bindForwardOperands(
+            model: try self.forwardOperandModelBinding(policy), requests: try seeds.indices.map { row in
+              try Self.forwardOperandRequest(owner: cacheOwner, prepared: promptIDs, seed: seeds[row],
+                output: maxTokens, settings: settings, row: row)
+            })
+        }
         let nativeReadmission = try selectedNativePlan.map { plan in
           try self.makeNativeReadmission(plan, flag: flag, authorization: joinedRetention?.authorization)
         }
@@ -1552,6 +1585,7 @@ actor MLXGemmaRunner {
             if reasons.contains(nil), !flag.isCancelled, !Task.isCancelled {
               try nativeReadmission?.beforeBatchForward(width: seeds.count)
               logits = try autoreleasepool {
+                cacheSession.observeDecodeOperands(sampled, active: reasons.map { $0 == nil })
                 let output = context.model(LMInput.Text(tokens: MLXArray(sampled).reshaped([seeds.count, 1])),
                   cache: cache, state: nil)
                 guard output.state == nil else { throw BoomError.invalid("Unexpected batch inference state.") }
@@ -1718,6 +1752,11 @@ actor MLXGemmaRunner {
           cachedPromptTokens: cacheSession.cachedTokenCount,
           cacheMissReason: cacheSession.observation.missReason)
         parameters.prefill = cacheSession.prefill
+        if nativeReuse {
+          parameters.prefill.observeTextForward = cacheSession.bindForwardOperands(
+            model: try self.forwardOperandModelBinding(policy), requests: [try Self.forwardOperandRequest(
+              owner: cacheOwner, prepared: promptIDs, seed: seed, output: maxTokens, settings: settings, row: 0)])
+        }
         let nativeReadmission = try selectedNativePlan.map { plan in
           try self.makeNativeReadmission(plan, flag: flag, authorization: joinedRetention?.authorization)
         }
