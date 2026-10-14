@@ -1113,7 +1113,7 @@ final class PromptPrefixCache: @unchecked Sendable {
   /// Hot-owner observations above keep their separate retention contract.
   var retainedLookupSnapshotObservations: [SnapshotObservation] {
     lock.lock(); defer { lock.unlock() }
-    let hot = activeNative?.rows.map { row in
+    let hot: [SnapshotObservation] = activeNative?.rows.map { row in
       var observation = row.observation
       observation.nativePhysicalWidth = row.nativePhysicalWidth
       return observation
