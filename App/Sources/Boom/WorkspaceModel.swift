@@ -1161,9 +1161,8 @@ private struct BoundedConsultationContext: Sendable {
     defer { PerformanceTrace.end("Request.ConsultationCapture", captureTrace) }
     if replay == nil { ensureChatForSend() }
     if replay == nil && authoredChatRole != nil { appendAuthoredChatMessage(); return }
-    guard (!isBusy || canQueueConsultation), let chat = selectedChat, canInfer,
-      replay != nil || draftHasContent || !pendingAttachments.isEmpty
-    else { if !canInfer && !isBusy { prepareModels() }; return }
+    guard (!isBusy || canQueueConsultation), let chat = selectedChat,
+      replay != nil || draftHasContent || !pendingAttachments.isEmpty else { return }
     let request = replay?.request ?? draft, interaction: InteractionMode = replay == nil ? mode : .propose
     let promptContract = replay?.promptContract ?? .referenceBindingsV3
     let selectedIDs = replay?.attachmentIDs ?? pendingAttachments, style = consultationStyle
@@ -1275,6 +1274,9 @@ private struct BoundedConsultationContext: Sendable {
     let instructions = chat.instructions ?? ""
     let targets: [Voice?] = voices.isEmpty ? [nil] : voices.map(Optional.some)
     let outputLimit = interaction == .ask ? 512 : 4096
+      // The accepted request retains its captured question/history and source
+      // while setup uses the SAME foreground operation and cancellation flag.
+      if !canInfer { try await prepareModels(flag: flag) }
       let runner = try await self.runnerForGeneration(.consultation, flag: flag)
       let executionPolicy = try ProductCore.resolvedGenerationPolicy(
         replay?.generationPolicy ?? runner.generationPolicy, loaded: runner.generationPolicy)
@@ -3344,58 +3346,61 @@ private struct BoundedConsultationContext: Sendable {
     if canInfer && (!layout.isAuthor || baseReady) { return }
     work("Preparing Bloom on this Mac…") { [weak self] flag in
       guard let self else { return }
-      self.settingUpModels = true
-      defer { self.settingUpModels = false }
-      do {
-        // A retry joins and releases a partially loaded setup before planning;
-        // it never admits a replacement on top of unaccounted resident weights.
-        await self.releaseRunner(.writing)
-        await self.releaseRunner(.consultation)
-        await self.reclaimModelCache()
-        try flag.check()
-        guard let device = MTLCreateSystemDefaultDevice() else { throw BoomError.unavailable("Metal is unavailable.") }
-        let writing = self.layout.isAuthor
-        let choices = try await detachedWork { try ModelPacks.setupChoices(writing: writing) }
-        let disk = try await detachedWork { try ModelPacks.availableDiskBytes() }
-        let candidates = choices.map { choice in
-          let candidate = choice.candidate
-          return ModelSetupCandidate(identity: candidate.identity, purpose: candidate.purpose,
-            weightBytes: candidate.weightBytes, diskBytes: candidate.diskBytes, cached: candidate.cached,
-            rank: self.preferredModel(candidate.purpose.rawValue) == candidate.identity ? 0 : candidate.rank + 1)
-        }
-        let plan = try ProductCore.modelSetup(physical: ProcessInfo.processInfo.physicalMemory,
-          metal: device.recommendedMaxWorkingSetSize, resident: ModelResidency.footprint(), disk: disk,
-          writing: writing, candidates: candidates)
-        self.writingUsesConsultation = plan.reuseConsultation
-        for identity in [plan.consultation, plan.writing].compactMap({ $0 }) {
-          try flag.check()
-          guard let choice = choices.first(where: { $0.candidate.identity == identity }) else {
-            throw BoomError.invalid("The model setup decision is absent from its catalog.")
-          }
-          let directory: URL
-          if let cached = choice.directory {
-            directory = cached
-            self.status = "Opening \(choice.candidate.purpose.rawValue) model…"
-          } else if let checkpoint = choice.checkpoint {
-            self.status = "Downloading a local model…"
-            directory = try await ModelPacks.installPublished(checkpoint, flag: flag) { progress in
-              Task { @MainActor in
-                guard self.activeFlag === flag, !flag.isCancelled else { return }
-                self.status = progress
-              }
-            }
-          } else { throw BoomError.invalid("The selected model has no local files or download.") }
-          _ = try await self.openModel(directory, purpose: choice.candidate.purpose, flag: flag)
-        }
-        if plan.reuseConsultation, let runner = self.mlxRunner { self.useConsultationForWriting(runner) }
-        self.status = "Ready · models stay on this Mac"
-      } catch is CancellationError { throw CancellationError() }
+      do { try await self.prepareModels(flag: flag) }
+      catch is CancellationError { throw CancellationError() }
       catch {
         try flag.check()
         self.modelSetupIssue = error.localizedDescription
         self.status = "Model setup needs attention"
       }
     }
+  }
+  private func prepareModels(flag: CancellationFlag) async throws {
+    modelSetupIssue = nil
+    settingUpModels = true
+    defer { settingUpModels = false }
+    // A retry joins and releases a partially loaded setup before planning;
+    // it never admits a replacement on top of unaccounted resident weights.
+    await self.releaseRunner(.writing)
+    await self.releaseRunner(.consultation)
+    await self.reclaimModelCache()
+    try flag.check()
+    guard let device = MTLCreateSystemDefaultDevice() else { throw BoomError.unavailable("Metal is unavailable.") }
+    let writing = self.layout.isAuthor
+    let choices = try await detachedWork { try ModelPacks.setupChoices(writing: writing) }
+    let disk = try await detachedWork { try ModelPacks.availableDiskBytes() }
+    let candidates = choices.map { choice in
+      let candidate = choice.candidate
+      return ModelSetupCandidate(identity: candidate.identity, purpose: candidate.purpose,
+        weightBytes: candidate.weightBytes, diskBytes: candidate.diskBytes, cached: candidate.cached,
+        rank: self.preferredModel(candidate.purpose.rawValue) == candidate.identity ? 0 : candidate.rank + 1)
+    }
+    let plan = try ProductCore.modelSetup(physical: ProcessInfo.processInfo.physicalMemory,
+      metal: device.recommendedMaxWorkingSetSize, resident: ModelResidency.footprint(), disk: disk,
+      writing: writing, candidates: candidates)
+    self.writingUsesConsultation = plan.reuseConsultation
+    for identity in [plan.consultation, plan.writing].compactMap({ $0 }) {
+      try flag.check()
+      guard let choice = choices.first(where: { $0.candidate.identity == identity }) else {
+        throw BoomError.invalid("The model setup decision is absent from its catalog.")
+      }
+      let directory: URL
+      if let cached = choice.directory {
+        directory = cached
+        self.status = "Opening \(choice.candidate.purpose.rawValue) model…"
+      } else if let checkpoint = choice.checkpoint {
+        self.status = "Downloading a local model…"
+        directory = try await ModelPacks.installPublished(checkpoint, flag: flag) { progress in
+          Task { @MainActor in
+            guard self.activeFlag === flag, !flag.isCancelled else { return }
+            self.status = progress
+          }
+        }
+      } else { throw BoomError.invalid("The selected model has no local files or download.") }
+      _ = try await self.openModel(directory, purpose: choice.candidate.purpose, flag: flag)
+    }
+    if plan.reuseConsultation, let runner = self.mlxRunner { self.useConsultationForWriting(runner) }
+    self.status = "Ready · models stay on this Mac"
   }
   func openModels() {
     showingModels = true
