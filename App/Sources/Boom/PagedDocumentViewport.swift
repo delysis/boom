@@ -445,8 +445,11 @@ import Foundation
     scrollTask = Task { [self] in
       defer { scrollTask = nil; scrollReadCancellation = nil }
       while true {
-        if scrollProjection != nil, !showingScroll || requestedScroll != nil {
-          hideScrollSurface()
+        // Keep the current bounded reading window painted while its successor
+        // is read. Revealing the unrelated caret island here causes a visible
+        // jump on every window boundary. Input/rebind explicitly hides this
+        // surface; only that path releases its projection before a new read.
+        if scrollProjection != nil, !showingScroll {
           scrollProjection = nil; scrollSnapshot = nil
         }
         guard let request = requestedScroll else { break }

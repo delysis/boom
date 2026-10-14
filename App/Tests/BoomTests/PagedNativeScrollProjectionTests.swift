@@ -298,10 +298,10 @@ private struct ScrollClickJoinFailure: Error, LocalizedError {
       let originalLogical = try session.captureLogicalState().source
       let gate = ScrollWriterHold(expectation(description: "actual writer body entered for local click"))
       let writer = Task { try await outputs.engine.storageExecutorForTesting.run { gate.enter() } }
-      var reads: [Task<Void, Error>] = [] // exactly the two entered presentation joins below
+      var reads: [Task<Void, Error>] = [] // exactly the three entered presentation joins below
       var failure: Error?
       @MainActor func readWhileHeld() async throws {
-        guard reads.count < 2 else { throw BoomError.invalid("The local click control exceeded its two real reads.") }
+        guard reads.count < 3 else { throw BoomError.invalid("The local click control exceeded its three real reads.") }
         try viewport.requestScroll(toUTF16: 0)
         let complete = expectation(description: "dirty copied scroll returned while writer remains entered")
         let read = Task { defer { complete.fulfill() }; try await viewport.joinPresentation() }
@@ -329,6 +329,35 @@ private struct ScrollClickJoinFailure: Error, LocalizedError {
         try await readWhileHeld()
         let displayed = try XCTUnwrap(viewport.visibleScrollWindow)
         XCTAssertEqual(displayed.start.utf16, 0); XCTAssertTrue(displayed.text.hasPrefix("publXic"))
+        // Hold delivery of a real successor, rather than racing a fast read
+        // against a timer. Its predecessor must remain painted throughout;
+        // neither a new request nor completion of its background I/O grants
+        // permission to expose the unrelated editable caret island.
+        let replacement = try await route.holdNext(.windowAfter)
+        try viewport.requestScroll(toUTF16: 0)
+        let replacing = Task { try await viewport.joinPresentation() }
+        reads.append(replacing)
+        var replacementFailure: Error?
+        do {
+          try await route.awaitHeld(replacement)
+          XCTAssertEqual(viewport.visibleScrollWindow?.windowID, displayed.windowID)
+          XCTAssertEqual(viewport.residentScrollWindowCount, 1)
+          XCTAssertTrue(viewport.hasPendingPresentationRead)
+          XCTAssertTrue(gate.isHeld, "A replacement display must also remain independent of the entered writer")
+        } catch { replacementFailure = error }
+        do { try await route.release(replacement) } catch {
+          if let original = replacementFailure {
+            replacementFailure = ScrollClickJoinFailure(original: original, cleanup: error)
+          } else { replacementFailure = error }
+        }
+        do { try await replacing.value } catch {
+          if let original = replacementFailure {
+            replacementFailure = ScrollClickJoinFailure(original: original, cleanup: error)
+          } else { replacementFailure = error }
+        }
+        if let replacementFailure { throw replacementFailure }
+        XCTAssertEqual(viewport.visibleScrollWindow?.text, displayed.text)
+        XCTAssertFalse(viewport.hasPendingPresentationRead)
         XCTAssertFalse(commands.hasPendingCommand)
         try viewport.selectVisibleUTF16(5, extending: true)
         let extended = try input.currentDocumentSelection()
