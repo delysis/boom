@@ -78,10 +78,6 @@ let package = Package(
         .linkedFramework("SystemConfiguration"),
         .linkedFramework("AVFoundation"), .linkedFramework("Speech"),
       ]),
-    .testTarget(name: "BoomTests", dependencies: ["Boom"], exclude: [
-      "PagedTextContainerTests.swift",
-      "PagedTextRootStoreTests.swift",
-      "PagedTextVaultTests.swift",
-    ], resources: [.copy("Fixtures")]),
+    .testTarget(name: "BoomTests", dependencies: ["Boom"], resources: [.copy("Fixtures")]),
   ], swiftLanguageModes: [.v5]
 )
