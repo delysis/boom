@@ -69,12 +69,24 @@ enum AttachmentInput {
     return result.isEmpty ? nil : result
   }
 
-  static func write(_ input: AttachmentInput, to pasteboard: NSPasteboard) {
+  @discardableResult static func write(_ input: AttachmentInput, to pasteboard: NSPasteboard) -> Bool {
     guard case .bytes(let name, let data) = input,
-      let encoded = try? PropertyListEncoder().encode(ClipboardMedia(name: name, data: data)) else { return }
-    pasteboard.clearContents(); pasteboard.setData(encoded, forType: .bloomMedia)
-    if let image = NSImage(data: data), let tiff = image.tiffRepresentation { pasteboard.setData(tiff, forType: .tiff) }
-    else if let type = UTType(filenameExtension: (name as NSString).pathExtension) { pasteboard.setData(data, forType: NSPasteboard.PasteboardType(type.identifier)) }
+      let encoded = try? PropertyListEncoder().encode(ClipboardMedia(name: name, data: data)) else { return false }
+    pasteboard.clearContents()
+    guard pasteboard.setData(encoded, forType: .bloomMedia) else { return false }
+    // Advertise exact image bytes from their actual header, including a
+    // misleading filename. AppKit can synthesize TIFF when a consumer asks;
+    // Copy/Cut need no eager pixel decode or full TIFF re-encoding on Main.
+    if let source = CGImageSourceCreateWithData(data as CFData,
+      [kCGImageSourceShouldCache: false] as CFDictionary),
+      let identifier = CGImageSourceGetType(source) as String?,
+      let type = UTType(identifier), type.conforms(to: .image) {
+      return pasteboard.setData(data, forType: NSPasteboard.PasteboardType(type.identifier))
+    }
+    if let type = UTType(filenameExtension: (name as NSString).pathExtension) {
+      return pasteboard.setData(data, forType: NSPasteboard.PasteboardType(type.identifier))
+    }
+    return true
   }
   static func readImage(_ pasteboard: NSPasteboard) -> AttachmentInput? {
     // AppKit can synthesize TIFF when asked for it on a JPEG/HEIC board.

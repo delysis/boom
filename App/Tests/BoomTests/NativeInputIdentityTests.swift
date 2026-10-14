@@ -420,4 +420,97 @@ final class NativeInputIdentityTests: XCTestCase {
       XCTAssertEqual(Data(try XCTUnwrap(completion.completionDocument).text.utf8), Data((source + " A lantern.").utf8))
     }
   }
+
+  @MainActor func testMarkedMediaKeepsLiveRangesUntilActualCommitAndReadyLoadThenCutsWithUndo() async throws {
+    try await withModel { model in
+      let bytes = try InlineMediaTests.image()
+      model.attachToCurrentChat([.bytes(name: "public-marked.png", data: bytes)])
+      try await model.joinWorkspaceOperation()
+      XCTAssertFalse(model.isBusy); XCTAssertNil(model.errorMessage)
+      let record = try XCTUnwrap(model.state.attachments.last)
+      XCTAssertEqual(try model.store.vault.get(.attachment, id: record.id), bytes)
+      let marker = "[Attachment: public-marked.png](boom-attachment:\(record.id.uuidString))"
+      let original = "Before\n" + marker + "\nAfter"
+      let view = MarkdownTextView(frame: NSRect(x: 0, y: 0, width: 600, height: 600))
+      view.isEditable = true; view.isSelectable = true; view.isRichText = false
+      let history = UndoManager(); history.groupsByEvent = false
+      view.documentUndo = history; view.allowsUndo = true
+      view.string = original; view.setMedia(model: model); MarkdownStyle.apply(to: view)
+      let itemKey = NSAttributedString.Key("BloomInlineMedia")
+      let originalRange = (original as NSString).range(of: marker)
+      var storage: NSTextStorage?
+      let edits = CharacterEdits()
+      var markedEdits = 0
+      history.beginUndoGrouping()
+      var failure: Error?
+      var markedSource = "", markedVersion = UUID()
+      var markedSelection = NSRange(), markedRange = NSRange(), shiftedRange = NSRange()
+      do {
+        let current = try XCTUnwrap(view.textStorage)
+        storage = current; current.delegate = edits
+        XCTAssertEqual(view.inlineMedia.currentRanges, [originalRange])
+        let initialItem = try XCTUnwrap(current.attribute(itemKey, at: originalRange.location,
+          effectiveRange: nil) as? InlineMediaItem)
+        XCTAssertNil(initialItem.bytes, "The actual surface load has been scheduled but no async turn has run yet.")
+        view.setSelectedRange(NSRange(location: 0, length: 0))
+        // The second real Cocoa preview starts while the first is marked;
+        // ordinary marked-text delegates deliberately leave parse spans alone.
+        view.setMarkedText("に", selectedRange: NSRange(location: 1, length: 0),
+          replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertTrue(view.hasMarkedText())
+        view.setMarkedText("Cafe\u{301}🙂", selectedRange: NSRange(location: "Cafe\u{301}🙂".utf16.count, length: 0),
+          replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertTrue(view.hasMarkedText())
+        markedSource = view.string; markedVersion = view.sourceVersion; markedEdits = edits.count
+        markedSelection = view.selectedRange(); markedRange = view.markedRange()
+        shiftedRange = (markedSource as NSString).range(of: marker)
+        XCTAssertEqual(Data(markedSource.utf8), Data(("Cafe\u{301}🙂" + original).utf8))
+        XCTAssertNotEqual(view.inlineMedia.spans.first?.range, shiftedRange,
+          "This is the actual stale-derived-coordinate boundary, not an already refreshed projection.")
+        XCTAssertEqual(view.inlineMedia.currentRanges, [shiftedRange], "Cocoa carries the real live media attributes with its character edits.")
+        // This is the production async completion's projection boundary. It
+        // must remain inert while the genuine Cocoa marked session is live.
+        view.inlineMedia.project(); view.inlineMedia.positionViews()
+        XCTAssertEqual(view.inlineMedia.currentRanges, [shiftedRange])
+        XCTAssertEqual(view.selectedRange(), markedSelection); XCTAssertEqual(view.markedRange(), markedRange)
+        XCTAssertEqual(view.sourceVersion, markedVersion); XCTAssertEqual(Data(view.string.utf8), Data(markedSource.utf8))
+      } catch { failure = error }
+      // Join the actual scheduled Vault/hash/thumbnail task on success AND
+      // failure; no fake item, read result, media acknowledgement or key focus.
+      await view.inlineMedia.joinPendingLoads()
+      if let failure {
+        if view.hasMarkedText() { view.unmarkText() }
+        history.endUndoGrouping()
+        throw failure
+      }
+      XCTAssertTrue(view.hasMarkedText())
+      XCTAssertEqual(edits.count, markedEdits, "Actual background presentation cannot publish character primitives.")
+      XCTAssertEqual(view.inlineMedia.currentRanges, [shiftedRange])
+      XCTAssertEqual(view.selectedRange(), markedSelection); XCTAssertEqual(view.markedRange(), markedRange)
+      XCTAssertEqual(view.sourceVersion, markedVersion); XCTAssertEqual(Data(view.string.utf8), Data(markedSource.utf8))
+      view.unmarkText(); history.endUndoGrouping()
+      XCTAssertFalse(view.hasMarkedText())
+      XCTAssertEqual(Data(view.string.utf8), Data(markedSource.utf8))
+      XCTAssertEqual(view.inlineMedia.spans.first?.range, shiftedRange)
+      XCTAssertEqual(view.inlineMedia.currentRanges, [shiftedRange])
+      let ready = try XCTUnwrap(try XCTUnwrap(storage).attribute(itemKey, at: shiftedRange.location,
+        effectiveRange: nil) as? InlineMediaItem)
+      XCTAssertEqual(ready.bytes, bytes); XCTAssertNotNil(ready.image)
+      XCTAssertTrue(history.canUndo)
+      history.undo()
+      XCTAssertEqual(Data(view.string.utf8), Data(original.utf8), "Attribute-only async media work cannot replace the native composition's actual Undo.")
+      MarkdownStyle.apply(to: view)
+      let range = (view.string as NSString).range(of: marker)
+      view.setSelectedRange(range)
+      history.beginUndoGrouping(); view.cut(nil); history.endUndoGrouping()
+      XCTAssertEqual(view.string, "Before\n\nAfter")
+      guard case .bytes(let name, let copied)? = AttachmentInput.read(.general)?.first else {
+        throw BoomError.invalid("The actual media Cut did not publish its original representation.")
+      }
+      XCTAssertEqual(name, record.name); XCTAssertEqual(copied, bytes)
+      history.undo(); XCTAssertEqual(Data(view.string.utf8), Data(original.utf8))
+      XCTAssertEqual(try model.store.vault.get(.attachment, id: record.id), bytes)
+      view.inlineMedia.stop()
+    }
+  }
 }

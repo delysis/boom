@@ -21,8 +21,7 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
   let bytes: Data?
   let image: CGImage?
   let failure: String?
-  private let prose = NativeReadingTextView(frame: .zero)
-  private let measurement = NativeTextMeasurement()
+  private lazy var prose = NativeReadingTextView(frame: .zero)
   var kind: AttachmentKind { record.kind }
   init(_ record: AttachmentRecord, bytes: Data? = nil, image: CGImage? = nil, failure: String? = nil) {
     self.record = record; self.bytes = bytes; self.image = image; self.failure = failure
@@ -40,7 +39,7 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
     case .video: return NSSize(width: min(width, 680), height: min(width, 680) * 9 / 16)
     case .pdf: return NSSize(width: width, height: 360)
     case .document:
-      let height = prose.textStorage.map { measurement.height(of: $0, width: width, insets: .zero, fragmentPadding: 0) } ?? 24
+      let height = prose.contentHeight(at: width)
       return NSSize(width: width, height: min(480, max(24, height)))
     case .unavailable: return NSSize(width: 24, height: 24)
     }
@@ -188,6 +187,8 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
   private var deferredLayout = false
   private var nativeEditDepth = 0
   var nativeEditInProgress: Bool { nativeEditDepth > 0 }
+  var mediaRefreshIsDeferred: Bool { nativeEditInProgress || hasMarkedText() }
+  fileprivate func deferMediaProjection() { deferTextLayout() }
   /// TextKit has not applied accumulated character edits to its glyph graph
   /// until the storage transaction closes. Never force that graph from an
   /// editing delegate, media projection, or a speculative resize callback.
@@ -211,6 +212,7 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
       let trace = PerformanceTrace.begin("Editor.DeferredLayout")
       defer { PerformanceTrace.end("Editor.DeferredLayout", trace) }
       self.deferredLayout = false
+      self.inlineMedia.resumeDeferredRefresh()
       self.invalidateIntrinsicContentSize()
       self.needsLayout = true; self.needsDisplay = true
       if let observer, let scheduled, let started {
@@ -248,6 +250,13 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
     defer { nativeEditDepth -= 1; deferTextLayout() }
     super.didChangeText(); if !hasMarkedText() { inlineMedia.refresh() }
   }
+  override func unmarkText() {
+    super.unmarkText()
+    if !hasMarkedText() {
+      inlineMedia.resumeDeferredRefresh()
+      if inlineMedia.deferredRefresh { deferTextLayout() }
+    }
+  }
   override func copy(_ sender: Any?) {
     if let payload = inlineMedia.selectedOriginal(selectedRange()) {
       AttachmentInput.write(payload, to: .general); return
@@ -255,7 +264,16 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
     super.copy(sender)
   }
   override func cut(_ sender: Any?) {
-    if isEditable, inlineMedia.selectedOriginal(selectedRange()) != nil { copy(sender); insertText("", replacementRange: selectedRange()); return }
+    let selection = selectedRange()
+    if isEditable, let payload = inlineMedia.selectedOriginal(selection) {
+      let version = sourceVersion, storage = textStorage
+      // The actual original representation must reach the pasteboard before
+      // its source range can be removed. Clipboard IO grants no newer range.
+      guard AttachmentInput.write(payload, to: .general), textStorage === storage,
+        sourceVersion == version, selectedRange() == selection else { return }
+      insertText("", replacementRange: selection)
+      return
+    }
     super.cut(sender)
   }
   override func layout() {
@@ -302,12 +320,31 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
   private var tasks: [UUID: Task<Void, Never>] = [:]
   private var hosts: [String: InlineMediaHost] = [:]
   private var parsedSourceVersion: UUID?
+  fileprivate var deferredRefresh = false
   func configure(model: WorkspaceModel?) {
     if self.model !== model { stop() }
     self.model = model
     refresh()
   }
   func invalidateMarkup() { parsedSourceVersion = nil }
+  private func deferRefresh(on view: NativeMediaTextView) {
+    deferredRefresh = true
+    // Ongoing composition is not a retry timer. Actual unmarking schedules
+    // its safe close if the enclosing native command is still open.
+    if !view.hasMarkedText() { view.deferMediaProjection() }
+  }
+  func resumeDeferredRefresh() {
+    guard deferredRefresh, let view, !view.mediaRefreshIsDeferred,
+      view.textStorage?.editedMask.isEmpty != false else { return }
+    let hadMedia = !spans.isEmpty || !hosts.isEmpty
+    refresh()
+    if hadMedia || !spans.isEmpty { view.mediaChanged() }
+  }
+  /// Explicit consumers can join the actual loads already entered on this
+  /// surface; ordinary input and display refresh never await them.
+  func joinPendingLoads() async {
+    for task in Array(tasks.values) { await task.value }
+  }
   /// Both views belong to the same workspace and exact displayed source.
   /// Share already immutable, verified presentation bytes so the adopted
   /// editor has the same media glyph metrics before original mouse tracking.
@@ -324,6 +361,10 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
     let trace = PerformanceTrace.begin("Editor.MediaRefresh")
     defer { PerformanceTrace.end("Editor.MediaRefresh", trace) }
     guard let view, let storage = view.textStorage else { return }
+    // Keep Cocoa's live shifted attributes throughout marked input. A ready
+    // asset remains retained; its display is resumed by actual unmarking.
+    guard !view.mediaRefreshIsDeferred else { deferRefresh(on: view); return }
+    deferredRefresh = false
     let version = view.sourceVersion
     let pendingCharacters = storage.editedMask.contains(.editedCharacters)
     if pendingCharacters || parsedSourceVersion != version {
@@ -350,11 +391,11 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
             }
             guard let self, !Task.isCancelled, self.items[record.id]?.record.rootDigest == record.rootDigest else { return }
             self.items[record.id] = InlineMediaItem(record, bytes: loaded.0, image: loaded.1)
-            self.tasks.removeValue(forKey: record.id); self.project(); self.view?.mediaChanged()
+            self.tasks.removeValue(forKey: record.id); self.refresh(); self.view?.mediaChanged()
           } catch {
             guard let self, !Task.isCancelled else { return }
             self.items[record.id] = InlineMediaItem(record, failure: error.localizedDescription)
-            self.tasks.removeValue(forKey: record.id); self.project(); self.view?.mediaChanged()
+            self.tasks.removeValue(forKey: record.id); self.refresh(); self.view?.mediaChanged()
           }
         }
       }
@@ -365,6 +406,11 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
     let trace = PerformanceTrace.begin("Editor.MediaProject")
     defer { PerformanceTrace.end("Editor.MediaProject", trace) }
     guard let view, let storage = view.textStorage else { return }
+    guard !view.mediaRefreshIsDeferred else { deferRefresh(on: view); return }
+    // A record's byte digest does not admit old character coordinates. Only
+    // refresh on this exact current source may assign media attributes.
+    guard parsedSourceVersion == view.sourceVersion,
+      !storage.editedMask.contains(.editedCharacters) else { deferRefresh(on: view); return }
     let desired = spans.compactMap { span -> (NSRange, InlineMediaItem)? in
       guard NSMaxRange(span.range) <= storage.length, let item = items[span.id] else { return nil }
       return (span.range, item)
@@ -396,13 +442,15 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
   func positionViews() {
     let trace = PerformanceTrace.begin("Editor.MediaLayout")
     defer { PerformanceTrace.end("Editor.MediaLayout", trace) }
+    guard let view else { return }
+    guard !view.mediaRefreshIsDeferred else { deferRefresh(on: view); return }
     if spans.isEmpty {
       for host in hosts.values { host.removeFromSuperview() }
       hosts.removeAll()
       return
     }
-    guard let view, let (manager, container) = view.mediaPresentation, let storage = manager.textStorage else { return }
-    guard view.prepareTextLayout() else { return }
+    guard let (manager, container) = view.mediaPresentation, let storage = manager.textStorage else { return }
+    guard view.prepareTextLayout() else { deferredRefresh = true; return }
     manager.ensureLayout(for: container)
     var counts: [UUID: Int] = [:], retained = Set<String>()
     var sourceRanges: [UUID: [NSRange]] = [:]
@@ -447,6 +495,7 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
     return .bytes(name: item.record.name, data: bytes)
   }
   func stop() {
+    deferredRefresh = false
     for task in tasks.values { task.cancel() }; tasks.removeAll()
     for host in hosts.values { host.removeFromSuperview() }; hosts.removeAll(); items.removeAll()
   }

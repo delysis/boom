@@ -102,7 +102,7 @@ final class InlineMediaTests: XCTestCase {
     let board = NSPasteboard(name: NSPasteboard.Name(UUID().uuidString))
     let retained = try XCTUnwrap(model.state.attachments.last)
     let original = try model.store.vault.get(.attachment, id: retained.id)
-    AttachmentInput.write(.bytes(name: retained.name, data: original), to: board)
+    XCTAssertTrue(AttachmentInput.write(.bytes(name: retained.name, data: original), to: board))
     guard case .bytes(let name, let copied)? = AttachmentInput.read(board)?.first else { return XCTFail("Copied media lost its original.") }
     XCTAssertEqual(name, retained.name); XCTAssertEqual(copied, original)
     board.clearContents()
@@ -228,5 +228,19 @@ final class InlineMediaTests: XCTestCase {
       Self.failedDisplayCopyControls.append((model, window, error))
       throw error
     }
+  }
+
+  @MainActor func testOriginalPNGCopyPublishesExactHeaderTypeDespiteMisleadingFilename() throws {
+    _ = NSApplication.shared
+    let bytes = try Self.image()
+    let board = NSPasteboard(name: NSPasteboard.Name(UUID().uuidString))
+    defer { board.clearContents() }
+    XCTAssertTrue(AttachmentInput.write(.bytes(name: "public-original.bin", data: bytes), to: board))
+    XCTAssertEqual(board.data(forType: .png), bytes, "The original image representation must remain byte-exact, rather than an eagerly encoded TIFF.")
+    guard case .bytes(let name, let original)? = AttachmentInput.read(board)?.first,
+      case .bytes(_, let image)? = AttachmentInput.readImage(board) else {
+      return XCTFail("The actual native pasteboard lost the original Bloom or PNG representation.")
+    }
+    XCTAssertEqual(name, "public-original.bin"); XCTAssertEqual(original, bytes); XCTAssertEqual(image, bytes)
   }
 }

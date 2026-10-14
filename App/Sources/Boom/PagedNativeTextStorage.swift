@@ -219,6 +219,9 @@ final class PagedNativeTextStorage: NSTextStorage {
     if !hasMarkedText() { MarkdownStyle.apply(to: self); mediaChanged() }
     return true
   }
+  override var mediaRefreshIsDeferred: Bool {
+    super.mediaRefreshIsDeferred || !inputCommandIsClosed || boundedStorage.hasOpenCharacterTransaction
+  }
   override var hasCompleteMarkupContext: Bool {
     guard let coordinates = try? session.documentCoordinates() else { return false }
     return coordinates.utf16Start == 0
