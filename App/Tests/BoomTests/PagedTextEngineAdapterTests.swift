@@ -98,6 +98,54 @@ import XCTest
     }
   }
 
+  /// Engine/ABI component: no AppKit/window host or product observer is needed.
+  /// The original strict UI control remains separately nominated and unentered.
+  func testActualColdDependentMarkupPrefixCancelsJoinsAndResumesToItsDistantDefinition() async throws {
+    let id = UUID(uuidString: "884646c1-14b4-490d-be8c-8953af793315")!
+    let text = "# [visible][REMOTE]\n\n" + String(repeating: "ordinary paragraph\n\n", count: 3400)
+      + "[remote]: boom-attachment:\(id.uuidString)\n"
+    try await fixture { outputs in
+      let imported = try await outputs.imported(Data(text.utf8)), engine = outputs.engine
+      let source = try PagedNativeLogicalSource(revision: imported.value.revision,
+        sessionID: UUID(), engineIncarnation: engine.custodyIncarnation)
+      let opening = try await outputs.window(imported.value.revision, maximumBytes: PagedWorkingWindow.targetBytes)
+      let head = try source.openingWindow(opening), original = try source.capture(forPublication: true)
+      XCTAssertTrue(head.snapshot.isSame(original))
+      let baseline = engine.custodySnapshot, before = try await engine.fileStatistics()
+      let cancellation = CancellationFlag()
+      var observedPrefix = false, invalidPrefix = false
+      do {
+        _ = try await engine.logicalMarkup(head, cancellation: cancellation) { mode, value in
+          guard mode == 0 && !value.complete else { return }
+          observedPrefix = true
+          invalidPrefix = invalidPrefix || !value.matches(head) || !value.markdown.isEmpty
+          cancellation.cancel()
+        }
+        XCTFail("A cancelled genuinely unproved prefix unexpectedly completed.")
+      } catch is CancellationError { }
+      XCTAssertTrue(observedPrefix); XCTAssertFalse(invalidPrefix)
+      let afterPrefix = try await engine.fileStatistics()
+      XCTAssertEqual(engine.custodySnapshot.jobs, baseline.jobs)
+      XCTAssertEqual(engine.custodySnapshot.reservedPayloadBytes, baseline.reservedPayloadBytes)
+      XCTAssertTrue(try source.capture().isSame(original))
+      let resolved = try await engine.logicalMarkup(head)
+      let afterResolved = try await engine.fileStatistics()
+      XCTAssertTrue(resolved.matches(head)); XCTAssertTrue(resolved.style.complete && resolved.media.complete)
+      XCTAssertEqual(resolved.style.markdown, try ProductCore.markdownSpans(text))
+      XCTAssertEqual(resolved.media.media, try ProductCore.markdownMediaSpans(text))
+      XCTAssertEqual(resolved.media.media.map(\.id), [id])
+      XCTAssertGreaterThan(afterResolved.appendedPages, afterPrefix.appendedPages,
+        "The exact cached unproved prefix must continue to its actual distant definition.")
+      XCTAssertEqual(afterResolved.rootPublications, before.rootPublications)
+      XCTAssertEqual(engine.custodySnapshot.jobs, baseline.jobs)
+      XCTAssertEqual(engine.custodySnapshot.reservedPayloadBytes, baseline.reservedPayloadBytes)
+      XCTAssertTrue(try source.capture().isSame(original))
+      let completeBytes = try await engine.logicalBytes(original, byteRange: 0..<original.summary.bytes)
+      XCTAssertEqual(completeBytes, Data(text.utf8))
+      XCTAssertEqual(original.sourceRevision, imported.value.revision)
+    }
+  }
+
   func testExplicitExportUsesForegroundAdmissionWhileBothBackgroundSlotsAreOccupied() async throws {
     try await fixture { outputs in
       let bytes = Data(String(repeating: "Public é🙂 source\n", count: 4_000).utf8)
