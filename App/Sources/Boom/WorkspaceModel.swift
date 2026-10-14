@@ -99,10 +99,12 @@ private struct BoundedConsultationContext: Sendable {
   @Published var composerFocusEpoch = 0
   @Published var draft = "" {
     didSet {
+      draftHasContent = draft.unicodeScalars.contains { !CharacterSet.whitespacesAndNewlines.contains($0) }
       draftVersion = UUID()
       retainComposerDraft()
     }
   }
+  private(set) var draftHasContent = false
   private(set) var draftVersion = UUID()
   @Published var mode: InteractionMode = .ask
   @Published var pendingAttachments: [UUID] = [] { didSet { if pendingAttachments != oldValue { retainComposerDraft() } } }
@@ -767,7 +769,7 @@ private struct BoundedConsultationContext: Sendable {
     scheduleSave()
   }
   private func ensureChatForSend() {
-    guard !isBusy, !draft.isEmpty, selectedChat == nil else { return }
+    guard !isBusy, draftHasContent, selectedChat == nil else { return }
     do { _ = try chatAttachmentDestination() }
     catch { report(error) }
   }
@@ -1160,7 +1162,7 @@ private struct BoundedConsultationContext: Sendable {
     if replay == nil { ensureChatForSend() }
     if replay == nil && authoredChatRole != nil { appendAuthoredChatMessage(); return }
     guard (!isBusy || canQueueConsultation), let chat = selectedChat, canInfer,
-      replay != nil || !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !pendingAttachments.isEmpty
+      replay != nil || draftHasContent || !pendingAttachments.isEmpty
     else { if !canInfer && !isBusy { prepareModels() }; return }
     let request = replay?.request ?? draft, interaction: InteractionMode = replay == nil ? mode : .propose
     let promptContract = replay?.promptContract ?? .referenceBindingsV3

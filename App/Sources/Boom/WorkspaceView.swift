@@ -421,7 +421,7 @@ struct ChatPane: View {
         Button { model.send() } label: {
           Image(systemName: "arrow.up.circle.fill").font(.system(size: 24))
         }.buttonStyle(.plain).disabled(
-          model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && model.pendingAttachments.isEmpty
+          !model.draftHasContent && model.pendingAttachments.isEmpty
         ).overlay(alignment: .topTrailing) {
           if model.pendingConsultationCount > 0 {
             Text("\(model.pendingConsultationCount)").font(.caption2).monospacedDigit()
