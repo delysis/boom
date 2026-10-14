@@ -346,7 +346,7 @@ final class InlineMediaTests: XCTestCase {
       scroll.hasVerticalScroller = true; scroll.documentView = view; window.contentView = scroll
       view.isRichText = false; view.string = source
       view.textContainer?.widthTracksTextView = false
-      view.textContainer?.size = NSSize(width: 580, height: .greatestFiniteMagnitude)
+      view.textContainer?.size = NSSize(width: 580, height: CGFloat.greatestFiniteMagnitude)
       view.setMedia(model: model); MarkdownStyle.apply(to: view)
       view.inlineMedia.positionViews(); await view.inlineMedia.joinPendingLoads()
       XCTAssertNil(view.inlineMedia.lastFailure)
