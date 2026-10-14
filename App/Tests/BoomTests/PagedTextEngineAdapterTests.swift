@@ -1,5 +1,6 @@
 import BoomCore
 import Foundation
+import Synchronization
 import XCTest
 @testable import Boom
 
@@ -94,6 +95,73 @@ import XCTest
       if Self.failedOutputs == nil { Self.failedOutputs = outputs }
       print("Failed public file engine retained: \(store.root.path)")
       throw error
+    }
+  }
+
+  func testExplicitExportUsesForegroundAdmissionWhileBothBackgroundSlotsAreOccupied() async throws {
+    try await fixture { outputs in
+      let bytes = Data(String(repeating: "Public é🙂 source\n", count: 4_000).utf8)
+      let imported = try await outputs.imported(bytes)
+      let engine = outputs.engine, executor = await engine.storageExecutorForTesting
+      let destination = outputs.root.appendingPathComponent("foreground-export.txt")
+      try Data().write(to: destination, options: .withoutOverwriting)
+      let file = try FileHandle(forWritingTo: destination)
+      let entered = expectation(description: "actual background source job entered")
+      let release = DispatchSemaphore(value: 0), exportFinished = Atomic(false)
+      let first = Task {
+        try await executor.run(priority: .background) {
+          entered.fulfill()
+          guard release.wait(timeout: .now() + 5) == .success else {
+            throw BoomError.unavailable("Public background hold timed out.")
+          }
+        }
+      }
+      var second: Task<Void, Error>?, exporting: Task<Void, Error>?
+      var failure: Error?
+      do {
+        guard await XCTWaiter.fulfillment(of: [entered], timeout: 2) == .completed else {
+          throw BoomError.unavailable("Public background source job did not enter.")
+        }
+        second = Task { try await executor.run(priority: .background) {} }
+        let clock = ContinuousClock(), queuedDeadline = clock.now.advanced(by: .seconds(2))
+        while executor.snapshot.backgroundRequests < 2, clock.now < queuedDeadline {
+          try await Task.sleep(for: .milliseconds(1))
+        }
+        guard executor.snapshot.backgroundRequests == 2 else {
+          throw BoomError.unavailable("The public control did not occupy both actual background slots.")
+        }
+        exporting = Task {
+          defer { exportFinished.store(true, ordering: .relaxed) }
+          try await engine.export(imported.value.revision, to: file)
+        }
+        let admittedDeadline = clock.now.advanced(by: .seconds(2))
+        while executor.snapshot.foregroundRequests == 0,
+          !exportFinished.load(ordering: .relaxed), clock.now < admittedDeadline {
+          try await Task.sleep(for: .milliseconds(1))
+        }
+        XCTAssertGreaterThan(executor.snapshot.foregroundRequests, 0,
+          "The actual export must enter foreground admission before either background job releases its slot.")
+      } catch { failure = error }
+      release.signal()
+      // Join every actually entered producer before closing its output file
+      // or allowing the fixture to release source custody, including failures.
+      for task in [first, second, exporting].compactMap({ $0 }) {
+        do { try await task.value } catch {
+          if let original = failure {
+            failure = BoomError.unavailable(original.localizedDescription + "; joined source job: " + error.localizedDescription)
+          } else { failure = error }
+        }
+      }
+      do { try file.close() } catch {
+        if let original = failure {
+          failure = BoomError.unavailable(original.localizedDescription + "; export close: " + error.localizedDescription)
+        } else { failure = error }
+      }
+      if let failure { throw failure }
+      XCTAssertEqual(try Data(contentsOf: destination), bytes)
+      XCTAssertEqual(executor.snapshot.backgroundRequests, 0)
+      XCTAssertEqual(executor.snapshot.foregroundRequests, 0)
+      XCTAssertEqual(executor.snapshot.bulkOperations, 0)
     }
   }
 

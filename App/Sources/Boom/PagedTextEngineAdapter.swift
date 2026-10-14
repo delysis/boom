@@ -1394,19 +1394,19 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
 
   func export(_ revision: PagedTextRevision, to file: FileHandle,
     cancellation: PagedTextCancellation = PagedTextCancellation()) async throws {
-    _ = try await stream(revision, to: file, cancellation: cancellation)
+    _ = try await stream(revision, to: file, cancellation: cancellation, priority: .foreground)
   }
 
   func wholeTextSha256(_ revision: PagedTextRevision,
     cancellation: PagedTextCancellation = PagedTextCancellation()) async throws -> String {
-    try await stream(revision, to: nil, cancellation: cancellation)
+    try await stream(revision, to: nil, cancellation: cancellation, priority: .background)
   }
 
   private func stream(_ revision: PagedTextRevision, to file: FileHandle?,
-    cancellation: PagedTextCancellation) async throws -> String {
+    cancellation: PagedTextCancellation, priority: PagedTextStorageExecutor.Priority) async throws -> String {
     let rootLease = try rootCustody.reserve(engine: self, purpose: .operation(UUID()), claims: [.source(revision)])
     let bulkLease: UUID
-    do { bulkLease = try executor.reserveBulk(cancellation); try rootCustody.start(rootLease) }
+    do { bulkLease = try executor.reserveBulk(cancellation, priority: priority); try rootCustody.start(rootLease) }
     catch { _ = try rootCustody.joinedFailure(rootLease, error: error); throw error }
     defer { executor.releaseBulk(bulkLease) }
     do {
@@ -1417,16 +1417,16 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
         } else {
           context = try PagedTextOperationContext(cancellation: cancellation)
         }
-        let operationID: UUID = try await onQueue(priority: .background, cancellation: cancellation, custody: rootLease) {
+        let operationID: UUID = try await onQueue(priority: priority, cancellation: cancellation, custody: rootLease) {
           let id: UUID = try self.execute(Request(op: file == nil ? "hash_begin" : "export_begin", revision: revision), cancellation: cancellation)
           try self.rootCustody.beganBulk(rootLease, operationID: id)
           return id
         }
         do {
           try await pump(Request(op: "stream_step", revision: revision, operationID: operationID),
-            expectedBytes: revision.summary.bytes, context: context, writes: false, custody: rootLease)
+            expectedBytes: revision.summary.bytes, context: context, writes: false, custody: rootLease, priority: priority)
           if context.hasOutput { try await performStreamIO { try context.finish() } }
-          return try await onQueue(priority: .background, cancellation: cancellation, custody: rootLease) {
+          return try await onQueue(priority: priority, cancellation: cancellation, custody: rootLease) {
             let digest: String = try self.execute(Request(op: "stream_finish", revision: revision,
               operationID: operationID), cancellation: cancellation)
             try self.validateDigest(digest)
