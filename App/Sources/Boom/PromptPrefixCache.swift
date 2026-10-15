@@ -327,6 +327,8 @@ final class PromptPrefixCache: @unchecked Sendable {
     var nativeCurrentPrefix: Int? = nil
     var nativePhysicalWidth: Int? = nil
     var nativeProcessedTokenCount: Int? = nil
+    // Physical row in the current native owner, independent of the original
+    // batch row retained in forward provenance after scalar extraction.
     var nativeLedgerRow: Int? = nil
     var nativeRowReceipt: NativeRowReceipt? = nil
     var joinedAcknowledgedRow: Int? = nil
@@ -1153,7 +1155,7 @@ final class PromptPrefixCache: @unchecked Sendable {
             nativeGlobalPrefix: supported,
             nativeCurrentPrefix: supported == end ? supported : nil,
             nativeProcessedTokenCount: row == nil ? end : processed,
-            nativeLedgerRow: independentRow ?? row)
+            nativeLedgerRow: independentRow ?? row ?? 0)
         }
         return value.supports(count) ? value : nil
       }
@@ -1222,7 +1224,7 @@ final class PromptPrefixCache: @unchecked Sendable {
           history: selectedHistory, nativeGlobalPrefix: nativeGlobals ? count : nil,
           nativeCurrentPrefix: nativeGlobals && count == end ? count : nil,
           nativeProcessedTokenCount: nativeGlobals ? (row == nil ? end : processed) : nil,
-          nativeLedgerRow: independentRow ?? row, joinedAcknowledgedRow: row)
+          nativeLedgerRow: independentRow ?? row ?? (nativeGlobals ? 0 : nil), joinedAcknowledgedRow: row)
       }
       var result: [Entry] = []
       if !lanes.isEmpty {

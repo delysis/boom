@@ -225,11 +225,10 @@ enum ActiveNativeKVStorage {
         guard step > 0 else { throw BoomError.invalid("Invalid native sliding step.") }
         let direct = sourceWidth == 1 && (native.offset == prefix || native.isTrimmable && native.offset >= prefix)
         let startingCapacity = direct ? capacity : min(prefix, window)
-        let (temporary, tempOverflow) = window.addingReportingOverflow(chunk - 1)
-        guard !tempOverflow else { throw BoomError.invalid("Native sliding capacity overflowed.") }
-        finalCapacity = max(min(startingCapacity, window), min(target, temporary))
-        extensionPositions = target > startingCapacity && startingCapacity < window
-          ? min(step, window - startingCapacity) : 0
+        let bound = try rotatingAllocation(window: window, step: step, prefix: prefix,
+          startingCapacity: startingCapacity, target: target, chunk: chunk)
+        finalCapacity = bound.capacity
+        extensionPositions = bound.extensionSize
         // Multi-token concat, startup growth and oversized-ring compaction may
         // require concatenate output beside a non-donated write destination.
         grows = chunk > 1 || extensionPositions > 0 || direct && capacity > window
@@ -283,11 +282,11 @@ enum ActiveNativeKVStorage {
         capacity = padded; extensionSize = extensionValue; hydratedPositions = prefix; grows = true
       case .rotating(let window, let keep, let step, _):
         guard window > keep, keep >= 0, step > 0 else { throw BoomError.invalid("Invalid historical sliding geometry.") }
-        let (temporary, tempOverflow) = window.addingReportingOverflow(chunk - 1)
-        guard !tempOverflow else { throw BoomError.invalid("Disk sliding capacity overflowed.") }
         let initial = min(prefix, window)
-        capacity = max(initial, min(target, temporary))
-        extensionSize = target > initial && initial < window ? min(step, window - initial) : 0
+        let bound = try rotatingAllocation(window: window, step: step, prefix: prefix,
+          startingCapacity: initial, target: target, chunk: chunk)
+        capacity = bound.capacity
+        extensionSize = bound.extensionSize
         hydratedPositions = initial; grows = chunk > 1 || extensionSize > 0
       }
       // Host pread bytes, immediate native raw-data copies and a possible
@@ -300,6 +299,23 @@ enum ActiveNativeKVStorage {
     }
     return ActiveNativeKVAdmissionPlan(cachedTokenCount: prefix, promptTokenCount: prompt,
       reservedOutputTokenCount: output, consumerWidth: width, sourceWidth: 1, sourceRow: nil, layers: layers)
+  }
+  /// RotatingKVCache's single-token write allocates a complete growth step,
+  /// even when only one requested token remains. Multi-token writes discard
+  /// spare capacity before concatenating, so a later decode can grow again.
+  /// Bound both paths across the request; never equate logical tokens to bytes.
+  private static func rotatingAllocation(window: Int, step: Int, prefix: Int,
+    startingCapacity: Int, target: Int, chunk: Int) throws -> (capacity: Int, extensionSize: Int) {
+    guard window > 0, step > 0, prefix > 0, chunk > 0 else {
+      throw BoomError.invalid("Invalid native sliding allocation geometry.")
+    }
+    let (temporary, tempOverflow) = window.addingReportingOverflow(chunk - 1)
+    let (padded, paddingOverflow) = target.addingReportingOverflow(step - 1)
+    guard !tempOverflow, !paddingOverflow else { throw BoomError.invalid("Native sliding capacity overflowed.") }
+    let capacity = max(min(startingCapacity, window), min(padded, window), min(target, temporary))
+    let growthBase = chunk > 1 ? min(prefix, window) : startingCapacity
+    let extensionSize = target > growthBase && growthBase < window ? min(step, window - growthBase) : 0
+    return (capacity, extensionSize)
   }
   static func rowOffset(_ cache: any KVCache, row: Int) throws -> Int {
     if let batch = PrefixKVStorage.unwrap(cache) as? any BatchKVCacheProtocol {

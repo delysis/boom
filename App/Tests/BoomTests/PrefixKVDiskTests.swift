@@ -118,6 +118,33 @@ final class PrefixKVDiskTests: XCTestCase {
     }
   }
 
+  func testHistoricalSlidingAdmissionReservesWholeNativeGrowthStep() async throws {
+    try await InferenceExecutor.shared.perform { _ in
+      let root = try Self.root(), disk = PrefixKVDiskStore(byteLimit: 4_096, temporaryParent: root)
+      let box = ResultBox()
+      let value = Device.withDefaultDevice(.cpu) { MLXArray(Self.bits(.float32, count: 20), [1, 1, 20, 1], dtype: .float32) }
+      eval(value)
+      let span = try PrefixKVDiskStore.ReadySpan(start: 0, layer: 0,
+        keys: XCTUnwrap(value.readyBuffer()), values: XCTUnwrap(value.readyBuffer()), positions: 0..<20)
+      XCTAssertTrue(disk.submit([span], isLive: { true }, completed: { box.set($0) }))
+      await disk.joinPending()
+      let spans = try XCTUnwrap(box.take())
+      try Device.withDefaultDevice(.cpu) {
+        let layout = PrefixKVStorage.Layout.rotating(window: 1_024, keep: 0, step: 256, capacityOrigin: "modelNative")
+        let plan = try ActiveNativeKVStorage.diskPlan(layouts: [layout], spans: [spans],
+          prefix: 20, prompt: 21, output: 1, width: 1, prefill: .init(stepSize: 256, chunking: .remainder))
+        XCTAssertTrue(try ProductCore.incrementalKVAdmission(application: 24 << 30,
+          used: 0, reserve: 2 << 30, layers: plan.layers).admitted)
+        let native = try PrefixKVStorage.hydrate(layout: layout, spans: spans, prefix: 20, row: 0, batchWidth: 1)
+        let next = MLXArray.zeros([1, 1, 1, 1], dtype: .float32)
+        _ = native.update(keys: next, values: next); eval(native)
+        let actual = UInt64(native.innerState().reduce(0) { $0 + $1.nbytes })
+        XCTAssertEqual(actual, 276 * 8, "The runtime allocates all 256 new slots, not just the requested token.")
+        XCTAssertLessThanOrEqual(actual, plan.layers[0].destinationBytes)
+      }
+    }
+  }
+
   func testOneInFlightCancellationQuotaAndGCUseActualWorker() async throws {
     let entered = expectation(description: "actual spill worker entered")
     let finished = expectation(description: "last actual C ready pin released before aggregate byte charge")

@@ -173,6 +173,45 @@ final class ActiveNativeKVTests: XCTestCase {
       XCTAssertLessThanOrEqual(one.retainedBytesUpperBound, 1 << 30)
     }
   }
+
+  func testInterruptedScalarExtractionRetainsPhysicalRowZeroAndBatchProvenance() async throws {
+    try await Device.withDefaultDevice(.cpu) {
+      let ids = Array(0..<9), first = [901, 911], last = [902, 912]
+      let store = PromptPrefixCache(byteLimit: 4_096), scope = owner()
+      let batched = try session(store, ids, scope, batchWidth: 2)
+      try await prefill(batched); expand(batched, width: 2)
+      for row in 0..<2 {
+        XCTAssertTrue(batched.captureDecodeLane(row: row, width: 2,
+          emittedTokenIDs: [first[row]], finished: false))
+      }
+      await append(batched, first, width: 2)
+      for row in 0..<2 {
+        XCTAssertTrue(batched.captureFinishedLane(row: row, width: 2,
+          emittedTokenIDs: [first[row], last[row]]))
+      }
+      XCTAssertTrue(store.publish(batched, completions: (0..<2).map {
+        .init(row: $0, emittedTokenIDs: [first[$0], last[$0]])
+      }))
+      let query = ids + [first[1], last[1]], retention = binding(scope)
+      let scalar = try session(store, query, scope, binding: retention)
+      XCTAssertEqual(scalar.observation.cachedRow, 1)
+      XCTAssertEqual(scalar.cachedTokenCount, 10)
+      // The extracted width-one cache really submits, but construction stops
+      // before a suffix forward. Its inherited history still ends in batch row 1.
+      eval(scalar.cache); scalar.markCacheSubmitted()
+      XCTAssertTrue(store.publishJoinedValidPrefix(scalar, proof: constructorProof,
+        authorization: approved(retention)))
+      let plan = try XCTUnwrap(store.nativeAdmissionPlan(owner: scope, tokens: query,
+        prefill: .init(stepSize: 2, chunking: .remainder), outputTokens: 2, batchWidth: 1))
+      XCTAssertEqual(plan.sourceWidth, 1)
+      XCTAssertEqual(plan.sourceRow, 0)
+      let resumed = try session(store, query, scope)
+      XCTAssertEqual(resumed.cachedTokenCount, 10)
+      XCTAssertEqual(resumed.observation.cachedRow, 1, "Keep original forward provenance separate from physical row identity.")
+      XCTAssertEqual(resumed.cache[0].state[0].asArray(Float.self), (ids + [first[1]]).map(Float.init))
+      XCTAssertEqual(resumed.cache[1].state[0].asArray(Float.self), [6, 7, 8, first[1]].map(Float.init))
+    }
+  }
   func testGeneratedPrefixKeepsDeliveredLedgerAndExcludesLookahead() async throws {
     try await Device.withDefaultDevice(.cpu) {
       let store = PromptPrefixCache(), scope = owner(), ids = Array(0..<9)
@@ -365,6 +404,40 @@ final class ActiveNativeKVTests: XCTestCase {
         "After actual submission its buffers stay in measured U, not a release credit.")
     }
   }
+  func testSlidingAdmissionCoversActualGrowthStepsAndDiscardedSpareCapacity() async throws {
+    try await Device.withDefaultDevice(.cpu) {
+      for prefix in [20, 255, 256, 1_023, 1_025] {
+        for suffix in [1, 8, 129] {
+          let native = RotatingKVCache(maxSize: 1_024, step: 256)
+          func update(_ count: Int) {
+            let keys = MLXArray.zeros([1, 2, count, 3], dtype: .float32)
+            _ = native.update(keys: keys, values: keys)
+            eval(native)
+          }
+          update(prefix)
+          // A preceding decode leaves unused step capacity. The next prefill
+          // discards it, then the tail/decode allocates another complete step.
+          update(1)
+          let retained = prefix + 1, output = 64
+          let plan = try ActiveNativeKVStorage.plan(owners: [.init(native: native)],
+            layouts: [try XCTUnwrap(PrefixKVStorage.layout(of: native))], prefix: retained,
+            prompt: retained + suffix, output: output, width: 1, row: nil,
+            prefill: .init(stepSize: 256, chunking: .remainder))
+          let admission = try ProductCore.incrementalKVAdmission(application: 24 << 30,
+            used: 0, reserve: 2 << 30, layers: plan.layers)
+          XCTAssertTrue(admission.admitted)
+          func checkCapacity() {
+            let actual = UInt64(native.innerState().reduce(0) { $0 + $1.nbytes })
+            XCTAssertLessThanOrEqual(actual, plan.layers[0].destinationBytes,
+              "Actual native capacity exceeds the reservation for prefix \(retained), suffix \(suffix).")
+          }
+          if suffix > 1 { update(suffix - 1); checkCapacity() }
+          for _ in 0...output { update(1); checkCapacity() }
+        }
+      }
+    }
+  }
+
   func testConstructorUsesSubmittedCohortAndRejectsUnsubmittedFinalGraph() async throws {
     try await Device.withDefaultDevice(.cpu) {
       for finalGraph in [false, true] {
