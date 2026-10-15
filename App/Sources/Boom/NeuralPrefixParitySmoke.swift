@@ -766,6 +766,7 @@ enum NeuralPrefixParitySmoke {
     let parameters = GenerateParameters(maxTokens: replay == nil ? 16 : 256, temperature: input.settings.temperature,
       topP: input.settings.topP, topK: input.settings.topK, minP: input.settings.minP,
       repetitionPenalty: nil, prefill: prefill, seed: 42)
+    try write(manager.retainedLookupSnapshotObservations, label + "-lookup-candidates-before.json", evidence)
     let session = try manager.makeSession(owner: owner,
       input: LMInput(tokens: MLXArray(input.prepared_token_ids.map(Int32.init))),
       promptTokenIDs: input.prepared_token_ids, prefill: prefill, allowSnapshot: allowSnapshot,
@@ -877,6 +878,8 @@ enum NeuralPrefixParitySmoke {
       "published": published, "retained_byte_bound": manager.retainedBytesUpperBound,
       "source_is_autonomous_generation": false], label + "-producer.json", evidence)
     try write(manager.retainedSnapshotObservations, label + "-manager-snapshots.json", evidence)
+    try write(session.retentionObservation, label + "-retention-after-publication.json", evidence)
+    try write(manager.retainedLookupSnapshotObservations, label + "-lookup-candidates-after-publication.json", evidence)
     guard published else { throw BoomError.invalid("The bounded normal manager did not retain the declared source.") }
     return Prepared(session: session, logits: prepared.logits, snapshot: snapshot, ranges: prepared.ranges, valueBoundary: frozenValues)
   }
@@ -1037,6 +1040,7 @@ enum NeuralPrefixParitySmoke {
       "final_native_offsets": cold.cache.map(\.offset)], "natural-full-query-cold-scope.json", evidence)
     fence(); try flag.check(); try ModelResidency.check()
 
+    try write(manager.retainedLookupSnapshotObservations, "actual-warm-lookup-candidates-before.json", evidence)
     let warm = try manager.makeSession(owner: owner,
       input: LMInput(tokens: MLXArray(request.query.prepared_token_ids.map(Int32.init))),
       promptTokenIDs: request.query.prepared_token_ids, prefill: prefill, allowSnapshot: allowSnapshot,
