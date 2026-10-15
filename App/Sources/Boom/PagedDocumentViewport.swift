@@ -475,7 +475,7 @@ import Foundation
           // Actual later input or a different arena supersedes this read.
           guard displayRequest == request.id, input.session.isCurrent(snapshot) else { continue }
           scrollProjection = output; scrollSnapshot = snapshot
-          try showScrollSurface(output, anchor: mouseSelectionGesture == nil ? nil : request.anchor)
+          try showScrollSurface(output, anchor: request.anchor)
           if let gesture = mouseSelectionGesture {
             try updateMouseSelection(gesture.event)
           }
@@ -489,7 +489,7 @@ import Foundation
       }
     }
   }
-  private func showScrollSurface(_ window: PagedNativeLogicalWindow, anchor: UInt64? = nil) throws {
+  private func showScrollSurface(_ window: PagedNativeLogicalWindow, anchor: UInt64) throws {
     guard window.summary.bytes <= UInt64(PagedWorkingWindow.targetBytes) else {
       throw BoomError.budget("The logical scroll window exceeds its display bound.")
     }
@@ -540,12 +540,21 @@ import Foundation
     surface.contentView.scroll(to: .zero); surface.isHidden = false; showingScroll = true
     (textView as? NativeMediaTextView)?.inlineMedia.setCovered(true)
     view.inlineMedia.viewportDidChange()
-    if let anchor, !window.text.isEmpty {
+    if !window.text.isEmpty {
       guard anchor >= window.start.utf16, anchor - window.start.utf16 <= window.summary.utf16,
         let manager = view.layoutManager, let container = view.textContainer else {
-        throw BoomError.stale("Mouse autoscroll lost its actual displayed source anchor.")
+        throw BoomError.stale("Scrolling lost its actual displayed source anchor.")
       }
-      let local = Int(anchor - window.start.utf16)
+      var local = Int(anchor - window.start.utf16)
+      // A scrollbar fraction may name the low half of a surrogate pair.
+      // Floor only that generated coordinate in the already-read window;
+      // explicit source endpoints still require their exact scalar proof.
+      let units = window.text as NSString
+      if local > 0, local < units.length,
+        (0xDC00...0xDFFF).contains(units.character(at: local)),
+        (0xD800...0xDBFF).contains(units.character(at: local - 1)) {
+        local -= 1
+      }
       _ = try window.position(localUTF16: local)
       manager.ensureLayout(for: container)
       let glyph = manager.glyphIndexForCharacter(at: min(local, max(0, view.string.utf16.count - 1)))

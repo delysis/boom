@@ -1427,6 +1427,63 @@ import XCTest
     }
   }
 
+  func testActualOrdinaryScrollPositionsRequestedUnicodeLineWithoutAdoptingEditorSource() async throws {
+    let line = "aé🙂\n"
+    try await fixture(#function, text: String(repeating: line, count: 6_000)) { f in
+      let source = f.session!, input = f.input!, commands = f.commands!, viewport = f.scroll!
+      let native = f.view, manager = commands.manager
+      let context = try XCTUnwrap(native.inputContext)
+      let layout = try XCTUnwrap(native.layoutManager), storage = try XCTUnwrap(native.textStorage)
+      let captured = try source.captureLogicalState(), saved = source.sealedRootRecord
+      let arena = source.arenaID, generation = source.generation, identity = input.activeIdentity
+      let selection = try input.currentDocumentSelection(), nativeSelection = native.selectedRange()
+      try viewport.enableDocumentNavigation(engine: f.engine!, publisher: f.publisher!)
+
+      // The second raw scrollbar coordinate is the low surrogate of 🙂.
+      // Both requests lie well inside the source, beyond the leading context.
+      let requests: [(UInt64, UInt64)] = [(10_002, 10_002), (20_003, 20_002)]
+      for (requested, scalar) in requests {
+        try viewport.requestScroll(toUTF16: requested)
+        try await viewport.joinPresentation()
+        let projection = try XCTUnwrap(viewport.visibleScrollWindow)
+        XCTAssertTrue(projection.snapshot.isSame(captured.source))
+        XCTAssertLessThan(projection.start.utf16, scalar)
+        XCTAssertGreaterThan(projection.start.utf16 + projection.summary.utf16, requested)
+        let local = Int(scalar - projection.start.utf16)
+        XCTAssertEqual(try projection.position(localUTF16: local).utf16, scalar)
+        if requested != scalar {
+          XCTAssertThrowsError(try projection.position(localUTF16: local + 1),
+            "The raw scrollbar target genuinely lies inside the retained surrogate pair.")
+        }
+        let surface = try XCTUnwrap(viewport.subviews.compactMap { $0 as? NSScrollView }.first { !$0.isHidden })
+        let display = try XCTUnwrap(surface.documentView as? NSTextView)
+        let displayLayout = try XCTUnwrap(display.layoutManager), container = try XCTUnwrap(display.textContainer)
+        displayLayout.ensureLayout(for: container)
+        let glyph = displayLayout.glyphIndexForCharacter(at: local)
+        let lineRect = displayLayout.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+        let origin = NSPoint(x: 0, y: max(0, lineRect.minY + display.textContainerOrigin.y))
+        let expected = surface.contentView.constrainBoundsRect(
+          NSRect(origin: origin, size: surface.contentView.bounds.size)).origin
+        XCTAssertGreaterThan(expected.y, 0, "The requested line follows the actual copied context.")
+        XCTAssertEqual(surface.contentView.bounds.minY, expected.y, accuracy: 0.001,
+          "Ordinary scroll must show its requested line rather than the contextual window start.")
+        XCTAssertNil(viewport.presentationFailure)
+        XCTAssertTrue(f.view === native); XCTAssertTrue(viewport.textView === native)
+        XCTAssertTrue(native.inputContext === context); XCTAssertTrue(native.layoutManager === layout)
+        XCTAssertTrue(native.textStorage === storage); XCTAssertTrue(commands.manager === manager)
+        XCTAssertEqual(input.activeIdentity, identity); XCTAssertEqual(source.arenaID, arena)
+        XCTAssertEqual(source.generation, generation); XCTAssertEqual(source.sealedRootRecord, saved)
+        XCTAssertTrue(source.logicalWindow.snapshot.isSame(captured.source))
+        XCTAssertEqual(try input.currentDocumentSelection(), selection)
+        XCTAssertEqual(native.selectedRange(), nativeSelection)
+        XCTAssertTrue(f.window!.firstResponder === native)
+      }
+      XCTAssertTrue(f.mounts.isEmpty); XCTAssertFalse(commands.hasPendingCommand)
+      XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+      try await f.assertSource(f.originalText)
+    }
+  }
+
   /// Actual NSWindow dispatch through the managed mouse responder. These SDK
   /// drag/up events are not a packaged physical-mouse acceptance.
   func testActualScrollMouseDownTracksDragAtNonzeroClipOriginAndKeepsOutsideShiftAnchorWithUndo() async throws {
