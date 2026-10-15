@@ -78,6 +78,13 @@ enum NativePrefixParityProbe {
     let layers: [Layer]
     var source: [SourceLayer] { layers.map(\.source) }
 
+    /// Exact physical layout at this captured boundary only. This neither
+    /// crops chronology nor replays a past prefix; oracle(prefix:) remains the
+    /// separate canonical, required-absolute-position reconstruction.
+    func originalBoundary() throws -> [any KVCache] {
+      try layers.map { try $0.originalBoundary(row: selectedRow) }
+    }
+
     func oracle(prefix: Int) throws -> [any KVCache] {
       guard prefix > 0, prefix <= evaluatedPrefix else {
         throw Failure.invalid("Oracle prefix is outside the evaluated native source.")
@@ -126,6 +133,40 @@ enum NativePrefixParityProbe {
     let keys: MLXArray
     let values: MLXArray
     let segments: [Segment]
+
+    func originalBoundary(row: Int) throws -> any KVCache {
+      guard source.offset > 0, source.scalarRoPEOffset == source.offset else {
+        throw Failure.invalid("Original native boundary has no evaluated live extent.")
+      }
+      try NativePrefixParityProbe.validateKV([keys, values], row: row)
+      let k = keys[row ..< row + 1, 0..., 0..., 0...]
+      let v = values[row ..< row + 1, 0..., 0..., 0...]
+      let restored: any KVCache
+      switch kind {
+      case .full(let step):
+        let full = KVCacheSimple(); full.step = step
+        full.state = [k, v]
+        // The native setter uses physical capacity as offset. Native trim
+        // restores the captured live extent without resizing that raw backing.
+        guard full.offset >= source.offset else { throw Failure.invalid("Original full-cache capacity is unavailable.") }
+        let excess = full.offset - source.offset
+        guard full.trim(excess) == excess else { throw Failure.invalid("Original full-cache extent changed.") }
+        restored = full
+      case .rotating(let ring):
+        let local = RotatingKVCache(maxSize: ring.window, keep: ring.keep, step: ring.step)
+        local.state = [k, v]
+        local.metaState = source.metadata // actual index, origin and wrapped order
+        restored = local
+      }
+      let raw = restored.innerState()
+      guard restored.offset == source.offset, restored.metaState == source.metadata,
+        case .scalar(let rope) = restored.ropeOffset, rope == source.scalarRoPEOffset,
+        raw.count == 2, raw[0].shape == k.shape, raw[1].shape == v.shape,
+        raw[0].dtype == k.dtype, raw[1].dtype == v.dtype else {
+        throw Failure.invalid("Original native boundary layout was not preserved.")
+      }
+      return restored
+    }
 
     // Read chronology from the pinned *native* storage and metadata. This is
     // independent of PrefixKVStorage and the resident manager's spans/index.
@@ -222,23 +263,24 @@ enum NativePrefixParityProbe {
       guard original.offset == evaluatedPrefix,
         case .scalar(let rope) = original.ropeOffset, rope == evaluatedPrefix
       else { throw Failure.invalid("Native layer offset or RoPE differs from the evaluated boundary.") }
-      let originalRaw = original.innerState()
+      let originalRaw = original.innerState(), metadata = original.metaState
       try validateKV(originalRaw, row: selectedRow)
       let kind: Kind
       if ObjectIdentifier(type(of: original)) == ObjectIdentifier(KVCacheSimple.self),
         let full = original as? KVCacheSimple {
         kind = .full(step: full.step)
       } else if ObjectIdentifier(type(of: original)) == ObjectIdentifier(RotatingKVCache.self) {
-        kind = .rotating(try RingMetadata(original.metaState, capacity: originalRaw[0].dim(2)))
+        kind = .rotating(try RingMetadata(metadata, capacity: originalRaw[0].dim(2)))
       } else {
         throw Failure.invalid("Oracle only supports exact full-precision native simple/rotating cache classes.")
       }
-      // Once per diagnostic boundary, use native copy()'s independent-cache
-      // contract. The pinned implementations freeze array descriptors and metadata.
-      let frozen = original.copy()
-      let raw = frozen.innerState()
+      // Same descriptor-freeze operation as pinned native copy(), applied to
+      // innerState rather than state: copy() can discard unused physical rows.
+      // Keep original capacity/order for a same-boundary comparison, not just
+      // enough chronology for the separate canonical crop. No host tensor copy.
+      let raw = originalRaw.map { $0[.ellipsis] }
       try validateKV(raw, row: selectedRow)
-      guard frozen.offset == evaluatedPrefix, frozen.metaState == original.metaState else {
+      guard original.offset == evaluatedPrefix, original.metaState == metadata else {
         throw Failure.invalid("Native snapshot metadata changed while being captured.")
       }
       let frozenKind: Kind
@@ -251,7 +293,7 @@ enum NativePrefixParityProbe {
         frozenKind = .full(step: step)
         segments = [Segment(absolute: 0 ..< evaluatedPrefix, chronological: 0 ..< evaluatedPrefix)]
       case .rotating:
-        let ring = try RingMetadata(frozen.metaState, capacity: raw[0].dim(2))
+        let ring = try RingMetadata(metadata, capacity: raw[0].dim(2))
         let held = ring.wrapped ? raw[0].dim(2) : ring.index
         let pinned = min(ring.keep, held)
         let tailCount = held - pinned
@@ -266,7 +308,7 @@ enum NativePrefixParityProbe {
             chronological: pinned ..< held)] : [])
       }
       let source = SourceLayer(layer: index, nativeClass: String(describing: type(of: original)),
-        offset: evaluatedPrefix, scalarRoPEOffset: rope, metadata: original.metaState,
+        offset: evaluatedPrefix, scalarRoPEOffset: rope, metadata: metadata,
         rawKeys: TensorDescriptor(originalRaw[0]), rawValues: TensorDescriptor(originalRaw[1]),
         sourceBatchWidth: originalRaw[0].dim(0), selectedRow: selectedRow,
         presentRanges: segments.map { TokenRange($0.absolute) })

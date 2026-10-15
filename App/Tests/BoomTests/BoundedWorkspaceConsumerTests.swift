@@ -1096,6 +1096,7 @@ private final class LiveBackupCopyHold: @unchecked Sendable {
     // actual /private/var directory. Keep that actual spelling when available.
     let selected = scratch.appendingPathComponent("workspace.json")
     let metadata = physical.appendingPathComponent("workspace.json")
+    print("Public export containment paths: selected=\(selected.path), foundation=\(selected.resolvingSymlinksInPath().path), physical=\(metadata.path)")
     let original = try await Task.detached { try Data(contentsOf: metadata) }.value
     let exported = try model.exportPagedDocument(to: selected)
     guard case .failure(let failure) = await exported.result else {

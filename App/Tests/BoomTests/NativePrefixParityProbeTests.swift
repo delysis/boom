@@ -88,15 +88,126 @@ final class NativePrefixParityProbeTests: XCTestCase {
         return [KVCacheSimple(), RotatingKVCache(maxSize: 4, step: 2)]
       }
       XCTAssertEqual(reuse.cachedTokenCount, 8)
-      let oracle = try native.oracle(prefix: 8)
+      let oracle = try native.originalBoundary()
+      let actual = NeuralPrefixParitySmoke.nativeBases(reuse.cache)
+      XCTAssertEqual(ObjectIdentifier(actual[0] as AnyObject), ObjectIdentifier(full))
+      XCTAssertEqual(ObjectIdentifier(actual[1] as AnyObject), ObjectIdentifier(local))
+      for layer in oracle.indices {
+        let reference = NativePrefixParityProbe.CacheDescriptor(oracle[layer])
+        let candidate = NativePrefixParityProbe.CacheDescriptor(actual[layer])
+        let source = native.source[layer]
+        XCTAssertEqual(reference.metadata, source.metadata)
+        XCTAssertEqual(candidate.metadata, source.metadata)
+        XCTAssertEqual(reference.raw.map(\.shape), [source.rawKeys.shape, source.rawValues.shape])
+        XCTAssertEqual(candidate.raw.map(\.shape), reference.raw.map(\.shape))
+        XCTAssertEqual(reference.raw.map(\.dtype), [source.rawKeys.dtype, source.rawValues.dtype])
+        XCTAssertEqual(candidate.raw.map(\.dtype), reference.raw.map(\.dtype))
+      }
       let restored = try NativePrefixParityProbe.compareState(oracle: oracle,
-        hydrated: NeuralPrefixParitySmoke.nativeBases(reuse.cache), suffixLength: 2, maskWindows: [nil, 4])
+        hydrated: actual, suffixLength: 2, maskWindows: [nil, 4])
       let failureDetail = restored.allKVBitsEqual && restored.allMasksEqual ? ""
         : String(decoding: try JSONEncoder().encode(restored), as: UTF8.self)
       XCTAssertTrue(restored.allKVBitsEqual, failureDetail)
       XCTAssertTrue(restored.allMasksEqual, failureDetail)
-      XCTAssertEqual(oracle[1].state[0].asArray(Float.self), [4, 5, 6, 7])
+      XCTAssertEqual(oracle[1].state[0].asArray(Float.self), [1, 2, 3, 4, 5, 6, 7])
+      XCTAssertEqual(oracle[1].metaState, ["0", "4", "2", "8", "7", "modelNative", "false"])
       XCTAssertEqual(restored.layers.map { $0.keys.differingElementCount }, [0, 0])
+      // Keep the distinct canonical contract and its original exact expectation.
+      let canonical = try native.oracle(prefix: 8)
+      XCTAssertEqual(canonical[1].state[0].asArray(Float.self), [4, 5, 6, 7])
+      let differentLayout = try NativePrefixParityProbe.compareState(oracle: canonical,
+        hydrated: actual, suffixLength: 2, maskWindows: [nil, 4])
+      XCTAssertFalse(differentLayout.structurallyEqual)
+      XCTAssertFalse(differentLayout.allKVBitsEqual)
+      XCTAssertTrue(differentLayout.allMasksEqual)
+      // Even an older overfull row that the next update will discard must be
+      // caught by the strict original-boundary comparison, not normalized away.
+      let corrupted = try native.originalBoundary()
+      var raw = corrupted[1].innerState(); raw[0][0, 0, 0, 0] = MLXArray(Float(999))
+      var target = corrupted[1]; target.state = raw
+      let wrong = try NativePrefixParityProbe.compareState(oracle: oracle,
+        hydrated: corrupted, suffixLength: 2, maskWindows: [nil, 4])
+      XCTAssertTrue(wrong.structurallyEqual); XCTAssertFalse(wrong.allKVBitsEqual)
+      XCTAssertEqual(wrong.layers[1].keys.differingElementCount, 1)
+      XCTAssertEqual(wrong.layers[1].keys.firstDifferingAxis2Index, 0)
+      XCTAssertEqual(wrong.layers[1].values.differingElementCount, 0)
+      let stillActual = try NativePrefixParityProbe.compareState(oracle: oracle,
+        hydrated: actual, suffixLength: 2, maskWindows: [nil, 4])
+      XCTAssertTrue(stillActual.allKVBitsEqual); XCTAssertTrue(stillActual.allMasksEqual)
+    }
+  }
+
+  func testOriginalBoundaryAndCanonicalCropHaveExactNextUpdatesForOneAndTwoTokenSuffixes() throws {
+    try Device.withDefaultDevice(.cpu) {
+      for keep in [0, 1] {
+        for firstSuffix in [1, 2] {
+          let full = KVCacheSimple(); full.step = 2
+          let local = RotatingKVCache(maxSize: 4, keep: keep, step: 2)
+          for range in [0..<4, 4..<8] { append(full, range); append(local, range) }
+          let snapshot = try NativePrefixParityProbe.captureNative([full, local], evaluatedPrefix: 8, selectedRow: 0)
+          let original = try snapshot.originalBoundary(), canonical = try snapshot.oracle(prefix: 8)
+          XCTAssertEqual(original[1].innerState()[0].dim(2), 7)
+          XCTAssertEqual(canonical[1].innerState()[0].dim(2), 4)
+          var at = 8
+          // Exercise both entry points, then repeated wrap/concat transitions.
+          for count in [firstSuffix, 1, 2, firstSuffix] {
+            for layer in original.indices {
+              let window: Int? = layer == 0 ? nil : 4
+              for materialized in [false, true] {
+                let mask = try NativePrefixParityProbe.compareMask(original[layer], canonical[layer],
+                  n: count, window: window, returnArray: materialized)
+                XCTAssertTrue(mask.bitwiseEqual, "pre-update mask: keep=\(keep), suffix=\(count), layer=\(layer)")
+              }
+              let keys = tensor(at..<(at + count)), values = tensor(at..<(at + count), values: true)
+              let a = original[layer].update(keys: keys, values: values)
+              let b = canonical[layer].update(keys: keys, values: values)
+              eval([a.0, a.1, b.0, b.1] + original[layer].innerState() + canonical[layer].innerState())
+              XCTAssertTrue(try NativePrefixParityProbe.compareTensor(a.0, b.0).bitwiseEqual == true,
+                "next-update keys: keep=\(keep), suffix=\(count), layer=\(layer)")
+              XCTAssertTrue(try NativePrefixParityProbe.compareTensor(a.1, b.1).bitwiseEqual == true,
+                "next-update values: keep=\(keep), suffix=\(count), layer=\(layer)")
+            }
+            at += count
+            for next in [1, 2] {
+              let same = try NativePrefixParityProbe.compareState(oracle: original, hydrated: canonical,
+                suffixLength: next, maskWindows: [nil, 4])
+              XCTAssertTrue(same.structurallyEqual); XCTAssertTrue(same.allKVBitsEqual); XCTAssertTrue(same.allMasksEqual)
+              XCTAssertEqual(original.map(\.offset), [at, at])
+            }
+          }
+        }
+      }
+    }
+  }
+
+  func testOriginalBoundaryPreservesUnusedPhysicalCapacityAndFrozenRawDescriptors() throws {
+    try Device.withDefaultDevice(.cpu) {
+      let full = KVCacheSimple(); full.step = 4
+      let local = RotatingKVCache(maxSize: 4, step: 4)
+      for position in 0..<3 { append(full, position..<(position + 1)); append(local, position..<(position + 1)) }
+      let snapshot = try NativePrefixParityProbe.captureNative([full, local], evaluatedPrefix: 3, selectedRow: 0)
+      let before = try snapshot.originalBoundary()
+      XCTAssertEqual(before.map(\.offset), [3, 3])
+      for layer in before.indices {
+        XCTAssertEqual(before[layer].innerState().map { $0.dim(2) }, [4, 4])
+        XCTAssertEqual(before[layer].state[0].asArray(Float.self), [0, 1, 2])
+        XCTAssertEqual(before[layer].innerState()[0].asArray(Float.self), [0, 1, 2, 0])
+        XCTAssertEqual(before[layer].innerState()[1].asArray(Float.self), [-1, -2, -3, 0])
+      }
+      append(full, 3..<4); append(local, 3..<4)
+      eval(full.innerState() + local.innerState())
+      let frozen = try snapshot.originalBoundary()
+      for layer in before.indices {
+        XCTAssertEqual(frozen[layer].innerState()[0].view(dtype: .uint32).asArray(UInt32.self),
+          [Float(0), 1, 2, 0].map(\.bitPattern))
+        XCTAssertEqual(frozen[layer].innerState()[1].view(dtype: .uint32).asArray(UInt32.self),
+          [Float(-1), -2, -3, 0].map(\.bitPattern))
+        XCTAssertEqual(frozen[layer].metaState, before[layer].metaState)
+      }
+      let exact = try NativePrefixParityProbe.compareState(oracle: before, hydrated: frozen,
+        suffixLength: 2, maskWindows: [nil, 4])
+      XCTAssertTrue(exact.allKVBitsEqual); XCTAssertTrue(exact.allMasksEqual)
+      XCTAssertEqual(full.offset, 4); XCTAssertEqual(local.offset, 4)
     }
   }
 

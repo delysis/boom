@@ -746,6 +746,18 @@ enum NeuralPrefixParitySmoke {
     _ = try warm.prefill.forEachChunk(total: tailCount) { ranges.append($0.count) }
     ranges.append(tailCount - ranges.reduce(0, +))
     guard ranges == d.warmSuffixPartitions else { throw BoomError.invalid("The actual warm suffix partitions changed.") }
+    // Equal prefix counters alone do not imply the same physical layout.
+    // Only an unchanged transfer of the retained producer's native objects
+    // uses its original boundary. Disk/row/interior restoration remains the
+    // independent canonical crop, never a format inferred from candidate data.
+    let sourceBases = capturedSource.map { nativeBases($0.session.cache) } ?? []
+    let sameOriginalBoundary = d.cachedPrefix == sourceSnapshot.evaluatedPrefix
+      && sourceBases.count == bases.count && bases.indices.allSatisfy {
+        ObjectIdentifier(bases[$0] as AnyObject) == ObjectIdentifier(sourceBases[$0] as AnyObject)
+      }
+    let restorationReference: [any KVCache]
+    if sameOriginalBoundary { restorationReference = try sourceSnapshot.originalBoundary() }
+    else { restorationReference = try sourceSnapshot.oracle(prefix: d.cachedPrefix) }
     try object(["comparison_A": "same_original_evaluated_native_history_vs_actual_normal_manager_hydration",
       "comparison_B": "retained_original_native_history_vs_independently_cold_full_current_query_native_history",
       "warm_suffix_partitions": ranges, "source_native_boundary": d.sourceNativeBoundary,
@@ -753,11 +765,13 @@ enum NeuralPrefixParitySmoke {
       "fixture_schema": request.schema, "source_stage": d.sourceStage?.rawValue ?? "legacy_prefill",
       "original_shared_row": d.sharedSourceRow.map { $0 as Any } ?? NSNull(),
       "same_integer_prefix_proved": true, "unavailable_oracle_fallback": false,
+      "same_original_native_boundary": sameOriginalBoundary,
+      "restoration_reference_layout": sameOriginalBoundary ? "original_native_boundary" : "canonical_prefix",
       "full_query_cold_history_is_primary": true, "historical_native_tensors_recreated_from_receipts": false],
       "comparison-scope.json", evidence)
 
     let a = try pair(name: "A-same-history-restoration", model: model,
-      reference: sourceSnapshot.oracle(prefix: d.cachedPrefix), candidate: bases,
+      reference: restorationReference, candidate: bases,
       query: request.query.prepared_token_ids, prefix: d.cachedPrefix, partitions: ranges, windows: windows,
       settings: request.query.settings, policy: policy, flag: flag, evidence: evidence)
     // A's working caches were advanced; B starts from fresh independent native
