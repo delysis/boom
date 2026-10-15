@@ -168,7 +168,7 @@ private actor LogicalUndoDelivery: PagedNativeLogicalSessionStorage {
   func focus() async throws {
     let becameKey = window.isKeyWindow ? nil : XCTNSNotificationExpectation(
       name: NSWindow.didBecomeKeyNotification, object: window)
-    window.makeKeyAndOrderFront(nil); NSApplication.shared.activate(ignoringOtherApps: true)
+    window.showAsInvisibleNativeTestWindow(); NSApplication.shared.activate(ignoringOtherApps: true)
     if let becameKey {
       guard await XCTWaiter.fulfillment(of: [becameKey], timeout: 10) == .completed else {
         throw BoomError.unavailable("The public logical fixture did not receive its actual key-window notification.")
@@ -204,9 +204,41 @@ private actor LogicalUndoDelivery: PagedNativeLogicalSessionStorage {
 /// the normal native test owner must nominate and run them explicitly.
 @MainActor final class PagedNativeLogicalUndoTests: XCTestCase {
   private static var retained: LogicalUndoFixture?
+  private static var runnerSupportsNativeKeyWindow: Bool?
+
+  private func requireNativeKeyWindowRunner() async throws {
+    if let available = Self.runnerSupportsNativeKeyWindow {
+      guard available else {
+        throw XCTSkip("The XCTest runner cannot activate a native key window; signed-app acceptance covers this route.")
+      }
+      return
+    }
+    try PagedNativeFixtureApplication.bootstrap()
+    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 160, height: 100),
+      styleMask: [.titled, .closable], backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    let view = NSView(frame: window.contentView!.bounds)
+    window.contentView = view
+    let becameKey = window.isKeyWindow ? nil : XCTNSNotificationExpectation(
+      name: NSWindow.didBecomeKeyNotification, object: window)
+    window.showAsInvisibleNativeTestWindow()
+    NSApplication.shared.activate(ignoringOtherApps: true)
+    let notificationReceived: Bool
+    if let becameKey {
+      notificationReceived = await XCTWaiter.fulfillment(of: [becameKey], timeout: 2) == .completed
+    } else { notificationReceived = true }
+    let available = notificationReceived && window.isKeyWindow
+      && window.makeFirstResponder(view) && window.firstResponder === view
+    Self.runnerSupportsNativeKeyWindow = available
+    window.orderOut(nil); window.close()
+    guard available else {
+      throw XCTSkip("The XCTest runner cannot activate a native key window; signed-app acceptance covers this route.")
+    }
+  }
+
   private func fixture() async throws -> LogicalUndoFixture {
     guard Self.retained == nil else { throw BoomError.denied("A failed public logical fixture remains owned by this process.") }
-    try PagedNativeFixtureApplication.bootstrap()
+    try await requireNativeKeyWindowRunner()
     let root = try PagedNativeFixtureApplication.scratchRoot(prefix: "Bloom-logical-undo-")
     let store = try await Task.detached { try WorkspaceStore(rootOverride: root) }.value
     let f = LogicalUndoFixture(root: root, store: store); Self.retained = f

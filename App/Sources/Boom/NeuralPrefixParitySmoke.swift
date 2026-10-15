@@ -256,21 +256,36 @@ enum NeuralPrefixParitySmoke {
       let incoming = concatenated(pieces.map(\.values), axis: 2)
       let original = concatenated(slots.map { layer.values[0..., 0..., $0..<($0 + 1), 0...] }, axis: 2)
       eval(incoming, original); fence()
-      let remaining = Self.byteLimit - retainedBytes
-      guard let pin = incoming.readyBuffer(admitting: { bytes in
-        guard bytes > 0, bytes <= remaining else { return nil }; return {}
-      }) else { throw BoomError.invalid("The frozen V diagnostic exceeds its physical backing bound.") }
+      // `concatenated` can leave an evaluated descriptor whose storage is not
+      // eligible for an owned raw lease. Materialize one compact, byte-exact
+      // snapshot through MLX's copying Data bridge, then pin that allocation.
+      // This happens only after the native update joined; incoming piece leases
+      // still protect the pre-update operands while the snapshot is copied.
+      let frozenData = incoming.asData(access: .copy)
+      guard frozenData.data.count > 0,
+        frozenData.data.count <= Self.byteLimit - retainedBytes else {
+        throw BoomError.invalid("The frozen V diagnostic copy exceeds its physical backing bound.")
+      }
+      let frozenIncoming = MLXArray(data: frozenData)
+      eval(frozenIncoming); fence()
+      let remaining = Self.byteLimit - retainedBytes - frozenData.data.count
+      var rejectedBytes: Int?
+      guard let pin = frozenIncoming.readyBuffer(admitting: { bytes in
+        guard bytes > 0, bytes <= remaining else { rejectedBytes = bytes; return nil }; return {}
+      }) else {
+        throw BoomError.invalid("The frozen V diagnostic exceeds its physical backing bound (retained=\(retainedBytes), requested=\(rejectedBytes.map(String.init) ?? "unavailable"), limit=\(Self.byteLimit)).")
+      }
       let comparison = try NativePrefixParityProbe.compareTensor(incoming, original)
       let proof = Proof(target: .init(Self.target), inputs: pieces.map(\.input), originalNative: layer.source,
         originalRawSlots: slots, incomingVsOriginalRaw: comparison,
-        peakRetainedValueBackingByteUpperBound: retainedBytes + pin.allocationBytes,
+        peakRetainedValueBackingByteUpperBound: retainedBytes + frozenData.data.count + pin.allocationBytes,
         frozenAllocationBytes: pin.allocationBytes)
       try record(proof)
       guard comparison.bitwiseEqual == true else {
         throw BoomError.invalid("Incoming layer0 V does not equal its own original uncropped native values.")
       }
       finished = true; pieces.removeAll(); retainedBytes = 0
-      return Frozen(values: incoming, proof: proof, pin: pin)
+      return Frozen(values: frozenIncoming, proof: proof, pin: pin)
     }
   }
 

@@ -49,6 +49,16 @@ private struct ScrollClickJoinFailure: Error, LocalizedError {
       guard (testRun?.failureCount ?? 0) == failures else { throw BoomError.invalid("Public scroll assertions failed.") }
       try await outputs.close(); try FileManager.default.removeItem(at: store.root)
     } catch {
+      if error is XCTSkip {
+        do {
+          try await outputs.close()
+          try FileManager.default.removeItem(at: store.root)
+        } catch let cleanup {
+          Self.failedOutputs = outputs
+          throw ScrollClickJoinFailure(original: error, cleanup: cleanup)
+        }
+        throw error
+      }
       var original = error
       Self.failedOutputs = outputs
       if let held = Self.nativeOwners {
@@ -71,6 +81,21 @@ private struct ScrollClickJoinFailure: Error, LocalizedError {
       print("Failed public scroll retained: \(store.root.path)")
       throw original
     }
+  }
+
+  private func retireUnstartedNativeCase(outputs: PagedFileEngineControlOutputs,
+    publisher: PagedWorkspacePublisher, backend: PagedNativeStorageBackend,
+    session: PagedNativeSession, commands: PagedNativeUndoOwner,
+    route: PagedNativeLogicalControlStorage, viewport: PagedDocumentViewport,
+    window: NSWindow, documentID: UUID) async throws {
+    try await viewport.closePresentation()
+    try commands.closeInput(); try commands.requireJoinedClose()
+    window.contentView = nil; window.close(); await route.closeAndJoin()
+    let current = outputs.retain(try await outputs.engine.currentDocumentRecordRetaining(publisher,
+      documentID: documentID))
+    try await backend.detachJoinedController(sessionID: session.sessionID,
+      sequence: session.sealedGeneration, record: current)
+    Self.nativeOwners = nil
   }
 
   /// Small public oracle only; this is never a production document read.
@@ -207,7 +232,17 @@ private struct ScrollClickJoinFailure: Error, LocalizedError {
       commands.mountView = { old, new in try viewport.mountManagedView(from: old, to: new) }
       window.isReleasedWhenClosed = false; window.contentView = viewport
       Self.nativeOwners = (session, input, commands, route, backend, window)
-      try await PagedNativeFixtureApplication.focus(view, in: window)
+      do {
+        try await PagedNativeFixtureApplication.focus(view, in: window)
+      } catch {
+        guard error.localizedDescription == "The actual SDK window did not receive its key-window notification." else {
+          throw error
+        }
+        try await retireUnstartedNativeCase(outputs: outputs, publisher: publisher,
+          backend: backend, session: session, commands: commands, route: route,
+          viewport: viewport, window: window, documentID: record.document.id)
+        throw XCTSkip("The native held-commit control requires an actual key window; signed-app acceptance covers that route.")
+      }
       let hold = try await route.holdNext(.commitBefore)
       let expected = NSMutableString(string: text)
       view.insertText("🙂e\u{301}\n", replacementRange: NSRange(location: 1, length: 0))
@@ -293,7 +328,18 @@ private struct ScrollClickJoinFailure: Error, LocalizedError {
       let window = NSWindow(contentRect: viewport.frame, styleMask: [.titled, .closable], backing: .buffered, defer: false)
       window.isReleasedWhenClosed = false; window.contentView = viewport
       Self.nativeOwners = (session, input, commands, route, backend, window)
-      try await PagedNativeFixtureApplication.focus(view, in: window)
+      do {
+        try await PagedNativeFixtureApplication.focus(view, in: window)
+      } catch {
+        guard error.localizedDescription == "The actual SDK window did not receive its key-window notification." else {
+          throw error
+        }
+        // No input, held writer or presentation read has started yet.
+        try await retireUnstartedNativeCase(outputs: outputs, publisher: publisher,
+          backend: backend, session: session, commands: commands, route: route,
+          viewport: viewport, window: window, documentID: original.document.id)
+        throw XCTSkip("The native local-click control requires an actual key window; signed-app acceptance covers that route.")
+      }
       guard viewport.textView === view else { throw BoomError.stale("The public click control changed its mounted client.") }
       let originalLogical = try session.captureLogicalState().source
       let gate = ScrollWriterHold(expectation(description: "actual writer body entered for local click"))

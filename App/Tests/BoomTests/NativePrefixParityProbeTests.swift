@@ -285,7 +285,10 @@ final class NativePrefixParityProbeTests: XCTestCase {
   }
 
   func testLayer0ValueBoundaryMatchesUncroppedWrappedAndOverfullNativeThenSurvivesLaterWrites() throws {
-    try Device.withDefaultDevice(.cpu) {
+    // This proof requires a physical Metal allocator backing. MLXReadyBuffer
+    // intentionally refuses CPU storage because exposing its raw pointer may
+    // perform a synchronous transfer and violate the ready-only contract.
+    try Device.withDefaultDevice(.gpu) {
       typealias Boundary = NeuralPrefixParitySmoke.Layer0ValueBoundary
       let source = RotatingKVCache(maxSize: 512), sourceTrace = Boundary()
       let sourceCalls = try sourceTrace.observing([source])
@@ -331,7 +334,7 @@ final class NativePrefixParityProbeTests: XCTestCase {
   }
 
   func testLayer0ValueBoundaryRefusesMissingIncomingCoverageAndDifferentOriginalRawValues() throws {
-    try Device.withDefaultDevice(.cpu) {
+    try Device.withDefaultDevice(.gpu) {
       typealias Boundary = NeuralPrefixParitySmoke.Layer0ValueBoundary
       let incomplete = RotatingKVCache(maxSize: 512), incompleteTrace = Boundary()
       let incompleteCalls = try incompleteTrace.observing([incomplete])

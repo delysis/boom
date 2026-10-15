@@ -104,10 +104,12 @@ final class ResidentPrefixAdversarialTests: XCTestCase {
 
   func testFinishedBatchRowSurvivesPeersAdvancingBeyondTwoWindowsWithoutInertTokens() async throws {
     try await Device.withDefaultDevice(.cpu) {
-      // The synthetic three-row simple-cache parents are 3,180 bytes each.
-      // The writer must be able to pin the complete key/value pair transiently;
+      // The writer must pin the complete two-layer K/V cohort transiently.
+      // MLX reports allocator-owned parents at slightly different physical
+      // sizes across suite order; 16 KiB covers this measured quartet while
       // successful publication still must leave no resident archive.
-      let store = PromptPrefixCache(byteLimit: 8_192), scope = owner(), ids = Array(0..<9)
+      let transientParentLimit: UInt64 = 16_384
+      let store = PromptPrefixCache(byteLimit: transientParentLimit), scope = owner(), ids = Array(0..<9)
       let request = try session(store, ids: ids, owner: scope) {
         [KVCacheSimple(), RotatingKVCache(maxSize: 4, step: 2)]
       }
@@ -132,6 +134,10 @@ final class ResidentPrefixAdversarialTests: XCTestCase {
             emittedTokenIDs: Array(first...(first + step + 1)), finished: step == additionalForwards))
         }
       }
+      let readyParentBytes = request.cache.flatMap { $0.innerState().map { $0.readyBuffer()?.allocationBytes ?? -1 } }
+      XCTAssertTrue(readyParentBytes.allSatisfy { $0 > 0 }, "Every physical key/value parent must be ready before publication.")
+      XCTAssertLessThanOrEqual(readyParentBytes.reduce(0, +), Int(transientParentLimit),
+        "The measured complete two-layer K/V cohort must fit the transient physical-parent budget.")
       let completions: [PromptPrefixCache.Completion] = [
         .init(row: 0, emittedTokenIDs: [901, 902]),
         .init(row: 1, emittedTokenIDs: Array(1001...1014)),
@@ -157,7 +163,7 @@ final class ResidentPrefixAdversarialTests: XCTestCase {
       XCTAssertEqual(store.retainedBytesUpperBound, 0)
       XCTAssertGreaterThanOrEqual(store.retainedNativeBytesUpperBound, globalBytes)
       _ = (frozenRowZeroBytes, currentLocalBytes) // predecessor RAM archive geometry is preserved in the preimage
-      XCTAssertLessThanOrEqual(store.retainedBytesUpperBound, 8_192)
+      XCTAssertLessThanOrEqual(store.retainedBytesUpperBound, transientParentLimit)
 
       for row in 0..<3 {
         let nextIDs = ids + completions[row].emittedTokenIDs

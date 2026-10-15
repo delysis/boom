@@ -114,7 +114,10 @@ import SwiftUI
           completion.schedule(delay: .zero)
           let started = ContinuousClock().now
           while completion.bundle?.candidates.first?.outputTokens ?? 0 < 8 {
-            guard started.duration(to: ContinuousClock().now) < .seconds(90) else { throw BoomError.unavailable("Interruption fixture timed out.") }
+            guard started.duration(to: ContinuousClock().now) < .seconds(90) else {
+              try write(completion.diagnosticState, "interruption-timeout-state")
+              throw BoomError.unavailable("Interruption fixture timed out.")
+            }
             try await Task.sleep(for: .milliseconds(50))
           }
           guard let interruptedID = completion.bundle?.id else { throw BoomError.invalid("Missing interruption identity.") }

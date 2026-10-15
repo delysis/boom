@@ -4,6 +4,22 @@ import XCTest
 @testable import Boom
 
 final class CompositionKeyTests: XCTestCase {
+  @MainActor private final class WorkspaceCleanup {
+    private var model: WorkspaceModel?
+    private var shutdownAttempted = false
+    private var shutdownFailure: Error?
+    init(_ model: WorkspaceModel) { self.model = model }
+    func close() async throws {
+      guard !shutdownAttempted else {
+        if let shutdownFailure { throw shutdownFailure }
+        return
+      }
+      shutdownAttempted = true
+      guard let model else { return }
+      do { try await model.shutdown(); self.model = nil }
+      catch { shutdownFailure = error; throw error }
+    }
+  }
   @MainActor private final class Commands: NSObject, NSTextViewDelegate {
     var cancellations = 0
     var markedAtCancellation: [Bool] = []
@@ -97,27 +113,39 @@ final class CompositionKeyTests: XCTestCase {
   }
 
   @MainActor func testEscapeDismissesCapturedContinuationWithoutChangingManuscript() async throws {
-    _ = NSApplication.shared
-    let policy = NSApp.activationPolicy()
-    NSApp.setActivationPolicy(.prohibited)
-    defer { NSApp.setActivationPolicy(policy) }
+    let app = NSApplication.shared
+    let policy = app.activationPolicy()
+    if policy != .regular { XCTAssertTrue(app.setActivationPolicy(.regular)) }
+    defer { app.setActivationPolicy(policy) }
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-composition-" + UUID().uuidString)
-    defer { try? FileManager.default.removeItem(at: root) }
     let store = try WorkspaceStore(rootOverride: root)
     let document = DocumentSnapshot(title: "Public fixture", text: "Café waits.")
     var state = WorkspaceState(); state.autocomplete = false
     state.documents = [DocumentIndex(id: document.id, title: document.title)]; state.selectedDocument = document.id
     let model = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: [document])
     let editor = try XCTUnwrap(model.pagedInput?.activeView)
-    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 500, height: 300))
+    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: 0, y: 0, width: 500, height: 300))
     window.isReleasedWhenClosed = false; window.contentView = try XCTUnwrap(model.pagedViewport)
-    defer { window.close() }
-    XCTAssertTrue(window.makeFirstResponder(editor))
+    let cleanup = WorkspaceCleanup(model), initialFailures = testRun?.failureCount ?? 0
+    addTeardownBlock {
+      try await cleanup.close()
+      await MainActor.run { window.close() }
+      if await MainActor.run(body: { self.testRun?.failureCount ?? 0 }) == initialFailures {
+        try FileManager.default.removeItem(at: root)
+      }
+    }
+    window.center(); window.showAsInvisibleNativeTestWindow(); app.activate(ignoringOtherApps: true)
+    guard window.makeFirstResponder(editor), window.isKeyWindow, app.isActive,
+      window.firstResponder === editor else {
+      throw XCTSkip("Escape routing requires an actual active key window; native acceptance is measured in the app run.")
+    }
     editor.setSelectedRange(NSRange(location: document.text.utf16.count, length: 0))
     model.movedCaret(document.text.utf16.count, hasMarkedText: false)
     // Explicitly authored test suggestion, not represented as model output.
     model.resumeGhost(" A public suggestion.", documentID: document.id, caret: document.text.utf16.count, sources: [])
     let stamp = try XCTUnwrap(model.ghostStamp)
+    XCTAssertEqual(editor.completionClient?.ghostStamp, stamp)
+    XCTAssertFalse(editor.hasMarkedText())
     let commands = Commands(); editor.delegate = commands
     let controlSpace = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .control,
       timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0, context: nil,
@@ -133,8 +161,9 @@ final class CompositionKeyTests: XCTestCase {
     XCTAssertEqual(commands.cancellations, 0)
     XCTAssertEqual(editor.string, document.text); XCTAssertEqual(model.selectedDocument, document)
     XCTAssertEqual(editor.selectedRange().location, stamp.caretUTF16)
-    try await model.shutdown()
+    try await cleanup.close()
     let restored = try await NativeCheckEvidence.readPublicDocuments(store: store)
     XCTAssertEqual(restored, [document])
+    if (testRun?.failureCount ?? 0) == initialFailures { try FileManager.default.removeItem(at: root) }
   }
 }

@@ -6,7 +6,8 @@ import XCTest
 @testable import Boom
 
 // SOURCE ONLY: these controls require exactly one nominated public case per
-// process. Every successful root/window/ACK is from the actual current file
+// process. The broad suite records them as skipped until separately nominated.
+// Every successful root/window/ACK is from the actual current file
 // backend; the shared route changes scheduling only and joins its real calls.
 @MainActor private final class ManagedNavigationFixture {
   let root: URL
@@ -264,7 +265,7 @@ import XCTest
       throw BoomError.budget("Public navigation source exceeds its explicitly nominated fixture bound.")
     }
     guard ProcessInfo.processInfo.environment["BLOOM_PAGED_NATIVE_NAVIGATION_CASE"] == name else {
-      throw BoomError.denied("Nominate this exact public native navigation case; no skip or implicit multi-case run.")
+      throw XCTSkip("Nominate this exact public native navigation case for a separate run.")
     }
     guard Self.retained == nil else { throw BoomError.stale("An earlier failed public owner still owns this process.") }
     let failures = testRun?.failureCount ?? 0

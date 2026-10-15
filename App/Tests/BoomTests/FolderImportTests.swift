@@ -24,7 +24,7 @@ final class FolderImportTests: XCTestCase {
     let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 640, height: 480))
     window.isReleasedWhenClosed = false; window.contentView = try XCTUnwrap(model.pagedViewport)
     defer { window.close() }
-    window.makeKeyAndOrderFront(nil)
+    window.showAsInvisibleNativeTestWindow()
     XCTAssertTrue(window.makeFirstResponder(try XCTUnwrap(model.pagedInput?.activeView)))
     try await NativeCheckEvidence.replacePublicDocument(model, text: "A changed manuscript. 🦋", id: first.id, caret: 0)
     for (file, bytes) in zip([a, b], originals) {

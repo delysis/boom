@@ -98,6 +98,7 @@ final class GenerationExecutionOriginTests: XCTestCase {
     model.state.autocomplete = false
     let recipe = try recipe(policy())
     model.appendDocument(recipe.document); model.state.selectedDocument = recipe.document.id
+    try await model.joinWorkspaceOperation()
     // This fixture has no loaded or known writing model. Origin-specific
     // admission with a matching model/policy is checked separately above.
     for observation in [nil, origin(), origin(8, miss: nil)] as [GenerationExecutionOrigin?] {

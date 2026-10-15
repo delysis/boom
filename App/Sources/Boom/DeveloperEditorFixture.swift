@@ -6,6 +6,7 @@ import BoomCore
 import CryptoKit
 import Darwin
 import Foundation
+import QuartzCore
 import SwiftUI
 
 /// One explicit public, warmed, model-free observation of the ordinary editor.
@@ -65,6 +66,18 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
 }
 
 @MainActor enum DeveloperEditorFixture {
+  private static func placeDiagnosticWindowOnRight(_ window: NSWindow, narrow: Bool = false) {
+    guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+    let visible = screen.visibleFrame
+    if narrow {
+      let content = window.contentView?.frame.size ?? window.frame.size
+      window.setContentSize(NSSize(width: min(content.width, floor(visible.width / 2)),
+        height: min(content.height, visible.height - 32)))
+    }
+    window.setFrameOrigin(NSPoint(x: visible.maxX - window.frame.width,
+      y: visible.midY - window.frame.height / 2))
+  }
+
   // Preserve the actual partial Model/window/source on any failed cleanup.
   // This is the existing fixture receiver, not another lifetime or root owner.
   private static var failedFixture: Prepared?
@@ -134,6 +147,10 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
       probe.mark("verify-and-close"); try await fixture.verifyAfterCapture()
     } catch { failures.append(error.localizedDescription) }
     do { try await fixture.shutdown() } catch { failures.append("Workspace shutdown: " + error.localizedDescription) }
+    if failures.isEmpty {
+      probe.mark("released-native-graph")
+      await fixture.releaseNormalGraphForObservation()
+    }
     do {
       let observed = try probe.finish()
       try fixture.writeNormalMemorySummary(maximumSampledCurrent: probe.maximumSampledCurrentFootprint(),
@@ -145,16 +162,90 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
     guard failures.isEmpty else { throw BoomError.unavailable(failures.joined(separator: "; ")) }
   }
 
+  /// Diagnostic control: the same imported document, window and native editor,
+  /// with the main run loop alive but no synthetic editing or scroll exercise.
+  static func runGraphicsIdle(arguments: [String]) async throws {
+    guard arguments.count == 5, arguments[1] == "--graphics-idle-smoke",
+      ["empty", "empty-display", "model-empty", "plain-text", "viewport-no-text", "viewport", "clamped-viewport", "clamped-primed", "flattened-primed", "manuscript", "editor", "editor-display", "startup", "primed", "flushed", "exported"].contains(arguments[2]), arguments[3] == "--evidence",
+      arguments[4].hasPrefix("/") else { throw BoomError.invalid("Invalid graphics idle diagnostic arguments.") }
+    let evidence = URL(fileURLWithPath: arguments[4], isDirectory: true)
+    guard mkdir(evidence.path, 0o700) == 0 else {
+      throw BoomError.invalid("Graphics idle evidence directory must be fresh and exclusively owned.")
+    }
+    if arguments[2] == "empty" || arguments[2] == "empty-display" {
+      try await runEmptyGraphicsIdle(evidence: evidence, forceDisplay: arguments[2] == "empty-display")
+      return
+    }
+    let plan = try DeveloperStackDiagnostics.PublicEditorPlan(kind: 2, operations: 1_000, utf8Bytes: 72_196)
+    let fixture = try Prepared(recipe: evidence.appendingPathComponent("graphics-idle-recipe.json"),
+      plan: plan, normalMemory: true, graphicsIdlePoint: arguments[2])
+    var failures: [String] = []
+    do { try await fixture.prepare() } catch { failures.append("Prepare: " + error.localizedDescription) }
+    do { try await fixture.shutdown() } catch { failures.append("Shutdown: " + error.localizedDescription) }
+    if failures.isEmpty { await fixture.releaseNormalGraphForObservation() }
+    try fixture.writeGraphicsIdleReceipt(failures: failures)
+    if !failures.isEmpty { failedFixture = fixture }
+    guard failures.isEmpty else { throw BoomError.unavailable(failures.joined(separator: "; ")) }
+  }
+
+  private static func runEmptyGraphicsIdle(evidence: URL, forceDisplay: Bool) async throws {
+    var stages: [[String: Any]] = []
+    var host: NSHostingView<EmptyView>? = NSHostingView(rootView: EmptyView())
+    var window: NSWindow? = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 1190, height: 846))
+    func mark(_ name: String) {
+      var info = task_vm_info_data_t()
+      var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+      let capacity = Int(count)
+      let status = withUnsafeMutablePointer(to: &info) { pointer in
+        pointer.withMemoryRebound(to: integer_t.self, capacity: capacity) {
+          task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+        }
+      }
+      stages.append(["stage": name, "uptime_seconds": ProcessInfo.processInfo.systemUptime,
+        "available": status == KERN_SUCCESS && Int(count) == capacity,
+        "graphics_footprint_bytes": info.ledger_tag_graphics_footprint,
+        "physical_footprint_bytes": info.phys_footprint,
+        "window_visible": window?.isVisible ?? false,
+        "window_key": window?.isKeyWindow ?? false,
+        "window_occlusion_visible": window?.occlusionState.contains(.visible) ?? false,
+        "window_backing_scale": window?.backingScaleFactor ?? 0])
+    }
+    guard host != nil, window != nil else { throw BoomError.unavailable("Empty graphics control could not construct its window.") }
+    window?.isReleasedWhenClosed = false; window?.contentView = host
+    mark("attached-hidden")
+    if let window { placeDiagnosticWindowOnRight(window, narrow: true) }
+    window?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+    for _ in 0..<10 { host?.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(25)) }
+    mark("visible-empty")
+    if forceDisplay { window?.displayIfNeeded(); CATransaction.flush(); mark("display-submitted") }
+    for tick in 1...20 { try await Task.sleep(for: .milliseconds(100)); mark("idle-empty-\(tick)") }
+    weak var oldWindow = window
+    weak var oldHost = host
+    window?.contentView = nil; window?.close()
+    host = nil; window = nil
+    try await Task.sleep(for: .seconds(1))
+    mark("released-empty")
+    let released: [String: Any] = ["window_deallocated": oldWindow == nil,
+      "host_deallocated": oldHost == nil]
+    let receipt: [String: Any] = ["schema": 1, "scope": "Diagnostic empty SwiftUI host in the production window factory",
+      "status": "complete", "force_display": forceDisplay,
+      "graphics_lifecycle_stages": stages, "released_graph_owners": released]
+    try JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys])
+      .write(to: evidence.appendingPathComponent("graphics-idle-receipt.json"), options: .withoutOverwriting)
+  }
+
   @MainActor private final class Prepared {
     private static let cycles: UInt32 = 1_000
     private static let observationSeconds: Int64 = 110
+    private static let normalObservationSeconds: Int64 = 140
     private let normalMemory: Bool
+    private let graphicsIdlePoint: String?
     private let plan: DeveloperStackDiagnostics.PublicEditorPlan
     private let root: URL
     private let temporaryRoot: URL
     private let providedTemporaryPath: String?
     private var workspace: WorkspaceModel?
-    private var host: NSHostingView<WorkspaceView>?
+    private var host: NSView?
     private var window: NSWindow?
     private var managedEditor: PagedNativeTextView?
     private var sourceFile: FileHandle?
@@ -176,6 +267,10 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
     private var startupImportedState: [String: Any]?, startupHistoryState: [String: Any]?
     private var primingBefore: [String: Any]?, primingAfterInsert: [String: Any]?, primingAfterDelete: [String: Any]?
     private var vmBefore: [String: Any]?, vmAfter: [String: Any]?
+    private var graphicsStages: [[String: Any]] = []
+    private var graphicsLayerHierarchy: [[String: Any]] = []
+    private let graphicsRunID = UUID()
+    private var releasedGraphOwners: [String: Bool] = [:]
     private var applicationBeforeFocus: [String: Any]?, applicationAfterFocus: [String: Any]?
     private var reactivationCount = 0, lastReactivationEvent: UInt64 = 0
     private var reactivationTotalSeconds: Double = 0, reactivationMaximumSeconds: Double = 0
@@ -203,11 +298,12 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
     private var heldSave: Task<Void, Error>?
     var memorySamplesURL: URL { root.appendingPathComponent("memory-samples.jsonl") }
 
-    init(recipe: URL, plan: DeveloperStackDiagnostics.PublicEditorPlan, normalMemory: Bool = false) throws {
+    init(recipe: URL, plan: DeveloperStackDiagnostics.PublicEditorPlan, normalMemory: Bool = false,
+      graphicsIdlePoint: String? = nil) throws {
       guard plan.operations == (plan.isMixed ? 200 : Self.cycles) else {
         throw BoomError.invalid("Public editor plan differs from its fixed source recipe.")
       }
-      self.plan = plan; self.normalMemory = normalMemory
+      self.plan = plan; self.normalMemory = normalMemory; self.graphicsIdlePoint = graphicsIdlePoint
       root = recipe.deletingLastPathComponent().appendingPathComponent("public-editor-workspace", isDirectory: true)
       if normalMemory {
         guard let path = ProcessInfo.processInfo.environment["TMPDIR"], !path.isEmpty, path.hasPrefix("/") else {
@@ -308,6 +404,26 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
         importedRevision.summary.bytes == extent, importedRevision.summary.utf16 == extent else {
         throw BoomError.invalid("Ordinary public import differs from its generated ASCII source.")
       }
+      if normalMemory { recordGraphicsStage("before-window") }
+      if graphicsIdlePoint == "clamped-viewport" || graphicsIdlePoint == "clamped-primed" {
+        guard let viewport = model.pagedViewport,
+          let native = viewport.textView as? PagedNativeTextView else {
+          throw BoomError.invalid("Geometry control has no native editor.")
+        }
+        let height: CGFloat = 846 // matched diagnostic window content height
+        native.isVerticallyResizable = false
+        native.maxSize = NSSize(width: native.maxSize.width, height: height)
+        native.textContainer?.heightTracksTextView = true
+        native.setFrameSize(NSSize(width: native.frame.width, height: height))
+        recordGraphicsStage("clamped-before-host")
+      }
+      if graphicsIdlePoint == "viewport-no-text" {
+        guard let viewport = model.pagedViewport else {
+          throw BoomError.invalid("Detached-text graphics control has no viewport.")
+        }
+        viewport.documentView = NSView(frame: NSRect(x: 0, y: 0, width: 1190, height: 846))
+        recordGraphicsStage("text-detached-before-host")
+      }
       // Capture the exact fresh imported value BEFORE exposing a key window.
       // A file revision/summary alone cannot identify a same-length native edit.
       let startupSession = model.pagedSession, startupCommands = model.pagedCommands
@@ -333,11 +449,38 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
           "persisted_history_generation": startupSession.sealedRootRecord.historyGeneration,
           "undo_count": imported.undo.count, "redo_count": imported.redo.count]
       }
-      let host = NSHostingView(rootView: WorkspaceView(model: model)); self.host = host
+      let host: NSView
+      switch graphicsIdlePoint {
+      case "model-empty": host = NSHostingView(rootView: EmptyView())
+      case "plain-text":
+        guard let original = model.pagedViewport?.textView else {
+          throw BoomError.invalid("Plain text graphics control has no source window.")
+        }
+        let storage = NSTextStorage(string: original.string), manager = NSLayoutManager()
+        let container = NSTextContainer(size: NSSize(width: 1190, height: CGFloat.greatestFiniteMagnitude))
+        storage.addLayoutManager(manager); manager.addTextContainer(container)
+        let text = NSTextView(frame: NSRect(x: 0, y: 0, width: 1190, height: 846), textContainer: container)
+        text.isEditable = true; text.isRichText = false; text.drawsBackground = false
+        text.font = original.font; text.textContainerInset = original.textContainerInset
+        text.isHorizontallyResizable = false; text.isVerticallyResizable = true
+        text.autoresizingMask = [.width]
+        container.widthTracksTextView = true; container.heightTracksTextView = false
+        text.sizeToFit()
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 1190, height: 846))
+        scroll.drawsBackground = false; scroll.hasVerticalScroller = true; scroll.documentView = text
+        host = scroll
+      case "viewport", "viewport-no-text", "clamped-viewport":
+        guard let viewport = model.pagedViewport else { throw BoomError.invalid("Viewport graphics control has no native viewport.") }
+        host = NSHostingView(rootView: PagedManuscriptView(viewport: viewport))
+      case "manuscript": host = NSHostingView(rootView: ManuscriptPane(model: model))
+      default: host = NSHostingView(rootView: WorkspaceView(model: model))
+      }
+      self.host = host
       let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 1190, height: 846))
       self.window = window; window.isReleasedWhenClosed = false; window.contentView = host
+      if normalMemory { recordGraphicsStage("attached-hidden") }
       if plan.isMixed || normalMemory {
-        window.center()
+        DeveloperEditorFixture.placeDiagnosticWindowOnRight(window, narrow: graphicsIdlePoint != nil)
         if NSApp.activationPolicy() != .regular {
           _ = NSApp.setActivationPolicy(.regular)
         }
@@ -347,14 +490,44 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
         window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
       }
       for _ in 0..<10 { host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(25)) }
+      if graphicsIdlePoint == "flattened-primed" {
+        guard let clip = model.pagedViewport?.contentView, clip.layer != nil else {
+          throw BoomError.invalid("Layer control has no attached clip backing layer after layout.")
+        }
+        clip.canDrawSubviewsIntoLayer = true
+      }
       // Initial external foreground delivery is preparation, outside measured
       // work. Later restoration/reactivation keeps its existing five-second bound.
       if plan.isMixed || normalMemory { try await receiveActualKeyWindow(window, within: .seconds(15)) }
+      if graphicsIdlePoint == "model-empty" {
+        recordGraphicsStage("visible-model-empty")
+        _ = try await observeGraphicsIdle(at: "model-empty")
+        return
+      }
+      if graphicsIdlePoint == "plain-text" {
+        if let plain = (host as? NSScrollView)?.documentView as? NSTextView {
+          _ = window.makeFirstResponder(plain)
+        }
+        recordGraphicsStage("visible-plain-text")
+        _ = try await observeGraphicsIdle(at: "plain-text")
+        return
+      }
+      if graphicsIdlePoint == "viewport-no-text" {
+        recordGraphicsStage("visible-viewport-no-text")
+        _ = try await observeGraphicsIdle(at: "viewport-no-text")
+        return
+      }
       guard let view = model.pagedViewport?.textView as? PagedNativeTextView,
         model.pagedInput?.activeView === view, window.makeFirstResponder(view), view.isEditable else {
         throw BoomError.invalid("Ordinary managed public editor focus was unavailable.")
       }
       managedEditor = view
+      if normalMemory { recordGraphicsStage("visible-editor") }
+      if try await observeGraphicsIdle(at: "editor") { return }
+      if try await observeGraphicsIdle(at: "editor-display") { return }
+      if try await observeGraphicsIdle(at: "viewport") { return }
+      if try await observeGraphicsIdle(at: "clamped-viewport") { return }
+      if try await observeGraphicsIdle(at: "manuscript") { return }
       var primingView = view
       if plan.isMixed || normalMemory {
         startupBefore = try nativePreparationState(view)
@@ -409,6 +582,8 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
         startupUndoJoined = startupUndoAttempted
         startupAfter = try nativePreparationState(primingView)
       }
+      if normalMemory { recordGraphicsStage("startup-input-recovered") }
+      if try await observeGraphicsIdle(at: "startup") { return }
       primingView.setSelectedRange(NSRange(location: 0, length: 0))
       if plan.isMixed { primingBefore = try nativePreparationState(primingView) }
       primingView.insertText("x", replacementRange: primingView.selectedRange())
@@ -416,6 +591,10 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
       primingView.insertText("", replacementRange: NSRange(location: 0, length: 1))
       if plan.isMixed { primingAfterDelete = try nativePreparationState(primingView) }
       host.layoutSubtreeIfNeeded()
+      if normalMemory { recordGraphicsStage("primed-native-layout") }
+      if try await observeGraphicsIdle(at: "primed") { return }
+      if try await observeGraphicsIdle(at: "flattened-primed") { return }
+      if try await observeGraphicsIdle(at: "clamped-primed") { return }
       if plan.isMixed {
         guard window.isKeyWindow else { throw BoomError.unavailable("Mixed diagnostics have no actual key window.") }
         try prepareBitmap(for: primingView, window: window, target: model.pagedViewport)
@@ -434,11 +613,18 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
         try rasterize(preparedView, target: plan.isMixed ? model.pagedViewport : nil)
       }
       try await model.flush() // actual canonical/worker join, not a delay or flag
+      if normalMemory { recordGraphicsStage("flushed") }
+      if try await observeGraphicsIdle(at: "flushed") { return }
       try requireManagedSource()
       try await verifyOrdinaryExport(named: "prepared-export.txt"); preparationExportJoined = true
+      if normalMemory { recordGraphicsStage("export-verified") }
+      if try await observeGraphicsIdle(at: "exported") { return }
       if plan.isMixed || normalMemory { try await verifyHeldWriterEditing() }
+      if normalMemory { recordGraphicsStage("held-writer-verified") }
       if plan.utf8Bytes == 72_196 && (plan.isMixed || normalMemory) { try await verifyLiveBackupControls() }
+      if normalMemory { recordGraphicsStage("backup-verified") }
       if plan.utf8Bytes == 72_196 && (plan.isMixed || normalMemory) { try await verifyDocumentInputControls() }
+      if normalMemory { recordGraphicsStage("input-controls-verified") }
       _ = try diskExtent(reservingReceipt: true)
       vmBefore = currentVMCategories()
     }
@@ -914,6 +1100,7 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
           group.addTask { @MainActor [self] in
             var iterator = signals.makeAsyncIterator()
             guard let _ = await iterator.next() else { throw BoomError.unavailable("Actual writer body did not enter.") }
+            if normalMemory { recordGraphicsStage("held-writer-entered") }
             view.setSelectedRange(NSRange(location: 1, length: 0))
             let beforeSelection = try input.currentDocumentSelection()
             view.insertText("Xé🙂", replacementRange: view.selectedRange())
@@ -927,6 +1114,7 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
               try Task.checkCancellation()
               try await Task.sleep(for: .milliseconds(1))
             }
+            if normalMemory { recordGraphicsStage("held-writer-save-queued") }
             guard model.pagedInput === input, try currentMixedView().session === session,
               NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil),
               session.generation == editedGeneration + 1,
@@ -941,8 +1129,10 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
               try input.currentDocumentSelection() == afterSelection else {
               throw BoomError.invalid("Resident responder Redo waited or restored another logical source.")
             }
+            if normalMemory { recordGraphicsStage("held-writer-redo") }
             let middle = edited.summary.utf16 / 2
             try viewport.requestScroll(toUTF16: middle); try await viewport.joinPresentation()
+            if normalMemory { recordGraphicsStage("held-writer-middle-scroll") }
             let displayed = viewport.visibleScrollWindow, queue = executor.snapshot
             guard let displayed, displayed.snapshot.isSame(edited),
               displayed.start.utf16 <= middle, middle <= displayed.start.utf16 + displayed.summary.utf16,
@@ -964,11 +1154,13 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
             try input.setDocumentSelection(PagedNativeNavigationSelection(utf16Offset: 0,
               utf16Length: 30_000, focusAtEnd: false, affinity: .upstream))
             try viewport.requestScroll(toUTF16: 0); try await viewport.joinPresentation()
+            if normalMemory { recordGraphicsStage("held-writer-head-scroll") }
             guard let head = viewport.visibleScrollWindow, head.start.utf16 == 0,
               head.snapshot.isSame(edited), head.text.hasPrefix("AXé🙂") else {
               throw BoomError.invalid("Actual dirty Unicode scroll did not retain its exact source under the held writer.")
             }
             try viewport.selectVisibleUTF16(5, extending: true)
+            if normalMemory { recordGraphicsStage("held-writer-extended-selection") }
             let extended = try input.currentDocumentSelection()
             guard extended.utf16Offset == 5, extended.utf16Length == 29_995,
               extended.anchorUTF16 == 30_000, !extended.focusAtEnd, extended.affinity == .upstream,
@@ -994,6 +1186,7 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
               throw BoomError.invalid("Actual responder actions did not restore the original public source while saving.")
             }
             managedEditor = try currentMixedView()
+            if normalMemory { recordGraphicsStage("held-writer-restored-source") }
           }
           group.addTask {
             try await Task.sleep(for: .seconds(8))
@@ -1012,9 +1205,11 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
         if let first = failure { failure = BoomError.unavailable(first.localizedDescription + "; actual save join: " + error.localizedDescription) }
         else { failure = error }
       }
+      if normalMemory { recordGraphicsStage("held-writer-joined") }
       if let failure { throw failure }
       try await model.flush(); managedEditor = model.pagedInput?.activeView
       try await verifyOrdinaryExport(named: "held-save-export.txt")
+      if normalMemory { recordGraphicsStage("held-writer-export") }
       try requireManagedSource(); heldWriterVerified = true; heldSave = nil
     }
 
@@ -1171,7 +1366,7 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
       backupRestoredWindow = restoredWindow; restoredWindow.isReleasedWhenClosed = false
       let restoredHost = NSHostingView(rootView: WorkspaceView(model: restored))
       backupRestoredHost = restoredHost; restoredWindow.contentView = restoredHost
-      restoredWindow.center()
+      DeveloperEditorFixture.placeDiagnosticWindowOnRight(restoredWindow)
       for _ in 0..<10 { restoredHost.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(25)) }
       try await receiveActualKeyWindow(restoredWindow)
       guard let restoredInput = restored.pagedInput, let restoredView = restoredInput.activeView,
@@ -1339,7 +1534,7 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
         "sample_interval_ms": 20, "samples": samples,
         "maximum_sampled_current_footprint_bytes": maximumSampledCurrent,
         "kernel_lifetime_peak_footprint_bytes": kernelLifetimePeak,
-        "scope": "Normal App/file/native graph. Unsuspended scheduled paired input and synchronous layout; no cached-view raster in the timed input loop, Mach stack capture, forced draw/compositor or GPU inference. Post-loop verification encodes a 72x42 clipboard bitmap while sampling continues. Memory probe overhead is included; setup/exports are distinct phases."]
+        "scope": "Normal App/file/native graph. Unsuspended scheduled paired input and synchronous layout; no cached-view raster in the timed input loop, Mach stack capture, forced draw/compositor or GPU inference. Post-loop verification encodes a 72x42 clipboard bitmap while sampling continues. After successful shutdown the fixture releases its graph and samples one more second. Memory probe overhead is included; setup/exports are distinct phases."]
       try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
         .write(to: root.appendingPathComponent("memory-summary.json"), options: .withoutOverwriting)
     }
@@ -1395,7 +1590,11 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
       try requireManagedSource()
       footprintBefore = ModelResidency.memoryAccounting().current
       guard footprintBefore > 0 else { throw BoomError.unavailable("Public process footprint is unavailable.") }
-      let clock = ContinuousClock(), deadline = ContinuousClock().now.advanced(by: .seconds(Self.observationSeconds))
+      // The 100 ms scheduled cadence already consumes at least 100 seconds.
+      // Normal unsuspended App runs need room for scheduler delay; the owned
+      // stack recipe retains its tighter fixed observation deadline.
+      let observationSeconds = normalMemory ? Self.normalObservationSeconds : Self.observationSeconds
+      let clock = ContinuousClock(), deadline = ContinuousClock().now.advanced(by: .seconds(observationSeconds))
       for index in 0..<requested.operations {
         try Task.checkCancellation()
         guard clock.now < deadline else { throw BoomError.unavailable("Public editor observation exceeded its bound.") }
@@ -2219,6 +2418,95 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
       shutdownJoined = true
     }
 
+    /// Normal memory observation only. Successful shutdown has already joined
+    /// the actual workspace and closed its windows; release this fixture's
+    /// remaining strong references before taking the final graphics sample.
+    func releaseNormalGraphForObservation() async {
+      guard normalMemory, shutdownJoined else { return }
+      recordGraphicsStage("closed-retained")
+      weak var oldWorkspace = workspace
+      weak var oldHost = host
+      weak var oldWindow = window
+      weak var oldEditor = managedEditor
+      window?.contentView = nil
+      managedEditor = nil; host = nil; window = nil; workspace = nil; bitmap = nil
+      try? await Task.sleep(for: .seconds(1))
+      releasedGraphOwners = ["workspace_deallocated": oldWorkspace == nil,
+        "host_deallocated": oldHost == nil, "window_deallocated": oldWindow == nil,
+        "editor_deallocated": oldEditor == nil]
+      recordGraphicsStage("released-graph")
+    }
+
+    private func recordGraphicsStage(_ stage: String) {
+      let vm = currentVMCategories()
+      graphicsStages.append(["stage": stage, "available": vm["available"] ?? false,
+        "uptime_seconds": ProcessInfo.processInfo.systemUptime,
+        "physical_footprint_bytes": vm["physical_footprint_bytes"] ?? 0,
+        "graphics_footprint_bytes": vm["graphics_footprint_bytes"] ?? 0,
+        "resident_bytes": vm["resident_bytes"] ?? 0,
+        "window_visible": window?.isVisible ?? false,
+        "window_key": window?.isKeyWindow ?? false,
+        "window_occlusion_visible": window?.occlusionState.contains(.visible) ?? false,
+        "window_backing_scale": window?.backingScaleFactor ?? 0,
+        "host_width": host?.frame.width ?? 0, "host_height": host?.frame.height ?? 0,
+        "viewport_width": workspace?.pagedViewport?.frame.width ?? 0,
+        "viewport_height": workspace?.pagedViewport?.frame.height ?? 0,
+        "text_width": managedEditor?.frame.width ?? 0,
+        "text_height": managedEditor?.frame.height ?? 0,
+        "plain_text_height": ((host as? NSScrollView)?.documentView as? NSTextView)?.frame.height ?? 0])
+    }
+
+    private func observeGraphicsIdle(at point: String) async throws -> Bool {
+      guard graphicsIdlePoint == point else { return false }
+      if point == "primed" || point == "flattened-primed" {
+        captureGraphicsLayerHierarchy()
+      }
+      if point == "editor-display" {
+        host?.layoutSubtreeIfNeeded(); window?.displayIfNeeded(); CATransaction.flush()
+        recordGraphicsStage("display-submitted")
+      }
+      for tick in 1...20 {
+        try await Task.sleep(for: .milliseconds(100))
+        recordGraphicsStage("idle-\(point)-\(tick)")
+      }
+      return true
+    }
+
+    private func captureGraphicsLayerHierarchy() {
+      guard let viewport = workspace?.pagedViewport else { return }
+      let views: [(String, NSView?)] = [
+        ("window-content", window?.contentView), ("host", host),
+        ("viewport", viewport), ("clip", viewport.contentView),
+        ("text", viewport.textView),
+      ]
+      graphicsLayerHierarchy = views.compactMap { name, candidate in
+        guard let view = candidate else { return nil }
+        let backing = view.convertToBacking(view.bounds)
+        return ["name": name, "class": String(describing: type(of: view)),
+          "view": String(describing: Unmanaged.passUnretained(view).toOpaque()),
+          "width": view.frame.width, "height": view.frame.height,
+          "backing_width": backing.width, "backing_height": backing.height,
+          "visible_width": view.visibleRect.width, "visible_height": view.visibleRect.height,
+          "wants_layer": view.wantsLayer, "draws_subviews_into_layer": view.canDrawSubviewsIntoLayer,
+          "layer": view.layer.map { String(describing: Unmanaged.passUnretained($0).toOpaque()) } ?? "none",
+          "layer_class": view.layer.map { String(describing: type(of: $0)) } ?? "none",
+          "layer_has_superlayer": view.layer?.superlayer != nil] as [String: Any]
+      }
+    }
+
+    func writeGraphicsIdleReceipt(failures: [String]) throws {
+      let receipt: [String: Any] = ["schema": 1, "scope": "Diagnostic native editor preparation with a fixed idle interval; no held writer, scrolling, backup or model generation",
+        "idle_point": graphicsIdlePoint ?? "none",
+        "run_id": graphicsRunID.uuidString, "pid": ProcessInfo.processInfo.processIdentifier,
+        "executable_path": CommandLine.arguments[0],
+        "status": failures.isEmpty && shutdownJoined ? "complete" : "incomplete",
+        "failures": failures, "graphics_lifecycle_stages": graphicsStages,
+        "graphics_layer_hierarchy": graphicsLayerHierarchy,
+        "released_graph_owners": releasedGraphOwners]
+      try JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys])
+        .write(to: root.appendingPathComponent("graphics-idle-receipt.json"), options: .withoutOverwriting)
+    }
+
     /// Ordinary recipe files are capped at32 entries,16 directories/depth6,
     /// and the fixed byte ceiling. Caller-owned TMPDIR admission is separate;
     /// never inspect that shared directory during typing.
@@ -2289,7 +2577,22 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
     }
 
     func writeReceipt(captureFinished: Bool, failures: [String]) throws {
-      let extent = try diskExtent(reservingReceipt: true, forBackupPreparation: backupPhaseActive)
+      let extent: UInt64?
+      let extentIssue: String?
+      if failures.isEmpty {
+        extent = try diskExtent(reservingReceipt: true, forBackupPreparation: backupPhaseActive)
+        extentIssue = nil
+      } else {
+        do {
+          extent = try diskExtent(reservingReceipt: true, forBackupPreparation: backupPhaseActive)
+          extentIssue = nil
+        } catch {
+          // Keep the primary failed-run receipt even when a partial backup or
+          // failed close leaves the strict success envelope unqualified.
+          extent = nil
+          extentIssue = error.localizedDescription
+        }
+      }
       let receipt: [String: Any] = [
         "schema": 1, "status": failures.isEmpty && (normalMemory || captureFinished) && shutdownJoined && sourceVerified
           && completed == plan.operations ? "complete" : "incomplete",
@@ -2311,6 +2614,8 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
         "priming_after_delete": primingAfterDelete ?? ["available": false],
         "vm_categories_before_capture": vmBefore ?? ["available": false],
         "vm_categories_after_capture": vmAfter ?? ["available": false],
+        "graphics_lifecycle_stages": graphicsStages,
+        "released_graph_owners": releasedGraphOwners,
         "application_before_focus": applicationBeforeFocus ?? ["available": false],
         "application_after_focus": applicationAfterFocus ?? ["available": false],
         "reactivation_count": reactivationCount, "last_reactivation_event": lastReactivationEvent,
@@ -2353,18 +2658,20 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
         "whole_source_sha256": expectedDigest?.map { String(format: "%02x", $0) }.joined() ?? "absent",
         "ordinary_import_joined": importJoined, "ordinary_selection_joined": selectionJoined,
         "preparation_export_joined": preparationExportJoined, "final_export_joined": finalExportJoined,
-        "observation_deadline_seconds": Self.observationSeconds,
+        "observation_deadline_seconds": normalMemory ? Self.normalObservationSeconds : Self.observationSeconds,
         "source_verified": sourceVerified, "capture_finish_acknowledged": captureFinished,
         "workspace_shutdown_joined": shutdownJoined,
         "process_footprint_before_bytes": footprintBefore, "process_footprint_after_bytes": footprintAfter,
-        "process_peak_footprint_bytes": peakFootprint, "workspace_disk_bytes_before_receipt": extent,
+        "process_peak_footprint_bytes": peakFootprint,
+        "workspace_disk_bytes_before_receipt": extent.map { $0 as Any } ?? NSNull(),
+        "workspace_disk_observation_error": extentIssue.map { $0 as Any } ?? NSNull(),
         "workspace_disk_limit_bytes": plan.diskLimit, "target_lifetime_seconds": plan.lifetimeSeconds, "failures": failures,
         "scope": normalMemory ? "Actual normal Release ordinary graph, physical streamed file and exact imports/exports, fixed paired native edits and synchronous layout with existing20ms memory Probe. The timed input loop performs no cached-view raster; post-loop verification encodes a 72x42 clipboard bitmap while sampling continues. No Mach suspension/model/GPU or presentation latency claim." : plan.isMixed ? "Warmed actual ordinary graph with bounded head/middle/tail edits, NFD/ZWJ deletion, direct marked-text primitives, actual window-responder Undo/Redo, bounded and whole-source root edits, read-only scroll/click/recenter and interleaved contained input. Visible actual App/key window with SDK raster; no hardware keyboard/input-method service/compositor, model or GPU-overlap acceptance. CPU dispatch spans contain no await; command/read/source joins have separate wait spans inside end-to-ready. All raw observations and failures retained." : "Warmed actual ordinary file WorkspaceModel/WorkspaceView/managed viewport; physical public ASCII imported/export-verified in <=64KiB chunks. Direct paired native edits, synchronous host layout and completed SDK cached-bitmap raster, closed-loop100ms pacing. No inference, IME, hardware input dispatch, deferred draw/compositor acceptance, or per-cycle whole-source copies/hash/files/Mach samples."
       ]
       let bytes = try JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys])
       guard bytes.count <= 16_384 else { throw BoomError.budget("Public fixture receipt exceeds its bound.") }
       try bytes.write(to: root.appendingPathComponent("fixture-receipt.json"), options: .withoutOverwriting)
-      _ = try diskExtent(reservingReceipt: false)
+      if failures.isEmpty { _ = try diskExtent(reservingReceipt: false) }
     }
   }
 }

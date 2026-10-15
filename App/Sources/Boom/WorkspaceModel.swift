@@ -177,7 +177,7 @@ private struct BoundedConsultationContext: Sendable {
   @Published private(set) var matchingChatIDs: Set<UUID> = []
   @Published private(set) var matchingVoiceIDs: Set<UUID> = []
   @Published private(set) var searchIssue: String?
-  private var searchedQuery = ""
+  @Published private var searchedQuery = ""
   private var searchEpoch: UInt64 = 0
   private var searchTask: Task<Void, Never>?
   private var visibleSearchTask: Task<Void, Never>?
@@ -448,6 +448,9 @@ private struct BoundedConsultationContext: Sendable {
     let previous = searchTask
     searchEpoch &+= 1; previous?.cancel()
     let query = librarySearch, identity = searchEpoch
+    documentSearch = [:]
+    searchedQuery = ""
+    matchingDocumentIDs = []; matchingChatIDs = []; matchingVoiceIDs = []
     refreshVisibleSearch()
     searchIssue = nil
     if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -492,7 +495,6 @@ private struct BoundedConsultationContext: Sendable {
         }
         guard let self, self.searchEpoch == identity else { return }
         self.matchingDocumentIDs = metadata.0; self.matchingChatIDs = metadata.1; self.matchingVoiceIDs = metadata.2
-        self.searchedQuery = query
         let (engine, publisher) = try self.pagedOwners()
         for header in headers where !metadata.0.contains(header.id) {
           try Task.checkCancellation()
@@ -504,6 +506,8 @@ private struct BoundedConsultationContext: Sendable {
             self.matchingDocumentIDs.insert(header.id)
           }
         }
+        guard self.searchEpoch == identity else { return }
+        self.searchedQuery = query
       } catch is CancellationError {} catch {
         guard let self, self.searchEpoch == identity else { return }
         self.searchIssue = error.localizedDescription
@@ -516,6 +520,7 @@ private struct BoundedConsultationContext: Sendable {
     let previous = visibleSearchTask
     previous?.cancel()
     let query = librarySearch, identity = searchEpoch
+    if let selectedDocumentID { documentSearch.removeValue(forKey: selectedDocumentID) }
     visibleSearchTask = Task { [weak self] in
       if let previous { await previous.value }
       do {
@@ -530,6 +535,8 @@ private struct BoundedConsultationContext: Sendable {
           !view.hasMarkedText(), self.searchEpoch == identity else { return }
         let arena = session.arenaID, generation = session.generation
         let documentID = self.selectedDocumentID, text = view.string
+        let textVersion = view.sourceVersion
+        let revision = session.logicalWindow.snapshot.rootID.uuidString
         let matches = try await detachedWork(priority: .utility) {
           try Task.checkCancellation()
           return try ProductCore.search(text, query: query)
@@ -538,9 +545,13 @@ private struct BoundedConsultationContext: Sendable {
         guard self.pagedSession === session, self.pagedInput?.activeView === view,
           session.arenaID == arena, session.generation == generation,
           self.selectedDocumentID == documentID, self.searchEpoch == identity,
-          !view.hasMarkedText() else { return }
+          view.sourceVersion == textVersion, !view.hasMarkedText() else { return }
         view.highlightSearch(matches.ranges.map(\.native),
           identity: documentID.map { $0.uuidString + "\n" + query })
+        if let documentID, matches.hasMatches {
+          self.documentSearch[documentID] = DocumentSearchMatches(query: query,
+            revision: revision, textVersion: textVersion, matches: matches)
+        }
       } catch is CancellationError {} catch {
         guard let self, self.searchEpoch == identity else { return }
         self.searchIssue = error.localizedDescription
@@ -1874,22 +1885,36 @@ private struct BoundedConsultationContext: Sendable {
   private func revalidateResponseSources(_ sources: [SourceReference], attachments: [SourceReference], targetID: UUID?) async throws {
     let trace = PerformanceTrace.begin("Request.SourceValidation")
     defer { PerformanceTrace.end("Request.SourceValidation", trace) }
-    try await revalidateOnDisk(sources, attachments: attachments)
+    // The authorized editing target can change while its response is being
+    // prepared. Its bounded captured range and patch validation govern that
+    // change; unrelated referenced documents and attachments still require
+    // their original identities and digests.
+    let stableSources = sources.filter { !($0.kind == "document" && $0.id == targetID) }
+    try await revalidateOnDisk(stableSources, attachments: attachments)
     if let targetID, !documentIndices.contains(where: { $0.id == targetID }) { throw BoomError.stale("The granted document was removed.") }
   }
   private func commit(_ proposal: StoredProposal) async throws {
-    guard state.selectedDocument == proposal.document.id, let capture = proposal.capture,
+    guard state.selectedDocument == proposal.document.id, let originalCapture = proposal.capture,
       let commands = pagedCommands, let session = pagedSession else {
       throw BoomError.stale("Choose the captured document before accepting its proposal.")
     }
-    try await revalidateResponseSources(proposal.documents, attachments: proposal.attachments, targetID: capture.documentID)
-    let current = try await selectedPagedRecord(capture.documentID)
-    guard current == capture.record, capture.generation == nil || session.generation == capture.generation else {
-      throw DocumentMergeConflict.changed
+    try await revalidateResponseSources(proposal.documents, attachments: proposal.attachments, targetID: originalCapture.documentID)
+    let current = try await selectedPagedRecord(originalCapture.documentID)
+    let capture: BoundedDocumentCapture
+    if current == originalCapture.record,
+      originalCapture.generation == nil || session.generation == originalCapture.generation {
+      capture = originalCapture
+    } else {
+      // A changed partial window cannot prove where its old boundaries moved.
+      // A whole-source capture can be refreshed and rebased by the planner.
+      guard originalCapture.isWholeSource else { throw DocumentMergeConflict.changed }
+      let refreshed = try await captureDocument(originalCapture.documentID)
+      guard refreshed.isWholeSource, refreshed.record == current else { throw DocumentMergeConflict.changed }
+      capture = refreshed
     }
     let document = capture.modelSnapshot
     let planned = try await detachedWork {
-      try DocumentTools.plan(proposal.patch, grant: DocumentGrant(mode: .propose, snapshot: document), current: document,
+      try DocumentTools.plan(proposal.patch, grant: DocumentGrant(mode: .propose, snapshot: proposal.document), current: document,
         targetWindow: proposal.targetWindow)
     }
     if planned.1.isEmpty {

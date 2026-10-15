@@ -128,9 +128,11 @@ import SwiftUI
           }
         }
       }
-      try await WorkspaceChromeCapture.run(evidence: evidence)
       guard !window.isVisible else { throw BoomError.invalid("The background layout fixture became visible.") }
       try await model.shutdown()
+      window.contentView = nil
+      window.close()
+      try await WorkspaceChromeCapture.run(evidence: evidence)
       try write("passed", observations: observations, evidence: evidence)
     } catch {
       try write("failed", observations: observations, evidence: evidence, error: error.localizedDescription)

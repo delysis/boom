@@ -33,6 +33,7 @@
     "patch": "patches/mlx-swift-ready-buffer.patch",
     "patchSHA256": "5cfeffc124a0bb6f670a297d62cb9e1ac803fdd64adfa7936ad29155d97706fc",
     "submodules": [
+      "Source/Cmlx/mlx",
       "Source/Cmlx/mlx-c"
     ],
     "files": [
@@ -43,6 +44,18 @@
       {
         "path": "Source/Cmlx/include/mlx/c/array.h",
         "sha256": "ca107802d1061ebeffeab9316555208a612e9e5d7e5486c0a010e25f9abbdb6e"
+      }
+    ]
+  },
+  {
+    "directory": "App/.build/checkouts/mlx-swift/Source/Cmlx/mlx",
+    "revision": "1f8e74e3f12f31365464a6867c6579f0e9b29d85",
+    "patch": "patches/mlx-metallib-resource-discovery.patch",
+    "patchSHA256": "3c000fa5b62030e0fc126b17966e9aac444105bd87bc4d9dce07fd1678b9b4e5",
+    "files": [
+      {
+        "path": "mlx/backend/metal/device.cpp",
+        "sha256": "9639fbe2ad3d086cc51d4dbd620151a08c4f28f649c10c00529f50551a7b6044"
       }
     ]
   },

@@ -66,6 +66,12 @@ private final class LiveBackupCopyHold: @unchecked Sendable {
   private static var failedWindow: NSWindow?
   private static var failedRoot: URL?
   private static var failedExport: URL?
+  override func setUpWithError() throws {
+    try super.setUpWithError()
+    guard Self.failedModel == nil, Self.failedWindow == nil else {
+      throw XCTSkip("A prior native fixture retained its workspace owner; later cases cannot safely open the process-wide text engine.")
+    }
+  }
   private func root(parent: URL? = nil) throws -> URL {
     let result = (parent ?? FileManager.default.temporaryDirectory).appendingPathComponent("Bloom-bounded-consumer-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: result, withIntermediateDirectories: false)
@@ -83,6 +89,23 @@ private final class LiveBackupCopyHold: @unchecked Sendable {
   }
   private func open(_ root: URL, requiresActualKeyWindow: Bool = true) async throws -> WorkspaceModel {
     try PagedNativeFixtureApplication.bootstrap()
+    if requiresActualKeyWindow {
+      do { try await PagedNativeFixtureApplication.requireNativeKeyWindow() }
+      catch {
+        let original = error
+        if Self.failedRoot == root {
+          do {
+            if try FileManager.default.contentsOfDirectory(atPath: root.path).isEmpty {
+              try FileManager.default.removeItem(at: root)
+              Self.failedRoot = nil
+            }
+          } catch let cleanup {
+            throw BoundedWorkspaceCleanupFailure(original: original, cleanup: cleanup)
+          }
+        }
+        throw original
+      }
+    }
     let store = try await Task.detached { try WorkspaceStore(rootOverride: root) }.value
     let model: WorkspaceModel
     do { model = try await WorkspaceModel(storeOverride: store, loadModels: false) }
@@ -94,7 +117,15 @@ private final class LiveBackupCopyHold: @unchecked Sendable {
     window.isReleasedWhenClosed = false
     window.contentView = NSHostingView(rootView: WorkspaceView(model: model))
     Self.failedWindow = window
-    try await focusCurrentEditor(model, requiresActualKeyWindow: requiresActualKeyWindow)
+    do { try await focusCurrentEditor(model, requiresActualKeyWindow: requiresActualKeyWindow) }
+    catch {
+      // A key-window refusal is a failed native assertion, but this fixture
+      // never returned ownership to its test. Join and close it here so one
+      // environmental focus failure cannot poison every later workspace case.
+      do { try await joinedClose(model) }
+      catch let cleanup { throw BoundedWorkspaceCleanupFailure(original: error, cleanup: cleanup) }
+      throw error
+    }
     return model
   }
   private func focusCurrentEditor(_ model: WorkspaceModel, requiresActualKeyWindow: Bool = true) async throws {
@@ -103,7 +134,7 @@ private final class LiveBackupCopyHold: @unchecked Sendable {
     window.contentView?.layoutSubtreeIfNeeded()
     let becameKey = !requiresActualKeyWindow || window.isKeyWindow ? nil : XCTNSNotificationExpectation(
       name: NSWindow.didBecomeKeyNotification, object: window)
-    window.makeKeyAndOrderFront(nil)
+    window.showAsInvisibleNativeTestWindow()
     NSApplication.shared.activate(ignoringOtherApps: true)
     if let becameKey {
       guard await XCTWaiter.fulfillment(of: [becameKey], timeout: 10) == .completed else {
@@ -245,9 +276,10 @@ private final class LiveBackupCopyHold: @unchecked Sendable {
 
   func testActualResponderUndoAndRedoActionsRestoreCanonicalSourceAndSelection() async throws {
     let failures = testRun?.failureCount ?? 0
-    // This SDK action control requires a real mounted first responder. The
-    // Application.run keyboard/menu journey separately requires a key window.
-    let scratch = try diagnosticRoot(), model = try await open(scratch, requiresActualKeyWindow: false)
+    // Undo requires the actual focused document client even when this control
+    // names its responder explicitly. Keep the key-window preflight ahead of
+    // workspace creation so a runner refusal cannot strand its process engine.
+    let scratch = try diagnosticRoot(), model = try await open(scratch)
     let original = try XCTUnwrap(model.pagedSelectedRecord)
     let input = try XCTUnwrap(model.pagedInput), commands = try XCTUnwrap(model.pagedCommands)
     let view = try XCTUnwrap(input.activeView), window = try XCTUnwrap(Self.failedWindow)
@@ -318,7 +350,7 @@ private final class LiveBackupCopyHold: @unchecked Sendable {
 
   func testActualContainedSelectedDeletionIsImmediateAndCanonicalUndoRestoresNativeSelection() async throws {
     let failures = testRun?.failureCount ?? 0
-    let scratch = try diagnosticRoot(), model = try await open(scratch, requiresActualKeyWindow: false)
+    let scratch = try diagnosticRoot(), model = try await open(scratch)
     let input = try XCTUnwrap(model.pagedInput), commands = try XCTUnwrap(model.pagedCommands)
     let session = try XCTUnwrap(model.pagedSession), window = try XCTUnwrap(Self.failedWindow)
     let initial = try XCTUnwrap(model.pagedSelectedRecord)
@@ -998,7 +1030,7 @@ private final class LiveBackupCopyHold: @unchecked Sendable {
 
   func testActualStaleClipboardBeforeCaptureLeavesLaterNativeTypingAndUndoUsable() async throws {
     let failures = testRun?.failureCount ?? 0
-    let scratch = try diagnosticRoot(), model = try await open(scratch, requiresActualKeyWindow: false)
+    let scratch = try diagnosticRoot(), model = try await open(scratch)
     let source = try await writeSource(scratch)
     let input = try XCTUnwrap(model.pagedInput), view = try XCTUnwrap(input.activeView)
     let commands = try XCTUnwrap(model.pagedCommands), session = try XCTUnwrap(model.pagedSession)
@@ -1244,7 +1276,7 @@ private final class LiveBackupCopyHold: @unchecked Sendable {
   /// inadmissible. Its actual text/client/controller remains retained on failure.
   func testActualOrdinarySelectionRefusesMarkedInputAndRetainsSourceInsteadOfClosingOrDiscardingIt() async throws {
     guard ProcessInfo.processInfo.environment["BLOOM_BOUNDED_WORKSPACE_CASE"] == #function else {
-      XCTFail("Nominate this retained-terminal exact case in its own process; zero skips."); return
+      throw XCTSkip("Run this retained-terminal case in its own process with BLOOM_BOUNDED_WORKSPACE_CASE set to its exact test name.")
     }
     let scratch = try root(), model = try await open(scratch)
     let first = try XCTUnwrap(model.pagedSelectedRecord)
@@ -1355,7 +1387,7 @@ private final class LiveBackupCopyHold: @unchecked Sendable {
   /// view's lexical key wrapper. Retired callbacks cannot write the new arena.
   func testActualCurrentStoragePrimitiveAndRetiredCallbacksKeepLaterTypingUndoAndRedoUsable() async throws {
     let failures = testRun?.failureCount ?? 0
-    let scratch = try diagnosticRoot(), model = try await open(scratch, requiresActualKeyWindow: false)
+    let scratch = try diagnosticRoot(), model = try await open(scratch)
     let initial = try XCTUnwrap(model.pagedSelectedRecord)
     let input = try XCTUnwrap(model.pagedInput), commands = try XCTUnwrap(model.pagedCommands)
     let view = try XCTUnwrap(input.activeView), session = try XCTUnwrap(model.pagedSession)
@@ -1430,7 +1462,7 @@ private final class LiveBackupCopyHold: @unchecked Sendable {
   /// poison the next native input primitive or its canonical inverse.
   func testActualMalformedAndStaleCallbacksLeaveLaterNativeTypingAndUndoUsable() async throws {
     let failures = testRun?.failureCount ?? 0
-    let scratch = try diagnosticRoot(), model = try await open(scratch, requiresActualKeyWindow: false)
+    let scratch = try diagnosticRoot(), model = try await open(scratch)
     let initial = try XCTUnwrap(model.pagedSelectedRecord)
     let input = try XCTUnwrap(model.pagedInput), commands = try XCTUnwrap(model.pagedCommands)
     let session = try XCTUnwrap(model.pagedSession), view = try XCTUnwrap(input.activeView)

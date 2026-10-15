@@ -81,8 +81,11 @@ final class ChatEditorTests: XCTestCase {
     defer { try? FileManager.default.removeItem(at: root) }
     let store = try WorkspaceStore(rootOverride: root)
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
-    guard model.layout.isAuthor else { throw XCTSkip("The chat edition creates its initial chat at startup.") }
-    let document = try XCTUnwrap(model.selectedDocument)
+    guard model.layout.isAuthor else {
+      try await model.shutdown()
+      throw XCTSkip("The chat edition creates its initial chat at startup.")
+    }
+    let documentID = try XCTUnwrap(model.selectedDocumentID)
     let host = NSHostingView(rootView: ChatPane(model: model))
     let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 480, height: 640))
     window.isReleasedWhenClosed = false; window.contentView = host
@@ -95,7 +98,7 @@ final class ChatEditorTests: XCTestCase {
     XCTAssertTrue(model.state.chats.isEmpty)
     model.send()
     XCTAssertEqual(model.state.chats.count, 1)
-    XCTAssertEqual(model.selectedChat?.attachedDocumentID, document.id)
+    XCTAssertEqual(model.selectedChat?.attachedDocumentID, documentID)
     XCTAssertTrue(model.selectedChat?.messages.isEmpty == true)
     XCTAssertEqual(model.draft, "Tell me about this document.", "Model setup must retain the unsent question.")
     model.send()
@@ -182,7 +185,10 @@ final class ChatEditorTests: XCTestCase {
     defer { try? FileManager.default.removeItem(at: root) }
     let store = try WorkspaceStore(rootOverride: root)
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
-    guard model.layout.isAuthor, let document = model.selectedDocument else { throw XCTSkip("No manuscript in the chat edition.") }
+    guard model.layout.isAuthor, let document = model.selectedDocument else {
+      try await model.shutdown()
+      throw XCTSkip("No manuscript in the chat edition.")
+    }
     model.state.autocomplete = false
     try await NativeCheckEvidence.replacePublicDocument(model, text: "# At the harbor\n\n" + String(repeating: "The river turns past the old house. 👩🏽‍💻 café e\u{301} 日本語. ", count: 100), id: document.id, caret: 0)
     let host = NSHostingView(rootView: ManuscriptPane(model: model))

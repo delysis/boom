@@ -12,6 +12,12 @@ import SwiftUI
     // Each UTF-16 unit costs at most three UTF-8 bytes. Ordinary short sources
     // need no whole-source encoding merely to decide whether a menu is enabled.
     if text.length > byteLimit / 3, document.text.utf8.count > byteLimit { return false }
+    // Foundation's composed-sequence query can expose the interior of CRLF as
+    // a boundary, while Rust/Swift Character treat CRLF as one grapheme.
+    // Keep menu availability aligned with the authoritative prompt boundary.
+    if caret < text.length, text.character(at: caret - 1) == 0x0D, text.character(at: caret) == 0x0A {
+      return false
+    }
     guard caret == text.length || text.rangeOfComposedCharacterSequence(at: caret).location == caret else {
       return false
     }

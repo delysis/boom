@@ -25,7 +25,7 @@ final class WindowPrivacyTests: XCTestCase {
     let model = try await WorkspaceModel(storeOverride: fresh, loadModels: false)
     let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 1190, height: 846))
     window.isReleasedWhenClosed = false; defer { window.close() }
-    window.title = model.layout.isAuthor ? model.selectedDocument?.title ?? "" : model.selectedChat?.title ?? ""
+    window.title = model.layout.isAuthor ? model.selectedDocumentIndex?.title ?? "" : model.selectedChat?.title ?? ""
     let host = NSHostingView(rootView: WorkspaceView(model: model)); window.contentView = host
     host.layoutSubtreeIfNeeded()
 
@@ -33,7 +33,8 @@ final class WindowPrivacyTests: XCTestCase {
     XCTAssertNil(window.restorationClass)
     XCTAssertFalse(window.isVisible); XCTAssertEqual(app.activationPolicy(), .prohibited)
     XCTAssertTrue(window.canBecomeKey)
-    XCTAssertEqual(model.selectedDocument, document)
+    XCTAssertEqual(model.pagedSelectedRecord?.document.id, document.id)
+    XCTAssertEqual(model.pagedInput?.activeView?.string, document.text)
     XCTAssertEqual(model.selectedChat, chat)
     XCTAssertEqual(model.state.selectedDocument, document.id)
     XCTAssertEqual(model.state.selectedChat, chat.id)

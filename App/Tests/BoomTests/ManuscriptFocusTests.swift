@@ -31,10 +31,7 @@ final class ManuscriptFocusTests: XCTestCase {
   }
 
   @MainActor func testRenderedManuscriptClickPlacesCaretWithoutPreassigningEditorFocus() async throws {
-    _ = NSApplication.shared
-    let previousPolicy = NSApp.activationPolicy()
-    NSApp.setActivationPolicy(.prohibited)
-    defer { NSApp.setActivationPolicy(previousPolicy) }
+    try await PagedNativeFixtureApplication.requireNativeKeyWindow()
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-native-caret-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
     let store = try WorkspaceStore(rootOverride: root)
@@ -42,7 +39,10 @@ final class ManuscriptFocusTests: XCTestCase {
     var state = WorkspaceState(); state.autocomplete = false; state.showChat = false
     state.documents = [DocumentIndex(id: document.id, title: document.title)]; state.selectedDocument = document.id
     let model = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: [document])
-    guard model.layout.isAuthor else { throw XCTSkip("The chat edition has no manuscript pane.") }
+    guard model.layout.isAuthor else {
+      try await model.shutdown()
+      throw XCTSkip("The chat edition has no manuscript pane.")
+    }
     for width in [1440, 760] {
       for dark in [true, false] {
         model.fitPanes(to: CGFloat(width))
@@ -56,6 +56,11 @@ final class ManuscriptFocusTests: XCTestCase {
         window.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         let host = NSHostingView(rootView: WorkspaceView(model: model).environment(\.colorScheme, dark ? .dark : .light))
         window.contentView = host
+        window.showAsInvisibleNativeTestWindow()
+        NSApp.activate(ignoringOtherApps: true)
+        let keyDeadline = ContinuousClock.now + .seconds(2)
+        while !window.isKeyWindow && ContinuousClock.now < keyDeadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertTrue(window.isKeyWindow)
         for _ in 0..<10 {
           host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(25))
         }
@@ -76,13 +81,13 @@ final class ManuscriptFocusTests: XCTestCase {
         XCTAssertEqual(model.ghostStamp, capturedStamp, "Refocusing at the same caret must not invalidate the captured request.")
         XCTAssertEqual(model.ghostText, " A public suggestion.")
         XCTAssertTrue(editor.acceptNextGhostWord())
-        XCTAssertNotEqual(model.selectedDocument?.text, document.text)
+        XCTAssertNotEqual(editor.string, document.text)
         try click(NativeCaretProbe.point(at: editor.selectedRange().location, in: editor), in: editor, window: window)
         let reverseWord = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .option,
           timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil,
           characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 123))
         editor.keyDown(with: reverseWord)
-        XCTAssertEqual(model.selectedDocument, document, "Refocusing an unchanged caret must preserve Option-Left reversal of a word acceptance.")
+        XCTAssertEqual(editor.string, document.text, "Refocusing an unchanged caret must preserve Option-Left reversal of a word acceptance.")
         let layout = try XCTUnwrap(editor.layoutManager), container = try XCTUnwrap(editor.textContainer)
         layout.ensureLayout(for: container)
         let firstGlyph = layout.boundingRect(forGlyphRange: NSRange(location: 0, length: 1), in: container)
@@ -91,7 +96,7 @@ final class ManuscriptFocusTests: XCTestCase {
         try click(first, in: editor, window: window)
         XCTAssertEqual(editor.selectedRange(), NSRange(location: 0, length: 0), "The text click must move the caret to the clicked glyph.")
         XCTAssertNil(model.ghostStamp); XCTAssertEqual(model.ghostText, "")
-        XCTAssertEqual(model.selectedDocument, document)
+        XCTAssertEqual(editor.string, document.text)
         XCTAssertTrue(editor.isEditable)
       }
     }
@@ -108,7 +113,10 @@ final class ManuscriptFocusTests: XCTestCase {
     var state = WorkspaceState(); state.autocomplete = false; state.showChat = false
     state.documents = [DocumentIndex(id: document.id, title: document.title)]; state.selectedDocument = document.id
     let model = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: [document])
-    guard model.layout.isAuthor else { throw XCTSkip("The chat edition has no manuscript pane.") }
+    guard model.layout.isAuthor else {
+      try await model.shutdown()
+      throw XCTSkip("The chat edition has no manuscript pane.")
+    }
     let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 1190, height: 846))
     window.isReleasedWhenClosed = false
     defer {
@@ -137,7 +145,7 @@ final class ManuscriptFocusTests: XCTestCase {
     editor.insertText(" A lantern moved.", replacementRange: editor.selectedRange())
     XCTAssertEqual(editor.selectedRange().length, 0)
     XCTAssertEqual(editor.selectedRange().location, editor.string.utf16.count)
-    XCTAssertEqual(model.selectedDocument?.text, document.text + " A lantern moved.")
+    XCTAssertEqual(editor.string, document.text + " A lantern moved.")
     model.isBusy = false
     try await model.flush()
     let reopened = try await NativeCheckEvidence.readPublicDocuments(model: model).first(where: { $0.id == document.id })

@@ -116,6 +116,10 @@ struct InputContextSnapshot: Sendable {
   private(set) var bundle: CandidateBundle?
   private var task: Task<Void, Never>?
   private var flag: CancellationFlag?
+  private var diagnosticScheduleCount = 0
+  private var diagnosticStartCount = 0
+  private var diagnosticAttemptStage = "idle"
+  private var diagnosticAttemptError: String?
   var hasCompletionChoices: Bool { bundle != nil && !ghostText.isEmpty }
 
   init(model: WorkspaceModel, target: TextInputTarget) {
@@ -181,12 +185,39 @@ struct InputContextSnapshot: Sendable {
       view.sourceVersion == documentSourceVersion else { return false }
     return true
   }
+  var diagnosticState: [String: String] {
+    ["eligible": String(eligible), "model": String(model != nil),
+      "model_busy": String(model?.isBusy == true),
+      "autocomplete": String(model?.state.autocomplete == true),
+      "runner": String(model?.inputCompletionRunner != nil),
+      "view": String(view != nil),
+      "first_responder": String(view?.window?.firstResponder === view),
+      "marked": String(view?.hasMarkedText() == true),
+      "selection": String(describing: view?.selectedRange()),
+      "caret": String(caret), "source_matches": String(view?.sourceVersion == documentSourceVersion),
+      "document": String(completionDocument != nil),
+      "ghost_stamp": String(ghostStamp != nil), "flag": String(flag != nil),
+      "ghost_boundary": String(view?.hasGhostBoundary == true),
+      "schedule_count": String(diagnosticScheduleCount),
+      "start_count": String(diagnosticStartCount),
+      "attempt_stage": diagnosticAttemptStage,
+      "attempt_error": diagnosticAttemptError ?? "none",
+      "bundle_state": String(describing: bundle?.candidates.first?.state),
+      "bundle_tokens": String(bundle?.candidates.first?.outputTokens ?? -1)]
+  }
   func schedule(delay: Duration = .milliseconds(650)) {
-    guard eligible, ghostStamp == nil, flag == nil, view?.hasGhostBoundary != true else { return }
+    diagnosticScheduleCount += 1
+    guard eligible, ghostStamp == nil, flag == nil, view?.hasGhostBoundary != true else {
+      diagnosticAttemptStage = "schedule-ineligible"
+      return
+    }
     start(count: 1, previous: nil, delay: delay)
   }
   private func start(count: Int, previous: CandidateBundle?, delay: Duration) {
     guard eligible, let model, let document = completionDocument else { return }
+    diagnosticStartCount += 1
+    diagnosticAttemptStage = "scheduled"
+    diagnosticAttemptError = nil
     let capturedEpoch = epoch, target = target, capturedCaret = caret
     let previousTask = task
     flag?.cancel(); previousTask?.cancel()
@@ -194,21 +225,30 @@ struct InputContextSnapshot: Sendable {
     task = Task { [weak self, weak model] in
       defer { if let self, self.flag === operation { self.flag = nil } }
       if let previousTask { await previousTask.value }
+      self?.diagnosticAttemptStage = "prior-joined"
       do {
         try await Task.sleep(for: delay)
         try operation.check()
-        guard let self, let model, self.epoch == capturedEpoch, self.eligible else { return }
+        guard let self, let model, self.epoch == capturedEpoch, self.eligible else {
+          self?.diagnosticAttemptStage = "preparation-admission-revoked"
+          return
+        }
+        self.diagnosticAttemptStage = "preparing-context"
         // Full-prefix validation belongs to this captured operation, after the
         // debounce, not every status, selection or native layout callback.
         guard let prepared = try await model.prepareInputContext(target, document: document,
           caret: capturedCaret, flag: operation), self.epoch == capturedEpoch, self.eligible,
           self.completionDocument?.textVersion == document.textVersion,
-          (try? model.inputContextStamp(target)) == prepared.stamp else { return }
+          (try? model.inputContextStamp(target)) == prepared.stamp else {
+          self.diagnosticAttemptStage = "prepared-context-revoked"
+          return
+        }
         let digest = prepared.digest, raw = prepared.raw, capturedContext = prepared.stamp
         self.contextDigest = digest; self.contextStamp = capturedContext
         let capture = TextInputCapture(chatID: target.chatID, messageID: target.messageID,
           contextDigest: digest, snapshot: document, caretUTF16: capturedCaret)
         let compiled = DocumentSnapshot(id: document.id, title: document.title, text: raw)
+        self.diagnosticAttemptStage = "generating-candidates"
         let result = try await model.generateInputCandidates(document: compiled, capture: capture,
           count: count, previous: previous, flag: operation,
           beforeCachePublication: { [weak self, weak model] in
@@ -238,7 +278,12 @@ struct InputContextSnapshot: Sendable {
             self.present(displayed.candidates[displayed.selected].text)
           }
         if self.epoch == capturedEpoch, !operation.isCancelled { self.bundle = result }
-      } catch is CancellationError {} catch {
+        self.diagnosticAttemptStage = "generation-finished"
+      } catch is CancellationError {
+        self?.diagnosticAttemptStage = "cancelled"
+      } catch {
+        self?.diagnosticAttemptStage = "failed"
+        self?.diagnosticAttemptError = String(describing: error)
         // A background suggestion can fail without interrupting authored text.
         // The attempt and its failure remain available for diagnosis.
       }

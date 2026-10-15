@@ -4,6 +4,19 @@ import XCTest
 @testable import Boom
 
 final class SearchTests: XCTestCase {
+  @MainActor private final class WorkspaceCleanup {
+    private var model: WorkspaceModel?
+    private var attempted = false
+    private var failure: Error?
+    init(_ model: WorkspaceModel) { self.model = model }
+    func close() async throws {
+      guard !attempted else { if let failure { throw failure }; return }
+      attempted = true
+      guard let model else { return }
+      do { try await model.shutdown(); self.model = nil }
+      catch { failure = error; throw error }
+    }
+  }
   @MainActor func testToolbarSearchOpensFromIconAndCollapsesOnBlurOrEscape() throws {
     _ = NSApplication.shared
     let delegate = ApplicationDelegate()
@@ -42,7 +55,6 @@ final class SearchTests: XCTestCase {
   }
   @MainActor func testLiveSearchFindsBodiesAndReplacesStaleResultsWithoutConsumingTheDraft() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-search-" + UUID().uuidString)
-    defer { try? FileManager.default.removeItem(at: root) }
     let store = try WorkspaceStore(rootOverride: root)
     let first = DocumentSnapshot(title: "One", text: "👩‍💻 Café in the body."), second = DocumentSnapshot(title: "Two", text: "A different passage.")
     let chat = ChatRecord(title: "Conversation", messages: [ChatMessage(role: .user, text: "Café in a conversation.")])
@@ -50,28 +62,44 @@ final class SearchTests: XCTestCase {
     state.documents = [first, second].map { DocumentIndex(id: $0.id, title: $0.title) }
     state.chats = [chat]; state.selectedDocument = first.id; state.selectedChat = chat.id
     let model = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: [first, second])
+    let cleanup = WorkspaceCleanup(model), initialFailures = testRun?.failureCount ?? 0
+    addTeardownBlock {
+      try await cleanup.close()
+      if await MainActor.run(body: { self.testRun?.failureCount ?? 0 }) == initialFailures {
+        try FileManager.default.removeItem(at: root)
+      }
+    }
     model.draft = "Keep my unfinished question."
     model.librarySearch = "missing"; model.librarySearch = "CAFÉ"
     try await waitForSearch(model, query: "CAFÉ", document: first.id)
+    try await waitForAbsentSearchResult(model, document: second)
     XCTAssertTrue(model.documentMatchesSearch(first)); XCTAssertFalse(model.documentMatchesSearch(second))
     XCTAssertTrue(model.chatMatchesSearch(chat))
     XCTAssertEqual(model.documentSearch[first.id]?.matches.ranges.first?.native, NSRange(location: 6, length: 4))
     try await NativeCheckEvidence.replacePublicDocument(model, text: "The match was removed.", id: first.id, caret: 0)
     try await model.flush()
-    for _ in 0..<100 where model.documentSearch[first.id] != nil { try await Task.sleep(nanoseconds: 10_000_000) }
+    try await waitForAbsentSearchResult(model, document: first)
     XCTAssertNil(model.documentSearch[first.id])
     XCTAssertFalse(model.documentMatchesSearch(try XCTUnwrap(model.selectedDocument)))
     XCTAssertEqual(model.draft, "Keep my unfinished question.")
     model.librarySearch = ""
     XCTAssertTrue(model.documentMatchesSearch(second)); XCTAssertTrue(model.documentSearch.isEmpty)
-    try await model.shutdown()
+    try await cleanup.close()
   }
   @MainActor private func waitForSearch(_ model: WorkspaceModel, query: String, document: UUID) async throws {
     for _ in 0..<100 {
-      if model.documentSearch[document]?.query == query { return }
+      if model.documentSearch[document]?.query == query,
+        model.documentSearch[document]?.matches.hasMatches == true { return }
       try await Task.sleep(nanoseconds: 10_000_000)
     }
-    XCTFail("Live search did not publish its captured result.")
+    XCTFail("Live search did not publish query=\(query), searchIssue=\(model.searchIssue ?? "none"), documentIDs=\(model.matchingDocumentIDs), results=\(model.documentSearch.keys), expected=\(document).")
+  }
+  @MainActor private func waitForAbsentSearchResult(_ model: WorkspaceModel, document: DocumentSnapshot) async throws {
+    for _ in 0..<100 {
+      if !model.documentMatchesSearch(document) { return }
+      try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    XCTFail("Search did not settle without a match for \(document.id).")
   }
   @MainActor func testHighlightsUseOriginalUnicodeRangesAndLeaveTextAndNativeUndoIntact() throws {
     _ = NSApplication.shared

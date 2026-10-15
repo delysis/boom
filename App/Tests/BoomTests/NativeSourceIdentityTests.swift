@@ -14,7 +14,7 @@ final class NativeSourceIdentityTests: XCTestCase {
   }
 
   @MainActor func testNativeEditAndUndoSurviveRepeatedStatusUpdatesWithoutSourceReplacement() async throws {
-    _ = NSApplication.shared
+    try await PagedNativeFixtureApplication.requireNativeKeyWindow()
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-status-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
     let document = DocumentSnapshot(title: "Public source", text: "Café 👩🏽‍💻 waits.")
@@ -22,17 +22,21 @@ final class NativeSourceIdentityTests: XCTestCase {
     var state = WorkspaceState(); state.autocomplete = false; state.showChat = false
     state.documents = [.init(id: document.id, title: document.title)]; state.selectedDocument = document.id
     let model = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: [document])
-    guard model.layout.isAuthor else { throw XCTSkip("The Chat edition has no manuscript pane.") }
+    guard model.layout.isAuthor else {
+      try await model.shutdown()
+      throw XCTSkip("The Chat edition has no manuscript pane.")
+    }
     let host = NSHostingView(rootView: WorkspaceView(model: model))
     let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 1190, height: 846))
     window.isReleasedWhenClosed = false; window.contentView = host
     defer { window.close() }
     for _ in 0..<10 { host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(25)) }
     let editor = try XCTUnwrap(model.pagedInput?.activeView), storage = try XCTUnwrap(editor.textStorage)
+    try await PagedNativeFixtureApplication.focus(editor, in: window)
     let edits = CharacterEdits(); storage.delegate = edits
     defer { storage.delegate = nil }
     model.isBusy = true
-    XCTAssertTrue(window.makeFirstResponder(editor))
+    XCTAssertTrue(window.firstResponder === editor)
     let suffix = " A lantern."
     editor.setSelectedRange(NSRange(location: document.text.utf16.count, length: 0))
     editor.insertText(suffix, replacementRange: editor.selectedRange())
@@ -48,9 +52,12 @@ final class NativeSourceIdentityTests: XCTestCase {
     XCTAssertTrue(window.firstResponder === editor)
     XCTAssertTrue(editor.undoManager?.canUndo == true)
     editor.undoManager?.undo()
+    try await model.pagedCommands?.joinPendingCommand()
     for _ in 0..<5 { host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(10)) }
     XCTAssertEqual(Data(editor.string.utf8), Data(document.text.utf8))
-    XCTAssertEqual(Data(try XCTUnwrap(model.selectedDocument).text.utf8), Data(document.text.utf8))
+    try await model.flush()
+    let readback = try await NativeCheckEvidence.readPublicDocuments(model: model).first { $0.id == document.id }
+    XCTAssertEqual(Data(try XCTUnwrap(readback).text.utf8), Data(document.text.utf8))
     try await model.shutdown()
   }
 
@@ -63,7 +70,10 @@ final class NativeSourceIdentityTests: XCTestCase {
     var state = WorkspaceState(); state.autocomplete = false; state.showChat = false
     state.documents = [.init(id: document.id, title: document.title)]; state.selectedDocument = document.id
     let model = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: [document])
-    guard model.layout.isAuthor else { throw XCTSkip("The Chat edition has no manuscript pane.") }
+    guard model.layout.isAuthor else {
+      try await model.shutdown()
+      throw XCTSkip("The Chat edition has no manuscript pane.")
+    }
     let host = NSHostingView(rootView: WorkspaceView(model: model))
     let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 1190, height: 846))
     window.isReleasedWhenClosed = false; window.contentView = host

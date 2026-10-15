@@ -99,7 +99,7 @@ final class NativeInputIdentityTests: XCTestCase {
     let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 500, height: 400))
     window.isReleasedWhenClosed = false; window.contentView = host
     do {
-      window.makeKeyAndOrderFront(nil)
+      window.showAsInvisibleNativeTestWindow()
       XCTAssertTrue(window.makeFirstResponder(try XCTUnwrap(model.pagedInput?.activeView)))
       try await NativeCheckEvidence.replacePublicDocument(model, text: source, id: id, caret: source.utf16.count)
       try await settle(host)

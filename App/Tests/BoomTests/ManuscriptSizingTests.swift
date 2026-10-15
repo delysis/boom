@@ -5,23 +5,55 @@ import XCTest
 @testable import Boom
 
 final class ManuscriptSizingTests: XCTestCase {
+  @MainActor private final class WorkspaceCleanup {
+    private var model: WorkspaceModel?
+    private var shutdownAttempted = false
+    private var shutdownFailure: Error?
+    init(_ model: WorkspaceModel) { self.model = model }
+    func close() async throws {
+      guard !shutdownAttempted else {
+        if let shutdownFailure { throw shutdownFailure }
+        return
+      }
+      shutdownAttempted = true
+      guard let model else { return }
+      do { try await model.shutdown(); self.model = nil }
+      catch { shutdownFailure = error; throw error }
+    }
+  }
   @MainActor func testFullReplacementAfterUndoAndDocumentSwitchKeepsGlyphsValid() async throws {
     _ = NSApplication.shared
     let url = try XCTUnwrap(Bundle.module.url(forResource: "ManuscriptSizing", withExtension: "json", subdirectory: "Fixtures"))
     let fixture = try JSONDecoder().decode(WritingEvaluation.Fixture.self, from: Data(contentsOf: url))
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-sizing-" + UUID().uuidString)
-    defer { try? FileManager.default.removeItem(at: root) }
     let store = try WorkspaceStore(rootOverride: root)
     var state = WorkspaceState(); state.autocomplete = false; state.showChat = false
     state.documents = [.init(id: fixture.document.id, title: fixture.document.title)]
     state.selectedDocument = fixture.document.id
     let model = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: [fixture.document])
+    let cleanup = WorkspaceCleanup(model)
     let host = NSHostingView(rootView: ManuscriptPane(model: model))
-    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 980, height: 846))
+    let app = NSApplication.shared
+    let policy = app.activationPolicy()
+    if policy != .regular { XCTAssertTrue(app.setActivationPolicy(.regular)) }
+    defer { app.setActivationPolicy(policy) }
+    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: 0, y: 0, width: 980, height: 846))
     window.isReleasedWhenClosed = false; window.contentView = host
-    defer { window.close() }
+    let initialFailures = testRun?.failureCount ?? 0
+    addTeardownBlock {
+      try await cleanup.close()
+      await MainActor.run { window.close() }
+      if await MainActor.run(body: { self.testRun?.failureCount ?? 0 }) == initialFailures {
+        try FileManager.default.removeItem(at: root)
+      }
+    }
+    window.center(); window.showAsInvisibleNativeTestWindow(); app.activate(ignoringOtherApps: true)
     for _ in 0..<5 { host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
     let editor = try XCTUnwrap(model.pagedInput?.activeView), manager = try XCTUnwrap(model.pagedCommands).manager
+    guard window.makeFirstResponder(editor), window.isKeyWindow,
+      window.firstResponder === editor else {
+      throw XCTSkip("Full-source Undo and replacement require the actual active manuscript editor; app-run acceptance covers that route.")
+    }
     manager.groupsByEvent = false; manager.removeAllActions()
     for _ in 0..<3 {
       editor.setSelectedRange(NSRange(location: fixture.caretUTF16, length: 0))
@@ -49,7 +81,8 @@ final class ManuscriptSizingTests: XCTestCase {
       try await NativeCheckEvidence.replacePublicDocument(model, text: fixture.document.text, id: fixture.document.id, caret: fixture.caretUTF16)
       host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(20))
     }
-    try await model.shutdown()
+    try await cleanup.close()
+    if (testRun?.failureCount ?? 0) == initialFailures { try FileManager.default.removeItem(at: root) }
   }
   private final class Layout: NSLayoutManager {
     var geometryChanges = 0

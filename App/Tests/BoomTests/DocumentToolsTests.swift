@@ -26,25 +26,16 @@ final class DocumentToolsTests: XCTestCase {
     manager.redo(); XCTAssertEqual(view.string, first.0.text)
   }
   @MainActor func testMountedEditorAppliesResponseAndUndoPreservesModelAndDisk() async throws {
-    _ = NSApplication.shared
-    let policy = NSApp.activationPolicy(); NSApp.setActivationPolicy(.prohibited)
-    defer { NSApp.setActivationPolicy(policy) }
+    try await PagedNativeFixtureApplication.requireNativeKeyWindow()
     let (model, store, root, document, chatID, pending) = try await responseFixture()
     defer { try? FileManager.default.removeItem(at: root) }
-    guard model.layout.isAuthor else { throw XCTSkip("The chat edition has no manuscript editor.") }
-    model.state.showChat = false
-    let host = NSHostingView(rootView: WorkspaceView(model: model))
-    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 1440, height: 900))
-    window.isReleasedWhenClosed = false; window.contentView = host
-    defer { window.close() }
-    host.layoutSubtreeIfNeeded()
-    let deadline = ContinuousClock.now + .seconds(2)
-    while model.pagedInput?.activeView == nil && ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+    guard model.layout.isAuthor else {
+      try await model.shutdown()
+      throw XCTSkip("The chat edition has no manuscript editor.")
+    }
     let editor = try XCTUnwrap(model.pagedInput?.activeView)
+    try await PagedNativeFixtureApplication.focus(editor, in: try XCTUnwrap(editor.window))
     XCTAssertEqual(editor.session.sourceBaseRevision.documentID, document.id); XCTAssertEqual(editor.string, document.text)
-    XCTAssertFalse(window.isVisible)
-    XCTAssertTrue(window.makeFirstResponder(editor))
-    editor.undoManager?.removeAllActions()
     let response = AssistantEnvelope(reply: "The replacement is included.",
       edits: [patch(document, [Replacement(old: "quiet", new: "bright")])])
     _ = try await model.finishConsultationResponse(
@@ -58,7 +49,8 @@ final class DocumentToolsTests: XCTestCase {
     XCTAssertEqual(persisted?.text, expected)
     XCTAssertTrue(editor.undoManager?.canUndo == true)
     editor.undoManager?.undo()
-    XCTAssertEqual(editor.string, document.text); XCTAssertEqual(model.selectedDocument, document)
+    try await model.pagedCommands?.joinPendingCommand()
+    XCTAssertEqual(editor.string, document.text)
     try await model.flush()
     let undone = try await NativeCheckEvidence.readPublicDocuments(model: model).first { $0.id == document.id }
     XCTAssertEqual(undone, document)
@@ -83,7 +75,7 @@ final class DocumentToolsTests: XCTestCase {
       try await model.shutdown()
     }
   }
-  @MainActor func testProposalRequiresAcceptanceAndRetainsNativeUndo() async throws {
+  @MainActor func testProposalRequiresAcceptanceAndRetainsNativeHistory() async throws {
     let (model, store, root, document, chatID, pending) = try await responseFixture()
     defer { try? FileManager.default.removeItem(at: root) }
     let response = AssistantEnvelope(reply: "Here is a brighter harbor.",
@@ -94,7 +86,6 @@ final class DocumentToolsTests: XCTestCase {
     let proposal = try XCTUnwrap(model.state.proposals.last)
     XCTAssertEqual(proposal.status, "pending")
     XCTAssertEqual(model.status, "Proposal ready for review")
-    XCTAssertEqual(model.selectedDocument, document)
     let persisted = try await NativeCheckEvidence.readPublicDocuments(model: model).first { $0.id == document.id }
     XCTAssertEqual(persisted, document)
     XCTAssertFalse(try XCTUnwrap(model.pagedCommands).manager.canUndo)
@@ -102,12 +93,10 @@ final class DocumentToolsTests: XCTestCase {
     try await waitForResponse(model)
     XCTAssertNil(model.errorMessage)
     XCTAssertEqual(model.status, "Document edited")
-    XCTAssertEqual(model.selectedDocument?.text, document.text.replacingOccurrences(of: "quiet", with: "bright"))
+    let applied = try await NativeCheckEvidence.readPublicDocuments(model: model).first { $0.id == document.id }
+    XCTAssertEqual(applied?.text, document.text.replacingOccurrences(of: "quiet", with: "bright"))
     XCTAssertEqual(model.state.proposals.last?.status, "applied")
     XCTAssertTrue(try XCTUnwrap(model.pagedCommands).manager.canUndo)
-    model.undoProposal(try XCTUnwrap(model.state.proposals.last))
-    XCTAssertEqual(model.selectedDocument, document)
-    XCTAssertEqual(model.state.proposals.last?.status, "undone")
     try await model.shutdown()
   }
   @MainActor func testProposalMergesLaterAuthoredTextWithoutOverwritingIt() async throws {
@@ -125,7 +114,8 @@ final class DocumentToolsTests: XCTestCase {
     model.accept(proposal.id)
     try await waitForResponse(model)
     XCTAssertNil(model.errorMessage)
-    XCTAssertEqual(model.selectedDocument?.text, authored.replacingOccurrences(of: "quiet", with: "bright"))
+    let applied = try await NativeCheckEvidence.readPublicDocuments(model: model).first { $0.id == document.id }
+    XCTAssertEqual(applied?.text, authored.replacingOccurrences(of: "quiet", with: "bright"))
     XCTAssertEqual(model.state.proposals.last?.status, "applied")
     let persisted = try await NativeCheckEvidence.readPublicDocuments(model: model).first { $0.id == document.id }
     XCTAssertEqual(persisted?.text, authored.replacingOccurrences(of: "quiet", with: "bright"))
@@ -141,7 +131,7 @@ final class DocumentToolsTests: XCTestCase {
     let model = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: [document])
     let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 640, height: 480))
     window.isReleasedWhenClosed = false; window.contentView = try XCTUnwrap(model.pagedViewport)
-    window.makeKeyAndOrderFront(nil); XCTAssertTrue(window.makeFirstResponder(try XCTUnwrap(model.pagedInput?.activeView)))
+    window.showAsInvisibleNativeTestWindow(); XCTAssertTrue(window.makeFirstResponder(try XCTUnwrap(model.pagedInput?.activeView)))
     addTeardownBlock { await MainActor.run { window.close() } }
     try model.newChat(about: document.id)
     let chatID = try XCTUnwrap(model.state.selectedChat)
@@ -158,41 +148,40 @@ final class DocumentToolsTests: XCTestCase {
     XCTAssertFalse(model.isBusy)
   }
   @MainActor func testResponseCompletesOnlyAfterAValidatedEditAndPreservesUndo() async throws {
-    let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-edit-response-" + UUID().uuidString)
+    try await PagedNativeFixtureApplication.requireNativeKeyWindow()
+    let (model, store, root, captured, chatID, firstPending) = try await responseFixture()
     defer { try? FileManager.default.removeItem(at: root) }
-    let store = try WorkspaceStore(rootOverride: root)
-    let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
-    if model.selectedDocument == nil { try model.newDocument() }
-    let document = try XCTUnwrap(model.selectedDocument)
-    try await NativeCheckEvidence.replacePublicDocument(model, text: "A quiet beginning.", id: document.id, caret: 0)
-    try model.newChat(about: document.id)
-    let captured = try XCTUnwrap(model.selectedDocument), chatID = try XCTUnwrap(model.state.selectedChat)
-    var pending = ChatMessage(role: .assistant, text: "", state: .pending)
     let chatIndex = try XCTUnwrap(model.state.chats.firstIndex { $0.id == chatID })
-    model.state.chats[chatIndex].messages.append(pending)
     let authority = CapturedDocumentAuthority(mode: .edit, target: captured, capture: try await model.captureDocument(captured.id))
     let bad = AssistantEnvelope(reply: "Claimed edit.", edits: [patch(captured, [Replacement(old: "missing", new: "Wrong.")])])
     let rawBad = String(decoding: try JSONEncoder().encode(bad), as: UTF8.self)
     let failed = try await model.finishConsultationResponse(rawBad,
-      pending: pending, chatID: chatID, authority: authority, documentSources: [], attachments: [])
+      pending: firstPending, chatID: chatID, authority: authority, documentSources: [], attachments: [])
     XCTAssertEqual(failed.state, .failed)
     XCTAssertEqual(failed.text, rawBad)
     XCTAssertNotNil(failed.failure)
-    XCTAssertEqual(model.selectedDocument?.text, captured.text)
+    let unchanged = try await NativeCheckEvidence.readPublicDocuments(model: model).first { $0.id == captured.id }
+    XCTAssertEqual(unchanged?.text, captured.text)
     XCTAssertEqual(model.selectedChat?.messages.last?.state, .failed)
     XCTAssertTrue(model.state.proposals.isEmpty)
-    pending = ChatMessage(role: .assistant, text: "", state: .pending)
+    let pending = ChatMessage(role: .assistant, text: "", state: .pending)
     model.state.chats[chatIndex].messages.append(pending)
     let envelope = AssistantEnvelope(reply: "Here is the new beginning.", edits: [patch(captured, [Replacement(old: captured.text, new: "A brighter beginning.")])])
     let result = try await model.finishConsultationResponse(String(decoding: JSONEncoder().encode(envelope), as: UTF8.self),
       pending: pending, chatID: chatID, authority: authority, documentSources: [], attachments: [])
     XCTAssertEqual(result.state, .complete)
-    XCTAssertEqual(model.selectedDocument?.text, "A brighter beginning.")
+    let applied = try await NativeCheckEvidence.readPublicDocuments(model: model).first { $0.id == captured.id }
+    XCTAssertEqual(applied?.text, "A brighter beginning.")
     XCTAssertEqual(model.state.proposals.last?.status, "applied")
     let persisted = (try await store.loadState(), try await NativeCheckEvidence.readPublicDocuments(model: model))
     XCTAssertEqual(persisted.1.first { $0.id == captured.id }?.text, "A brighter beginning.")
+    let view = try XCTUnwrap(model.pagedInput?.activeView)
+    try await PagedNativeFixtureApplication.focus(view, in: try XCTUnwrap(view.window))
     try XCTUnwrap(model.pagedCommands).manager.undo()
-    XCTAssertEqual(model.selectedDocument?.text, captured.text)
+    try await model.pagedCommands?.joinPendingCommand()
+    try await model.flush()
+    let undone = try await NativeCheckEvidence.readPublicDocuments(model: model).first { $0.id == captured.id }
+    XCTAssertEqual(undone?.text, captured.text)
     try await model.shutdown()
   }
   @MainActor func testMalformedResponseRetainsRawTextWithoutProposalUndoOrAlert() async throws {
@@ -213,13 +202,12 @@ final class DocumentToolsTests: XCTestCase {
     try await model.shutdown()
   }
 
-  @MainActor func testEditMergesInterveningTypingAndUndoPreservesThatTyping() async throws {
+  @MainActor private func mergedInterveningEdit() async throws
+    -> (WorkspaceModel, URL, DocumentSnapshot, String, StoredProposal) {
     let (model, store, root, base, chatID, pending) = try await responseFixture()
-    defer { try? FileManager.default.removeItem(at: root) }
     let currentText = base.text + " Human addition."
     try await NativeCheckEvidence.replacePublicDocument(model, text: currentText, id: base.id, caret: currentText.utf16.count)
     try await model.flush()
-    try XCTUnwrap(model.pagedCommands).manager.removeAllActions()
     let envelope = AssistantEnvelope(reply: "A brighter harbor.", edits: [patch(base,
       [Replacement(old: "The harbor was quiet.", new: "The harbor was bright.")])])
     let response = try await model.finishConsultationResponse(String(decoding: JSONEncoder().encode(envelope), as: UTF8.self),
@@ -227,14 +215,33 @@ final class DocumentToolsTests: XCTestCase {
       documentSources: [SourceReference(id: base.id, title: base.title, digest: base.revision, kind: "document")], attachments: [])
     XCTAssertEqual(response.state, .complete)
     let expected = currentText.replacingOccurrences(of: "quiet", with: "bright")
-    XCTAssertEqual(model.selectedDocument?.text, expected)
-    XCTAssertEqual(model.state.proposals.last?.appliedRevision, Digest.sha256(expected))
+    let appliedCapture = try await model.captureDocument(base.id)
+    XCTAssertEqual(model.state.proposals.last?.appliedRevision, appliedCapture.revisionDigest)
     let persisted = (try await store.loadState(), try await NativeCheckEvidence.readPublicDocuments(model: model))
     XCTAssertEqual(persisted.1.first { $0.id == base.id }?.text, expected)
     let proposal = try XCTUnwrap(model.state.proposals.last)
+    return (model, root, base, currentText, proposal)
+  }
+
+  @MainActor func testEditMergesInterveningTypingAndPersists() async throws {
+    let (model, root, _, _, _) = try await mergedInterveningEdit()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try await model.shutdown()
+  }
+
+  @MainActor func testMergedEditNativeUndoPreservesInterveningTyping() async throws {
+    try await PagedNativeFixtureApplication.requireNativeKeyWindow()
+    let (model, root, base, currentText, proposal) = try await mergedInterveningEdit()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let view = try XCTUnwrap(model.pagedInput?.activeView)
+    try await PagedNativeFixtureApplication.focus(view, in: try XCTUnwrap(view.window))
     XCTAssertTrue(model.canUndo(proposal))
     model.undoProposal(proposal)
-    XCTAssertEqual(model.selectedDocument?.text, currentText)
+    try await waitForResponse(model)
+    XCTAssertNil(model.errorMessage)
+    let undone = try await NativeCheckEvidence.readPublicDocuments(model: model).first { $0.id == base.id }
+    XCTAssertEqual(undone?.text, currentText)
+    XCTAssertEqual(model.state.proposals.first(where: { $0.id == proposal.id })?.status, "undone")
     try await model.shutdown()
   }
 

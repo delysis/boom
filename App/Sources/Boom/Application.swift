@@ -51,6 +51,16 @@ import SwiftUI
       }
       app.run(); return
     }
+    if CommandLine.arguments.contains("--graphics-idle-smoke") {
+      let app = NSApplication.shared
+      if app.activationPolicy() != .regular { _ = app.setActivationPolicy(.regular) }
+      guard app.activationPolicy() == .regular else { fputs("Graphics diagnostic activation refused.\n", stderr); exit(1) }
+      Task {
+        do { try await DeveloperEditorFixture.runGraphicsIdle(arguments: CommandLine.arguments); exit(0) }
+        catch { fputs("Graphics idle diagnostic failed: \(error.localizedDescription)\n", stderr); exit(1) }
+      }
+      app.run(); return
+    }
     if CommandLine.arguments.contains("--video-storyboard-smoke") {
       let app = NSApplication.shared; app.setActivationPolicy(.prohibited)
       Task {

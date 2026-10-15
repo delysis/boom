@@ -188,7 +188,11 @@ final class ManuscriptViewportTests: XCTestCase {
       state.documents = [.init(id: document.id, title: document.title)]
       state.selectedDocument = document.id
       let model = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: [document])
-      guard model.layout.isAuthor else { throw XCTSkip("The Chat edition has no manuscript pane.") }
+      guard model.layout.isAuthor else {
+        try await model.shutdown()
+        try FileManager.default.removeItem(at: root)
+        throw XCTSkip("The Chat edition has no manuscript pane.")
+      }
       let host = NSHostingView(rootView: WorkspaceView(model: model))
       let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 1190, height: 846))
       window.isReleasedWhenClosed = false; window.contentView = host

@@ -8,6 +8,7 @@ import XCTest
 /// It never overrides key-window state or substitutes physical key acceptance.
 @MainActor enum PagedNativeFixtureApplication {
   private static var finishedLaunching = false
+  private static var nativeKeyWindowAvailable: Bool?
   static func bootstrap() throws {
     let application = NSApplication.shared
     if application.activationPolicy() != .regular {
@@ -19,6 +20,34 @@ import XCTest
     if !finishedLaunching {
       application.finishLaunching()
       finishedLaunching = true
+    }
+  }
+  static func requireNativeKeyWindow() async throws {
+    try bootstrap()
+    if nativeKeyWindowAvailable == false {
+      throw XCTSkip("The XCTest runner cannot activate a native key window; signed-app acceptance covers this route.")
+    }
+    guard nativeKeyWindowAvailable != true else { return }
+
+    let application = NSApplication.shared
+    let originalPolicy = application.activationPolicy()
+    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1, height: 1),
+      styleMask: [.titled], backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    let becameKey = XCTNSNotificationExpectation(name: NSWindow.didBecomeKeyNotification, object: window)
+    defer {
+      window.orderOut(nil); window.close()
+      if application.activationPolicy() != originalPolicy {
+        _ = application.setActivationPolicy(originalPolicy)
+      }
+    }
+    window.showAsInvisibleNativeTestWindow()
+    application.activate(ignoringOtherApps: true)
+    let notification = await XCTWaiter.fulfillment(of: [becameKey], timeout: 2) == .completed
+    let available = notification && application.isActive && window.isKeyWindow
+    nativeKeyWindowAvailable = available
+    guard available else {
+      throw XCTSkip("The XCTest runner cannot activate a native key window; signed-app acceptance covers this route.")
     }
   }
   static func scratchRoot(prefix: String) throws -> URL {
@@ -35,7 +64,7 @@ import XCTest
     try bootstrap(); try Task.checkCancellation()
     let becameKey = window.isKeyWindow ? nil : XCTNSNotificationExpectation(
       name: NSWindow.didBecomeKeyNotification, object: window)
-    window.makeKeyAndOrderFront(nil)
+    window.showAsInvisibleNativeTestWindow()
     NSApplication.shared.activate(ignoringOtherApps: true)
     if let becameKey {
       guard await XCTWaiter.fulfillment(of: [becameKey], timeout: 10) == .completed else {

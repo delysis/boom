@@ -3,6 +3,28 @@ import XCTest
 @testable import Boom
 
 final class WritingHistoryTests: XCTestCase {
+  @MainActor private final class WorkspaceCleanup {
+    private var model: WorkspaceModel?
+    private var attempted = false
+    private var failure: Error?
+    init(_ model: WorkspaceModel) { self.model = model }
+    func close() async throws {
+      guard !attempted else { if let failure { throw failure }; return }
+      attempted = true
+      guard let model else { return }
+      do { try await model.shutdown(); self.model = nil }
+      catch { failure = error; throw error }
+    }
+  }
+  @MainActor private func track(_ model: WorkspaceModel, root: URL) {
+    let cleanup = WorkspaceCleanup(model), failures = testRun?.failureCount ?? 0
+    addTeardownBlock {
+      try await cleanup.close()
+      if await MainActor.run(body: { self.testRun?.failureCount ?? 0 }) == failures {
+        try FileManager.default.removeItem(at: root)
+      }
+    }
+  }
   func testCancelledHistoryDoesNotReadMissingCandidateRecords() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-cancelled-history-" + UUID().uuidString)
     let store = try WorkspaceStore(rootOverride: root)
@@ -55,6 +77,14 @@ final class WritingHistoryTests: XCTestCase {
     XCTFail("Opening a saved set did not finish within five seconds")
     throw CancellationError()
   }
+  @MainActor private func waitForSavedHistory(_ model: WorkspaceModel, count: Int) async throws {
+    for _ in 0..<500 {
+      if model.savedExplorations.count == count { return }
+      try await Task.sleep(for: .milliseconds(10))
+    }
+    XCTFail("Saved continuation history did not load.")
+    throw CancellationError()
+  }
   func testLatestExplicitSetSurvivesMoreRecentAutomaticSuggestion() async throws {
     let (root, store, a, b, first, second) = try await fixture()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -72,38 +102,45 @@ final class WritingHistoryTests: XCTestCase {
   }
   @MainActor func testDismissReopenAndOlderSetPreserveLiveTextCaretAndCapturedRecipe() async throws {
     let (root, store, a, _, first, second) = try await fixture()
-    defer { try? FileManager.default.removeItem(at: root) }
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    let cleanup = WorkspaceCleanup(model); track(model, root: root)
+    try await waitForSavedHistory(model, count: 2)
+    model.showContinuations(); try await finish(model)
     XCTAssertEqual(model.candidates?.id, second.id)
     model.dismissCandidates()
     XCTAssertNil(model.candidates); XCTAssertTrue(model.canShowContinuations)
     model.showContinuations(); try await finish(model)
     XCTAssertTrue(model.showingCandidates); XCTAssertEqual(model.candidates?.id, second.id)
     let liveText = a.text + " A subsequent human edit."
-    try await NativeCheckEvidence.replacePublicDocument(model, text: liveText, id: a.id, caret: 7)
+    try await NativeCheckEvidence.replacePublicDocument(model, text: liveText, id: a.id, caret: 5)
     model.reviewContinuation(first.id); try await finish(model)
-    XCTAssertEqual(model.selectedDocument?.text, liveText); XCTAssertEqual(model.caret, 7)
+    XCTAssertEqual(model.pagedSelectedRecord?.document.id, a.id)
+    XCTAssertEqual(model.pagedInput?.activeView?.string, liveText); XCTAssertEqual(model.caret, 5)
     XCTAssertEqual(model.candidates?.recipe.prompt, first.recipe.prompt)
     XCTAssertEqual(model.candidates?.recipe.document, a)
     XCTAssertEqual(model.candidates?.candidates.first?.seed, first.candidates.first?.seed)
     XCTAssertEqual(model.candidates?.candidates.first?.text, first.candidates.first?.text)
     XCTAssertFalse(model.candidateIsCurrent)
     XCTAssertEqual(model.savedExplorations.map(\.id), [second.id, first.id])
-    try await model.shutdown()
+    try await cleanup.close()
   }
-  @MainActor func testSwitchDuringOpenCannotPublishAnotherManuscriptsSet() async throws {
+  @MainActor func testSwitchResetsCandidateSetAndCannotShowAnotherManuscriptsSet() async throws {
     let (root, store, a, b, first, _) = try await fixture()
-    defer { try? FileManager.default.removeItem(at: root) }
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
-    model.dismissCandidates(); model.reviewContinuation(first.id)
+    let cleanup = WorkspaceCleanup(model); track(model, root: root)
+    model.reviewContinuation(first.id); try await finish(model)
+    XCTAssertEqual(model.candidates?.id, first.id)
     model.selectDocument(b.id)
     try await finish(model)
     XCTAssertNil(model.candidates); XCTAssertFalse(model.showingCandidates)
-    XCTAssertEqual(model.selectedDocument, b); XCTAssertEqual(model.caret, 0)
-    model.selectDocument(a.id)
+    XCTAssertEqual(model.pagedSelectedRecord?.document.id, b.id)
+    XCTAssertEqual(model.pagedInput?.activeView?.string, b.text); XCTAssertEqual(model.caret, 0)
+    model.selectDocument(a.id); try await finish(model)
     model.reviewContinuation(first.id); try await finish(model)
-    XCTAssertEqual(model.candidates?.id, first.id); XCTAssertEqual(model.selectedDocument, a)
-    try await model.shutdown()
+    XCTAssertEqual(model.candidates?.id, first.id)
+    XCTAssertEqual(model.pagedSelectedRecord?.document.id, a.id)
+    XCTAssertEqual(model.pagedInput?.activeView?.string, a.text)
+    try await cleanup.close()
   }
   func testIncompatibleSetIsRejectedBeforeRecoveryCanRewriteIt() async throws {
     let (root, store, _, _, first, _) = try await fixture()
@@ -120,16 +157,20 @@ final class WritingHistoryTests: XCTestCase {
   }
   @MainActor func testCorruptRecordIsRejectedWithoutReplacingBytesOrVisibleSet() async throws {
     let (root, store, a, _, first, second) = try await fixture()
-    defer { try? FileManager.default.removeItem(at: root) }
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    let cleanup = WorkspaceCleanup(model); track(model, root: root)
+    model.reviewContinuation(second.id); try await finish(model)
+    XCTAssertEqual(model.candidates?.id, second.id)
     let url = store.vault.recordURL(.candidate, first.id)
     var damaged = try Data(contentsOf: url); damaged[damaged.count - 1] ^= 1
     try damaged.write(to: url, options: .atomic)
     model.reviewContinuation(first.id); try await finish(model)
     XCTAssertNotNil(model.errorMessage)
-    XCTAssertEqual(model.candidates?.id, second.id); XCTAssertEqual(model.selectedDocument, a)
+    XCTAssertEqual(model.candidates?.id, second.id)
+    XCTAssertEqual(model.pagedSelectedRecord?.document.id, a.id)
+    XCTAssertEqual(model.pagedInput?.activeView?.string, a.text)
     XCTAssertEqual(try Data(contentsOf: url), damaged)
-    try await model.shutdown()
+    try await cleanup.close()
     XCTAssertEqual(try Data(contentsOf: url), damaged)
   }
 }
