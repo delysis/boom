@@ -112,6 +112,7 @@ typedef struct BloomLogicalSource BloomLogicalSource;
 typedef struct BloomLogicalSnapshot BloomLogicalSnapshot;
 typedef struct BloomLogicalWindow BloomLogicalWindow;
 typedef struct BloomLogicalWindowSeed BloomLogicalWindowSeed;
+typedef struct BloomLogicalPosition BloomLogicalPosition;
 typedef struct { uint64_t bytes, utf16, lf_count; } BloomLogicalPoint;
 typedef struct {
   uint8_t root_id[16], owner_id[16], document_id[16]; BloomLogicalPoint summary;
@@ -130,6 +131,9 @@ typedef struct { BloomLogicalPoint start; BloomLogicalPoint summary; } BloomLogi
 int32_t bloom_logical_seed_info(const BloomLogicalWindowSeed *seed, BloomLogicalSeedInfo *output);
 void bloom_logical_seed_free(const BloomLogicalWindowSeed *seed);
 int32_t bloom_logical_source_prepare_replacement(const BloomLogicalSource *source, const BloomLogicalWindow *window, uint64_t first_utf16, uint64_t last_utf16, const uint8_t *insertion, size_t insertion_length, const BloomLogicalWindow **output, BloomLogicalPoint *cursor, uint8_t *changed, uint8_t *resident, BoomAttachmentBuffer *error);
+/* Optional actual scalar proofs avoid a worker reread after same-root recenter.
+ * Raw BloomLogicalPoint counters cannot construct a proof. No source advances. */
+int32_t bloom_logical_source_prepare_replacement_with_positions(const BloomLogicalSource *source, const BloomLogicalWindow *window, uint64_t first_utf16, uint64_t last_utf16, const BloomLogicalPosition *first_position, const BloomLogicalPosition *last_position, const uint8_t *insertion, size_t insertion_length, const BloomLogicalWindow **output, BloomLogicalPoint *cursor, uint8_t *changed, uint8_t *resident, BoomAttachmentBuffer *error);
 int32_t bloom_logical_source_capture(const BloomLogicalSource *, uint8_t freeze,
                                     const BloomLogicalSnapshot **, BoomAttachmentBuffer *);
 int32_t bloom_logical_source_restore(const BloomLogicalSource *, const BloomLogicalSnapshot *, BoomAttachmentBuffer *);
@@ -140,6 +144,8 @@ int32_t bloom_logical_window_trim(const BloomLogicalWindow *, uint64_t local_foc
                                  const BloomLogicalWindow **, BoomAttachmentBuffer *);
 int32_t bloom_logical_window_info(const BloomLogicalWindow *, BloomLogicalWindowInfo *);
 int32_t bloom_logical_window_position(const BloomLogicalWindow *, uint64_t local_utf16, BloomLogicalPoint *, BoomAttachmentBuffer *);
+int32_t bloom_logical_window_position_proof(const BloomLogicalWindow *, uint64_t local_utf16, const BloomLogicalPosition **, BloomLogicalPoint *, BoomAttachmentBuffer *);
+void bloom_logical_position_free(const BloomLogicalPosition *);
 int32_t bloom_logical_window_snapshot(const BloomLogicalWindow *, const BloomLogicalSnapshot **);
 int32_t bloom_logical_snapshot_info(const BloomLogicalSnapshot *, BloomLogicalSnapshotInfo *);
 void bloom_logical_snapshot_retain(const BloomLogicalSnapshot *);

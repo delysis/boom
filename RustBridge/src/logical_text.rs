@@ -1,7 +1,9 @@
 //! Retained native values. Only materialize uses the existing writer EngineSlot.
 //! Source edits/Undo do not take that slot, encode trees or invoke callbacks.
 use super::*;
-use bloom_text::{LogicalSnapshot, LogicalSource, LogicalWindow, LogicalWindowSeed, TextSummary};
+use bloom_text::{
+    LogicalPosition, LogicalSnapshot, LogicalSource, LogicalWindow, LogicalWindowSeed, TextSummary,
+};
 use std::ptr;
 
 pub struct BloomLogicalSource {
@@ -15,6 +17,9 @@ pub struct BloomLogicalWindow {
 }
 pub struct BloomLogicalWindowSeed {
     value: LogicalWindowSeed,
+}
+pub struct BloomLogicalPosition {
+    value: LogicalPosition,
 }
 
 #[repr(C)]
@@ -386,6 +391,45 @@ pub unsafe extern "C" fn bloom_logical_source_prepare_replacement(
     resident: *mut u8,
     error: *mut BoomAttachmentBuffer,
 ) -> i32 {
+    // SAFETY: same borrowed handles/output contract; absent retained positions
+    // preserve the existing exact-window/start/end path.
+    unsafe {
+        bloom_logical_source_prepare_replacement_with_positions(
+            source,
+            window,
+            first_utf16,
+            last_utf16,
+            ptr::null(),
+            ptr::null(),
+            insertion,
+            insertion_length,
+            output,
+            cursor,
+            changed,
+            resident,
+            error,
+        )
+    }
+}
+/// # Safety
+/// Same actual source/window/output contract, plus optional retained positions
+/// created by bloom_logical_window_position_proof. Their root/offset must match.
+#[no_mangle]
+pub unsafe extern "C" fn bloom_logical_source_prepare_replacement_with_positions(
+    source: *const BloomLogicalSource,
+    window: *const BloomLogicalWindow,
+    first_utf16: u64,
+    last_utf16: u64,
+    first_position: *const BloomLogicalPosition,
+    last_position: *const BloomLogicalPosition,
+    insertion: *const u8,
+    insertion_length: usize,
+    output: *mut *const BloomLogicalWindow,
+    cursor: *mut BloomLogicalPoint,
+    changed: *mut u8,
+    resident: *mut u8,
+    error: *mut BoomAttachmentBuffer,
+) -> i32 {
     unsafe {
         call(error, || {
             let source = source.as_ref().ok_or(Error::Invalid("native source"))?;
@@ -404,11 +448,13 @@ pub unsafe extern "C" fn bloom_logical_source_prepare_replacement(
                 .value
                 .try_lock()
                 .map_err(|_| Error::Invalid("reentered native source"))?
-                .prepare_resident_replacement(
+                .prepare_replacement_with_positions(
                     &window.value,
                     first_utf16,
                     last_utf16,
                     text(insertion, insertion_length)?,
+                    first_position.as_ref().map(|position| &position.value),
+                    last_position.as_ref().map(|position| &position.value),
                 )?;
             if let Some(result) = result {
                 *resident = 1;
@@ -486,6 +532,41 @@ pub unsafe extern "C" fn bloom_logical_window_position(
             *output = window.value.position(local_utf16)?.point().into();
             Ok(())
         })
+    }
+}
+/// # Safety
+/// Actual retained window, scalar-valid local UTF16 and writable outputs. The
+/// retained result owns only its exact snapshot/summary, not a window/table.
+#[no_mangle]
+pub unsafe extern "C" fn bloom_logical_window_position_proof(
+    window: *const BloomLogicalWindow,
+    local_utf16: u64,
+    output: *mut *const BloomLogicalPosition,
+    point: *mut BloomLogicalPoint,
+    error: *mut BoomAttachmentBuffer,
+) -> i32 {
+    unsafe {
+        call(error, || {
+            let window = window.as_ref().ok_or(Error::Invalid("native window"))?;
+            if output.is_null() || point.is_null() {
+                return Err(Error::Invalid("native retained position output"));
+            }
+            *output = ptr::null();
+            let value = window.value.position(local_utf16)?;
+            *point = value.point().into();
+            *output = Arc::into_raw(Arc::new(BloomLogicalPosition { value }));
+            Ok(())
+        })
+    }
+}
+/// # Safety
+/// Consume one actual position reference only after every borrower returned.
+#[no_mangle]
+pub unsafe extern "C" fn bloom_logical_position_free(position: *const BloomLogicalPosition) {
+    if !position.is_null() {
+        unsafe {
+            Arc::decrement_strong_count(position);
+        }
     }
 }
 /// # Safety

@@ -1207,7 +1207,7 @@ impl LogicalSource {
         Ok(cursor)
     }
     /// Known endpoints are actual window scalar proofs or the immutable
-    /// snapshot's exact start/end. A distant endpoint needs a worker read.
+    /// snapshot's exact start/end. A distant unproved endpoint needs a worker read.
     pub fn prepare_resident_replacement(
         &mut self,
         window: &LogicalWindow,
@@ -1215,13 +1215,35 @@ impl LogicalSource {
         last: u64,
         text: &str,
     ) -> Result<Option<LogicalEdit>> {
+        self.prepare_replacement_with_positions(window, first, last, text, None, None)
+    }
+    /// Retained endpoints come only from an actual window/read on this exact
+    /// immutable root. They contain no window text and survive physical recenter
+    /// without becoming authority for a later edit/Undo root. No provider calls.
+    pub fn prepare_replacement_with_positions(
+        &mut self,
+        window: &LogicalWindow,
+        first: u64,
+        last: u64,
+        text: &str,
+        first_position: Option<&LogicalPosition>,
+        last_position: Option<&LogicalPosition>,
+    ) -> Result<Option<LogicalEdit>> {
         if !self.head.same(window.snapshot()) {
             return Err(Error::Stale);
         }
         if text.len() > WINDOW_BYTES || first > last || last > self.head.summary().utf16 {
             return Err(Error::Invalid("logical replacement envelope"));
         }
-        let known = |offset: u64| -> Result<Option<LogicalPosition>> {
+        let known = |offset: u64,
+                     retained: Option<&LogicalPosition>|
+         -> Result<Option<LogicalPosition>> {
+            if let Some(position) = retained {
+                if !self.head.same(position.snapshot()) || position.point().utf16 != offset {
+                    return Err(Error::Stale);
+                }
+                return Ok(Some(position.clone()));
+            }
             let point = if offset == 0 {
                 TextSummary::EMPTY
             } else if offset == self.head.summary().utf16 {
@@ -1238,7 +1260,10 @@ impl LogicalSource {
                 point,
             }))
         };
-        let (Some(start), Some(end)) = (known(first)?, known(last)?) else {
+        let (Some(start), Some(end)) = (
+            known(first, first_position)?,
+            known(last, last_position)?,
+        ) else {
             return Ok(None);
         };
         if first == last && text.is_empty() {

@@ -382,7 +382,10 @@ private final class PagedNativeInputObservers {
   func userSelectionDidChange(from view: PagedNativeTextView,
     previousRange: NSRange?, previousGeneration: UInt64) {
     guard view === activeView, !isAdopting, !projectingDocumentSelection else { return }
-    defer { commandOwner?.inputSelectionDidChange() }
+    defer {
+      session.retainSelectionEndpointProofs(for: currentOwnedDocumentSelection)
+      commandOwner?.inputSelectionDidChange()
+    }
     var previous = documentSelectionGeneration == session.generation ? documentSelection : nil
     documentSelection = nil; documentSelectionGeneration = nil
     do {
@@ -453,7 +456,8 @@ private final class PagedNativeInputObservers {
   /// A document range is two scalar coordinates. Cocoa paints only the
   /// intersection with its bounded island; neither selection nor Undo copies
   /// the selected source bytes into memory.
-  func setDocumentSelection(_ selection: PagedNativeNavigationSelection, mouseDown: NSEvent? = nil) throws {
+  func setDocumentSelection(_ selection: PagedNativeNavigationSelection, mouseDown: NSEvent? = nil,
+    observedWindow: PagedNativeLogicalWindow? = nil) throws {
     let coordinates = try session.documentCoordinates()
     guard selection.utf16Offset <= coordinates.projectedUTF16,
       selection.utf16Length <= coordinates.projectedUTF16 - selection.utf16Offset,
@@ -485,6 +489,7 @@ private final class PagedNativeInputObservers {
     // A distant logical endpoint may change while Cocoa paints the identical
     // island range. It still invalidates pending input/navigation observations.
     if recordsSelectionIngress, binding.selectionEpoch == beforeEpoch { binding.recordSelectionChange() }
+    session.retainSelectionEndpointProofs(for: selection, observedWindow: observedWindow)
     notifyNativeState(from: view, edited: false)
   }
 

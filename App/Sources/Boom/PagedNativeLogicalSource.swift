@@ -65,6 +65,18 @@ final class PagedNativeLogicalSnapshot: @unchecked Sendable {
   }
 }
 
+/// An actual scalar endpoint on one immutable logical root. Retention does
+/// not keep a window String/scalar table or authorize a later edited root.
+final class PagedNativeLogicalPosition: @unchecked Sendable {
+  let snapshot: PagedNativeLogicalSnapshot
+  let point: PagedTextSummary
+  fileprivate let pointer: OpaquePointer
+  fileprivate init(taking pointer: OpaquePointer, snapshot: PagedNativeLogicalSnapshot, point: BloomLogicalPoint) {
+    self.pointer = pointer; self.snapshot = snapshot; self.point = logicalSummary(point)
+  }
+  deinit { bloom_logical_position_free(pointer) }
+}
+
 /// Real prepared native text from a logical snapshot. Distinct from both the
 /// file-authenticated PagedTextWindow and the read-only ScrollProjection.
 /// This owns the ONE scalar table used by native Working range admission.
@@ -113,6 +125,15 @@ final class PagedNativeLogicalWindow: @unchecked Sendable {
     var error = BoomAttachmentBuffer(data: nil, length: 0)
     try pagedLogicalResult(bloom_logical_window_position(pointer, offset, &point, &error), error)
     return logicalSummary(point)
+  }
+  func positionProof(localUTF16: Int) throws -> PagedNativeLogicalPosition {
+    guard let offset = UInt64(exactly: localUTF16) else { throw BoomError.invalid("Negative logical local selection.") }
+    var output: OpaquePointer?
+    var point = BloomLogicalPoint()
+    var error = BoomAttachmentBuffer(data: nil, length: 0)
+    try pagedLogicalResult(bloom_logical_window_position_proof(pointer, offset, &output, &point, &error), error)
+    guard let output else { throw BoomError.invalid("Logical position returned no retained proof.") }
+    return PagedNativeLogicalPosition(taking: output, snapshot: snapshot, point: point)
   }
   func localBytes(for range: NSRange) throws -> Range<Int> {
     guard range.location >= 0, range.length >= 0,
@@ -409,19 +430,25 @@ struct PagedNativeLogicalEdit: Sendable {
     sourceRevision = snapshot.sourceRevision
   }
   func prepareResidentReplacement(in window: PagedNativeLogicalWindow,
-    selection: PagedNativeNavigationSelection, replacement: String) throws -> PagedNativeLogicalEdit? {
+    selection: PagedNativeNavigationSelection, replacement: String,
+    firstPosition: PagedNativeLogicalPosition? = nil,
+    lastPosition: PagedNativeLogicalPosition? = nil) throws -> PagedNativeLogicalEdit? {
     let end = selection.utf16Offset.addingReportingOverflow(selection.utf16Length)
     guard !end.overflow else { throw BoomError.invalid("Logical replacement selection overflow.") }
     var output: OpaquePointer?
     var point = BloomLogicalPoint(), changed: UInt8 = 0, resident: UInt8 = 0
     var error = BoomAttachmentBuffer(data: nil, length: 0)
     let bytes = replacement.utf8
-    let status = bytes.withContiguousStorageIfAvailable {
-      bloom_logical_source_prepare_replacement(pointer, window.pointer, selection.utf16Offset,
-        end.partialValue, $0.baseAddress, $0.count, &output, &point, &changed, &resident, &error)
-    } ?? Data(bytes).withUnsafeBytes {
-      bloom_logical_source_prepare_replacement(pointer, window.pointer, selection.utf16Offset,
-        end.partialValue, $0.bindMemory(to: UInt8.self).baseAddress, $0.count, &output, &point, &changed, &resident, &error)
+    let status = withExtendedLifetime((window, firstPosition, lastPosition)) {
+      bytes.withContiguousStorageIfAvailable {
+        bloom_logical_source_prepare_replacement_with_positions(pointer, window.pointer, selection.utf16Offset,
+          end.partialValue, firstPosition?.pointer, lastPosition?.pointer,
+          $0.baseAddress, $0.count, &output, &point, &changed, &resident, &error)
+      } ?? Data(bytes).withUnsafeBytes {
+        bloom_logical_source_prepare_replacement_with_positions(pointer, window.pointer, selection.utf16Offset,
+          end.partialValue, firstPosition?.pointer, lastPosition?.pointer,
+          $0.bindMemory(to: UInt8.self).baseAddress, $0.count, &output, &point, &changed, &resident, &error)
+      }
     }
     try pagedLogicalResult(status, error)
     guard resident != 0 else { return nil }

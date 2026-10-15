@@ -1883,6 +1883,65 @@ import XCTest
     }
   }
 
+  func testActualObservedCrossWindowEndpointsReplaceWhileUnrelatedReadIsHeldAndResponderUndoRestoresUnicode() async throws {
+    let text = String(repeating: "aé🙂\n", count: 8_000)
+    try await fixture(#function, text: text) { f in
+      let input = f.input!, source = f.session!, commands = f.commands!, route = f.route!
+      let selected = PagedNativeNavigationSelection(utf16Offset: 7, utf16Length: 29_997,
+        focusAtEnd: true, affinity: .upstream)
+      try input.setDocumentSelection(PagedNativeNavigationSelection(utf16Offset: 7, utf16Length: 0))
+      let before = try source.captureLogicalState(), manager = commands.manager, view = f.view
+      _ = try await commands.navigate(toUTF16: selected.focusUTF16, selectingUTF16: selected)
+      XCTAssertEqual(try input.currentDocumentSelection(), selected)
+      XCTAssertGreaterThan(source.logicalWindow.start.utf16, selected.utf16Offset)
+      XCTAssertTrue(selected.focusUTF16 >= source.logicalWindow.start.utf16
+        && selected.focusUTF16 - source.logicalWindow.start.utf16 <= source.logicalWindow.summary.utf16)
+      XCTAssertTrue(try source.captureLogicalState().source.isSame(before.source))
+      let hold = try await route.holdNext(.windowAfter)
+      let read = Task {
+        try await route.logicalWindow(before.source, utf16Anchor: 35_000,
+          maximumBytes: PagedWorkingWindow.targetBytes, cancellation: CancellationFlag())
+      }
+      do {
+        try await route.awaitHeld(hold)
+        let generation = source.generation, arena = source.arenaID
+        try commands.requestDocumentReplacement(selected, replacement: Data("Ω🌱\n".utf8), actionName: "Edit")
+        // Before yielding: this actual source command must already have used
+        // retained scalar proofs, not started another asynchronous endpoint read.
+        XCTAssertEqual(source.generation, generation + 1)
+        XCTAssertNotEqual(source.arenaID, arena)
+        XCTAssertFalse(commands.hasPendingCommand)
+        XCTAssertEqual(source.activeNavigationOperationCount, 0)
+        XCTAssertEqual(commands.queuedRawKeyCount, 0)
+        XCTAssertEqual(commands.retainedRefusedInputCount, 0)
+        XCTAssertTrue(commands.manager === manager); XCTAssertTrue(f.view === view)
+        XCTAssertTrue(f.window!.firstResponder === view)
+        try await route.release(hold)
+        let delivered = try await read.value
+        XCTAssertTrue(delivered.snapshot.isSame(before.source), "the unrelated read retains its original exact source")
+      } catch {
+        let original = error
+        try? await route.release(hold)
+        _ = await read.result
+        throw original
+      }
+      let expected = (text as NSString).replacingCharacters(in:
+        NSRange(location: Int(selected.utf16Offset), length: Int(selected.utf16Length)), with: "Ω🌱\n")
+      try await commands.joinPendingCommand(); try await f.assertSource(expected)
+      let after = try source.captureLogicalState()
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, 11)
+      XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+      try await commands.joinPendingCommand(); try await f.assertSource(text)
+      XCTAssertTrue(try source.captureLogicalState().source.isSame(before.source))
+      XCTAssertEqual(try input.currentDocumentSelection(), selected)
+      XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("redo:"), to: nil, from: nil))
+      try await commands.joinPendingCommand(); try await f.assertSource(expected)
+      XCTAssertTrue(try source.captureLogicalState().source.isSame(after.source))
+      XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+      XCTAssertNil(view.boundedStorage.mutationFailure)
+    }
+  }
+
   func testActualFirstKeyReplacingCrossWindowSelectionSurvivesFocusMoveAndUndoesAsOneNativeGroup() async throws {
     try await fixture(#function) { f in
       let input = f.input!, commands = f.commands!, source = f.session!, window = f.window!, view = f.view

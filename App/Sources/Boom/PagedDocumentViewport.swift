@@ -702,7 +702,7 @@ import Foundation
       // This exact display/source hit is a real new pointer intent. Existing
       // selection ingress cancels a superseded cold command; its task/events
       // keep their old authority and join independently of this installation.
-      try input.setDocumentSelection(selection, mouseDown: mouseDown)
+      try input.setDocumentSelection(selection, mouseDown: mouseDown, observedWindow: output)
     }
     let nativeEnd = current.utf16Start.addingReportingOverflow(UInt64(current.localUTF16))
     if !installingDisplay, !nativeEnd.overflow, !owner.hasPendingCommand, input.session.isCurrent(snapshot),
@@ -712,7 +712,7 @@ import Foundation
       // source generation. Selection is not a new window or a durable grant.
       // Keep an outside Shift anchor; only its actual focus must be mounted.
       _ = try input.session.nativeSelection(NSRange(location: focus, length: 0))
-      try input.setDocumentSelection(selection)
+      try input.setDocumentSelection(selection, observedWindow: output)
       revealEditableWindow()
       view.scrollRangeToVisible(NSRange(location: focus, length: 0))
       return
@@ -869,7 +869,9 @@ import Foundation
     let selection = PagedNativeNavigationSelection(utf16Offset: min(gesture.anchor, focus),
       utf16Length: max(gesture.anchor, focus) - min(gesture.anchor, focus),
       focusAtEnd: focus > gesture.anchor, affinity: gesture.affinity)
-    if try input.currentDocumentSelection() != selection { try input.setDocumentSelection(selection) }
+    if try input.currentDocumentSelection() != selection {
+      try input.setDocumentSelection(selection, observedWindow: output)
+    }
     if surface !== self {
       let start = min(output.start.utf16 + output.summary.utf16, max(output.start.utf16, selection.utf16Offset))
       let end = min(output.start.utf16 + output.summary.utf16, max(start, selection.utf16Offset + selection.utf16Length))

@@ -96,6 +96,10 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
   private var characterDepth = 0
   private var navigationOperations: Set<UUID> = []
   private var openingHistory: PagedNativeLogicalHistoryProjection?
+  // Two scalar proofs for the current or same-root staged selection. Recenter
+  // preserves their root; accepted source changes discard them, never rebase.
+  private var selectionLowerPosition: PagedNativeLogicalPosition?
+  private var selectionUpperPosition: PagedNativeLogicalPosition?
   private(set) var canonicalOpening: PagedNativeCanonicalOpening?
   private(set) var sealedRootRecord: PagedDocumentRootRecord
   private(set) var sealedRevision: PagedTextRevision
@@ -190,6 +194,53 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
     guard let openingHistory, canonicalOpening != nil else { throw BoomError.stale("Logical history opening was already consumed.") }
     return openingHistory
   }
+  /// Opportunistic proof retention, not input admission. The caller has
+  /// already admitted its actual selection/window. Missing or stale proofs
+  /// leave the existing reader path intact; no window/table/event is retained.
+  func retainSelectionEndpointProofs(for selection: PagedNativeNavigationSelection?,
+    observedWindow: PagedNativeLogicalWindow? = nil, beforeRecenter: Bool = false) {
+    let current = logicalWindow
+    guard let selection else { clearSelectionEndpointProofs(); return }
+    let last = selection.utf16Offset.addingReportingOverflow(selection.utf16Length)
+    guard !last.overflow, last.partialValue <= current.snapshot.summary.utf16 else {
+      clearSelectionEndpointProofs(); return
+    }
+    func contains(_ window: PagedNativeLogicalWindow, _ offset: UInt64) -> Bool {
+      window.snapshot.isSame(current.snapshot) && offset >= window.start.utf16
+        && offset - window.start.utf16 <= window.summary.utf16
+    }
+    // Ordinary contained typing/selection does not allocate retained handles.
+    // Capture its endpoints only when an actual recenter can unmount them.
+    if !beforeRecenter, contains(current, selection.utf16Offset), contains(current, last.partialValue) {
+      clearSelectionEndpointProofs(); return
+    }
+    let priorLower = selectionLowerPosition, priorUpper = selectionUpperPosition
+    func retained(_ offset: UInt64) -> PagedNativeLogicalPosition? {
+      if let priorLower, priorLower.snapshot.isSame(current.snapshot), priorLower.point.utf16 == offset { return priorLower }
+      if let priorUpper, priorUpper.snapshot.isSame(current.snapshot), priorUpper.point.utf16 == offset { return priorUpper }
+      // The existing source already proves start/EOF without a handle.
+      if offset == 0 || offset == current.snapshot.summary.utf16 { return nil }
+      if let observedWindow, contains(observedWindow, offset),
+        let local = Int(exactly: offset - observedWindow.start.utf16) {
+        return try? observedWindow.positionProof(localUTF16: local)
+      }
+      if contains(current, offset), let local = Int(exactly: offset - current.start.utf16) {
+        return try? current.positionProof(localUTF16: local)
+      }
+      return nil
+    }
+    selectionLowerPosition = retained(selection.utf16Offset)
+    selectionUpperPosition = selection.utf16Length == 0 ? selectionLowerPosition : retained(last.partialValue)
+  }
+  private func clearSelectionEndpointProofs() {
+    selectionLowerPosition = nil; selectionUpperPosition = nil
+  }
+  private func selectionPosition(at offset: UInt64) -> PagedNativeLogicalPosition? {
+    let head = logicalWindow.snapshot
+    if let lower = selectionLowerPosition, lower.snapshot.isSame(head), lower.point.utf16 == offset { return lower }
+    if let upper = selectionUpperPosition, upper.snapshot.isSame(head), upper.point.utf16 == offset { return upper }
+    return nil
+  }
   func currentLogicalCursor(for selection: PagedNativeNavigationSelection) throws -> PagedNativeLogicalCursor {
     let summary = logicalWindow.snapshot.summary
     let end = selection.utf16Offset.addingReportingOverflow(selection.utf16Length)
@@ -200,6 +251,8 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
     else if selection.utf16Offset >= logicalWindow.start.utf16,
       selection.utf16Offset - logicalWindow.start.utf16 <= logicalWindow.summary.utf16 {
       point = try logicalWindow.position(localUTF16: Int(selection.utf16Offset - logicalWindow.start.utf16))
+    } else if let retained = selectionPosition(at: selection.utf16Offset) {
+      point = retained.point
     } else if selection.utf16Offset == working.currentCursor.utf16Offset {
       point = PagedTextSummary(bytes: working.currentCursor.byteOffset, utf16: selection.utf16Offset, lfCount: 0)
     } else { throw BoomError.stale("A distant selection endpoint requires its actual independent read proof.") }
@@ -248,6 +301,7 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
     let observesPointer = subscription?.observesPointerSplices?() == true
     let before = observesPointer ? logicalWindow : nil
     let changed = try working.replace(range, with: replacement, groupID: groupID, beforeCursor: cursor, source: source)
+    if changed { clearSelectionEndpointProofs() }
     if changed, let before {
       subscription?.pointerSplice?(before.snapshot, logicalWindow.snapshot,
         before.start.utf16 + UInt64(range.location), UInt64(range.length), UInt64(replacement.utf16.count))
@@ -279,6 +333,9 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
     let receipt = try working.closeNativeGroup(source: source); emit(receipt); return receipt
   }
   private func emit(_ receipt: PagedNativeGroupClosureReceipt?) {
+    // A net-zero native group can restore its exact original root too.
+    if let lower = selectionLowerPosition, !lower.snapshot.isSame(logicalWindow.snapshot) { clearSelectionEndpointProofs() }
+    if let upper = selectionUpperPosition, !upper.snapshot.isSame(logicalWindow.snapshot) { clearSelectionEndpointProofs() }
     guard let receipt else { return }
     notifyingGroup = true; defer { notifyingGroup = false }
     if let subscription { subscription.receiver?(subscription, receipt) }
@@ -302,7 +359,9 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
     guard managedArenaOwner == nil, owner.session === self else { throw BoomError.denied("This native source already has its physical owner.") }
     managedArenaOwner = owner
   }
-  func retireManagedArenaOwner(_ owner: PagedNativeInputOwner) { if managedArenaOwner === owner { managedArenaOwner = nil } }
+  func retireManagedArenaOwner(_ owner: PagedNativeInputOwner) {
+    if managedArenaOwner === owner { managedArenaOwner = nil; clearSelectionEndpointProofs() }
+  }
   func registerNativeGroupSubscription(ownerID: UUID,
     onClose: @escaping (PagedNativeGroupSubscription, PagedNativeGroupClosureReceipt) -> Void,
     captureLogicalHistory: (() throws -> PagedNativeLogicalHistoryProjection)? = nil) throws -> PagedNativeGroupSubscription {
@@ -359,6 +418,9 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
     _ = try closeNativeGroup()
     guard before.isSame(logicalWindow.snapshot) else { throw BoomError.stale("Native group closure changed the prepared root.") }
     try cursor.validate(in: window.snapshot)
+    if window.snapshot.isSame(before) {
+      retainSelectionEndpointProofs(for: selection, observedWindow: window, beforeRecenter: true)
+    }
     let ticket = try PagedNativeNavigationInstallationTicket(owner: self, inputOwner: owner,
       window: window, selection: selection, cursor: cursor, before: before, kind: kind,
       provisionalArenaID: provisionalArenaID)
@@ -367,6 +429,7 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
   func prepareLogicalWindowInstallation(_ window: PagedNativeLogicalWindow,
     selectingUTF16 selection: PagedNativeNavigationSelection, owner: PagedNativeInputOwner) throws -> PagedNativeNavigationInstallationTicket {
     guard window.snapshot.isSame(logicalWindow.snapshot) else { throw BoomError.stale("Displayed logical window is no longer current.") }
+    retainSelectionEndpointProofs(for: selection, observedWindow: window, beforeRecenter: true)
     let cursor = try cursor(selection, in: window)
     return try prepare(window: window, selection: selection, cursor: cursor,
       before: logicalWindow.snapshot, kind: .navigation, owner: owner)
@@ -500,6 +563,7 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
       }
     }
     precondition(consumed, "Actual Foundation target must consume its prepared source")
+    if ticket.sourceChanged { clearSelectionEndpointProofs() }
     if ticket.sourceChanged, let splice = ticket.pointerSplice,
       subscription?.observesPointerSplices?() == true {
       subscription?.pointerSplice?(ticket.before, window.snapshot, splice.start, splice.removed, splice.inserted)
@@ -513,7 +577,10 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
     guard let text = String(data: replacement, encoding: .utf8) else { throw BoomError.invalid("Replacement is not UTF8.") }
     _ = try closeNativeGroup()
     let before = logicalWindow
-    guard let candidate = try source.prepareResidentReplacement(in: before, selection: selection, replacement: text) else { return nil }
+    let end = selection.utf16Offset.addingReportingOverflow(selection.utf16Length)
+    guard !end.overflow else { throw BoomError.invalid("Logical replacement selection overflow.") }
+    guard let candidate = try source.prepareResidentReplacement(in: before, selection: selection, replacement: text,
+      firstPosition: selectionPosition(at: selection.utf16Offset), lastPosition: selectionPosition(at: end.partialValue)) else { return nil }
     let beforeCursor = try currentLogicalCursor(for: owner.currentDocumentSelection())
     let afterCursor = PagedNativeLogicalCursor(byteOffset: candidate.cursor.bytes, utf16Offset: candidate.cursor.utf16)
     guard candidate.changed else {

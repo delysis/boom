@@ -1182,6 +1182,41 @@ fn logical_native_controls(host: &mut Host, revision: &Value, original: &str) {
         assert_eq!(text_of(window), original);
         let pages = host.pages.len();
         host.reject_read = true;
+        // The ABI retains the actual Rust scalar proof, not just its public
+        // counters. No page callback is available for this native prepare.
+        let mut first_position = ptr::null();
+        let mut last_position = ptr::null();
+        let mut proof_point = BloomLogicalPoint::default();
+        error = empty();
+        check(bloom_logical_window_position_proof(window, 3, &mut first_position, &mut proof_point, &mut error), error);
+        assert_eq!(proof_point.bytes, 4);
+        assert_eq!(proof_point.utf16, 3);
+        error = empty();
+        check(bloom_logical_window_position_proof(window, 4, &mut last_position, &mut proof_point, &mut error), error);
+        assert_eq!(proof_point.bytes, 6);
+        let reads = host.read_calls;
+        let writes = host.write_calls;
+        let mut proven = ptr::null();
+        let mut proven_cursor = BloomLogicalPoint::default();
+        let mut proven_changed = 0;
+        let mut proven_resident = 0;
+        error = empty();
+        let status = bloom_logical_source_prepare_replacement_with_positions(
+            source, window, 3, 4, first_position, last_position, "Ω".as_ptr(), "Ω".len(),
+            &mut proven, &mut proven_cursor, &mut proven_changed, &mut proven_resident, &mut error,
+        );
+        check(status, error);
+        assert_eq!(proven_resident, 1);
+        assert_eq!(proven_changed, 1);
+        assert_eq!(text_of(proven), original.replacen('é', "Ω", 1));
+        assert_eq!(host.read_calls, reads);
+        assert_eq!(host.write_calls, writes);
+        let mut unconsumed = ptr::null();
+        error = empty();
+        check(bloom_logical_source_capture(source, 0, &mut unconsumed, &mut error), error);
+        assert_eq!(identity(unconsumed), identity(before));
+        bloom_logical_snapshot_free(unconsumed);
+        bloom_logical_window_free(proven); // abandoned prepare, actual head is unchanged
         let insertion = "é🌱";
         let mut edited = ptr::null();
         let mut cursor = BloomLogicalPoint::default();
@@ -1203,6 +1238,18 @@ fn logical_native_controls(host: &mut Host, revision: &Value, original: &str) {
         assert_eq!(changed, 1);
         assert_eq!(cursor.utf16, 3);
         assert_eq!(text_of(edited), format!("{insertion}{original}"));
+        error = empty();
+        let status = bloom_logical_source_prepare_replacement_with_positions(
+            source, edited, 3, 4, first_position, last_position, b"x".as_ptr(), 1,
+            &mut proven, &mut proven_cursor, &mut proven_changed, &mut proven_resident, &mut error,
+        );
+        assert_eq!(status, 1, "an old-root proof cannot authorize the current native source");
+        let failure: Value = serde_json::from_slice(slice::from_raw_parts(error.data, error.length)).expect("actual stale proof refusal");
+        assert_eq!(failure["error"]["code"], "stale");
+        boom_attachment_free(error);
+        assert!(proven.is_null());
+        bloom_logical_position_free(first_position);
+        bloom_logical_position_free(last_position);
         assert_eq!(
             host.pages.len(),
             pages,
