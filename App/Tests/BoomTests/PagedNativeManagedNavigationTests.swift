@@ -240,6 +240,17 @@ import XCTest
   ])
 }
 
+@MainActor private func actualVisiblePointerPoint(in display: NSTextView, horizontalOffset: CGFloat = 22) throws -> NSPoint {
+  let visible = display.visibleRect.intersection(display.bounds)
+  let point = NSPoint(x: display.textContainerOrigin.x + horizontalOffset,
+    y: visible.minY + min(24, visible.height / 2))
+  guard visible.contains(point), let window = display.window, let content = window.contentView, let parent = content.superview,
+    content.hitTest(parent.convert(point, from: display)) === display else {
+    throw BoomError.invalid("The native pointer target is outside its actual visible text surface.")
+  }
+  return point
+}
+
 @MainActor final class PagedNativeManagedNavigationTests: XCTestCase {
   private static var retained: ManagedNavigationFixture?
   private static let entryKey = UndoManager.UserInfoKey(rawValue: "bloom.paged.native-entry.v1")
@@ -1709,7 +1720,7 @@ import XCTest
       let projection = try XCTUnwrap(viewport.visibleScrollWindow)
       let surface = try XCTUnwrap(viewport.subviews.compactMap { $0 as? NSScrollView }.first { !$0.isHidden })
       let display = try XCTUnwrap(surface.documentView as? NSTextView)
-      let point = NSPoint(x: display.textContainerOrigin.x + 22, y: display.textContainerOrigin.y + 10)
+      let point = try actualVisiblePointerPoint(in: display)
       let local = display.characterIndexForInsertion(at: point)
       let capturedCaret = try projection.position(localUTF16: local).utf16
       let originalArena = source.arenaID, generation = source.generation
@@ -1805,7 +1816,7 @@ import XCTest
         let projection = try XCTUnwrap(viewport.visibleScrollWindow)
         let surface = try XCTUnwrap(viewport.subviews.compactMap { $0 as? NSScrollView }.first { !$0.isHidden })
         let display = try XCTUnwrap(surface.documentView as? NSTextView)
-        let point = NSPoint(x: display.textContainerOrigin.x + 22, y: display.textContainerOrigin.y + 10)
+        let point = try actualVisiblePointerPoint(in: display)
         let local = display.characterIndexForInsertion(at: point)
         let capturedCaret = try projection.position(localUTF16: local).utf16
         let navigationCaret: UInt64 = 12_001
@@ -1862,8 +1873,8 @@ import XCTest
       let projection = try XCTUnwrap(viewport.visibleScrollWindow)
       let surface = try XCTUnwrap(viewport.subviews.compactMap { $0 as? NSScrollView }.first { !$0.isHidden })
       let display = try XCTUnwrap(surface.documentView as? NSTextView)
-      let startPoint = NSPoint(x: display.textContainerOrigin.x + 22, y: display.textContainerOrigin.y + 10)
-      let dragPoint = NSPoint(x: display.textContainerOrigin.x + 86, y: display.textContainerOrigin.y + 10)
+      let startPoint = try actualVisiblePointerPoint(in: display)
+      let dragPoint = try actualVisiblePointerPoint(in: display, horizontalOffset: 86)
       let anchor = try projection.position(localUTF16: display.characterIndexForInsertion(at: startPoint)).utf16
       let focus = try projection.position(localUTF16: display.characterIndexForInsertion(at: dragPoint)).utf16
       XCTAssertGreaterThan(focus, anchor)
@@ -1920,7 +1931,7 @@ import XCTest
       try viewport.requestScroll(toUTF16: 40_000); try await viewport.joinPresentation()
       let surface = try XCTUnwrap(viewport.subviews.compactMap { $0 as? NSScrollView }.first { !$0.isHidden })
       let display = try XCTUnwrap(surface.documentView as? NSTextView)
-      let point = NSPoint(x: display.textContainerOrigin.x + 22, y: display.textContainerOrigin.y + 10)
+      let point = try actualVisiblePointerPoint(in: display)
       let hold = try await f.route!.holdNext(.windowAfter)
       let loading = try f.startNavigation(anchor: 12_000, caret: 12_001)
       try await f.route!.awaitHeld(hold)

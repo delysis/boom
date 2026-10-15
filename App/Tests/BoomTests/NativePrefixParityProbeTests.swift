@@ -278,12 +278,14 @@ final class NativePrefixParityProbeTests: XCTestCase {
   private func parityDeclaration(processed: Int = 8, delivered: Int = 9, row: Int = 2,
     stage: NeuralPrefixParitySmoke.SourceStage = .anchorPrefill) -> NeuralPrefixParitySmoke.Declaration {
     let reference = NeuralPrefixParitySmoke.Reference(path: "/public/receipt.json", sha256: String(repeating: "a", count: 64))
-    return .init(kind: .writingLateDivergence, namespace: UUID(), sharedSource: reference,
+    var declaration = NeuralPrefixParitySmoke.Declaration(kind: .writingLateDivergence, namespace: UUID(), sharedSource: reference,
       anchorSource: reference, currentQuery: reference, modelManifest: reference, sourceStage: stage,
       sharedSourceRow: row, sharedProcessedDecodeTokens: processed, sharedDeliveredLedgerTokens: delivered,
       sharedWidth: 3, anchorCachedPrefix: 4096 + processed,
       sourceNativeBoundary: stage == .sharedDecode ? 4349 : 4352, cachedPrefix: 4349,
       coldNativeBoundary: 4352, warmSuffixPartitions: [3, 1], decodeControlTokens: 16, seed: 42)
+    declaration.interveningSources = [reference, reference]
+    return declaration
   }
 
   private func parityInputs(processed: Int = 8, corruptMatrix: Bool = false) throws
@@ -332,7 +334,19 @@ final class NativePrefixParityProbeTests: XCTestCase {
         output_history_evidence: rows.indices.map { .init(promptTokens: prompt.count,
           decodeRow: $0, decodeWidth: rows.count, blockers: [], forwards: forwards) })
     }
-    let source = try input("writing-three-repeat", ids, emitted, cached: 4095, forwards: prefill)
+    var source = try input("writing-three-repeat", ids, emitted, cached: 4095, forwards: prefill)
+    source.max_tokens_per_row = 256
+    source.batch_metrics = .init(width: 3, sharedPromptPrefills: 1, decodeForwardPasses: 255)
+    if lengths[0] < 256 {
+      let value = source.outputs[0]
+      source = .init(name: source.name, model: source.model, prompt: source.prompt, plan: source.plan,
+        prepared_token_ids: source.prepared_token_ids, generation_policy: source.generation_policy,
+        settings: source.settings, outputs: [.init(token_ids: value.token_ids, stop_reason: "eos", stop_token_id: 0,
+          prompt_digest: value.prompt_digest, prompt_tokens: value.prompt_tokens)] + Array(source.outputs.dropFirst()),
+        status: source.status, expected_cached_tokens_at_snapshot: source.expected_cached_tokens_at_snapshot,
+        seeds: source.seeds, output_history_evidence: source.output_history_evidence,
+        max_tokens_per_row: 256, batch_metrics: .init(width: 3, sharedPromptPrefills: 1, decodeForwardPasses: 255))
+    }
     let tail: [NeuralPrefixParitySmoke.CapturedForward] = [
       .init(start: 4096 + processed, end: 4352, evaluatedEnd: 4352, origin: "prefill", width: 1, row: nil, originalInput: nil),
       .init(start: 4352, end: 4353, evaluatedEnd: 4353, origin: "prefill", width: 1, row: nil, originalInput: nil)]
@@ -347,29 +361,88 @@ final class NativePrefixParityProbeTests: XCTestCase {
     return (source, anchor, query)
   }
 
+  private func parityIntervening(_ source: NeuralPrefixParitySmoke.CapturedInput) throws
+    -> [NeuralPrefixParitySmoke.CapturedInput] {
+    var forwards = try XCTUnwrap(source.output_history_evidence?.first?.forwards)
+    var prompt = source.prepared_token_ids, result: [NeuralPrefixParitySmoke.CapturedInput] = []
+    for count in 4097...4098 {
+      prompt.append(12_000)
+      forwards.append(.init(start: count - 1, end: count, evaluatedEnd: count,
+        origin: "prefill", width: 1, row: nil, originalInput: nil))
+      let digest = Digest.sha256(try JSONEncoder().encode(prompt))
+      result.append(.init(name: "writing-append-\(count)", model: source.model, prompt: "public", plan: nil,
+        prepared_token_ids: prompt, generation_policy: source.generation_policy, settings: source.settings,
+        outputs: [.init(token_ids: Array(20_000..<20_016), stop_reason: "output_limit", stop_token_id: nil,
+          prompt_digest: digest, prompt_tokens: count)], status: "passed", expected_cached_tokens_at_snapshot: count - 1,
+        seeds: [42], output_history_evidence: [.init(promptTokens: count, decodeRow: 0, decodeWidth: 1,
+          blockers: [], forwards: forwards)], max_tokens_per_row: 16))
+    }
+    return result
+  }
+
   func testCurrentParityAdmissionUsesActualShortRowsAndCompletedOriginalMatrix() throws {
     let (source, anchor, query) = try parityInputs()
     let declaration = parityDeclaration()
     XCTAssertNoThrow(try NeuralPrefixParitySmoke.validateRequest(declaration, schema: 2,
-      shared: source, anchor: anchor, query: query))
+      shared: source, anchor: anchor, query: query, intervening: parityIntervening(source)))
     XCTAssertEqual(source.outputs.map { $0.token_ids.count }, [43, 256, 256])
     XCTAssertThrowsError(try NeuralPrefixParitySmoke.validateRequest(parityDeclaration(processed: 85, delivered: 86),
-      schema: 2, shared: source, anchor: anchor, query: query))
+      schema: 2, shared: source, anchor: anchor, query: query, intervening: parityIntervening(source)))
     let (sameIDs, wrongMatrix, sameQuery) = try parityInputs(corruptMatrix: true)
     XCTAssertThrowsError(try NeuralPrefixParitySmoke.validateRequest(declaration, schema: 2,
-      shared: sameIDs, anchor: wrongMatrix, query: sameQuery))
+      shared: sameIDs, anchor: wrongMatrix, query: sameQuery, intervening: parityIntervening(sameIDs)))
     XCTAssertThrowsError(try NeuralPrefixParitySmoke.validateRequest(parityDeclaration(row: 1), schema: 2,
-      shared: source, anchor: anchor, query: query))
+      shared: source, anchor: anchor, query: query, intervening: parityIntervening(source)))
   }
 
   func testCurrentParityAdmissionUsesRecordedEarlierRowBeforeNativeRingLosesOldestPositions() throws {
     let (source, anchor, query) = try parityInputs(processed: 255)
     let declaration = parityDeclaration(processed: 255, delivered: 256, stage: .sharedDecode)
     XCTAssertNoThrow(try NeuralPrefixParitySmoke.validateRequest(declaration, schema: 2,
-      shared: source, anchor: anchor, query: query))
+      shared: source, anchor: anchor, query: query, intervening: parityIntervening(source)))
     XCTAssertEqual(declaration.sourceNativeBoundary, 4349)
     XCTAssertEqual(declaration.sharedSourceRow, 2)
     XCTAssertEqual(query.output_history_evidence?.first?.forwards.last?.end, 4353)
+  }
+
+  func testCurrentWritingReplayRetainsEarlyEOSPhysicalInputsAndFullSharedBoundary() throws {
+    let (source, _, _) = try parityInputs()
+    let replay = try NeuralPrefixParitySmoke.receiptBatchReplay(source)
+    XCTAssertEqual(replay.processed, 255)
+    XCTAssertEqual(replay.ledgers.map(\.count), [43, 256, 256])
+    XCTAssertEqual(replay.terminalIterations, [43, 255, 255])
+    XCTAssertEqual(try replay.column(at: 42)[0], source.outputs[0].token_ids[42])
+    XCTAssertEqual(try replay.column(at: 43)[0], source.outputs[0].stop_token_id)
+    XCTAssertEqual(try replay.column(at: 44)[0], source.generation_policy.eosTokenIDs[0])
+    XCTAssertEqual(try replay.column(at: 254)[1], source.outputs[1].token_ids[254])
+    XCTAssertEqual(replay.ledgers[1].last, source.outputs[1].token_ids[255],
+      "The final delivered token is retained but is not an invented 256th batch forward.")
+    XCTAssertThrowsError(try replay.column(at: -1)); XCTAssertThrowsError(try replay.column(at: 255))
+    let (long, _, _) = try parityInputs(processed: 255)
+    let longReplay = try NeuralPrefixParitySmoke.receiptBatchReplay(long)
+    XCTAssertEqual(longReplay.terminalIterations, [255, 255, 255])
+    XCTAssertEqual(try longReplay.column(at: 252), long.outputs.map { $0.token_ids[252] },
+      "The earlier E2 snapshot4349 is captured after253actual forwards; two more remain before joined4351.")
+    XCTAssertEqual(4096 + longReplay.processed, 4351)
+  }
+
+  func testCurrentWritingReplayRequiresOriginalOrderedAppendHistoryAndBoundedTerminalMetadata() throws {
+    let (source, anchor, query) = try parityInputs(), declaration = parityDeclaration()
+    let steps = try parityIntervening(source)
+    XCTAssertNoThrow(try NeuralPrefixParitySmoke.validateRequest(declaration, schema: 2,
+      shared: source, anchor: anchor, query: query, intervening: steps))
+    XCTAssertThrowsError(try NeuralPrefixParitySmoke.validateRequest(declaration, schema: 2,
+      shared: source, anchor: anchor, query: query))
+    XCTAssertThrowsError(try NeuralPrefixParitySmoke.validateRequest(declaration, schema: 2,
+      shared: source, anchor: anchor, query: query, intervening: Array(steps.reversed())))
+    for extreme in [Int.min, Int.max] {
+      var changed = source
+      changed.batch_metrics = .init(width: 3, sharedPromptPrefills: 1, decodeForwardPasses: extreme)
+      XCTAssertThrowsError(try NeuralPrefixParitySmoke.receiptBatchReplay(changed))
+      var changedSteps = steps; changedSteps[1].max_tokens_per_row = extreme
+      XCTAssertThrowsError(try NeuralPrefixParitySmoke.validateRequest(declaration, schema: 2,
+        shared: source, anchor: anchor, query: query, intervening: changedSteps))
+    }
   }
 
   func testParityVersionTwoRejectsExtremeCountersBeforeArithmeticAndPreservesVersionOneScope() throws {
@@ -392,6 +465,7 @@ final class NativePrefixParityProbeTests: XCTestCase {
     XCTAssertThrowsError(try NeuralPrefixParitySmoke.validateDeclaration(changed, schema: 2))
     XCTAssertThrowsError(try NeuralPrefixParitySmoke.validateDeclaration(good, schema: 1))
     object["modelManifest"] = NSNull(); object["sourceStage"] = NSNull(); object["sharedSourceRow"] = NSNull()
+    object["interveningSources"] = NSNull()
     object["sharedProcessedDecodeTokens"] = 85; object["sharedDeliveredLedgerTokens"] = 86
     object["anchorCachedPrefix"] = 4181; object["warmSuffixPartitions"] = [3, 1]
     let legacy = try JSONDecoder().decode(NeuralPrefixParitySmoke.Declaration.self,

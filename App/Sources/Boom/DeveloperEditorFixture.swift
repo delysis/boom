@@ -684,7 +684,14 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
             let display = surface.documentView as? NSTextView else {
             throw BoomError.invalid("The actual readonly pointer target was not installed.")
           }
-          let point = NSPoint(x: display.textContainerOrigin.x + 22, y: display.textContainerOrigin.y + 10)
+          let visible = display.visibleRect.intersection(display.bounds)
+          let point = NSPoint(x: display.textContainerOrigin.x + 22,
+            y: visible.minY + min(24, visible.height / 2))
+          guard visible.contains(point), display.window === window,
+            let content = window.contentView, let parent = content.superview,
+            content.hitTest(parent.convert(point, from: display)) === display else {
+            throw BoomError.invalid("The public pointer target is outside its actual visible text surface.")
+          }
           let caret = try projection.position(localUTF16: display.characterIndexForInsertion(at: point)).utf16
           let navigationCaret: UInt64 = 12_001, generation = session.generation
           guard caret > navigationCaret else { throw BoomError.invalid("Pointer chronology requires the real distant target.") }

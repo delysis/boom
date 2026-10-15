@@ -54,6 +54,7 @@ enum NeuralPrefixParitySmoke {
     let warmSuffixPartitions: [Int]
     let decodeControlTokens: Int
     let seed: UInt64
+    var interveningSources: [Reference]? = nil
   }
   struct Fixture: Codable, Sendable {
     let schema: Int
@@ -71,6 +72,11 @@ enum NeuralPrefixParitySmoke {
     let prompt_tokens: Int
   }
   struct CapturedInput: Codable, Sendable {
+    struct Batch: Codable, Sendable {
+      let width: Int
+      let sharedPromptPrefills: Int
+      let decodeForwardPasses: Int
+    }
     let name: String
     let model: String
     let prompt: String?
@@ -83,6 +89,8 @@ enum NeuralPrefixParitySmoke {
     let expected_cached_tokens_at_snapshot: Int?
     let seeds: [UInt64]?
     let output_history_evidence: [CapturedHistory]?
+    var max_tokens_per_row: Int? = nil
+    var batch_metrics: Batch? = nil
   }
   struct Request: Sendable {
     let declaration: Declaration
@@ -90,7 +98,8 @@ enum NeuralPrefixParitySmoke {
     let shared: CapturedInput
     let anchor: CapturedInput?
     let query: CapturedInput
-    var inputs: [CapturedInput] { [shared] + (anchor.map { [$0] } ?? []) + [query] }
+    let intervening: [CapturedInput]
+    var inputs: [CapturedInput] { [shared] + intervening + (anchor.map { [$0] } ?? []) + [query] }
     var name: String { declaration.kind.rawValue }
   }
   struct Samples: Codable, Sendable {
@@ -149,7 +158,8 @@ enum NeuralPrefixParitySmoke {
     }
     if schema == 1 {
       // Preserve the original registered scope and refusal behavior.
-      guard d.modelManifest == nil, d.sourceStage == nil, d.sharedSourceRow == nil else {
+      guard d.modelManifest == nil, d.sourceStage == nil, d.sharedSourceRow == nil,
+        d.interveningSources == nil else {
         throw BoomError.invalid("Version-one parity cannot declare a new source geometry.")
       }
       switch d.kind {
@@ -175,7 +185,8 @@ enum NeuralPrefixParitySmoke {
       }
       switch d.kind {
       case .consultationInterior:
-        guard d.anchorSource == nil, d.anchorCachedPrefix == nil, d.sharedWidth == 1, row == 0,
+        guard d.anchorSource == nil, d.anchorCachedPrefix == nil, d.interveningSources == nil,
+          d.sharedWidth == 1, row == 0,
           d.sharedProcessedDecodeTokens == 16, d.sharedDeliveredLedgerTokens == 16,
           d.sourceStage == .sharedDecode, d.sourceNativeBoundary == 4112,
           d.cachedPrefix == 4112, d.coldNativeBoundary == 4128, d.warmSuffixPartitions == [16, 1] else {
@@ -183,6 +194,8 @@ enum NeuralPrefixParitySmoke {
         }
       case .writingLateDivergence:
         guard let anchor = d.anchorSource, validReference(anchor), let prefix = d.anchorCachedPrefix,
+          let intervening = d.interveningSources, intervening.count == 2,
+          intervening.allSatisfy(validReference),
           (4_097...4_351).contains(prefix), d.sharedWidth == 3,
           d.sharedProcessedDecodeTokens == prefix - 4096,
           d.sharedDeliveredLedgerTokens == d.sharedProcessedDecodeTokens + 1,
@@ -334,10 +347,95 @@ enum NeuralPrefixParitySmoke {
     }
   }
 
+  /// A bounded replay of the recorded ordinary width-three loop, not a new
+  /// sampling policy. Finished rows submit the real stop once, then the same
+  /// inert EOS operand as runBatch; those operands are never delivered output.
+  struct ReceiptBatchReplay: Sendable {
+    let processed: Int
+    let ledgers: [[Int]]
+    let terminalIterations: [Int]
+    let stopTokenIDs: [Int?]
+    let inertToken: Int
+
+    func column(at position: Int) throws -> [Int] {
+      guard (0..<processed).contains(position) else {
+        throw BoomError.invalid("Recorded batch replay position exceeds its actual forwards.")
+      }
+      return ledgers.indices.map { row in
+        if position < ledgers[row].count { return ledgers[row][position] }
+        if position == ledgers[row].count, let stop = stopTokenIDs[row] { return stop }
+        return inertToken
+      }
+    }
+  }
+
+  static func receiptBatchReplay(_ input: CapturedInput) throws -> ReceiptBatchReplay {
+    guard input.name == "writing-three-repeat", input.max_tokens_per_row == 256,
+      let batch = input.batch_metrics, batch.width == 3, batch.sharedPromptPrefills == 1,
+      batch.decodeForwardPasses == 255, input.outputs.count == 3,
+      (1...Int(Int32.max)).contains(input.generation_policy.vocabularySize),
+      let inert = input.generation_policy.eosTokenIDs.first,
+      (0..<input.generation_policy.vocabularySize).contains(inert) else {
+      throw BoomError.invalid("The original complete shared batch timeline is unavailable.")
+    }
+    var terminals: [Int] = []
+    for output in input.outputs {
+      guard (1...256).contains(output.token_ids.count), output.token_ids.allSatisfy({
+        (0..<input.generation_policy.vocabularySize).contains($0)
+          && !input.generation_policy.controlTokenIDs.contains($0)
+      }) else { throw BoomError.invalid("The recorded batch delivered ledger is invalid.") }
+      switch output.stop_reason {
+      case "output_limit":
+        guard output.token_ids.count == 256, output.stop_token_id == nil else {
+          throw BoomError.invalid("The recorded batch output limit has no actual terminal boundary.")
+        }
+        terminals.append(output.token_ids.count - 1)
+      case "eos", "model_control":
+        guard output.token_ids.count < 256, let stop = output.stop_token_id,
+          (0..<input.generation_policy.vocabularySize).contains(stop),
+          input.generation_policy.controlTokenIDs.contains(stop),
+          input.generation_policy.eosTokenIDs.contains(stop) == (output.stop_reason == "eos") else {
+          throw BoomError.invalid("The recorded batch control stop differs from its policy.")
+        }
+        terminals.append(output.token_ids.count)
+      default: throw BoomError.invalid("The original shared batch did not finish normally.")
+      }
+    }
+    guard terminals.max() == batch.decodeForwardPasses else {
+      throw BoomError.invalid("Recorded shared forwards and terminal row boundaries disagree.")
+    }
+    return ReceiptBatchReplay(processed: batch.decodeForwardPasses,
+      ledgers: input.outputs.map(\.token_ids), terminalIterations: terminals,
+      stopTokenIDs: input.outputs.map(\.stop_token_id), inertToken: inert)
+  }
+
+  private static func validateInterveningWriting(_ inputs: [CapturedInput], shared: CapturedInput) throws {
+    guard inputs.count == 2 else { throw BoomError.invalid("The two original intervening append requests are required.") }
+    for (index, input) in inputs.enumerated() {
+      let count = 4097 + index
+      guard input.name == "writing-append-\(count)", input.prepared_token_ids.count == count,
+        input.max_tokens_per_row == 16, input.expected_cached_tokens_at_snapshot == count - 1,
+        input.outputs.count == 1, input.outputs[0].token_ids.count == 16,
+        input.outputs[0].stop_reason == "output_limit", input.outputs[0].stop_token_id == nil,
+        input.prepared_token_ids.prefix(4096).elementsEqual(shared.prepared_token_ids),
+        index == 0 || input.prepared_token_ids.prefix(count - 1).elementsEqual(inputs[index - 1].prepared_token_ids)
+      else { throw BoomError.invalid("The original intervening append inputs or completion bounds changed.") }
+      let forwards = try sourcePrefill(input)
+      guard forwards.count == 10 + index,
+        (0...index).allSatisfy({ offset in
+          sameForward(forwards[9 + offset], 4096 + offset, 4097 + offset, origin: "prefill", width: 1)
+        }) else { throw BoomError.invalid("The actual intervening append prefill partitions changed.") }
+    }
+  }
+
   static func validateRequest(_ declaration: Declaration, schema: Int, shared: CapturedInput,
-    anchor: CapturedInput?, query: CapturedInput) throws -> Request {
+    anchor: CapturedInput?, query: CapturedInput, intervening: [CapturedInput] = []) throws -> Request {
     try validateDeclaration(declaration, schema: schema)
-    let request = Request(declaration: declaration, schema: schema, shared: shared, anchor: anchor, query: query)
+    let request = Request(declaration: declaration, schema: schema, shared: shared, anchor: anchor,
+      query: query, intervening: intervening)
+    guard intervening.count == (declaration.interveningSources?.count ?? 0) else {
+      throw BoomError.invalid("The source-bound intervening manager timeline is missing.")
+    }
     guard shared.prepared_token_ids.count == 4096, shared.outputs.count == declaration.sharedWidth,
       query.outputs.count == 1, query.outputs[0].token_ids.count == 16,
       request.inputs.allSatisfy({ $0.model == shared.model && $0.settings == query.settings
@@ -380,6 +478,8 @@ enum NeuralPrefixParitySmoke {
         throw BoomError.invalid("The public width-three row/late-anchor integer prefixes changed.")
       }
       if schema == 2 {
+        _ = try receiptBatchReplay(shared)
+        try validateInterveningWriting(intervening, shared: shared)
         guard shared.expected_cached_tokens_at_snapshot == 4095,
           anchor.expected_cached_tokens_at_snapshot == prefix,
           query.expected_cached_tokens_at_snapshot == declaration.cachedPrefix else {
@@ -408,7 +508,8 @@ enum NeuralPrefixParitySmoke {
   static func request(_ declaration: Declaration, schema: Int = 1) throws -> Request {
     try validateRequest(declaration, schema: schema, shared: captured(declaration.sharedSource, schema: schema),
       anchor: declaration.anchorSource.map { try captured($0, schema: schema) },
-      query: captured(declaration.currentQuery, schema: schema))
+      query: captured(declaration.currentQuery, schema: schema),
+      intervening: (declaration.interveningSources ?? []).map { try captured($0, schema: schema) })
   }
 
   private static func write<T: Encodable>(_ value: T, _ name: String, _ evidence: URL) throws {
@@ -483,14 +584,18 @@ enum NeuralPrefixParitySmoke {
     manager: PromptPrefixCache, owner: PromptCacheOwner, prefill: PrefillParameters,
     policy: ModelGenerationPolicy, expectedCached: Int, width: Int, processed: Int, delivered: Int,
     captureAt: Int?, captureRow: Int = 0, expectedSourceRow: Int? = nil, label: String, flag: CancellationFlag,
+    replayCompleteBatch: Bool = false,
     allowSnapshot: @escaping @Sendable (UInt64) -> Bool, fence: () -> Void, evidence: URL) async throws -> Prepared {
-    let parameters = GenerateParameters(maxTokens: 16, temperature: input.settings.temperature,
+    let replay = replayCompleteBatch ? try receiptBatchReplay(input) : nil
+    let processedCount = replay?.processed ?? processed
+    let parameters = GenerateParameters(maxTokens: replay == nil ? 16 : 256, temperature: input.settings.temperature,
       topP: input.settings.topP, topK: input.settings.topK, minP: input.settings.minP,
       repetitionPenalty: nil, prefill: prefill, seed: 42)
     let session = try manager.makeSession(owner: owner,
       input: LMInput(tokens: MLXArray(input.prepared_token_ids.map(Int32.init))),
       promptTokenIDs: input.prepared_token_ids, prefill: prefill, allowSnapshot: allowSnapshot,
-      useActiveNative: true, outputTokens: 16, batchWidth: width, makeCache: { try model.newCache(parameters: parameters) })
+      useActiveNative: true, outputTokens: replay == nil ? 16 : 256, batchWidth: width,
+      makeCache: { try model.newCache(parameters: parameters) })
     try write(session.observation, label + "-lookup.json", evidence)
     guard session.cachedTokenCount == expectedCached else {
       throw BoomError.invalid("The declared source's actual manager selection changed.")
@@ -510,8 +615,8 @@ enum NeuralPrefixParitySmoke {
       processed <= delivered, width == 1 || processed < delivered else {
       throw BoomError.invalid("Invalid public teacher-forced ledger dimensions.")
     }
-    let ledgers = input.outputs.map { Array($0.token_ids.prefix(delivered)) }
-    guard ledgers.allSatisfy({ $0.count == delivered && $0.allSatisfy { !policy.controlTokenIDs.contains($0)
+    let ledgers = replay?.ledgers ?? input.outputs.map { Array($0.token_ids.prefix(delivered)) }
+    guard ledgers.allSatisfy({ (replay != nil || $0.count == delivered) && $0.allSatisfy { !policy.controlTokenIDs.contains($0)
         && $0 >= 0 && $0 < policy.vocabularySize } }) else {
       throw BoomError.invalid("Invalid public teacher-forced ledger bounds.")
     }
@@ -526,14 +631,17 @@ enum NeuralPrefixParitySmoke {
       eval(session.cache)
     }
     var processedMatrices: [[Int]] = []
-    for position in 0 ..< processed {
+    for position in 0 ..< processedCount {
       try flag.check(); try ModelResidency.check()
-      let column = ledgers.map { $0[position] }
+      let column = try replay?.column(at: position) ?? ledgers.map { $0[position] }
       if width == 1 { session.didSample?(MLXArray(Int32(column[0]))) }
       else {
         for row in 0 ..< width {
+          if let replay, position > replay.terminalIterations[row] { continue }
+          let stop = replay.flatMap { position == $0.terminalIterations[row] ? $0.stopTokenIDs[row] : nil }
           guard session.captureDecodeLane(row: row, width: width,
-            emittedTokenIDs: Array(ledgers[row].prefix(position + 1)), finished: false) else {
+            emittedTokenIDs: Array(ledgers[row].prefix(position + 1)), stopTokenID: stop,
+            finished: replay.map { position == $0.terminalIterations[row] } ?? false) else {
             throw BoomError.invalid("The actual manager refused a declared batch ledger boundary.")
           }
         }
@@ -560,7 +668,9 @@ enum NeuralPrefixParitySmoke {
     }
     if width > 1 {
       for row in 0 ..< width {
-        guard session.captureFinishedLane(row: row, width: width, emittedTokenIDs: ledgers[row]) else {
+        if let replay, replay.terminalIterations[row] < processedCount { continue }
+        guard session.captureFinishedLane(row: row, width: width, emittedTokenIDs: ledgers[row],
+          stopTokenID: replay?.stopTokenIDs[row]) else {
           throw BoomError.invalid("The actual manager refused the public finished-row checkpoint.")
         }
       }
@@ -568,16 +678,21 @@ enum NeuralPrefixParitySmoke {
     fence(); try flag.check(); try ModelResidency.check()
     await session.joinPendingSpill(cancelled: false)
     let published = manager.publish(session, completions: ledgers.indices.map {
-      PromptPrefixCache.Completion(row: $0, emittedTokenIDs: ledgers[$0])
+      PromptPrefixCache.Completion(row: $0, emittedTokenIDs: ledgers[$0],
+        stopTokenID: replay?.stopTokenIDs[$0])
     })
     try object(["method": "teacher_force_exact_public_receipt_ledger",
       "original_receipt_emitted_counts": input.outputs.map { $0.token_ids.count },
       "original_receipt_stop_reasons": input.outputs.map(\.stop_reason),
       "original_receipt_stop_token_ids": input.outputs.map { $0.stop_token_id.map { $0 as Any } ?? NSNull() },
       "declared_supplied_ledger_counts": ledgers.map(\.count),
-      "processed_decode_positions": processed, "processed_row_matrix": processedMatrices,
-      "unprocessed_supplied_ledger_suffixes": ledgers.map { Array($0.dropFirst(processed)) },
-      "inert_positions": [], "actual_native_offsets": session.cache.map { $0.offset },
+      "processed_decode_positions": processedCount, "processed_row_matrix": processedMatrices,
+      "unprocessed_supplied_ledger_suffixes": ledgers.map { Array($0.dropFirst(processedCount)) },
+      "complete_original_batch_timeline": replayCompleteBatch,
+      "recorded_terminal_sample_iterations": replay?.terminalIterations ?? [],
+      "inert_positions": replay.map { value in
+        (0..<value.processed).filter { position in value.terminalIterations.contains { $0 < position } }
+      } ?? [], "actual_native_offsets": session.cache.map { $0.offset },
       "actual_native_batch_dimensions": session.cache.flatMap { $0.state.map { $0.dim(0) } },
       "published": published, "retained_byte_bound": manager.retainedBytesUpperBound,
       "source_is_autonomous_generation": false], label + "-producer.json", evidence)
@@ -685,7 +800,21 @@ enum NeuralPrefixParitySmoke {
       processed: d.sharedProcessedDecodeTokens, delivered: d.sharedDeliveredLedgerTokens,
       captureAt: sharedCapture ? d.sourceNativeBoundary : nil,
       captureRow: request.schema == 2 && sharedCapture ? (d.sharedSourceRow ?? 0) : 0,
-      label: "shared-source", flag: flag, allowSnapshot: allowSnapshot, fence: fence, evidence: evidence)
+      label: "shared-source", flag: flag,
+      replayCompleteBatch: request.schema == 2 && d.kind == .writingLateDivergence,
+      allowSnapshot: allowSnapshot, fence: fence, evidence: evidence)
+    // These two actual requests replaced the hot batch owner before the
+    // original anchor queried historical rows. Omitting them changes a valid
+    // normal tie from the original disk row to the freshly published hot row.
+    for input in request.intervening {
+      guard let cached = input.expected_cached_tokens_at_snapshot else {
+        throw BoomError.invalid("An original intervening request lost its cache boundary.")
+      }
+      _ = try await produce(input, model: model, manager: manager, owner: owner,
+        prefill: prefill, policy: policy, expectedCached: cached, width: 1, processed: 16, delivered: 16,
+        captureAt: nil, label: input.name, flag: flag,
+        allowSnapshot: allowSnapshot, fence: fence, evidence: evidence)
+    }
     let anchor: Prepared?
     if let input = request.anchor {
       guard let cached = d.anchorCachedPrefix else { throw BoomError.invalid("Missing declared anchor admission.") }
