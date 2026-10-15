@@ -1035,7 +1035,9 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
       ["running": NSApp.isRunning, "active": NSApp.isActive, "hidden": NSApp.isHidden,
         "activation_policy": NSApp.activationPolicy().rawValue,
         "actual_key_window": NSApp.keyWindow === window, "window_is_key": window.isKeyWindow,
-        "window_visible": window.isVisible, "window_can_become_key": window.canBecomeKey]
+        "window_visible": window.isVisible, "window_can_become_key": window.canBecomeKey,
+        "frontmost_pid": NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1,
+        "frontmost_bundle": NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "none"]
     }
 
     // Real AppKit readiness, outside donation/timing and inside the existing
@@ -1068,7 +1070,10 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
           try await Task.sleep(for: timeout)
           throw BoomError.unavailable("Actual public App/key-window readiness exceeded its bounded allowance: \(timeout).")
         }
-        window.makeKeyAndOrderFront(nil); NSApp.activate()
+        // This explicitly requested foreground fixture uses the same activation
+        // request at startup and re-entry. It still requires observed readiness;
+        // a locked desktop cannot satisfy the key-window checks above.
+        window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
         try await group.next()
       }
       guard NSApp.isRunning, NSApp.isActive, NSApp.keyWindow === window, window.isKeyWindow else {
@@ -2271,6 +2276,7 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
         let png = bitmap.representation(using: .png, properties: [:]) else {
         throw BoomError.invalid("The fixed public attachment could not be prepared.")
       }
+      if normalMemory { recordGraphicsStage("clipboard-bitmap-prepared") }
       let chatVisible = model.state.showChat == true
       if model.selectedChat == nil { try model.newChat() }
       model.attachToCurrentChat([.bytes(name: "public-collapsed-verification.png", data: png)])
@@ -2364,9 +2370,12 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
       }
       do {
         markupVerificationStage = "visible-demand"
+        if normalMemory { recordGraphicsStage("before-markup-verification") }
         try await verifyVisibleDemandMarkup(original: original, bytes: bytes)
+        if normalMemory { recordGraphicsStage("after-markup-verification") }
         markupVerificationStage = "collapsed-media"
         try await verifyCollapsedMediaClipboard(original: original, bytes: bytes)
+        if normalMemory { recordGraphicsStage("after-media-verification") }
         try await requireDocumentInputSource(bytes, root: original)
         _ = try currentMixedView()
         markupVerificationStage = "complete"
@@ -2490,7 +2499,12 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
           "wants_layer": view.wantsLayer, "draws_subviews_into_layer": view.canDrawSubviewsIntoLayer,
           "layer": view.layer.map { String(describing: Unmanaged.passUnretained($0).toOpaque()) } ?? "none",
           "layer_class": view.layer.map { String(describing: type(of: $0)) } ?? "none",
-          "layer_has_superlayer": view.layer?.superlayer != nil] as [String: Any]
+          "layer_has_superlayer": view.layer?.superlayer != nil,
+          "layer_contents_format": view.layer?.contentsFormat.rawValue ?? "none",
+          "layer_draws_asynchronously": view.layer?.drawsAsynchronously ?? false,
+          "layer_sublayer_formats": view.layer?.sublayers?.map { $0.contentsFormat.rawValue } ?? [],
+          "layer_sublayer_classes": view.layer?.sublayers?.map { String(describing: type(of: $0)) } ?? [],
+          "layer_sublayer_async": view.layer?.sublayers?.map { $0.drawsAsynchronously } ?? []] as [String: Any]
       }
     }
 

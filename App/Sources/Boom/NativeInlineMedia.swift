@@ -149,6 +149,14 @@ struct InlineMediaSpan: Decodable, Sendable, Equatable {
 }
 
 @MainActor class NativeMediaTextView: NSTextView {
+  private var textDrawing: NativeTextDrawing?
+
+  override func makeBackingLayer() -> CALayer {
+    let backing = super.makeBackingLayer()
+    textDrawing = NativeTextDrawing(backing: backing)
+    return backing
+  }
+
   let inlineMedia = NativeInlineMedia()
   /// Optional component observers retain only monotonic timing. Ordinary views
   /// leave these nil; they neither change scheduling nor retain authored text.
