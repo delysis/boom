@@ -1332,6 +1332,59 @@ import XCTest
   }
 
 
+  func testCanceledNavigationStillJoiningDoesNotQueueActualSelectAllAndResidentTyping() async throws {
+    try await fixture(#function) { f in
+      let input = f.input!, source = f.session!, commands = f.commands!, view = f.view, window = f.window!
+      let original = try source.captureLogicalState(), manager = commands.manager
+      let context = try XCTUnwrap(view.inputContext)
+      let hold = try await f.route!.holdNext(.windowAfter)
+      let loading = try f.startNavigation(anchor: 48_000, caret: 50_000)
+      try await f.route!.awaitHeld(hold)
+      XCTAssertTrue(commands.isNavigating); XCTAssertEqual(source.activeNavigationOperationCount, 1)
+      // Actual selection ingress supersedes the earlier navigation before any
+      // later key is admitted. Its canceled real reply deliberately stays held.
+      view.setSelectedRange(NSRange(location: 8, length: 0))
+      XCTAssertFalse(commands.isNavigating); XCTAssertFalse(commands.hasPendingCommand)
+      XCTAssertEqual(source.activeNavigationOperationCount, 1)
+      XCTAssertEqual(commands.queuedRawKeyCount, 0); XCTAssertEqual(commands.queuedNativeContinuationCount, 0)
+      let full = PagedNativeNavigationSelection(utf16Offset: 0,
+        utf16Length: original.source.summary.utf16, focusAtEnd: true)
+      view.selectAll(nil) // genuine public/menu selector, through the owned document consumer
+      XCTAssertEqual(try input.currentDocumentSelection(), full)
+      XCTAssertFalse(commands.hasPendingCommand)
+      window.sendEvent(try f.key())
+      // No await or release: actual0/EOF replacement and native character
+      // interpretation finish while the canceled read still owns its slot.
+      XCTAssertEqual(source.generation, original.generation + 2)
+      XCTAssertEqual(source.logicalWindow.snapshot.summary.bytes, 1)
+      XCTAssertEqual(source.logicalWindow.snapshot.summary.utf16, 1)
+      XCTAssertEqual(view.string, "z")
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, 1)
+      XCTAssertEqual(commands.queuedRawKeyCount, 0); XCTAssertEqual(commands.retainedInputBytes, 0)
+      XCTAssertEqual(commands.retainedRefusedInputCount, 0); XCTAssertEqual(commands.unretainedRawKeyCount, 0)
+      XCTAssertEqual(source.activeNavigationOperationCount, 1)
+      XCTAssertFalse(commands.hasPendingCommand); XCTAssertTrue(commands.manager === manager)
+      XCTAssertTrue(f.view === view); XCTAssertTrue(view.inputContext === context)
+      XCTAssertTrue(window.firstResponder === view)
+      let edited = try source.captureLogicalState(), arena = source.arenaID
+      let joinedBeforeRelease = await f.route!.snapshot
+      XCTAssertEqual(joinedBeforeRelease.activeCalls, 1)
+      try await f.route!.release(hold); try await f.requireStale(loading)
+      XCTAssertEqual(source.activeNavigationOperationCount, 0)
+      XCTAssertEqual(source.generation, edited.generation); XCTAssertEqual(source.arenaID, arena)
+      XCTAssertTrue(try source.captureLogicalState().source.isSame(edited.source), "The canceled old projection never adopts over later native writing.")
+      try await f.assertSource("z")
+      XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+      try await commands.joinPendingCommand(); try await f.assertSource(f.originalText)
+      XCTAssertTrue(try source.captureLogicalState().source.isSame(original.source))
+      XCTAssertEqual(try input.currentDocumentSelection(), full)
+      XCTAssertTrue(NSApp.sendAction(NSSelectorFromString("redo:"), to: nil, from: nil))
+      try await commands.joinPendingCommand(); try await f.assertSource("z")
+      XCTAssertTrue(try source.captureLogicalState().source.isSame(edited.source))
+      XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure); XCTAssertNil(view.boundedStorage.mutationFailure)
+    }
+  }
+
   func testSameSelectionPreloadDoesNotEscrowContainedKeysPastTargetSizeAndStaleReadKeepsRealUndo() async throws {
     try await fixture(#function) { f in
       let source = f.session!, old = f.view, input = f.input!, commands = f.commands!

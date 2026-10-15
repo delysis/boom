@@ -1617,6 +1617,21 @@ import Foundation
 
   func requestDocumentCommand(_ selector: Selector, from view: PagedNativeTextView) throws {
     guard view === input.activeView else { return }
+    if selector == NSSelectorFromString("selectAll:"), phase == .idle,
+      navigationTask?.isCancelled == true, relatedReadObservation == nil, !isNavigating,
+      commandTask == nil, capturedEditTask == nil, capturedEditObservation == nil, capturedContext == nil,
+      queue.isEmpty, queuedDirections == 0, queuedRawKeyCount == 0, queuedContextCount == 0,
+      deliveringContext == nil, contextDeliveryFailure == nil, deferredContextBytes == 0, rawKeyBytes == 0,
+      !input.isAdopting, !input.session.isPinned, !input.needsContextSpliceObservation,
+      historyAtCommandClose == nil, !replayingRawKeys, !dispatchingRecenteredKey,
+      gatedManager.groupingLevel == 0, !gatedManager.isUndoing, !gatedManager.isRedoing {
+      // A superseded read still owns its real join, but no earlier intent
+      // precedes this immediate selection. Keep its canceled handle/slot;
+      // the actual source/SDK guards below grant only current Select All.
+      try requireLocalCommand()
+      try input.performQueuedDocumentCommand(selector)
+      return
+    }
     if shouldQueueSourceCommand {
       try enqueueSourceCommand(.documentCommand(selector), from: view, chargedBytes: 512)
       return

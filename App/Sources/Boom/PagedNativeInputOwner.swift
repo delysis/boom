@@ -577,8 +577,9 @@ private final class PagedNativeInputObservers {
     else { try documentCommand(selector, observed) }
   }
 
-  /// Only the existing command queue calls this after its original physical
-  /// lease/window check. Selection follows all earlier admitted input.
+  /// The actual command owner calls this after current source/client admission.
+  /// Selection follows earlier admitted input; a canceled empty read slot does
+  /// not precede an immediate Select All.
   func performQueuedDocumentCommand(_ selector: Selector) throws {
     guard let documentCommand else {
       throw BoomError.stale("The queued document command lost its actual presentation consumer.")
