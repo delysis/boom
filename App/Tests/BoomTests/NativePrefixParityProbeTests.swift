@@ -274,6 +274,95 @@ final class NativePrefixParityProbeTests: XCTestCase {
     XCTAssertThrowsError(try MLXNativeSmoke.validateParityArguments(wrongSeed))
   }
 
+  private func updateValueBoundary(_ caches: [any KVCache],
+    trace: NeuralPrefixParitySmoke.Layer0ValueBoundary, positions: Range<Int>) throws {
+    // An actual compact immutable projected operand, not a cache slice.
+    let values = take(tensor(positions, values: true),
+      MLXArray(Int32(0)..<Int32(positions.count)), axis: 2)
+    _ = caches[0].update(keys: tensor(positions), values: values)
+    eval(caches.flatMap { $0.innerState() })
+    try trace.completedNativeForward(caches, fence: {})
+  }
+
+  func testLayer0ValueBoundaryMatchesUncroppedWrappedAndOverfullNativeThenSurvivesLaterWrites() throws {
+    try Device.withDefaultDevice(.cpu) {
+      typealias Boundary = NeuralPrefixParitySmoke.Layer0ValueBoundary
+      let source = RotatingKVCache(maxSize: 512), sourceTrace = Boundary()
+      let sourceCalls = try sourceTrace.observing([source])
+      for start in stride(from: 0, to: 3584, by: 512) {
+        try updateValueBoundary(sourceCalls, trace: sourceTrace, positions: start..<(start + 512))
+      }
+      try updateValueBoundary(sourceCalls, trace: sourceTrace, positions: 3584..<4095)
+      for position in Boundary.target {
+        try updateValueBoundary(sourceCalls, trace: sourceTrace, positions: position..<(position + 1))
+      }
+      let sourceSnapshot = try NativePrefixParityProbe.captureNative([source], evaluatedPrefix: 4112, selectedRow: 0)
+      let capturedSource = try sourceTrace.freeze(at: sourceSnapshot, fence: {})
+      XCTAssertEqual(capturedSource.proof.originalRawSlots, Array(0..<17))
+      XCTAssertEqual(capturedSource.proof.inputs.count, 17)
+      XCTAssertEqual(capturedSource.proof.incomingVsOriginalRaw.bitwiseEqual, true)
+
+      let cold = RotatingKVCache(maxSize: 512), coldTrace = Boundary()
+      let coldCalls = try coldTrace.observing([cold])
+      for start in stride(from: 0, to: 4096, by: 512) {
+        try updateValueBoundary(coldCalls, trace: coldTrace, positions: start..<(start + 512))
+      }
+      try updateValueBoundary(coldCalls, trace: coldTrace, positions: 4096..<4128)
+      let coldSnapshot = try NativePrefixParityProbe.captureNative([cold], evaluatedPrefix: 4128, selectedRow: 0)
+      let capturedCold = try coldTrace.freeze(at: coldSnapshot, fence: {})
+      XCTAssertEqual(capturedCold.proof.originalRawSlots, Array(510..<527))
+      XCTAssertEqual(capturedCold.proof.inputs.count, 2)
+      XCTAssertEqual(capturedCold.proof.incomingVsOriginalRaw.bitwiseEqual, true)
+      for proof in [capturedSource.proof, capturedCold.proof] {
+        XCTAssertTrue(proof.inputs.allSatisfy { !$0.aliasesNativeAllocation && $0.incomingAllocationBytes > 0 })
+        XCTAssertLessThanOrEqual(proof.peakRetainedValueBackingByteUpperBound, Boundary.byteLimit)
+        XCTAssertGreaterThan(proof.frozenAllocationBytes, 0)
+      }
+      // Equality is a valid observation too: no diagnostic gate requires the
+      // two incoming histories to differ or guesses a kernel's numerical result.
+      XCTAssertEqual(try NativePrefixParityProbe.compareTensor(capturedSource.values, capturedCold.values).bitwiseEqual, true)
+      for position in 4112..<4624 { append(source, position..<(position + 1)) }
+      eval(source)
+      withExtendedLifetime((capturedSource, capturedCold)) {
+        XCTAssertEqual(capturedSource.values.asArray(Float.self), Boundary.target.map { -Float($0) - 1 })
+        XCTAssertEqual(capturedCold.values.asArray(Float.self), Boundary.target.map { -Float($0) - 1 })
+      }
+    }
+  }
+
+  func testLayer0ValueBoundaryRefusesMissingIncomingCoverageAndDifferentOriginalRawValues() throws {
+    try Device.withDefaultDevice(.cpu) {
+      typealias Boundary = NeuralPrefixParitySmoke.Layer0ValueBoundary
+      let incomplete = RotatingKVCache(maxSize: 512), incompleteTrace = Boundary()
+      let incompleteCalls = try incompleteTrace.observing([incomplete])
+      append(incomplete, 0..<4095)
+      for position in 4095..<4111 {
+        try updateValueBoundary(incompleteCalls, trace: incompleteTrace, positions: position..<(position + 1))
+      }
+      append(incomplete, 4111..<4112) // genuine native value, deliberately unobserved
+      let completeNative = try NativePrefixParityProbe.captureNative([incomplete], evaluatedPrefix: 4112, selectedRow: 0)
+      XCTAssertThrowsError(try incompleteTrace.freeze(at: completeNative, fence: {}),
+        "A complete native cache cannot invent the missing pre-update observation.")
+
+      let source = RotatingKVCache(maxSize: 512), trace = Boundary()
+      let calls = try trace.observing([source])
+      append(source, 0..<4095)
+      for position in Boundary.target {
+        try updateValueBoundary(calls, trace: trace, positions: position..<(position + 1))
+      }
+      let different = RotatingKVCache(maxSize: 512)
+      append(different, 0..<4095)
+      for position in Boundary.target {
+        _ = different.update(keys: tensor(position..<(position + 1)), values: tensor(position..<(position + 1)))
+      }
+      let wrongRaw = try NativePrefixParityProbe.captureNative([different], evaluatedPrefix: 4112, selectedRow: 0)
+      var proof: Boundary.Proof?
+      XCTAssertThrowsError(try trace.freeze(at: wrongRaw, fence: {}, record: { proof = $0 }))
+      XCTAssertEqual(try XCTUnwrap(proof).incomingVsOriginalRaw.bitwiseEqual, false,
+        "Exact metadata and shapes do not excuse different original native V bits.")
+    }
+  }
+
   // Supplied DTO admission only; these checks do not execute a model or qualify numerical parity.
   private func parityDeclaration(processed: Int = 8, delivered: Int = 9, row: Int = 2,
     stage: NeuralPrefixParitySmoke.SourceStage = .anchorPrefill) -> NeuralPrefixParitySmoke.Declaration {

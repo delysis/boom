@@ -109,6 +109,171 @@ enum NeuralPrefixParitySmoke {
     let stopTokenID: Int?
     let processedDecodeTokens: Int
   }
+  /// Explicit diagnostic only. The update tap does no evaluation or copying;
+  /// actual native completion precedes every backing pin and comparison.
+  final class Layer0ValueBoundary {
+    static let target = 4095..<4112
+    static let byteLimit = 16 << 20
+    struct Input: Codable, Sendable {
+      let actualInput: NativePrefixParityProbe.TokenRange
+      let observed: NativePrefixParityProbe.TokenRange
+      let incomingShape: [Int]
+      let incomingAllocationBytes: Int
+      let nativeAllocationBytes: Int
+      let aliasesNativeAllocation: Bool
+    }
+    struct Proof: Codable, Sendable {
+      let target: NativePrefixParityProbe.TokenRange
+      let inputs: [Input]
+      let originalNative: NativePrefixParityProbe.SourceLayer
+      let originalRawSlots: [Int]
+      let incomingVsOriginalRaw: NativePrefixParityProbe.TensorComparison
+      let peakRetainedValueBackingByteUpperBound: Int
+      let frozenAllocationBytes: Int
+    }
+    struct Frozen {
+      let values: MLXArray
+      let proof: Proof
+      fileprivate let pin: MLXReadyBuffer
+    }
+    struct Comparison: Codable, Sendable {
+      let source: Proof
+      let cold: Proof
+      let incomingSourceVsCold: NativePrefixParityProbe.TensorComparison
+      let method: String
+    }
+    private struct Pending {
+      let input: Range<Int>
+      let observed: Range<Int>
+      let values: MLXArray
+    }
+    private struct Piece {
+      let input: Input
+      let values: MLXArray
+      let pin: MLXReadyBuffer
+    }
+    private var pending: Pending?
+    private var pieces: [Piece] = []
+    private var failure: Error?
+    private var next = Layer0ValueBoundary.target.lowerBound
+    private var retainedBytes = 0
+    private var finished = false
+
+    func observing(_ caches: [any KVCache]) throws -> [any KVCache] {
+      guard let first = caches.first else { throw BoomError.invalid("No layer0 cache for the V boundary diagnostic.") }
+      let observed = PrefixKVCache(layer: 0, base: first) { [weak self] _, offset, _, values in
+        self?.willUpdate(offset: offset, values: values)
+      }
+      var result = caches; result[0] = observed; return result
+    }
+    private func willUpdate(offset: Int, values: MLXArray) {
+      guard !finished, failure == nil else { return }
+      guard offset >= 0, values.ndim == 4, values.dim(0) == 1, values.dim(2) > 0 else {
+        failure = BoomError.invalid("Invalid layer0 incoming V extent."); return
+      }
+      let (end, overflow) = offset.addingReportingOverflow(values.dim(2))
+      guard !overflow else { failure = BoomError.invalid("Incoming V extent overflow."); return }
+      let lower = max(offset, Self.target.lowerBound), upper = min(end, Self.target.upperBound)
+      guard lower < upper else { return }
+      guard pending == nil, pieces.count < Self.target.count, lower == next,
+        values.dim(2) <= 512, values.nbytes > 0, values.nbytes <= Self.byteLimit,
+        [.float16, .bfloat16, .float32].contains(values.dtype) else {
+        failure = BoomError.invalid("Layer0 V boundary is noncontiguous or exceeds its diagnostic bound."); return
+      }
+      // Freeze the incoming projected descriptor, never an original cache view.
+      // Its full physical allocation is charged after actual native completion.
+      pending = Pending(input: offset..<end, observed: lower..<upper, values: values[.ellipsis])
+    }
+    func completedNativeForward(_ caches: [any KVCache], fence: () -> Void) throws {
+      guard pending != nil || failure != nil else { return }
+      eval(caches.flatMap { $0.innerState() }); fence()
+      if let failure { throw failure }
+      guard let pending else { return }
+      // A retained lazy view is not a completion or allocation-size witness.
+      // This deliberate evaluation happens only AFTER the native update joined.
+      eval(pending.values); fence()
+      let remaining = Self.byteLimit - retainedBytes
+      guard let pin = pending.values.readyBuffer(admitting: { bytes in
+        guard bytes > 0, bytes <= remaining else { return nil }; return {}
+      }), let native = PrefixKVStorage.unwrap(caches[0]).innerState().last,
+        let nativePin = native.readyBuffer(), nativePin.allocationBytes <= Self.byteLimit else {
+        throw BoomError.invalid("Completed layer0 V backing is unavailable or exceeds its exact physical bound.")
+      }
+      let aliases = pin.withUnsafeBytes { incoming in
+        nativePin.withUnsafeBytes { actual in incoming.baseAddress == actual.baseAddress }
+      }
+      guard !aliases else {
+        throw BoomError.invalid("Incoming V aliases native storage; an independent pre-update witness is unavailable.")
+      }
+      let relative = (pending.observed.lowerBound - pending.input.lowerBound)..<(pending.observed.upperBound - pending.input.lowerBound)
+      pieces.append(Piece(input: Input(actualInput: .init(pending.input), observed: .init(pending.observed),
+        incomingShape: pending.values.shape, incomingAllocationBytes: pin.allocationBytes,
+        nativeAllocationBytes: nativePin.allocationBytes, aliasesNativeAllocation: aliases),
+        values: pending.values[0..., 0..., relative, 0...], pin: pin))
+      retainedBytes += pin.allocationBytes
+      next = pending.observed.upperBound; self.pending = nil
+    }
+    func freeze(at snapshot: NativePrefixParityProbe.Snapshot, fence: () -> Void,
+      record: (Proof) throws -> Void = { _ in }) throws -> Frozen {
+      let heldPins = pieces.map(\.pin)
+      defer { withExtendedLifetime(heldPins) {} }
+      guard !finished, failure == nil, pending == nil, next == Self.target.upperBound,
+        !pieces.isEmpty, snapshot.selectedRow == 0, let layer = snapshot.layers.first,
+        layer.source.layer == 0, layer.source.sourceBatchWidth == 1,
+        layer.source.offset >= Self.target.upperBound, layer.values.dim(0) == 1,
+        case .rotating(let ring) = layer.kind else {
+        throw BoomError.invalid("The completed layer0 V boundary or original native coverage is unavailable.")
+      }
+      let capacity = layer.values.dim(2), held = ring.wrapped ? capacity : ring.index
+      let keep = min(ring.keep, held), tailCount = held - keep
+      let tailStart = ring.offset - tailCount
+      guard ring.offset == layer.source.offset, held > 0, held <= capacity,
+        ring.index <= capacity, tailStart >= keep else {
+        throw BoomError.invalid("Original native V metadata does not describe its raw backing.")
+      }
+      var slots: [Int] = []
+      for absolute in Self.target {
+        guard layer.source.presentRanges.contains(where: { $0.start <= absolute && absolute < $0.end }) else {
+          throw BoomError.invalid("Original native V has no authenticated requested absolute position.")
+        }
+        let slot: Int
+        if absolute < keep { slot = absolute }
+        else {
+          guard absolute >= tailStart, absolute < ring.offset, tailCount > 0 else {
+            throw BoomError.invalid("The original raw V tail does not cover the requested position.")
+          }
+          let relative = absolute - tailStart
+          if ring.wrapped {
+            let start = ring.index == capacity ? keep : ring.index
+            guard start >= keep, capacity > keep else { throw BoomError.invalid("Invalid wrapped V origin.") }
+            slot = keep + (start - keep + relative) % (capacity - keep)
+          } else { slot = keep + relative }
+        }
+        guard (0..<held).contains(slot) else { throw BoomError.invalid("Original raw V slot exceeds live backing.") }
+        slots.append(slot)
+      }
+      // Direct original raw slots: no oracle(), crop(), chronology helper or hydration.
+      let incoming = concatenated(pieces.map(\.values), axis: 2)
+      let original = concatenated(slots.map { layer.values[0..., 0..., $0..<($0 + 1), 0...] }, axis: 2)
+      eval(incoming, original); fence()
+      let remaining = Self.byteLimit - retainedBytes
+      guard let pin = incoming.readyBuffer(admitting: { bytes in
+        guard bytes > 0, bytes <= remaining else { return nil }; return {}
+      }) else { throw BoomError.invalid("The frozen V diagnostic exceeds its physical backing bound.") }
+      let comparison = try NativePrefixParityProbe.compareTensor(incoming, original)
+      let proof = Proof(target: .init(Self.target), inputs: pieces.map(\.input), originalNative: layer.source,
+        originalRawSlots: slots, incomingVsOriginalRaw: comparison,
+        peakRetainedValueBackingByteUpperBound: retainedBytes + pin.allocationBytes,
+        frozenAllocationBytes: pin.allocationBytes)
+      try record(proof)
+      guard comparison.bitwiseEqual == true else {
+        throw BoomError.invalid("Incoming layer0 V does not equal its own original uncropped native values.")
+      }
+      finished = true; pieces.removeAll(); retainedBytes = 0
+      return Frozen(values: incoming, proof: proof, pin: pin)
+    }
+  }
+
   struct PairSummary: Codable, Sendable {
     let name: String
     let initialState: NativePrefixParityProbe.StateComparison
@@ -132,6 +297,7 @@ enum NeuralPrefixParitySmoke {
     let naturalFullQueryColdSamples: Samples
     let fullQueryColdPromptHistory: [NativePrefixParityProbe.TokenRange]
     let releaseQualified: Bool
+    var preCacheLayer0Values: Layer0ValueBoundary.Comparison? = nil
     var sameHistoryRestorationExact: Bool {
       restoration.initialState.allKVBitsEqual && restoration.initialState.allMasksEqual
         && restoration.allLogitBitsEqual && restoration.allSamplesEqual
@@ -530,24 +696,30 @@ enum NeuralPrefixParitySmoke {
     let logits: MLXArray
     let snapshot: NativePrefixParityProbe.Snapshot?
     let ranges: [NativePrefixParityProbe.TokenRange]
+    var valueBoundary: Layer0ValueBoundary.Frozen? = nil
   }
 
   // Mirrors pinned Gemma text-only prepare, in this explicit diagnostic only.
   // Capture may occur before a later prefill chunk, not only at its final extent.
   private static func prepare(model: any LanguageModel, session: PromptPrefixCache.Session,
-    captureAt: Int?, label: String, flag: CancellationFlag, evidence: URL) async throws -> Prepared {
+    captureAt: Int?, label: String, flag: CancellationFlag, evidence: URL,
+    forwardCache: [any KVCache]? = nil, valueBoundary: Layer0ValueBoundary? = nil,
+    fence: () -> Void = {}) async throws -> Prepared {
+    let executionCache = forwardCache ?? session.cache
     let ids = session.input.text.tokens.asArray(Int.self)
     let y = MLXArray(ids.map(Int32.init)).expandedDimensions(axis: 0)
+    var frozenValues: Layer0ValueBoundary.Frozen?
     var snapshot: NativePrefixParityProbe.Snapshot?, ranges: [NativePrefixParityProbe.TokenRange] = []
     var partition = session.prefill; partition.progress = nil
     var chunks: [Range<Int>] = []
     let done = try partition.forEachChunk(total: ids.count) { chunks.append($0) }
     for range in chunks {
       try flag.check(); try ModelResidency.check()
-      let result = model(LMInput.Text(tokens: y[0..., range]), cache: session.cache, state: nil)
+      let result = model(LMInput.Text(tokens: y[0..., range]), cache: executionCache, state: nil)
       guard result.state == nil else { throw BoomError.invalid("Unsupported public model state.") }
       asyncEval([result.logits] + session.cache.flatMap { $0.innerState() })
       eval(result.logits); session.markCacheSubmitted()
+      try valueBoundary?.completedNativeForward(executionCache, fence: fence)
       session.prefill.progress?(range.upperBound, ids.count)
       session.observeReadySpill(); await session.joinPendingSpill(cancelled: false)
       let absolute = session.cachedTokenCount + range.upperBound
@@ -557,13 +729,15 @@ enum NeuralPrefixParitySmoke {
         let captured = try NativePrefixParityProbe.captureNative(nativeBases(session.cache),
           evaluatedPrefix: absolute, selectedRow: 0)
         snapshot = captured
+        frozenValues = try valueBoundary?.freeze(at: captured, fence: fence,
+          record: { try write($0, label + "-incoming-v-boundary.json", evidence) })
         try write(captured.source, label + "-native-source.json", evidence)
       }
       try write(ranges, label + "-prefill-ranges.json", evidence)
     }
     if done > 0 { eval(session.cache) }
     try flag.check(); try ModelResidency.check()
-    let final = model(LMInput.Text(tokens: y[0..., done...]), cache: session.cache, state: nil)
+    let final = model(LMInput.Text(tokens: y[0..., done...]), cache: executionCache, state: nil)
     guard final.state == nil, final.logits.ndim == 3, final.logits.dim(0) == 1 else {
       throw BoomError.invalid("Unsupported final public model output.")
     }
@@ -571,20 +745,21 @@ enum NeuralPrefixParitySmoke {
     session.prefill.progress?(ids.count, ids.count)
     asyncEval([final.logits] + session.cache.flatMap { $0.innerState() })
     eval(final.logits); session.markCacheSubmitted()
+    try valueBoundary?.completedNativeForward(executionCache, fence: fence)
     session.observeReadySpill(); await session.joinPendingSpill(cancelled: false)
     try flag.check(); try ModelResidency.check()
     try write(ranges, label + "-prefill-ranges.json", evidence)
     if captureAt != nil, snapshot == nil {
       throw BoomError.invalid("The declared native boundary was not part of the actual source partitions.")
     }
-    return Prepared(session: session, logits: final.logits[0..., -1, 0...], snapshot: snapshot, ranges: ranges)
+    return Prepared(session: session, logits: final.logits[0..., -1, 0...], snapshot: snapshot, ranges: ranges, valueBoundary: frozenValues)
   }
 
   private static func produce(_ input: CapturedInput, model: any LanguageModel,
     manager: PromptPrefixCache, owner: PromptCacheOwner, prefill: PrefillParameters,
     policy: ModelGenerationPolicy, expectedCached: Int, width: Int, processed: Int, delivered: Int,
     captureAt: Int?, captureRow: Int = 0, expectedSourceRow: Int? = nil, label: String, flag: CancellationFlag,
-    replayCompleteBatch: Bool = false,
+    replayCompleteBatch: Bool = false, valueBoundary: Layer0ValueBoundary? = nil,
     allowSnapshot: @escaping @Sendable (UInt64) -> Bool, fence: () -> Void, evidence: URL) async throws -> Prepared {
     let replay = replayCompleteBatch ? try receiptBatchReplay(input) : nil
     let processedCount = replay?.processed ?? processed
@@ -606,10 +781,12 @@ enum NeuralPrefixParitySmoke {
         throw BoomError.invalid("The actual manager selected a different original batch row.")
       }
     }
+    let executionCache = try valueBoundary?.observing(session.cache) ?? session.cache
     let decodeCapture = captureAt.map { $0 > input.prepared_token_ids.count } == true
     let prepared = try await prepare(model: model, session: session,
-      captureAt: decodeCapture ? nil : captureAt, label: label, flag: flag, evidence: evidence)
-    var snapshot = prepared.snapshot
+      captureAt: decodeCapture ? nil : captureAt, label: label, flag: flag, evidence: evidence,
+      forwardCache: executionCache, valueBoundary: valueBoundary, fence: fence)
+    var snapshot = prepared.snapshot, frozenValues = prepared.valueBoundary
     guard (1...3).contains(width), (0...255).contains(processed), (1...256).contains(delivered),
       (0..<width).contains(captureRow), input.outputs.count == width,
       processed <= delivered, width == 1 || processed < delivered else {
@@ -647,10 +824,11 @@ enum NeuralPrefixParitySmoke {
         }
       }
       let output = model(LMInput.Text(tokens: MLXArray(column.map(Int32.init)).reshaped([width, 1])),
-        cache: session.cache, state: nil)
+        cache: executionCache, state: nil)
       guard output.state == nil else { throw BoomError.invalid("Unexpected teacher-forced model state.") }
       asyncEval([output.logits] + session.cache.flatMap { $0.innerState() })
       eval(output.logits); session.markCacheSubmitted()
+      try valueBoundary?.completedNativeForward(executionCache, fence: fence)
       session.observeReadySpill(); await session.joinPendingSpill(cancelled: false)
       processedMatrices.append(column)
       let absolute = input.prepared_token_ids.count + position + 1
@@ -660,6 +838,8 @@ enum NeuralPrefixParitySmoke {
         let captured = try NativePrefixParityProbe.captureNative(nativeBases(session.cache),
           evaluatedPrefix: absolute, selectedRow: captureRow)
         snapshot = captured
+        frozenValues = try valueBoundary?.freeze(at: captured, fence: fence,
+          record: { try write($0, label + "-incoming-v-boundary.json", evidence) })
         try write(captured.source, label + "-native-source.json", evidence)
       }
     }
@@ -698,7 +878,7 @@ enum NeuralPrefixParitySmoke {
       "source_is_autonomous_generation": false], label + "-producer.json", evidence)
     try write(manager.retainedSnapshotObservations, label + "-manager-snapshots.json", evidence)
     guard published else { throw BoomError.invalid("The bounded normal manager did not retain the declared source.") }
-    return Prepared(session: session, logits: prepared.logits, snapshot: snapshot, ranges: prepared.ranges)
+    return Prepared(session: session, logits: prepared.logits, snapshot: snapshot, ranges: prepared.ranges, valueBoundary: frozenValues)
   }
 
   private static func naturalSamples(model: any LanguageModel, cache: [any KVCache], logits initial: MLXArray,
@@ -795,6 +975,8 @@ enum NeuralPrefixParitySmoke {
     let owner = PromptCacheOwner(namespace: d.namespace, entity: d.namespace,
       route: d.kind == .consultationInterior ? .consultation : .writing)
     let sharedCapture = request.schema == 1 ? d.kind == .consultationInterior : d.sourceStage == .sharedDecode
+    let inspectValues = request.schema == 2 && d.kind == .consultationInterior
+    let sourceValues = inspectValues ? Layer0ValueBoundary() : nil
     let shared = try await produce(request.shared, model: model, manager: manager, owner: owner,
       prefill: prefill, policy: policy, expectedCached: 0, width: d.sharedWidth,
       processed: d.sharedProcessedDecodeTokens, delivered: d.sharedDeliveredLedgerTokens,
@@ -802,6 +984,7 @@ enum NeuralPrefixParitySmoke {
       captureRow: request.schema == 2 && sharedCapture ? (d.sharedSourceRow ?? 0) : 0,
       label: "shared-source", flag: flag,
       replayCompleteBatch: request.schema == 2 && d.kind == .writingLateDivergence,
+      valueBoundary: sourceValues,
       allowSnapshot: allowSnapshot, fence: fence, evidence: evidence)
     // These two actual requests replaced the hot batch owner before the
     // original anchor queried historical rows. Omitting them changes a valid
@@ -838,8 +1021,11 @@ enum NeuralPrefixParitySmoke {
       input: LMInput(tokens: MLXArray(request.query.prepared_token_ids.map(Int32.init))),
       promptTokenIDs: request.query.prepared_token_ids, prefill: prefill,
       makeCache: { try model.newCache(parameters: parameters) })
+    let coldValues = inspectValues ? Layer0ValueBoundary() : nil
+    let coldForwardCache = try coldValues?.observing(cold.cache) ?? cold.cache
     let coldPrepared = try await prepare(model: model, session: cold, captureAt: d.coldNativeBoundary,
-      label: "natural-full-query-cold", flag: flag, evidence: evidence)
+      label: "natural-full-query-cold", flag: flag, evidence: evidence,
+      forwardCache: coldForwardCache, valueBoundary: coldValues, fence: fence)
     guard let coldSnapshot = coldPrepared.snapshot else { throw BoomError.invalid("Full-query cold native boundary was not captured.") }
     let coldSamples = try naturalSamples(model: model, cache: cold.cache, logits: coldPrepared.logits,
       settings: request.query.settings, policy: policy, flag: flag)
@@ -910,11 +1096,22 @@ enum NeuralPrefixParitySmoke {
       query: request.query.prepared_token_ids, prefix: d.cachedPrefix, partitions: ranges, windows: windows,
       settings: request.query.settings, policy: policy, flag: flag, evidence: evidence)
     fence(); try flag.check(); try ModelResidency.check()
-    let result = CaseSummary(name: request.name, modelIdentity: request.query.model,
+    var result = CaseSummary(name: request.name, modelIdentity: request.query.model,
       sourceBoundary: d.sourceNativeBoundary, coldBoundary: d.coldNativeBoundary,
       prefix: d.cachedPrefix, actualWarmObservation: warm.observation,
       restoration: a, coldVsRetained: b, naturalFullQueryColdSamples: coldSamples,
       fullQueryColdPromptHistory: coldPrepared.ranges, releaseQualified: false)
+    if inspectValues {
+      guard let source = shared.valueBoundary, let cold = coldPrepared.valueBoundary else {
+        throw BoomError.invalid("The completed pre-cache layer0 V boundary was not observed.")
+      }
+      result.preCacheLayer0Values = Layer0ValueBoundary.Comparison(source: source.proof, cold: cold.proof,
+        incomingSourceVsCold: try withExtendedLifetime((source.pin, cold.pin)) {
+          try NativePrefixParityProbe.compareTensor(source.values, cold.values)
+        },
+        method: "incoming_layer0_V4095..<4112_after_native_completion; exact_own_uncropped_raw_slots; cross_history_observation_only_no_kernel_attribution")
+      try write(result.preCacheLayer0Values, "pre-cache-layer0-values.json", evidence)
+    }
     try write(result, "case-result.json", evidence)
     try object(["status": "execution_complete", "source_bound": true,
       "same_history_restoration_exact": result.sameHistoryRestorationExact,
