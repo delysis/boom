@@ -151,6 +151,7 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
     private let plan: DeveloperStackDiagnostics.PublicEditorPlan
     private let root: URL
     private let temporaryRoot: URL
+    private let providedTemporaryPath: String?
     private var workspace: WorkspaceModel?
     private var host: NSHostingView<WorkspaceView>?
     private var window: NSWindow?
@@ -211,8 +212,11 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
         guard let path = ProcessInfo.processInfo.environment["TMPDIR"], !path.isEmpty, path.hasPrefix("/") else {
           throw BoomError.invalid("Normal public fixture requires its actual absolute caller TMPDIR.")
         }
-        temporaryRoot = URL(fileURLWithPath: path, isDirectory: true)
+        let supplied = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+        providedTemporaryPath = supplied.path
+        temporaryRoot = supplied.resolvingSymlinksInPath().standardizedFileURL
       } else {
+        providedTemporaryPath = nil
         temporaryRoot = recipe.deletingLastPathComponent().appendingPathComponent("public-editor-tmp", isDirectory: true)
       }
       // Atomic fresh-directory admission; no reuse or cleanup of an existing path.
@@ -229,8 +233,16 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
     }
 
     private func prepareOrdinary() async throws {
-      guard ProcessInfo.processInfo.environment["TMPDIR"] == temporaryRoot.path,
-        temporaryRoot.resolvingSymlinksInPath() == temporaryRoot else {
+      let suppliedPath = ProcessInfo.processInfo.environment["TMPDIR"]
+      let pathMatches: Bool
+      if normalMemory, let suppliedPath, let providedTemporaryPath {
+        let supplied = URL(fileURLWithPath: suppliedPath, isDirectory: true).standardizedFileURL
+        pathMatches = supplied.path == providedTemporaryPath
+          && supplied.resolvingSymlinksInPath().standardizedFileURL == temporaryRoot
+      } else {
+        pathMatches = suppliedPath == temporaryRoot.path && temporaryRoot.resolvingSymlinksInPath() == temporaryRoot
+      }
+      guard pathMatches else {
         throw BoomError.invalid("Public ordinary fixture requires its exact owner-provided physical TMPDIR.")
       }
       var temporary = stat()
@@ -2206,9 +2218,9 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
       shutdownJoined = true
     }
 
-    /// Ordinary recipes admit32files,16directories/depth6 and their fixed
-    /// byte ceilings, including
-    /// the owner's public TMPDIR. Never inspect a directory during typing.
+    /// Ordinary recipe files are capped at32 entries,16 directories/depth6,
+    /// and the fixed byte ceiling. Caller-owned TMPDIR admission is separate;
+    /// never inspect that shared directory during typing.
     private func diskExtent(reservingReceipt: Bool, forBackupPreparation: Bool = false,
       reservingWorkspaceCopies: Int = 0, reservingDirectories: Int = 0,
       copyingBackupSnapshot: Bool = false) throws -> UInt64 {
@@ -2220,7 +2232,9 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
         !copyingBackupSnapshot || (forBackupPreparation && reservingWorkspaceCopies == 1 && reservingDirectories == 2) else {
         throw BoomError.invalid("Backup preparation reservation differs from its fixed phase.")
       }
-      var pending: [(URL, Int)] = [(root, 0), (temporaryRoot, 0)]
+      // Normal-memory TMPDIR is caller-owned shared infrastructure. Validate
+      // it at admission, but never inventory its unrelated contents here.
+      var pending: [(URL, Int)] = normalMemory ? [(root, 0)] : [(root, 0), (temporaryRoot, 0)]
       var files = 0, directories = 0, bytes: UInt64 = 0
       var workspaceFiles = 0, workspaceDirectories = 0, workspaceBytes: UInt64 = 0
       // Restore copies the captured snapshot, not the workspace that kept

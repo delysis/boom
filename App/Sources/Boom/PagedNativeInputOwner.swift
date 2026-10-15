@@ -67,6 +67,14 @@ extension PagedNativeSelectionObservation {
       && range == other.range && affinity == other.affinity
       && inputLease.hasSameSourceAndKeyboard(as: other.inputLease)
   }
+
+  // Recovery may follow a selection round trip. The old epoch cannot match,
+  // but the original source, generation, range and keyboard still can.
+  func hasSameLogicalSelectionAndKeyboard(as other: Self) -> Bool {
+    identity == other.identity && generation == other.generation
+      && range == other.range && affinity == other.affinity
+      && inputLease.hasSameSourceAndKeyboard(as: other.inputLease)
+  }
 }
 
 struct PagedNativeReplayInputTransition {
@@ -351,7 +359,13 @@ private final class PagedNativeInputObservers {
     activeView?.completionClient = client
     activeView?.owner = model
     activeView?.setMedia(model: model)
-    activeView?.didRejectInput = { _ in PerformanceTrace.event("Editor.ManagedAdmission") }
+    activeView?.didRejectInput = { [weak self] error in
+      guard let self else { PerformanceTrace.event("Editor.ManagedAdmission"); return }
+      guard let commands = self.commandOwner, !commands.hasPendingCommand else {
+        PerformanceTrace.event("Editor.ManagedAdmission"); return
+      }
+      commands.reportNativeInputRefusal(error)
+    }
   }
 
   /// Read only the explicitly owned selection. Session's native-coordinate

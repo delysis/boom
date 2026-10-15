@@ -43,13 +43,10 @@ fn media_from_parser_cancelled<'a, F: BrokenLinkCallback<'a>>(
     let mut offsets = None;
     let mut result = Vec::new();
     let mut parser = parser.into_offset_iter();
-    loop {
-        let Some((event, range)) = parser
-            .next_with_check(cancelled)
-            .map_err(|_| Error("Paged Markdown projection was cancelled.".into()))?
-        else {
-            break;
-        };
+    while let Some((event, range)) = parser
+        .next_with_check(cancelled)
+        .map_err(|_| Error("Paged Markdown projection was cancelled.".into()))?
+    {
         let Event::Start(
             Tag::Link {
                 dest_url,
@@ -148,13 +145,10 @@ fn spans_from_parser_cancelled<'a, F: BrokenLinkCallback<'a>>(
         }
     };
     let mut parser = parser.into_offset_iter();
-    loop {
-        let Some((event, range)) = parser
-            .next_with_check(cancelled)
-            .map_err(|_| Error("Paged Markdown projection was cancelled.".into()))?
-        else {
-            break;
-        };
+    while let Some((event, range)) = parser
+        .next_with_check(cancelled)
+        .map_err(|_| Error("Paged Markdown projection was cancelled.".into()))?
+    {
         let source = &text[range.clone()];
         match event {
             Event::Start(tag) => {

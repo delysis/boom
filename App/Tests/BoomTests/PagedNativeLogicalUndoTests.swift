@@ -627,7 +627,7 @@ private actor LogicalUndoDelivery: PagedNativeLogicalSessionStorage {
     }
   }
 
-  func testSelectionSupersedesColdUndoRetainsOriginalKeysAndLaterNativeTypingStaysLive() async throws {
+  func testSelectionSupersedesColdUndoRetainsAcceptedKeysUntilOriginalReceiverReturns() async throws {
     try await run { f in
       try f.input!.setDocumentSelection(PagedNativeNavigationSelection(utf16Offset: 1, utf16Length: 0))
       f.view.insertText("X", replacementRange: f.view.selectedRange())
@@ -641,6 +641,7 @@ private actor LogicalUndoDelivery: PagedNativeLogicalSessionStorage {
         throw BoomError.unavailable("The original cold Undo did not join its actual file read.")
       }
       let originalGeneration = session.generation
+      let originalSelection = try input.currentDocumentSelection()
       let event = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero,
         modifierFlags: [], timestamp: 0, windowNumber: f.window.windowNumber,
         context: nil, characters: "z", charactersIgnoringModifiers: "z", isARepeat: false, keyCode: 6))
@@ -648,14 +649,17 @@ private actor LogicalUndoDelivery: PagedNativeLogicalSessionStorage {
       XCTAssertEqual(commands.queuedRawKeyCount, 1); XCTAssertEqual(session.generation, originalGeneration)
       try input.setDocumentSelection(PagedNativeNavigationSelection(utf16Offset: 0, utf16Length: 0))
       commands.inputSelectionDidChange() // same confirmed ingress; redundant call is inert
-      XCTAssertFalse(commands.hasPendingCommand)
-      XCTAssertEqual(commands.queuedRawKeyCount, 0)
-      XCTAssertEqual(commands.retainedRefusedInputCount, 2) // exact Undo request + original key
-      XCTAssertNotNil(commands.refusedInputFailure)
+      XCTAssertTrue(commands.hasPendingCommand)
+      XCTAssertEqual(commands.queuedRawKeyCount, 1)
+      XCTAssertEqual(commands.retainedRefusedInputCount, 0)
+      XCTAssertNotNil(commands.acceptedInputFailure)
       XCTAssertLessThanOrEqual(commands.retainedInputBytes, PagedNativeUndoOwner.maximumRawKeyBytes)
-      f.view.insertText("Y", replacementRange: f.view.selectedRange())
-      XCTAssertEqual(session.generation, originalGeneration + 1); XCTAssertEqual(f.view.string, "YaXbc")
-      XCTAssertNil(input.firstRefusal); XCTAssertNil(commands.firstFailure)
+      let later = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero,
+        modifierFlags: [], timestamp: 0, windowNumber: f.window.windowNumber,
+        context: nil, characters: "Y", charactersIgnoringModifiers: "Y", isARepeat: false, keyCode: 16))
+      f.view.keyDown(with: later)
+      XCTAssertEqual(session.generation, originalGeneration)
+      XCTAssertEqual(f.view.string, "aXbc", "Later input cannot overtake an accepted key after its receiver changes.")
       await route.release()
       do { try await commands.joinPendingCommand(); XCTFail("Superseded cold read must report its original refusal once.") }
       catch {
@@ -663,18 +667,21 @@ private actor LogicalUndoDelivery: PagedNativeLogicalSessionStorage {
         else if case BoomError.stale = error { }
         else { throw error }
       }
-      XCTAssertEqual(f.view.string, "YaXbc"); XCTAssertFalse(f.view.string.contains("z"))
-      f.view.insertText("Q", replacementRange: f.view.selectedRange())
-      XCTAssertEqual(f.view.string, "YQaXbc")
+      try input.setDocumentSelection(originalSelection)
+      commands.inputSelectionDidChange()
+      try await commands.joinPendingCommand()
+      XCTAssertEqual(f.view.string, "aXzbc", "The original key replays once at its original selection after recovery.")
+      XCTAssertEqual(commands.queuedRawKeyCount, 0)
+      XCTAssertNil(commands.acceptedInputFailure)
       XCTAssertNil(commands.firstFailure); XCTAssertNil(input.firstRefusal)
       XCTAssertNil(f.view.boundedStorage.mutationFailure)
-      XCTAssertEqual(commands.retainedRefusedInputCount, 2)
+      XCTAssertEqual(commands.retainedRefusedInputCount, 0)
       let actualReads = await route.readReturns
       XCTAssertEqual(actualReads, 1)
     }
   }
 
-  func testFullDiagnosticCustodyDoesNotSwallowUnretainedKeyOrBlockResidentUndoWhileReadJoins() async throws {
+  func testFullInputCustodyRefusesNewKeyWithoutReorderingAcceptedPrefix() async throws {
     try await run { f in
       try f.input!.setDocumentSelection(PagedNativeNavigationSelection(utf16Offset: 1, utf16Length: 0))
       f.view.insertText("X", replacementRange: f.view.selectedRange())
@@ -699,36 +706,22 @@ private actor LogicalUndoDelivery: PagedNativeLogicalSessionStorage {
         if commands.unretainedRawKeyCount > 0 { break }
       }
       XCTAssertEqual(commands.unretainedRawKeyCount, 1)
-      XCTAssertEqual(session.generation, before + 1) // the unretained event went to actual native input once
-      XCTAssertEqual(f.view.string, "aXzbc")
-      XCTAssertEqual(commands.queuedRawKeyCount, 0)
-      XCTAssertGreaterThan(commands.retainedRefusedInputCount, 500)
-      XCTAssertLessThanOrEqual(commands.retainedRefusedInputCount, PagedNativeUndoOwner.maximumQueuedEntries)
+      XCTAssertEqual(session.generation, before)
+      XCTAssertEqual(f.view.string, "aXbc", "The unretained newcomer is refused; the accepted prefix remains pending.")
+      XCTAssertEqual(commands.queuedRawKeyCount, PagedNativeUndoOwner.maximumRawKeyBytes / 514)
+      XCTAssertTrue(commands.hasPendingCommand)
+      XCTAssertEqual(commands.retainedRefusedInputCount, 0)
       XCTAssertLessThanOrEqual(commands.retainedInputBytes, PagedNativeUndoOwner.maximumRawKeyBytes)
       XCTAssertNil(commands.firstFailure); XCTAssertNil(input.firstRefusal)
-      // The canceled read has deliberately not been released or joined yet.
-      // Resident Undo still enters and finishes its genuine SDK action now.
+      // New commands cannot overtake the accepted history/key prefix.
       XCTAssertTrue(NSApplication.shared.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
-      XCTAssertEqual(session.generation, before + 2); XCTAssertEqual(f.view.string, "aXbc")
-      XCTAssertNil(commands.firstFailure)
-      let duringCharacters = LogicalUndoDuringCharacters(view: f.view)
-      f.view.boundedStorage.delegate = duringCharacters
-      f.view.insertText("N", replacementRange: f.view.selectedRange())
-      XCTAssertTrue(duringCharacters.delivered)
-      XCTAssertEqual(session.generation, before + 4); XCTAssertEqual(f.view.string, "aXbc")
-      // Its actual selector arrived inside character processing. It restored
-      // only after that outer scope closed, despite full refused-history cap.
-      f.view.insertText("Q", replacementRange: f.view.selectedRange())
-      XCTAssertEqual(f.view.string, "aXQbc")
+      XCTAssertEqual(session.generation, before); XCTAssertEqual(f.view.string, "aXbc")
       await route.release()
-      do { try await commands.joinPendingCommand(); XCTFail("The actual bounded custody refusal must remain reported.") }
-      catch {
-        if error is CancellationError { }
-        else if case BoomError.stale = error { }
-        else if case BoomError.budget = error { }
-        else { throw error }
-      }
-      XCTAssertEqual(f.view.string, "aXQbc")
+      try await commands.joinPendingCommand()
+      XCTAssertEqual(f.view.string, "a" + String(repeating: "z", count: PagedNativeUndoOwner.maximumRawKeyBytes / 514) + "bc")
+      XCTAssertEqual(commands.queuedRawKeyCount, 0)
+      XCTAssertFalse(commands.hasPendingCommand)
+      XCTAssertNil(commands.acceptedInputFailure)
       XCTAssertNil(commands.firstFailure); XCTAssertNil(input.firstRefusal)
       XCTAssertNil(f.view.boundedStorage.mutationFailure)
     }

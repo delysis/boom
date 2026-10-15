@@ -69,6 +69,18 @@ struct ManuscriptPane: View {
           PagedManuscriptView(viewport: viewport)
             .id(ObjectIdentifier(viewport))
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .overlay(alignment: .topTrailing) {
+              if let issue = model.nativeInputIssue {
+                Image(systemName: "exclamationmark.triangle.fill")
+                  .foregroundStyle(.orange)
+                  .frame(width: WorkspaceGeometry.controlSize, height: WorkspaceGeometry.controlSize)
+                  .contentShape(Circle())
+                  .help(issue)
+                  .accessibilityLabel("Input notice")
+                  .accessibilityValue(issue)
+                  .padding(8)
+              }
+            }
         } else {
           Color.clear.accessibilityLabel("No document selected")
             .frame(maxWidth: .infinity, maxHeight: .infinity)

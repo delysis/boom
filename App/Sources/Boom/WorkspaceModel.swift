@@ -128,6 +128,7 @@ private struct BoundedConsultationContext: Sendable {
       && selectedChat != nil && !pagedShutdownRequested
   }
   @Published var status = "Install a consultation model to begin"
+  @Published var nativeInputIssue: String?
   @Published var errorMessage: String?
   @Published var composerIssue: String?
   @Published var streamingText = ""
@@ -3765,6 +3766,7 @@ extension WorkspaceModel {
     commands.didFail = { [weak self, weak commands] error in
       if commands?.firstFailure != nil { self?.failPagedSource(error) }
       else {
+        self?.nativeInputIssue = error.localizedDescription
         self?.status = error.localizedDescription
         PerformanceTrace.event("Editor.ManagedAdmission")
       }
@@ -3802,6 +3804,7 @@ extension WorkspaceModel {
     let changed = self.caret != caret
     self.caret = caret; lastInputPane = .document
     if edited {
+      nativeInputIssue = nil
       captureCache.removeValue(forKey: selectedDocumentID ?? UUID())
       if !librarySearch.isEmpty { refreshVisibleSearch() }
     }
@@ -3845,6 +3848,7 @@ extension WorkspaceModel {
     session.didSeal = nil; session.didFail = nil
     pagedViewport = nil; pagedCommands = nil; pagedInput = nil
     pagedSession = nil; pagedBackend = nil; pagedSelectedRecord = nil
+    nativeInputIssue = nil
   }
 
   @discardableResult func beginPagedWorkspaceSave() throws -> Task<Void, Error> {

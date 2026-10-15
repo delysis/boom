@@ -493,19 +493,19 @@ final class PagedNativeTextStorage: NSTextStorage {
     // This escape is synchronous but outlives the producer callback. Snapshot
     // supported values before the input method can mutate its original runs.
     let payload = try PagedNativeContextPayload(original)
-    try commands.reserveDeferredContextPayload(identity: client.identity, chargedBytes: payload.chargedBytes)
+    let old = pendingDocumentMarkedText
+    guard old == nil || old?.commands === commands else {
+      throw BoomError.stale("A deferred native preview belongs to another actual input owner.")
+    }
+    let oldBytes = old?.chargedBytes ?? 0
+    try commands.reserveDeferredContextPayload(identity: client.identity, chargedBytes: payload.chargedBytes,
+      replacing: oldBytes)
     do {
       let copied = try payload.materialize()
-      let oldBytes = pendingDocumentMarkedText?.chargedBytes
-      guard pendingDocumentMarkedText == nil || pendingDocumentMarkedText?.commands === commands else {
-        throw BoomError.stale("A deferred native preview belongs to another actual input owner.")
-      }
       pendingDocumentMarkedText = DeferredDocumentMarkedText(pendingID: pendingID, text: copied, selected: selected,
         replacement: replacement, chargedBytes: payload.chargedBytes, commands: commands)
-      // The old preview is released by replacement before its charge returns.
-      if let oldBytes { commands.releaseDeferredContextPayload(chargedBytes: oldBytes) }
     } catch {
-      commands.releaseDeferredContextPayload(chargedBytes: payload.chargedBytes)
+      commands.restoreDeferredContextPayloadReservation(chargedBytes: payload.chargedBytes, replacing: oldBytes)
       throw error
     }
     return true
