@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import AVKit
 import BoomCore
 import Foundation
 import SwiftUI
@@ -46,7 +47,11 @@ import SwiftUI
     } else { model.attachToCurrentChat([.bytes(name: "Public image.png", data: red)]); try await finish() }
     let picture = model.state.attachments[0]
     model.attachToCurrentChat([.bytes(name: "Public tone.m4a", data: audio), .bytes(name: "Public video.mp4", data: video)]); try await finish()
-    let audioRecord = model.state.attachments.first { $0.name == "Public tone.m4a" }!
+    guard let audioRecord = model.state.attachments.first(where: { $0.name == "Public tone.m4a" }),
+      let videoRecord = model.state.attachments.first(where: { $0.name == "Public video.mp4" }),
+      audioRecord.kind == .audio, videoRecord.kind == .video else {
+      throw BoomError.invalid("The actual stored audio/video attachments are unavailable.")
+    }
     let host = NSHostingView(rootView: WorkspaceView(model: model))
     let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 1440, height: 1000))
     window.isReleasedWhenClosed = false; window.contentView = host; defer { window.close() }
@@ -62,25 +67,91 @@ import SwiftUI
         try png.write(to: evidence.appendingPathComponent("\(dark ? "dark" : "light")-\(Int(width)).png"), options: .atomic)
       }
     }
-    // Exercise the same player surface at the smallest manuscript column,
-    // independently of horizontal scrolling in the pending-media collection.
-    for (name, bytes, kind) in [("Public tone.m4a", audio, "audio"), ("Public video.mp4", video, "video")] {
-      let playerHost = NSHostingView(rootView: AttachmentMediaView(name: name, bytes: bytes))
+    // Exercise the actual stored-record/native-owner route at each available
+    // width. Its production card cap remains real even in a wider viewport.
+    @MainActor func attachmentReader(in view: NSView) -> NativeReadingTextView? {
+      if let reader = view as? NativeReadingTextView { return reader }
+      for child in view.subviews { if let reader = attachmentReader(in: child) { return reader } }
+      return nil
+    }
+    for (record, kind) in [(audioRecord, "audio"), (videoRecord, "video")] {
+      let controller = NSHostingController(rootView: InlineAttachmentView(model: model, record: record))
+      let playerHost = controller.view
       let playerWindow = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 680, height: 400))
       playerWindow.isReleasedWhenClosed = false; playerWindow.contentView = playerHost
-      for dark in [true, false] {
-        playerWindow.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
-        for width in [144.0, 300.0, 680.0] {
-          playerWindow.setContentSize(NSSize(width: width, height: kind == "audio" ? 44 : width * 9 / 16))
-          playerHost.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(300))
-          playerHost.layoutSubtreeIfNeeded(); playerHost.displayIfNeeded()
-          guard let bitmap = playerHost.bitmapImageRepForCachingDisplay(in: playerHost.bounds) else { throw BoomError.invalid("Player bitmap unavailable.") }
-          playerHost.cacheDisplay(in: playerHost.bounds, to: bitmap)
-          guard let png = bitmap.representation(using: .png, properties: [:]) else { throw BoomError.invalid("Player PNG unavailable.") }
-          try png.write(to: evidence.appendingPathComponent("\(kind)-\(dark ? "dark" : "light")-\(Int(width)).png"), options: .atomic)
+
+      @MainActor func closePlayer() async throws {
+        defer { playerWindow.contentView = nil; playerWindow.close() }
+        if let reader = attachmentReader(in: playerHost) {
+          reader.inlineMedia.stop()
+          if let cleanup = await reader.inlineMedia.joinPendingLoads() { throw cleanup }
         }
       }
-      playerWindow.close()
+      @MainActor func readyPlayer(at width: CGFloat) async throws {
+        let clock = ContinuousClock(), started = clock.now
+        while started.duration(to: clock.now) < .seconds(5) {
+          try Task.checkCancellation()
+          let fitting = controller.sizeThatFits(in: NSSize(width: width, height: 1000))
+          guard fitting.width.isFinite, fitting.width > 0, fitting.width <= width + 0.5,
+            fitting.height.isFinite, fitting.height > 0, fitting.height <= 1000 else {
+            throw BoomError.invalid("The actual attachment card has invalid fitting geometry.")
+          }
+          playerWindow.setContentSize(NSSize(width: width, height: ceil(fitting.height)))
+          playerHost.layoutSubtreeIfNeeded()
+          if let reader = attachmentReader(in: playerHost) {
+            reader.inlineMedia.positionViews()
+            await reader.inlineMedia.joinPendingLoads()
+            if let failure = reader.inlineMedia.lastFailure { throw failure }
+            try Task.checkCancellation()
+            guard started.duration(to: clock.now) < .seconds(5) else { break }
+            playerHost.layoutSubtreeIfNeeded(); reader.inlineMedia.positionViews()
+            if let media = reader.subviews.compactMap({ $0 as? InlineMediaHost }).first,
+              let native = media.subviews.compactMap({ $0 as? AVPlayerView }).first,
+              let player = native.player, let current = player.currentItem {
+              if let failure = player.error { throw failure }
+              if let failure = current.error { throw failure }
+              guard player.status != .failed, current.status != .failed else {
+                throw BoomError.unavailable("The actual native attachment player failed.")
+              }
+              if player.status == .readyToPlay, current.status == .readyToPlay {
+                guard reader.window === playerWindow, media.superview === reader,
+                  media.item.record == record, model.state.attachments.contains(record),
+                  let range = media.sourceRange, reader.inlineMedia.currentRanges.contains(range),
+                  let file = media.item.file, let asset = media.item.asset,
+                  let currentAsset = current.asset as? AVURLAsset,
+                  currentAsset.url == file.url, asset.url == file.url,
+                  media.bounds.width > 0, media.bounds.height > 0,
+                  playerHost.bounds.insetBy(dx: -0.5, dy: -0.5).contains(media.convert(media.bounds, to: playerHost)),
+                  media.bounds.insetBy(dx: -0.5, dy: -0.5).contains(native.frame) else {
+                  throw BoomError.stale("The actual ready player lost its stored source or was clipped by its fitted card.")
+                }
+                playerHost.displayIfNeeded()
+                return
+              }
+            }
+          }
+          try await Task.sleep(for: .milliseconds(10))
+        }
+        throw BoomError.unavailable("The actual native attachment player did not become ready within five seconds.")
+      }
+      do {
+        for dark in [true, false] {
+          playerWindow.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+          for width in [144.0, 300.0, 680.0] {
+            try await readyPlayer(at: width)
+            guard let bitmap = playerHost.bitmapImageRepForCachingDisplay(in: playerHost.bounds) else { throw BoomError.invalid("Player bitmap unavailable.") }
+            playerHost.cacheDisplay(in: playerHost.bounds, to: bitmap)
+            guard let png = bitmap.representation(using: .png, properties: [:]) else { throw BoomError.invalid("Player PNG unavailable.") }
+            try png.write(to: evidence.appendingPathComponent("\(kind)-\(dark ? "dark" : "light")-\(Int(width)).png"), options: .atomic)
+          }
+        }
+      } catch {
+        let original = error
+        do { try await closePlayer() }
+        catch { throw NativeInlineMediaCleanupFailure(original: original, cleanup: error) }
+        throw original
+      }
+      try await closePlayer()
     }
     model.loadPack(pack, purpose: .writing); try await finish()
     guard let runner = model.completionRunner else { throw BoomError.invalid("Writing runner unavailable.") }
