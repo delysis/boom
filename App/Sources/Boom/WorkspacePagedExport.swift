@@ -16,9 +16,15 @@ extension WorkspaceStore {
       throw BoomError.denied("Export belongs to another document or private storage owner.")
     }
     try record.validate()
-    let target = url.standardizedFileURL.resolvingSymlinksInPath()
-    let workspace = root.standardizedFileURL.resolvingSymlinksInPath()
-    guard url.isFileURL, target != workspace,
+    guard url.isFileURL else { throw BoomError.invalid("Export requires a selected file destination.") }
+    // Resolve the existing parent through the kernel. Foundation can retain
+    // /var for a /private/var workspace; the file leaf must remain untouched
+    // so the publisher can still refuse an existing symlink or directory.
+    let selected = url.standardizedFileURL
+    let target = try WorkspaceBackup.physicalDirectory(selected.deletingLastPathComponent())
+      .appendingPathComponent(selected.lastPathComponent)
+    let workspace = root
+    guard target.path != workspace.path,
       !target.path.hasPrefix(workspace.path + "/") else {
       throw BoomError.denied("An export destination cannot replace workspace records.")
     }

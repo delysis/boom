@@ -1081,6 +1081,40 @@ private final class LiveBackupCopyHold: @unchecked Sendable {
     try await joinedClose(model); try await removeJoinedScratch(scratch)
   }
 
+  func testActualPagedExportRefusesWorkspaceDestinationThroughPhysicalParentAlias() async throws {
+    let failures = testRun?.failureCount ?? 0
+    let scratch = try root(), model = try await open(scratch, requiresActualKeyWindow: false)
+    let sourceText = "Original é🙂 document.\n"
+    let view = try XCTUnwrap(model.pagedInput?.activeView)
+    view.insertText(sourceText, replacementRange: NSRange(location: 0, length: 0))
+    try await model.flush()
+    let record = try XCTUnwrap(model.pagedSelectedRecord)
+    let engine = try XCTUnwrap(model.pagedEngine)
+    let before = try await engine.wholeTextSha256(record.document.revision)
+    let physical = model.store.root
+    // On this Mac Foundation preserves /var, while WorkspaceStore holds the
+    // actual /private/var directory. Keep that actual spelling when available.
+    let selected = scratch.appendingPathComponent("workspace.json")
+    let metadata = physical.appendingPathComponent("workspace.json")
+    let original = try await Task.detached { try Data(contentsOf: metadata) }.value
+    let exported = try model.exportPagedDocument(to: selected)
+    guard case .failure(let failure) = await exported.result else {
+      throw BoomError.invalid("An actual document export replaced workspace metadata.")
+    }
+    guard let refusal = failure as? BoomError, case .denied(let reason) = refusal,
+      reason == "An export destination cannot replace workspace records." else { throw failure }
+    let retained = try await Task.detached { try Data(contentsOf: metadata) }.value
+    XCTAssertEqual(retained, original)
+    let after = try await engine.wholeTextSha256(record.document.revision)
+    XCTAssertEqual(after, before)
+    XCTAssertEqual(model.pagedSelectedRecord, record)
+    model.dismissError()
+    guard (testRun?.failureCount ?? 0) == failures else {
+      throw BoomError.invalid("Actual workspace export containment assertions failed; workspace retained.")
+    }
+    try await joinedClose(model); try await removeJoinedScratch(scratch)
+  }
+
   func testActualOrdinaryRenameRetiresOldClientAndTrashRetainsFileSourceWithoutRemovingDraft() async throws {
     let failureCount = testRun?.failureCount ?? 0
     let scratch = try root(), model = try await open(scratch)
