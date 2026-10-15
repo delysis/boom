@@ -268,6 +268,7 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
     private var primingBefore: [String: Any]?, primingAfterInsert: [String: Any]?, primingAfterDelete: [String: Any]?
     private var vmBefore: [String: Any]?, vmAfter: [String: Any]?
     private var graphicsStages: [[String: Any]] = []
+    private var verificationGraphicsStages: [[String: Any]] = []
     private var graphicsLayerHierarchy: [[String: Any]] = []
     private let graphicsRunID = UUID()
     private var releasedGraphOwners: [String: Bool] = [:]
@@ -2276,7 +2277,7 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
         let png = bitmap.representation(using: .png, properties: [:]) else {
         throw BoomError.invalid("The fixed public attachment could not be prepared.")
       }
-      if normalMemory { recordGraphicsStage("clipboard-bitmap-prepared") }
+      if normalMemory { recordGraphicsStage("clipboard-bitmap-prepared", verification: true) }
       let chatVisible = model.state.showChat == true
       if model.selectedChat == nil { try model.newChat() }
       model.attachToCurrentChat([.bytes(name: "public-collapsed-verification.png", data: png)])
@@ -2370,12 +2371,12 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
       }
       do {
         markupVerificationStage = "visible-demand"
-        if normalMemory { recordGraphicsStage("before-markup-verification") }
+        if normalMemory { recordGraphicsStage("before-markup-verification", verification: true) }
         try await verifyVisibleDemandMarkup(original: original, bytes: bytes)
-        if normalMemory { recordGraphicsStage("after-markup-verification") }
+        if normalMemory { recordGraphicsStage("after-markup-verification", verification: true) }
         markupVerificationStage = "collapsed-media"
         try await verifyCollapsedMediaClipboard(original: original, bytes: bytes)
-        if normalMemory { recordGraphicsStage("after-media-verification") }
+        if normalMemory { recordGraphicsStage("after-media-verification", verification: true) }
         try await requireDocumentInputSource(bytes, root: original)
         _ = try currentMixedView()
         markupVerificationStage = "complete"
@@ -2446,9 +2447,9 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
       recordGraphicsStage("released-graph")
     }
 
-    private func recordGraphicsStage(_ stage: String) {
+    private func recordGraphicsStage(_ stage: String, verification: Bool = false) {
       let vm = currentVMCategories()
-      graphicsStages.append(["stage": stage, "available": vm["available"] ?? false,
+      let sample: [String: Any] = ["stage": stage, "available": vm["available"] ?? false,
         "uptime_seconds": ProcessInfo.processInfo.systemUptime,
         "physical_footprint_bytes": vm["physical_footprint_bytes"] ?? 0,
         "graphics_footprint_bytes": vm["graphics_footprint_bytes"] ?? 0,
@@ -2462,7 +2463,9 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
         "viewport_height": workspace?.pagedViewport?.frame.height ?? 0,
         "text_width": managedEditor?.frame.width ?? 0,
         "text_height": managedEditor?.frame.height ?? 0,
-        "plain_text_height": ((host as? NSScrollView)?.documentView as? NSTextView)?.frame.height ?? 0])
+        "plain_text_height": ((host as? NSScrollView)?.documentView as? NSTextView)?.frame.height ?? 0]
+      if verification { verificationGraphicsStages.append(sample) }
+      else { graphicsStages.append(sample) }
     }
 
     private func observeGraphicsIdle(at point: String) async throws -> Bool {
@@ -2683,6 +2686,13 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
         "scope": normalMemory ? "Actual normal Release ordinary graph, physical streamed file and exact imports/exports, fixed paired native edits and synchronous layout with existing20ms memory Probe. The timed input loop performs no cached-view raster; post-loop verification encodes a 72x42 clipboard bitmap while sampling continues. No Mach suspension/model/GPU or presentation latency claim." : plan.isMixed ? "Warmed actual ordinary graph with bounded head/middle/tail edits, NFD/ZWJ deletion, direct marked-text primitives, actual window-responder Undo/Redo, bounded and whole-source root edits, read-only scroll/click/recenter and interleaved contained input. Visible actual App/key window with SDK raster; no hardware keyboard/input-method service/compositor, model or GPU-overlap acceptance. CPU dispatch spans contain no await; command/read/source joins have separate wait spans inside end-to-ready. All raw observations and failures retained." : "Warmed actual ordinary file WorkspaceModel/WorkspaceView/managed viewport; physical public ASCII imported/export-verified in <=64KiB chunks. Direct paired native edits, synchronous host layout and completed SDK cached-bitmap raster, closed-loop100ms pacing. No inference, IME, hardware input dispatch, deferred draw/compositor acceptance, or per-cycle whole-source copies/hash/files/Mach samples."
       ]
       let bytes = try JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys])
+      // Keep optional post-capture samples separate from the fixed-size core
+      // receipt. Each file retains its own bound; no sample is truncated.
+      if !verificationGraphicsStages.isEmpty {
+        let verification = try JSONSerialization.data(withJSONObject: verificationGraphicsStages, options: [.sortedKeys])
+        guard verification.count <= 8_192 else { throw BoomError.budget("Graphics verification samples exceed their bound.") }
+        try verification.write(to: root.appendingPathComponent("graphics-verification-stages.json"), options: .withoutOverwriting)
+      }
       guard bytes.count <= 16_384 else { throw BoomError.budget("Public fixture receipt exceeds its bound.") }
       try bytes.write(to: root.appendingPathComponent("fixture-receipt.json"), options: .withoutOverwriting)
       if failures.isEmpty { _ = try diskExtent(reservingReceipt: false) }

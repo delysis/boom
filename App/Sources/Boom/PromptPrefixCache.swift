@@ -2240,7 +2240,7 @@ final class PromptPrefixCache: @unchecked Sendable {
           guard span.start < count else { return nil }
           return try? span.sliced(positions: 0..<(min(count, span.end) - span.start))
         } }, geometry: original.geometry, origin: history.last?.origin ?? .prefill,
-        batchWidth: original.batchWidth, row: original.nativeLedgerRow ?? original.row,
+        batchWidth: original.batchWidth, row: original.row,
         history: history, nativePhysicalWidth: original.nativePhysicalWidth,
         nativeProcessedTokenCount: original.nativeProcessedTokenCount,
         nativeLedgerRow: original.nativeLedgerRow, nativeRowReceipt: original.nativeRowReceipt,
