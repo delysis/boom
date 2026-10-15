@@ -327,7 +327,11 @@ fn retained_cross_window_positions_prepare_without_provider_calls_and_reject_cha
     let last_window = engine.logical_window(&before, last, 16_384, &mut || false)?;
     let start = first_window.position(first - first_window.start().utf16)?;
     let end = last_window.position(last - last_window.start().utf16)?;
-    assert!(first_window.position(first + 1 - first_window.start().utf16).is_err());
+    assert!(
+        first_window
+            .position(first + 1 - first_window.start().utf16)
+            .is_err()
+    );
     assert_eq!(start.point().lf_count, 20_000);
     assert_eq!(end.point().lf_count, 380_000);
     drop(first_window);
@@ -335,29 +339,76 @@ fn retained_cross_window_positions_prepare_without_provider_calls_and_reject_cha
     let mounted = engine.logical_window(&before, 1_000_000, 16_384, &mut || false)?;
     assert!(start.point().utf16 < mounted.start().utf16);
     assert!(end.point().utf16 > mounted.start().utf16 + mounted.local_summary().utf16);
-    assert!(source.prepare_resident_replacement(&mounted, first, last, "Ω🌱\n")?.is_none());
-    assert!(source.prepare_replacement_with_positions(&mounted, first, last, "Ω🌱\n", Some(&start), None)?.is_none());
+    assert!(
+        source
+            .prepare_resident_replacement(&mounted, first, last, "Ω🌱\n")?
+            .is_none()
+    );
+    assert!(
+        source
+            .prepare_replacement_with_positions(&mounted, first, last, "Ω🌱\n", Some(&start), None)?
+            .is_none()
+    );
     let stats = engine.stats();
-    let candidate = source.prepare_replacement_with_positions(
-        &mounted, first, last, "Ω🌱\n", Some(&start), Some(&end),
-    )?.ok_or(Error::Invalid("actual retained endpoints did not prepare"))?;
+    let candidate = source
+        .prepare_replacement_with_positions(
+            &mounted,
+            first,
+            last,
+            "Ω🌱\n",
+            Some(&start),
+            Some(&end),
+        )?
+        .ok_or(Error::Invalid("actual retained endpoints did not prepare"))?;
     assert_eq!(engine.stats().page_reads, stats.page_reads);
     assert_eq!(engine.stats().page_writes, stats.page_writes);
-    assert!(source.capture().same(&before), "preparation cannot consume a native source");
+    assert!(
+        source.capture().same(&before),
+        "preparation cannot consume a native source"
+    );
     assert_eq!(candidate.window.text(), "Ω🌱\n");
     assert_eq!(candidate.window.start(), start.point());
-    assert_eq!(candidate.cursor.point(), start.point().checked_add(TextSummary::of("Ω🌱\n"))?);
-    assert!(matches!(source.prepare_replacement_with_positions(
-        &mounted, first + 1, last, "x", Some(&start), Some(&end),
-    ), Err(Error::Stale)), "a caller offset cannot relabel a retained proof");
+    assert_eq!(
+        candidate.cursor.point(),
+        start.point().checked_add(TextSummary::of("Ω🌱\n"))?
+    );
+    assert!(
+        matches!(
+            source.prepare_replacement_with_positions(
+                &mounted,
+                first + 1,
+                last,
+                "x",
+                Some(&start),
+                Some(&end),
+            ),
+            Err(Error::Stale)
+        ),
+        "a caller offset cannot relabel a retained proof"
+    );
     assert!(source.capture().same(&before));
-    let expected = format!("{}Ω🌱\n{}", &text[..start.point().bytes as usize], &text[end.point().bytes as usize..]);
+    let expected = format!(
+        "{}Ω🌱\n{}",
+        &text[..start.point().bytes as usize],
+        &text[end.point().bytes as usize..]
+    );
     source.install_prepared(candidate.window.snapshot());
     let installed = source.capture();
     assert_eq!(installed.summary(), TextSummary::of(&expected));
-    assert!(matches!(source.prepare_replacement_with_positions(
-        &candidate.window, first, first, "x", Some(&start), Some(&start),
-    ), Err(Error::Stale)), "equal coordinates on a later root are not the old proof");
+    assert!(
+        matches!(
+            source.prepare_replacement_with_positions(
+                &candidate.window,
+                first,
+                first,
+                "x",
+                Some(&start),
+                Some(&start),
+            ),
+            Err(Error::Stale)
+        ),
+        "equal coordinates on a later root are not the old proof"
+    );
     assert!(source.capture().same(&installed));
     assert_source(&mut engine, &before, &text)?;
     assert_source(&mut engine, &installed, &expected)?;

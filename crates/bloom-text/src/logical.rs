@@ -1235,35 +1235,32 @@ impl LogicalSource {
         if text.len() > WINDOW_BYTES || first > last || last > self.head.summary().utf16 {
             return Err(Error::Invalid("logical replacement envelope"));
         }
-        let known = |offset: u64,
-                     retained: Option<&LogicalPosition>|
-         -> Result<Option<LogicalPosition>> {
-            if let Some(position) = retained {
-                if !self.head.same(position.snapshot()) || position.point().utf16 != offset {
-                    return Err(Error::Stale);
+        let known =
+            |offset: u64, retained: Option<&LogicalPosition>| -> Result<Option<LogicalPosition>> {
+                if let Some(position) = retained {
+                    if !self.head.same(position.snapshot()) || position.point().utf16 != offset {
+                        return Err(Error::Stale);
+                    }
+                    return Ok(Some(position.clone()));
                 }
-                return Ok(Some(position.clone()));
-            }
-            let point = if offset == 0 {
-                TextSummary::EMPTY
-            } else if offset == self.head.summary().utf16 {
-                self.head.summary()
-            } else if offset >= window.start.utf16
-                && offset <= window.start.checked_add(window.local_summary())?.utf16
-            {
-                return window.position(offset - window.start.utf16).map(Some);
-            } else {
-                return Ok(None);
+                let point = if offset == 0 {
+                    TextSummary::EMPTY
+                } else if offset == self.head.summary().utf16 {
+                    self.head.summary()
+                } else if offset >= window.start.utf16
+                    && offset <= window.start.checked_add(window.local_summary())?.utf16
+                {
+                    return window.position(offset - window.start.utf16).map(Some);
+                } else {
+                    return Ok(None);
+                };
+                Ok(Some(LogicalPosition {
+                    snapshot: self.capture(),
+                    point,
+                }))
             };
-            Ok(Some(LogicalPosition {
-                snapshot: self.capture(),
-                point,
-            }))
-        };
-        let (Some(start), Some(end)) = (
-            known(first, first_position)?,
-            known(last, last_position)?,
-        ) else {
+        let (Some(start), Some(end)) = (known(first, first_position)?, known(last, last_position)?)
+        else {
             return Ok(None);
         };
         if first == last && text.is_empty() {
