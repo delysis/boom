@@ -20,7 +20,7 @@ final class ResidentPrefixAdversarialTests: XCTestCase {
     let keys = MLXArray(ids.map(Float.init), [width, 1, ids.count / width, 1])
     let values = MLXArray(ids.map { -Float($0) - 1 }, [width, 1, ids.count / width, 1])
     for cache in request.cache { _ = cache.update(keys: keys, values: values) }
-      if submitted {
+    if submitted {
       asyncEval(request.cache.flatMap { $0.innerState() })
       eval(request.cache); request.markCacheSubmitted()
       request.observeReadySpill(); await request.joinPendingSpill(cancelled: false)
@@ -104,7 +104,10 @@ final class ResidentPrefixAdversarialTests: XCTestCase {
 
   func testFinishedBatchRowSurvivesPeersAdvancingBeyondTwoWindowsWithoutInertTokens() async throws {
     try await Device.withDefaultDevice(.cpu) {
-      let store = PromptPrefixCache(byteLimit: 4_096), scope = owner(), ids = Array(0..<9)
+      // The synthetic three-row simple-cache parents are 3,180 bytes each.
+      // The writer must be able to pin the complete key/value pair transiently;
+      // successful publication still must leave no resident archive.
+      let store = PromptPrefixCache(byteLimit: 8_192), scope = owner(), ids = Array(0..<9)
       let request = try session(store, ids: ids, owner: scope) {
         [KVCacheSimple(), RotatingKVCache(maxSize: 4, step: 2)]
       }
@@ -135,6 +138,8 @@ final class ResidentPrefixAdversarialTests: XCTestCase {
         .init(row: 2, emittedTokenIDs: Array(1101...1114)),
       ]
       XCTAssertTrue(store.publish(request, completions: completions))
+      XCTAssertNil(request.retentionObservation?.refusalReason,
+        "This positive multi-lookup fixture requires disk-backed row history to be admitted.")
       let snapshots = store.retainedSnapshotObservations
       XCTAssertEqual(snapshots.count, 3)
       XCTAssertEqual(snapshots.first(where: { $0.row == 0 })?.tokenIDs, ids + [901])
@@ -152,7 +157,7 @@ final class ResidentPrefixAdversarialTests: XCTestCase {
       XCTAssertEqual(store.retainedBytesUpperBound, 0)
       XCTAssertGreaterThanOrEqual(store.retainedNativeBytesUpperBound, globalBytes)
       _ = (frozenRowZeroBytes, currentLocalBytes) // predecessor RAM archive geometry is preserved in the preimage
-      XCTAssertLessThanOrEqual(store.retainedBytesUpperBound, 4_096)
+      XCTAssertLessThanOrEqual(store.retainedBytesUpperBound, 8_192)
 
       for row in 0..<3 {
         let nextIDs = ids + completions[row].emittedTokenIDs
@@ -172,7 +177,10 @@ final class ResidentPrefixAdversarialTests: XCTestCase {
 
   func testImmediateEOSFreezesEnoughResidentCoverageForTheLastPromptTokenToBeRecomputed() async throws {
     try await Device.withDefaultDevice(.cpu) {
-      let store = PromptPrefixCache(byteLimit: 4_096), scope = owner(), ids = Array(0..<9)
+      // This fixture's transient three-row source pair is larger than 4 KiB;
+      // let the real ready parents reach the disk writer, then require zero RAM
+      // archive after publication as above.
+      let store = PromptPrefixCache(byteLimit: 8_192), scope = owner(), ids = Array(0..<9)
       let request = try session(store, ids: ids, owner: scope) {
         [KVCacheSimple(), RotatingKVCache(maxSize: 4, step: 2)]
       }
@@ -197,7 +205,12 @@ final class ResidentPrefixAdversarialTests: XCTestCase {
       ]))
       let snapshots = store.retainedSnapshotObservations
       XCTAssertEqual(snapshots.count, 3)
-      XCTAssertEqual(snapshots.first(where: { $0.row == 0 })?.tokenIDs, ids)
+      let eos = try XCTUnwrap(snapshots.first { $0.nativeRowReceipt?.observedStopTokenID == 99 })
+      XCTAssertEqual(eos.tokenIDs, ids)
+      XCTAssertEqual(eos.origin, .prefill)
+      XCTAssertEqual(eos.batchWidth, 1)
+      XCTAssertNil(eos.row)
+      XCTAssertEqual(eos.nativePhysicalWidth, 3)
       XCTAssertEqual(snapshots.first(where: { $0.row == 1 })?.tokenIDs, ids + Array(1000...1011))
       XCTAssertEqual(snapshots.first(where: { $0.row == 2 })?.tokenIDs, ids + Array(2000...2011))
       XCTAssertFalse(snapshots.contains { $0.tokenIDs.contains(99) })
@@ -208,24 +221,25 @@ final class ResidentPrefixAdversarialTests: XCTestCase {
       XCTAssertEqual(store.retainedBytesUpperBound, 0)
       XCTAssertGreaterThanOrEqual(store.retainedNativeBytesUpperBound, globalBytes)
       _ = (frozenPromptLocalBytes, currentPeerLocalBytes)
-      XCTAssertLessThanOrEqual(store.retainedBytesUpperBound, 4_096)
+      XCTAssertLessThanOrEqual(store.retainedBytesUpperBound, 8_192)
 
       let repeatRequest = try session(store, ids: ids, owner: scope) {
         [KVCacheSimple(), RotatingKVCache(maxSize: 4, step: 2)]
       }
       XCTAssertEqual(repeatRequest.cachedTokenCount, 8, "One prompt token must remain for logits after EOS.")
       XCTAssertEqual(repeatRequest.input.text.tokens.asArray(Int.self), [8])
-      XCTAssertEqual(repeatRequest.observation.cachedBatchWidth, 3)
+      XCTAssertEqual(repeatRequest.observation.cachedOrigin, .prefill)
+      XCTAssertEqual(repeatRequest.observation.cachedBatchWidth, 1)
+      XCTAssertNil(repeatRequest.observation.cachedRow)
+      XCTAssertEqual(repeatRequest.observation.cachedNativePhysicalWidth, 3)
       assertKV(repeatRequest.cache[0], ids: Array(0..<8))
       assertKV(repeatRequest.cache[1], ids: Array(4..<8))
-      // The repeat's first eight tokens are shared by all rows. Only the
-      // frozen EOS row still covers the ninth prompt token after its peers roll.
+      // The repeat consumes the one hot record. Later disk candidates may be
+      // equivalent; assert exact reconstructed data without requiring a row tie-break.
       let continued = try session(store, ids: ids + [77], owner: scope) {
         [KVCacheSimple(), RotatingKVCache(maxSize: 4, step: 2)]
       }
       XCTAssertEqual(continued.cachedTokenCount, ids.count)
-      XCTAssertEqual(continued.observation.cachedRow, 0)
-      XCTAssertEqual(continued.observation.cachedBatchWidth, 3)
       XCTAssertEqual(continued.input.text.tokens.asArray(Int.self), [77])
       assertKV(continued.cache[0], ids: ids)
       assertKV(continued.cache[1], ids: Array(5..<9))

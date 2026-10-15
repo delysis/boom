@@ -112,7 +112,8 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
   #endif
 
   /// Same physical public source and ordinary graph as the owned stack fixture.
-  /// Normal Release: no transport, suspension, model or cached-bitmap path.
+  /// Normal Release: no transport, suspension, model or cached-view raster in
+  /// the timed input loop. Post-loop verification encodes a small clipboard image.
   static func runMemory(arguments: [String]) async throws {
     guard arguments.count == 5, arguments[1] == "--editor-memory-smoke",
       ["short", "gib"].contains(arguments[2]), arguments[3] == "--evidence",
@@ -1338,7 +1339,7 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
         "sample_interval_ms": 20, "samples": samples,
         "maximum_sampled_current_footprint_bytes": maximumSampledCurrent,
         "kernel_lifetime_peak_footprint_bytes": kernelLifetimePeak,
-        "scope": "Normal App/file/native graph. Unsuspended scheduled paired input and synchronous layout; no bitmap, Mach stack capture, forced draw/compositor or GPU inference. Memory probe overhead is included; setup/exports are distinct phases."]
+        "scope": "Normal App/file/native graph. Unsuspended scheduled paired input and synchronous layout; no cached-view raster in the timed input loop, Mach stack capture, forced draw/compositor or GPU inference. Post-loop verification encodes a 72x42 clipboard bitmap while sampling continues. Memory probe overhead is included; setup/exports are distinct phases."]
       try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
         .write(to: root.appendingPathComponent("memory-summary.json"), options: .withoutOverwriting)
     }
@@ -2322,7 +2323,9 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
         "ready_wait_stage": "Editor.PublicReadyWait",
         "end_to_ready_stage": "Editor.PublicMixedOperation",
         "offscreen_sdk_diagnostic": !(plan.isMixed || normalMemory), "normal_release_memory_observation": normalMemory,
-        "bitmap_raster_exercised": !normalMemory, "actual_held_writer_control_passed": heldWriterVerified,
+        "bitmap_raster_exercised": !normalMemory,
+        "post_capture_clipboard_bitmap_verification": normalMemory,
+        "actual_held_writer_control_passed": heldWriterVerified,
         "actual_held_writer_shift_anchor_passed": heldScrollShiftVerified,
         "actual_visible_demand_markup_passed": visibleDemandVerified,
         "actual_collapsed_media_clipboard_passed": collapsedMediaVerified,
@@ -2356,7 +2359,7 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
         "process_footprint_before_bytes": footprintBefore, "process_footprint_after_bytes": footprintAfter,
         "process_peak_footprint_bytes": peakFootprint, "workspace_disk_bytes_before_receipt": extent,
         "workspace_disk_limit_bytes": plan.diskLimit, "target_lifetime_seconds": plan.lifetimeSeconds, "failures": failures,
-        "scope": normalMemory ? "Actual normal Release ordinary graph, physical streamed file and exact imports/exports, fixed paired native edits and synchronous layout with existing20ms memory Probe. No bitmap/Mach suspension/model/GPU or presentation latency claim." : plan.isMixed ? "Warmed actual ordinary graph with bounded head/middle/tail edits, NFD/ZWJ deletion, direct marked-text primitives, actual window-responder Undo/Redo, bounded and whole-source root edits, read-only scroll/click/recenter and interleaved contained input. Visible actual App/key window with SDK raster; no hardware keyboard/input-method service/compositor, model or GPU-overlap acceptance. CPU dispatch spans contain no await; command/read/source joins have separate wait spans inside end-to-ready. All raw observations and failures retained." : "Warmed actual ordinary file WorkspaceModel/WorkspaceView/managed viewport; physical public ASCII imported/export-verified in <=64KiB chunks. Direct paired native edits, synchronous host layout and completed SDK cached-bitmap raster, closed-loop100ms pacing. No inference, IME, hardware input dispatch, deferred draw/compositor acceptance, or per-cycle whole-source copies/hash/files/Mach samples."
+        "scope": normalMemory ? "Actual normal Release ordinary graph, physical streamed file and exact imports/exports, fixed paired native edits and synchronous layout with existing20ms memory Probe. The timed input loop performs no cached-view raster; post-loop verification encodes a 72x42 clipboard bitmap while sampling continues. No Mach suspension/model/GPU or presentation latency claim." : plan.isMixed ? "Warmed actual ordinary graph with bounded head/middle/tail edits, NFD/ZWJ deletion, direct marked-text primitives, actual window-responder Undo/Redo, bounded and whole-source root edits, read-only scroll/click/recenter and interleaved contained input. Visible actual App/key window with SDK raster; no hardware keyboard/input-method service/compositor, model or GPU-overlap acceptance. CPU dispatch spans contain no await; command/read/source joins have separate wait spans inside end-to-ready. All raw observations and failures retained." : "Warmed actual ordinary file WorkspaceModel/WorkspaceView/managed viewport; physical public ASCII imported/export-verified in <=64KiB chunks. Direct paired native edits, synchronous host layout and completed SDK cached-bitmap raster, closed-loop100ms pacing. No inference, IME, hardware input dispatch, deferred draw/compositor acceptance, or per-cycle whole-source copies/hash/files/Mach samples."
       ]
       let bytes = try JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys])
       guard bytes.count <= 16_384 else { throw BoomError.budget("Public fixture receipt exceeds its bound.") }
