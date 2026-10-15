@@ -170,6 +170,8 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
     private var footprintBefore: UInt64 = 0, footprintAfter: UInt64 = 0, peakFootprint: UInt64 = 0
     private var startupBefore: [String: Any]?, startupAfter: [String: Any]?
     private var startupUndoAttempted = false, startupUndoJoined = false
+    private var startupUndoGroups = 0
+    private var startupImportedState: [String: Any]?, startupHistoryState: [String: Any]?
     private var primingBefore: [String: Any]?, primingAfterInsert: [String: Any]?, primingAfterDelete: [String: Any]?
     private var vmBefore: [String: Any]?, vmAfter: [String: Any]?
     private var applicationBeforeFocus: [String: Any]?, applicationAfterFocus: [String: Any]?
@@ -293,6 +295,31 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
         importedRevision.summary.bytes == extent, importedRevision.summary.utf16 == extent else {
         throw BoomError.invalid("Ordinary public import differs from its generated ASCII source.")
       }
+      // Capture the exact fresh imported value BEFORE exposing a key window.
+      // A file revision/summary alone cannot identify a same-length native edit.
+      let startupSession = model.pagedSession, startupCommands = model.pagedCommands
+      var startupImported: PagedNativeLogicalSnapshot?
+      if plan.isMixed || normalMemory {
+        guard let startupSession, let startupCommands else {
+          throw BoomError.invalid("The fresh public import lost its actual native history owner.")
+        }
+        let imported = try startupCommands.captureLogicalHistory()
+        guard startupSession.generation == 0, imported.generation == 0,
+          startupSession.sealedRootRecord.historyGeneration == 0,
+          imported.undo.isEmpty, imported.redo.isEmpty, imported.activeGroup == nil,
+          imported.snapshot.sourceRevision == importedRevision,
+          imported.snapshot.summary == importedRevision.summary,
+          imported.snapshot.sessionID == startupSession.sessionID,
+          imported.snapshot.sourceRevision.documentID == id else {
+          throw BoomError.invalid("The public import did not begin with its exact fresh source and empty native history.")
+        }
+        startupImported = imported.snapshot
+        startupImportedState = ["root": imported.snapshot.rootID.uuidString,
+          "document": id.uuidString, "session": startupSession.sessionID.uuidString,
+          "engine": startupSession.engineIncarnation.uuidString, "generation": imported.generation,
+          "persisted_history_generation": startupSession.sealedRootRecord.historyGeneration,
+          "undo_count": imported.undo.count, "redo_count": imported.redo.count]
+      }
       let host = NSHostingView(rootView: WorkspaceView(model: model)); self.host = host
       let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 1190, height: 846))
       self.window = window; window.isReleasedWhenClosed = false; window.contentView = host
@@ -318,36 +345,55 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
       var primingView = view
       if plan.isMixed || normalMemory {
         startupBefore = try nativePreparationState(view)
-        if view.session.generation != 0 {
-          // An incidental key in this explicitly public window is real input.
-          // Exercise its actual responder Undo once before the fixed recipe;
-          // never guess a deletion or accept a shifted source baseline.
-          try await joinMixedInput(0, measured: false)
-          let current = try currentMixedView()
-          guard let commands = model.pagedCommands else {
-            throw BoomError.invalid("Public startup input lost its actual native history owner.")
+        try await joinMixedInput(0, measured: false)
+        let current = try currentMixedView()
+        guard let startupSession, let startupCommands, let startupImported,
+          current.session === startupSession, model.pagedCommands === startupCommands,
+          model.selectedDocumentID == id else {
+          throw BoomError.invalid("Public startup input lost its original document/session/history owner.")
+        }
+        let history = try startupCommands.captureLogicalHistory()
+        try history.validate() // the existing combined100-entry native bound
+        startupHistoryState = ["root": history.snapshot.rootID.uuidString,
+          "imported_root": startupImported.rootID.uuidString,
+          "generation": current.session.generation, "capture_generation": history.generation,
+          "sealed_source_generation": current.session.sealedGeneration,
+          "persisted_history_generation": current.session.sealedRootRecord.historyGeneration,
+          "undo_count": history.undo.count, "redo_count": history.redo.count,
+          "oldest_undo_root": history.undo.first?.snapshot.rootID.uuidString ?? "nil"]
+        guard history.generation == current.session.generation else {
+          throw BoomError.invalid("The actual startup capture lost its live source generation.")
+        }
+        if !history.snapshot.isSame(startupImported) {
+          // Incidental public input can span several real groups. Only the
+          // exact pre-exposure imported root may be the oldest retained target.
+          guard history.undo.first?.snapshot.isSame(startupImported) == true else {
+            throw BoomError.invalid("Public startup Undo does not reach the exact fresh imported source.")
           }
-          let history = try commands.captureLogicalHistory()
-          guard current.session.generation == 1, history.generation == 1,
-            current.session.sealedRootRecord.historyGeneration == 1,
-            history.undo.count == 1, history.redo.isEmpty,
-            history.undo[0].snapshot.sourceRevision == importedRevision,
-            history.undo[0].snapshot.summary == importedRevision.summary,
-            !history.snapshot.isSame(history.undo[0].snapshot) else {
-            throw BoomError.invalid("Public startup input is not exactly one admitted edit of the imported source.")
-          }
-          let startupTarget = history.undo[0].snapshot
           startupUndoAttempted = true
-          try await mixedResponder(false, event: 0, measured: false)
-          startupUndoJoined = true
-          primingView = try currentMixedView()
-          guard try primingView.session.captureLogicalState().source.isSame(startupTarget),
-            primingView.session.sealedGeneration == primingView.session.generation,
-            model.pagedSelectedRecord?.document.revision.summary == importedRevision.summary,
-            try primingView.session.documentCoordinates().projectedUTF16 == extent else {
-            throw BoomError.invalid("The actual startup Undo did not restore the original public source.")
+          for entry in history.undo.reversed() {
+            let pending = try startupCommands.captureLogicalHistory()
+            guard let next = pending.undo.last, next.groupID == entry.groupID,
+              next.cursor == entry.cursor, next.snapshot.isSame(entry.snapshot) else {
+              throw BoomError.invalid("Actual startup history changed before its next responder Undo.")
+            }
+            try await mixedResponder(false, event: 0, measured: false)
+            startupUndoGroups += 1
+            primingView = try currentMixedView()
+            guard primingView.session === startupSession,
+              try primingView.session.captureLogicalState().source.isSame(entry.snapshot) else {
+              throw BoomError.invalid("An actual startup Undo did not reach its captured native target.")
+            }
           }
         }
+        primingView = try currentMixedView()
+        guard try primingView.session.captureLogicalState().source.isSame(startupImported),
+          primingView.session.sealedGeneration == primingView.session.generation,
+          model.pagedSelectedRecord?.document.revision.summary == importedRevision.summary,
+          try primingView.session.documentCoordinates().projectedUTF16 == extent else {
+          throw BoomError.invalid("Startup recovery did not restore the exact original public source.")
+        }
+        startupUndoJoined = startupUndoAttempted
         startupAfter = try nativePreparationState(primingView)
       }
       primingView.setSelectedRange(NSRange(location: 0, length: 0))
@@ -2235,6 +2281,9 @@ private struct DeveloperInputControlFailure: Error, LocalizedError {
         "startup_input_after": startupAfter ?? ["available": false],
         "startup_incidental_undo_attempted": startupUndoAttempted,
         "startup_incidental_undo_joined": startupUndoJoined,
+        "startup_incidental_undo_groups": startupUndoGroups,
+        "startup_imported_baseline": startupImportedState ?? ["available": false],
+        "startup_history_before_recovery": startupHistoryState ?? ["available": false],
         "priming_before": primingBefore ?? ["available": false],
         "priming_after_insert": primingAfterInsert ?? ["available": false],
         "priming_after_delete": primingAfterDelete ?? ["available": false],
