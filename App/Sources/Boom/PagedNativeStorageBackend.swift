@@ -40,11 +40,11 @@ actor PagedNativeStorageBackend: PagedNativeLogicalSessionStorage {
     openingAttempted = true; openingInFlight = true; sessionID = requested
     defer { openingInFlight = false }
     try engine.bindNativeOpeningCustody(controllerCustody, sessionID: requested, record: record)
-    let output = try await engine.nativeCanonicalOpeningRetaining(publisher: publisher, expected: record, sessionID: requested)
+    let output = try await engine.nativeCanonicalOpeningRetaining(publisher: publisher, expected: record, sessionID: requested, controller: controllerCustody)
     do {
       try output.value.history.admit(record: record, sessionID: requested, engineIncarnation: engineIncarnation,
         scope: .opening(sessionID: requested, windowID: output.value.window.windowID))
-      try engine.installNativeCustody(output.lease, controller: controllerCustody, expected: record, record: record)
+      try engine.installNativeCustody(output.lease, controller: controllerCustody, expected: record, record: record, openingSessionID: requested)
     } catch { unresolvedOutput = output.lease; throw PagedTextCustodyFailure(original: error, lease: output.lease) }
     return output.value
   }

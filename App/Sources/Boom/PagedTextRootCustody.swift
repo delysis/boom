@@ -58,6 +58,7 @@ final class PagedTextRootCustody: @unchecked Sendable {
     var logicalInput: PagedNativeLogicalPublication?; var acknowledgement: PagedNativeCommitAcknowledgement?
     var session: UUID?; var sequence: UInt64 = 0; var current: PagedDocumentRootRecord?; var pendingBatch: UUID?
     var error: Error?
+    var openingProducer: UUID?
   }
   private struct State {
     var entries: [UUID: Entry] = [:]
@@ -161,16 +162,47 @@ final class PagedTextRootCustody: @unchecked Sendable {
   }
   func bindNativeOpening(_ controller: PagedTextRootLease, sessionID: UUID, record: PagedDocumentRootRecord) throws { try update(controller) { e in guard e.current == record, e.session == nil else { throw BoomError.stale("Native controller already opened.") }; e.session = sessionID } }
   func installControllerOutput(_ output: PagedTextRootLease, into controller: PagedTextRootLease,
-    expected: PagedDocumentRootRecord, record: PagedDocumentRootRecord) throws {
+    expected: PagedDocumentRootRecord, record: PagedDocumentRootRecord, openingSessionID: UUID? = nil) throws {
     try state.withLock { s in var c = try require(controller, s); let e = try require(output, s)
-      guard output != controller, c.current == expected, c.pendingBatch == nil, e.joined, !e.isJob,
+      guard output != controller, c.current == expected, c.pendingBatch == nil, c.openingProducer == nil, e.joined, !e.isJob,
         e.claims.contains(.record(record)), e.error == nil || (e.phase == .output && e.publicationComplete) else { throw BoomError.stale("Native output cannot replace this controller.") }
+      if let openingSessionID {
+        guard c.session == openingSessionID, c.sequence == 0, record == expected,
+          e.acknowledgement == nil, e.logicalInput == nil, e.error == nil else {
+          throw BoomError.stale("Opening output has another actual controller or source epoch.")
+        }
+        c.openingProducer = output.id
+      }
       c.reservation = max(c.reservation, e.reservation)
       c.current = record; c.claims = [.record(expected), .record(record)]; c.acknowledgement = e.acknowledgement
       c.logicalInput = e.logicalInput; c.error = e.error
       c.publicationComplete = e.publicationComplete
       if let ack = e.acknowledgement { c.session = ack.sessionID; c.sequence = ack.lastSequence; c.pendingBatch = ack.batchID }
       s.entries[controller.id] = c; remove(output.id, &s)
+    }
+  }
+  /// Preflight before the nonfallible Foundation/physical opening activation.
+  /// That synchronous scope excludes a save, replacement opening or close.
+  func prepareNativeOpeningHandoff(_ controller: PagedTextRootLease, producer: PagedTextRootLease,
+    sessionID: UUID, record: PagedDocumentRootRecord) throws -> (@Sendable () -> Void) {
+    try state.withLock { s in
+      let c = try require(controller, s)
+      guard case .controller = c.purpose, c.joined, !c.isJob, c.phase == .liveController,
+        c.session == sessionID, c.sequence == 0, c.current == record, c.pendingBatch == nil,
+        c.openingProducer == producer.id, producer.ownerID == ownerID,
+        producer.engineIncarnation == engineIncarnation, c.error == nil else {
+        throw BoomError.stale("Native opening lost its exact joined window producer.")
+      }
+    }
+    return { [self] in
+      state.withLock { s in
+        guard var c = s.entries[controller.id] else { preconditionFailure("Opening controller retired before its adoption.") }
+        precondition(c.session == sessionID && c.current == record && c.sequence == 0
+          && c.openingProducer == producer.id && c.pendingBatch == nil && c.joined && !c.isJob)
+        c.openingProducer = nil
+        c.reservation = PagedWorkingWindow.hardBytes + Self.maximumNativeMetadataBytes
+        s.entries[controller.id] = c
+      }
     }
   }
   func finishNativeCommit(_ controller: PagedTextRootLease, acknowledgement: PagedNativeCommitAcknowledgement) throws {
@@ -245,6 +277,9 @@ final class PagedTextRootCustody: @unchecked Sendable {
       if case .controller = e.purpose { throw BoomError.denied("Native controller must join its close.") }; remove(lease.id, &s)
     }
   }
+  // A joined opening may close before native construction activates it.
+  // Removing its controller also retires the unused activation ticket; a
+  // later preflight fails require(controller) before any native mutation.
   func transferJoinedToHead(_ lease: PagedTextRootLease, record: PagedDocumentRootRecord) throws {
     try state.withLock { s in let e = try require(lease, s); guard e.joined, !e.isJob, e.bulk == nil,
       e.phase != .unresolved, e.pendingBatch == nil,

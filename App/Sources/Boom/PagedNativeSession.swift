@@ -131,7 +131,28 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
     sealedRootRecord = opening.record; sealedRevision = opening.record.document.revision
     canonicalOpening = opening
     working = try PagedWorkingWindow(window: window, cursor: PagedNativeLogicalCursor(opening.history.currentCursor))
-    func entry(_ entry: PagedRootHistoryEntry) throws -> PagedNativeLogicalHistoryEntry {
+    let undo = opening.preparedUndo, redo = opening.preparedRedo
+    if let undo, let redo {
+      guard undo.count == opening.history.undo.count, redo.count == opening.history.redo.count else {
+        throw BoomError.invalid("Prepared opening entries differ from their actual saved history.")
+      }
+    } else if undo != nil || redo != nil {
+      throw BoomError.invalid("Opening history preparation is incomplete.")
+    }
+    func entry(_ entry: PagedRootHistoryEntry, prepared: PagedNativeLogicalHistoryEntry?) throws -> PagedNativeLogicalHistoryEntry {
+      if let prepared {
+        let snapshot = prepared.snapshot
+        guard snapshot.sessionID == opening.sessionID, snapshot.engineIncarnation == storage.engineIncarnation,
+          snapshot.sourceRevision == entry.revision, snapshot.summary == entry.revision.summary,
+          prepared.cursor == PagedNativeLogicalCursor(entry.cursor), prepared.groupID == entry.groupID,
+          let seed = prepared.seed, seed.snapshot.isSame(snapshot),
+          seed.containsFocusUTF16(prepared.cursor.selection.focusUTF16) else {
+          throw BoomError.invalid("Prepared opening target lost its exact saved root, cursor or native seed.")
+        }
+        return prepared
+      }
+      // Explicit seedless test consumers retain the actual cold-reader path.
+      // Production canonical openings always supply both prepared arrays.
       let owner = try PagedNativeLogicalSource(revision: entry.revision,
         sessionID: opening.sessionID, engineIncarnation: storage.engineIncarnation)
       return try PagedNativeLogicalHistoryEntry(snapshot: owner.capture(),
@@ -139,7 +160,8 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
     }
     openingHistory = try PagedNativeLogicalHistoryProjection(snapshot: window.snapshot,
       cursor: PagedNativeLogicalCursor(opening.history.currentCursor),
-      undo: opening.history.undo.map(entry), redo: opening.history.redo.map(entry),
+      undo: opening.history.undo.enumerated().map { try entry($0.element, prepared: undo?[$0.offset]) },
+      redo: opening.history.redo.enumerated().map { try entry($0.element, prepared: redo?[$0.offset]) },
       activeGroup: opening.history.activeGroup, generation: 0)
   }
   var sessionID: UUID { working.sessionID }
@@ -403,8 +425,11 @@ struct PagedNativeNavigationSelection: Sendable, Equatable {
     try requireToken(token, ownerID: ownerID)
     guard canonicalOpening != nil, openingHistory != nil, generation == 0,
       !hookTransition, characterDepth == 0 else { throw BoomError.stale("Logical opening has already been exposed.") }
+    guard let opening = canonicalOpening else { throw BoomError.stale("Canonical opening lost its actual window payload.") }
+    let finishHandoff = try opening.prepareNativeHandoff()
     hookTransition = true; defer { hookTransition = false }
-    completing(); canonicalOpening = nil; openingHistory = nil
+    completing(); finishHandoff()
+    canonicalOpening = nil; openingHistory = nil
   }
 
   private func prepare(window: PagedNativeLogicalWindow, selection: PagedNativeNavigationSelection,

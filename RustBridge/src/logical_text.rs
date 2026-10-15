@@ -114,7 +114,9 @@ unsafe fn text<'a>(bytes: *const u8, length: usize) -> bloom_text::Result<&'a st
 
 /// # Safety
 /// All nonnull values are actual retained handles from these functions, and
-/// output pointers refer to writable structs. Source calls are Main-owned;
+/// output pointers refer to writable structs. Live mutable sources are Main-owned;
+/// creation/opening/free may also use an exclusively owned temporary source on the
+/// storage worker, from which only retained immutable windows/snapshots escape.
 /// snapshots/windows can be retained across read workers. No handle may be
 /// released until its borrower returns. Errors use boom_attachment_free.
 #[no_mangle]

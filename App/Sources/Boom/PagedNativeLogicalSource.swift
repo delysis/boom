@@ -22,6 +22,33 @@ private func logicalSummary(_ point: BloomLogicalPoint) -> PagedTextSummary {
   PagedTextSummary(bytes: point.bytes, utf16: point.utf16, lfCount: point.lf_count)
 }
 
+/// Exclusive raw construction is shared by Main's mutable owner and the
+/// worker's temporary opening factory. Only immutable windows/seeds escape
+/// the latter; its raw source is always freed before the factory returns.
+private func createLogicalSourcePointer(_ revision: PagedTextRevision) throws -> OpaquePointer {
+  let bytes = try JSONEncoder().encode(revision)
+  var output: OpaquePointer?
+  var error = BoomAttachmentBuffer(data: nil, length: 0)
+  let status = bytes.withUnsafeBytes {
+    bloom_logical_source_create($0.bindMemory(to: UInt8.self).baseAddress, bytes.count, &output, &error)
+  }
+  try pagedLogicalResult(status, error)
+  guard let output else { throw BoomError.invalid("Logical opening returned no source.") }
+  return output
+}
+private func createLogicalOpeningWindowPointer(_ source: OpaquePointer, window: PagedTextWindow) throws -> OpaquePointer {
+  let bytes = try JSONEncoder().encode(window)
+  var output: OpaquePointer?
+  var error = BoomAttachmentBuffer(data: nil, length: 0)
+  let status = bytes.withUnsafeBytes {
+    bloom_logical_source_opening_window(source, $0.bindMemory(to: UInt8.self).baseAddress,
+      bytes.count, &output, &error)
+  }
+  try pagedLogicalResult(status, error)
+  guard let output else { throw BoomError.invalid("Opening lost its actual logical island.") }
+  return output
+}
+
 /// An ordinary retained immutable value, not a file Revision, published head,
 /// second cache or storage lease. Existing Foundation entries retain these
 /// exact values/cursors; only their existing owner advances native history.
@@ -118,6 +145,20 @@ final class PagedNativeLogicalWindow: @unchecked Sendable {
     accepted = true
   }
   deinit { bloom_logical_window_free(pointer) }
+
+  /// The actual opening producer has already authenticated this file window
+  /// and cursor. A temporary source is exclusively owned on that worker; its
+  /// immutable window retains the SAME snapshot after the source is freed.
+  nonisolated static func fromWorkerOpening(_ window: PagedTextWindow,
+    sessionID: UUID, engineIncarnation: UUID) throws -> PagedNativeLogicalWindow {
+    guard !Thread.isMainThread else { throw BoomError.invalid("Historical opening preparation belongs to storage execution.") }
+    try window.validate()
+    let source = try createLogicalSourcePointer(window.revision)
+    defer { bloom_logical_source_free(source) }
+    let result = try createLogicalOpeningWindowPointer(source, window: window)
+    return try PagedNativeLogicalWindow(taking: result, sourceRevision: window.revision,
+      sessionID: sessionID, engineIncarnation: engineIncarnation)
+  }
 
   func position(localUTF16: Int) throws -> PagedTextSummary {
     guard let offset = UInt64(exactly: localUTF16) else { throw BoomError.invalid("Negative logical local selection.") }
@@ -253,6 +294,11 @@ struct PagedNativeLogicalHistoryEntry: Sendable {
   let snapshot: PagedNativeLogicalSnapshot
   let cursor: PagedNativeLogicalCursor
   let groupID: UUID
+  let seed: PagedNativeLogicalWindowSeed?
+  init(snapshot: PagedNativeLogicalSnapshot, cursor: PagedNativeLogicalCursor, groupID: UUID,
+    seed: PagedNativeLogicalWindowSeed? = nil) {
+    self.snapshot = snapshot; self.cursor = cursor; self.groupID = groupID; self.seed = seed
+  }
 }
 /// A capture of the actual Foundation entries, never another history owner.
 struct PagedNativeLogicalHistoryProjection: Sendable {
@@ -399,28 +445,12 @@ struct PagedNativeLogicalEdit: Sendable {
   private let pointer: OpaquePointer
 
   init(revision: PagedTextRevision, sessionID: UUID, engineIncarnation: UUID) throws {
-    let bytes = try JSONEncoder().encode(revision) // one bounded opening, not input
-    var output: OpaquePointer?
-    var error = BoomAttachmentBuffer(data: nil, length: 0)
-    let status = bytes.withUnsafeBytes {
-      bloom_logical_source_create($0.bindMemory(to: UInt8.self).baseAddress, bytes.count, &output, &error)
-    }
-    try pagedLogicalResult(status, error)
-    guard let output else { throw BoomError.invalid("Logical opening returned no source.") }
-    pointer = output; sourceRevision = revision
+    pointer = try createLogicalSourcePointer(revision); sourceRevision = revision
     self.sessionID = sessionID; self.engineIncarnation = engineIncarnation
   }
   func openingWindow(_ window: PagedTextWindow) throws -> PagedNativeLogicalWindow {
     guard window.revision == sourceRevision else { throw BoomError.invalid("Opening island belongs to another file root.") }
-    let bytes = try JSONEncoder().encode(window)
-    var output: OpaquePointer?
-    var error = BoomAttachmentBuffer(data: nil, length: 0)
-    let status = bytes.withUnsafeBytes {
-      bloom_logical_source_opening_window(pointer, $0.bindMemory(to: UInt8.self).baseAddress,
-        bytes.count, &output, &error)
-    }
-    try pagedLogicalResult(status, error)
-    guard let output else { throw BoomError.invalid("Opening lost its actual logical island.") }
+    let output = try createLogicalOpeningWindowPointer(pointer, window: window)
     return try PagedNativeLogicalWindow(taking: output, sourceRevision: sourceRevision,
       sessionID: sessionID, engineIncarnation: engineIncarnation)
   }

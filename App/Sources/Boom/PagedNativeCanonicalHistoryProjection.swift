@@ -79,9 +79,15 @@ struct PagedNativeCanonicalHistoryProjection: Sendable, Equatable {
 
 /// Real retained cursor and bounded opening island before native exposure.
 struct PagedNativeCanonicalOpening: Sendable {
+  // Current + at most 100 immutable history seeds, and bounded conversion scratch.
+  static let maximumPayloadBytes = (PagedRootHistory.maximumEntries + 2) * PagedWorkingWindow.targetBytes
   let sessionID: UUID
   let record: PagedDocumentRootRecord
   let window: PagedTextWindow
   let history: PagedNativeCanonicalHistoryProjection
   let localCaretUTF16: Int
+  let preparedUndo: [PagedNativeLogicalHistoryEntry]?
+  let preparedRedo: [PagedNativeLogicalHistoryEntry]?
+  let historyPayloadBytes: Int
+  let prepareNativeHandoff: @Sendable () throws -> (@Sendable () -> Void)
 }

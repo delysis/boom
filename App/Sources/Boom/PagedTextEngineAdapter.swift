@@ -1150,16 +1150,16 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
   }
 
   private func nativeHistoryWindow(_ revision: PagedTextRevision,
-    cursor: PagedSealedCursor) throws -> PagedTextWindow {
+    cursor: PagedSealedCursor, cancellation: PagedTextCancellation) throws -> PagedTextWindow {
     try cursor.validate(in: revision)
     // The normalized lower endpoint retains its own byte/UTF16 admission,
     // even when the physical window must be at the distant focus endpoint.
-    let lowerByte: UInt64 = try execute(Request(op: "position", revision: revision, utf16Offset: cursor.utf16Offset))
+    let lowerByte: UInt64 = try execute(Request(op: "position", revision: revision, utf16Offset: cursor.utf16Offset), cancellation: cancellation)
     guard lowerByte == cursor.byteOffset else { throw BoomError.invalid("History selection lower endpoint has another byte coordinate.") }
     if cursor.selectionLengthUTF16 > 0, !cursor.focusAtEnd {
       // The bounded focus window cannot validate the distant other endpoint.
       let _: UInt64 = try execute(Request(op: "position", revision: revision,
-        utf16Offset: cursor.utf16Offset + cursor.selectionLengthUTF16))
+        utf16Offset: cursor.utf16Offset + cursor.selectionLengthUTF16), cancellation: cancellation)
     }
     // At most 4096 UTF16 units precede the exact cursor, using <=12288 bytes.
     // This leaves room for its scalar in the fixed 16KiB projection. Only this
@@ -1167,13 +1167,13 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
     // the exact retained cursor is never rounded or truncated.
     var anchor = cursor.focusUTF16 > 4_096 ? cursor.focusUTF16 - 4_096 : 0
     let start: UInt64
-    do { start = try execute(Request(op: "position", revision: revision, utf16Offset: anchor)) }
+    do { start = try execute(Request(op: "position", revision: revision, utf16Offset: anchor), cancellation: cancellation) }
     catch BoomError.invalid(let message) where message == "Invalid paged text: half-surrogate offset" {
       anchor += 1
-      start = try execute(Request(op: "position", revision: revision, utf16Offset: anchor))
+      start = try execute(Request(op: "position", revision: revision, utf16Offset: anchor), cancellation: cancellation)
     }
     let window: PagedTextWindow = try execute(Request(op: "window", revision: revision,
-      byteStart: start, maximumBytes: PagedWorkingWindow.targetBytes))
+      byteStart: start, maximumBytes: PagedWorkingWindow.targetBytes), cancellation: cancellation)
     try window.validate()
     guard window.revision == revision, window.byteStart == start, window.utf16Start == anchor,
       window.text.utf8.count <= PagedWorkingWindow.targetBytes, cursor.focusUTF16 >= anchor,
@@ -1216,24 +1216,66 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
   }
 
   func nativeCanonicalOpeningRetaining(publisher: PagedWorkspacePublisher,
-    expected: PagedDocumentRootRecord, sessionID: UUID) async throws -> PagedTextCustodiedValue<PagedNativeCanonicalOpening> {
-    try await rootOutput(claims: [.record(expected), .workspace], payloadBytes: PagedWorkingWindow.targetBytes,
-      metadataBytes: PagedTextRootCustody.maximumNativeMetadataBytes,
+    expected: PagedDocumentRootRecord, sessionID: UUID, controller: PagedTextRootLease) async throws -> PagedTextCustodiedValue<PagedNativeCanonicalOpening> {
+    let cancellation = PagedTextCancellation()
+    return try await withTaskCancellationHandler {
+      try await rootOutput(claims: [.record(expected), .workspace], payloadBytes: PagedNativeCanonicalOpening.maximumPayloadBytes,
+      metadataBytes: PagedTextRootCustody.maximumNativeMetadataBytes, cancellation: cancellation,
       outputClaims: { _ in [.record(expected)] },
-      outputBytes: { $0.window.text.utf8.count + PagedNativeCanonicalHistoryProjection.chargedBytes }) {
+      outputBytes: { $0.window.text.utf8.count + $0.historyPayloadBytes
+        + PagedNativeCanonicalHistoryProjection.chargedBytes }) {
       try self.admit(publisher)
       try publisher.admitCurrentRecord(expected, validateRecord: { try self.validateNativeRecord($0) })
       let history = try self.withNativeHistory(documentID: expected.document.id, writes: false) { try $0.load(expected) }
-      let window = try self.nativeHistoryWindow(history.current, cursor: history.currentCursor)
+      let window = try self.nativeHistoryWindow(history.current, cursor: history.currentCursor, cancellation: cancellation)
+      // Each actual read and raw-source conversion finishes on THIS worker.
+      // Only its immutable seed/snapshot escapes the per-entry pool; no
+      // history-window JSON parsing or scalar-table build reaches Main.
+      func prepare(_ entry: PagedRootHistoryEntry) throws -> PagedNativeLogicalHistoryEntry {
+        try autoreleasepool {
+          if cancellation.isCancelled { throw CancellationError() }
+          let actual = try self.nativeHistoryWindow(entry.revision, cursor: entry.cursor, cancellation: cancellation)
+          let logical = try PagedNativeLogicalWindow.fromWorkerOpening(actual,
+            sessionID: sessionID, engineIncarnation: self.custodyIncarnation)
+          let focus = entry.cursor.focusUTF16
+          guard focus >= logical.start.utf16, focus - logical.start.utf16 <= logical.summary.utf16,
+            let local = Int(exactly: focus - logical.start.utf16) else {
+            throw BoomError.invalid("Opening history window lost its exact scalar focus.")
+          }
+          let seed = try logical.makeSeed(localFocusUTF16: local)
+          if cancellation.isCancelled { throw CancellationError() }
+          return PagedNativeLogicalHistoryEntry(snapshot: logical.snapshot,
+            cursor: PagedNativeLogicalCursor(entry.cursor), groupID: entry.groupID, seed: seed)
+        }
+      }
+      var preparedUndo: [PagedNativeLogicalHistoryEntry] = [], preparedRedo: [PagedNativeLogicalHistoryEntry] = []
+      preparedUndo.reserveCapacity(history.undo.count); preparedRedo.reserveCapacity(history.redo.count)
+      for entry in history.undo { preparedUndo.append(try prepare(entry)) }
+      for entry in history.redo { preparedRedo.append(try prepare(entry)) }
+      let payloadBytes = try (preparedUndo + preparedRedo).reduce(0) { total, entry in
+        guard let seed = entry.seed, let bytes = Int(exactly: seed.summary.bytes),
+          bytes <= PagedWorkingWindow.targetBytes,
+          total <= PagedNativeCanonicalOpening.maximumPayloadBytes - bytes else {
+          throw BoomError.invalid("Prepared opening payload exceeds its actual bounded windows.")
+        }
+        return total + bytes
+      }
       guard let caret = Int(exactly: history.currentCursor.focusUTF16 - window.utf16Start) else {
         throw BoomError.budget("Canonical opening cursor exceeds its bounded island.")
       }
       try publisher.admitCurrentRecord(expected, validateRecord: { try self.validateNativeRecord($0) })
       let projection = try self.nativeCanonicalProjection(history: history, beforeHistory: nil,
         record: expected, beforeRecord: nil, scope: .opening(sessionID: sessionID, windowID: window.windowID))
+      if cancellation.isCancelled { throw CancellationError() }
       return PagedNativeCanonicalOpening(sessionID: sessionID, record: expected, window: window,
-        history: projection, localCaretUTF16: caret)
-    }
+        history: projection, localCaretUTF16: caret,
+        preparedUndo: preparedUndo, preparedRedo: preparedRedo, historyPayloadBytes: payloadBytes,
+        prepareNativeHandoff: {
+          try self.rootCustody.prepareNativeOpeningHandoff(controller, producer: projection.producer,
+            sessionID: sessionID, record: expected)
+        })
+      }
+    } onCancel: { cancellation.cancel() }
   }
 
   private func withNativeHistory<T>(documentID: UUID, writes: Bool,
@@ -1821,7 +1863,7 @@ final class PagedTextEngineAdapter: @unchecked Sendable {
     }
   }
   func installNativeCustody(_ output: PagedTextRootLease, controller: PagedTextRootLease,
-    expected: PagedDocumentRootRecord, record: PagedDocumentRootRecord) throws { try rootCustody.installControllerOutput(output, into: controller, expected: expected, record: record) }
+    expected: PagedDocumentRootRecord, record: PagedDocumentRootRecord, openingSessionID: UUID? = nil) throws { try rootCustody.installControllerOutput(output, into: controller, expected: expected, record: record, openingSessionID: openingSessionID) }
   func finishNativeCommitCustody(_ controller: PagedTextRootLease,
     acknowledgement: PagedNativeCommitAcknowledgement, publisher: PagedWorkspacePublisher) async throws {
     try await onQueue(custody: controller) {

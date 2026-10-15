@@ -136,10 +136,19 @@ private actor LogicalUndoDelivery: PagedNativeLogicalSessionStorage {
     window.contentView = scroll
   }
   var view: PagedNativeTextView { input!.activeView! }
-  func install(_ record: PagedDocumentRootRecord) async throws {
+  func install(_ record: PagedDocumentRootRecord, omittingOpeningSeeds: Bool = false) async throws {
     let backend = try await engine!.makeNativeStorage(publisher!, expected: record)
     self.backend = backend
-    let opening = try await backend.opening(sessionID: UUID())
+    let prepared = try await backend.opening(sessionID: UUID())
+    let opening: PagedNativeCanonicalOpening
+    if omittingOpeningSeeds {
+      // Explicit negative fixture: omit the REAL prepared immutable entries.
+      // Only these cold-read controls do so; production always adopts them.
+      opening = PagedNativeCanonicalOpening(sessionID: prepared.sessionID, record: prepared.record,
+        window: prepared.window, history: prepared.history, localCaretUTF16: prepared.localCaretUTF16,
+        preparedUndo: nil, preparedRedo: nil, historyPayloadBytes: 0,
+        prepareNativeHandoff: prepared.prepareNativeHandoff)
+    } else { opening = prepared }
     let route = LogicalUndoDelivery(backend); self.route = route
     let session = try PagedNativeSession(opening: opening, storage: route); self.session = session
     let input = try PagedNativeInputOwner(frame: scroll.bounds, session: session); self.input = input
@@ -246,6 +255,22 @@ private actor LogicalUndoDelivery: PagedNativeLogicalSessionStorage {
       throw error
     }
   }
+  func testJoinedOpeningCanCloseBeforeNativeActivationAndCannotActivateAfterClose() async throws {
+    try await run { f in
+      let saved = try await f.detach()
+      let backend = try await f.engine!.makeNativeStorage(f.publisher!, expected: saved)
+      f.backend = backend // preserve the exact controller if this control fails
+      let opening = try await backend.opening(sessionID: UUID())
+      XCTAssertEqual(opening.record, saved)
+      try await backend.detachJoinedController(sessionID: opening.sessionID, sequence: 0, record: saved)
+      f.backend = nil
+      XCTAssertThrowsError(try opening.prepareNativeHandoff(),
+        "A retired opening must fail its preflight before native activation.")
+      try await f.install(saved)
+      XCTAssertEqual(f.view.string, "abc")
+    }
+  }
+
   func testResidentResponderUndoRedoIsSynchronousWhileActualSaveReplyIsHeld() async throws {
     try await run { f in
       let session = f.session!, input = f.input!, commands = f.commands!, route = f.route!
@@ -542,12 +567,72 @@ private actor LogicalUndoDelivery: PagedNativeLogicalSessionStorage {
       }
     }
   }
+  func testReopenedResponderUndoAndRedoUseAuthenticOpeningSeedsWhileStorageDeliveryIsHeld() async throws {
+    try await run { f in
+      try f.input!.setDocumentSelection(PagedNativeNavigationSelection(utf16Offset: 1, utf16Length: 0))
+      f.view.insertText("X", replacementRange: f.view.selectedRange())
+      f.view.insertText("Y", replacementRange: f.view.selectedRange())
+      XCTAssertTrue(NSApplication.shared.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+      XCTAssertEqual(f.view.string, "aXbc")
+      let saved = try await f.detach()
+      try await f.install(saved) // actual file opening, including saved Undo AND Redo
+      let session = f.session!, input = f.input!, commands = f.commands!, route = f.route!
+      let opening = try commands.captureLogicalHistory()
+      XCTAssertEqual(opening.undo.count, 1); XCTAssertEqual(opening.redo.count, 1)
+      let undo = try XCTUnwrap(opening.undo.last), redo = try XCTUnwrap(opening.redo.last)
+      let source = try session.captureLogicalState().source, manager = commands.manager
+      let generation = session.generation
+      let retained = f.engine!.custodySnapshot
+      XCTAssertEqual(retained.jobs, 0)
+      XCTAssertEqual(retained.reservedPayloadBytes,
+        PagedWorkingWindow.hardBytes + PagedTextRootCustody.maximumNativeMetadataBytes,
+        "The actual canonical handoff releases only its temporary opening reservation.")
+      await route.holdRead { XCTFail("A prepared reopened SDK target must not request a storage window.") }
+      let enteredSave = expectation(description: "real reopened publication returned before held delivery")
+      await route.holdPublication { enteredSave.fulfill() }
+      XCTAssertTrue(NSApplication.shared.sendAction(NSSelectorFromString("redo:"), to: nil, from: nil))
+      XCTAssertEqual(f.view.string, "aXYbc"); XCTAssertEqual(session.generation, generation + 1)
+      XCTAssertTrue(try session.captureLogicalState().source.isSame(redo.snapshot))
+      XCTAssertFalse(commands.hasPendingCommand)
+      guard await XCTWaiter.fulfillment(of: [enteredSave], timeout: 10) == .completed else {
+        throw BoomError.unavailable("The real reopened save did not enter its held delivery boundary.")
+      }
+      XCTAssertTrue(NSApplication.shared.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+      XCTAssertEqual(f.view.string, "aXbc")
+      XCTAssertTrue(try session.captureLogicalState().source.isSame(source))
+      XCTAssertTrue(NSApplication.shared.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+      XCTAssertEqual(f.view.string, "abc"); XCTAssertEqual(session.generation, generation + 3)
+      XCTAssertTrue(try session.captureLogicalState().source.isSame(undo.snapshot))
+      let event = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero,
+        modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+        windowNumber: f.window.windowNumber, context: nil, characters: "z",
+        charactersIgnoringModifiers: "z", isARepeat: false, keyCode: 6))
+      f.window.sendEvent(event)
+      XCTAssertEqual(f.view.string, "azbc"); XCTAssertEqual(session.generation, generation + 4)
+      XCTAssertEqual(try input.currentDocumentSelection().utf16Offset, 2)
+      XCTAssertTrue(NSApplication.shared.sendAction(NSSelectorFromString("undo:"), to: nil, from: nil))
+      XCTAssertEqual(f.view.string, "abc")
+      XCTAssertTrue(try session.captureLogicalState().source.isSame(undo.snapshot))
+      XCTAssertTrue(commands.manager === manager); XCTAssertFalse(commands.hasPendingCommand)
+      XCTAssertEqual(commands.queuedRawKeyCount, 0); XCTAssertEqual(commands.retainedInputBytes, 0)
+      XCTAssertEqual(commands.retainedRefusedInputCount, 0)
+      XCTAssertNil(commands.firstFailure); XCTAssertNil(input.firstRefusal)
+      let reads = await route.readReturns
+      XCTAssertEqual(reads, 0, "No reader was entered or hidden behind the withheld delivery.")
+      await route.release()
+      try await commands.joinPendingCommand()
+      let current = try session.captureLogicalRead()
+      let bytes = try await f.engine!.logicalBytes(current.source, byteRange: 0..<current.source.summary.bytes)
+      XCTAssertEqual(bytes, Data("abc".utf8))
+    }
+  }
+
   func testSelectionSupersedesColdUndoRetainsOriginalKeysAndLaterNativeTypingStaysLive() async throws {
     try await run { f in
       try f.input!.setDocumentSelection(PagedNativeNavigationSelection(utf16Offset: 1, utf16Length: 0))
       f.view.insertText("X", replacementRange: f.view.selectedRange())
       let record = try await f.detach()
-      try await f.install(record) // genuine file opening; persisted targets have no eager seeds
+      try await f.install(record, omittingOpeningSeeds: true) // deliberate seedless cold-reader control
       let session = f.session!, input = f.input!, commands = f.commands!, route = f.route!
       let read = expectation(description: "actual cold logical read returned")
       await route.holdRead { read.fulfill() }
@@ -594,7 +679,7 @@ private actor LogicalUndoDelivery: PagedNativeLogicalSessionStorage {
       try f.input!.setDocumentSelection(PagedNativeNavigationSelection(utf16Offset: 1, utf16Length: 0))
       f.view.insertText("X", replacementRange: f.view.selectedRange())
       let record = try await f.detach()
-      try await f.install(record)
+      try await f.install(record, omittingOpeningSeeds: true)
       let session = f.session!, input = f.input!, commands = f.commands!, route = f.route!
       let read = expectation(description: "actual cold read held before delivery")
       await route.holdRead { read.fulfill() }

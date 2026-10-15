@@ -342,15 +342,23 @@ import Foundation
     var inversePops: [PagedNativeUndoEntry] = []
     registration.reserveCapacity(PagedRootHistory.maximumEntries)
     inversePops.reserveCapacity(PagedRootHistory.maximumEntries)
+    let currentWindow = input.session.logicalWindow
+    let currentFocus = opening.cursor.selection.focusUTF16
+    guard currentFocus >= currentWindow.start.utf16,
+      currentFocus - currentWindow.start.utf16 <= currentWindow.summary.utf16,
+      let currentLocal = Int(exactly: currentFocus - currentWindow.start.utf16) else {
+      throw BoomError.invalid("Opening current seed lost its actual native focus.")
+    }
+    let currentSeed = try currentWindow.makeSeed(localFocusUTF16: currentLocal)
     for target in opening.undo {
       registration.append(try makeEntry(snapshot: target.snapshot, cursor: target.cursor,
-        seed: nil, groupID: target.groupID, direction: .undo, actionName: "Edit"))
+        seed: target.seed, groupID: target.groupID, direction: .undo, actionName: "Edit"))
     }
     for target in opening.redo.reversed() {
       let entry = try makeEntry(snapshot: opening.snapshot, cursor: opening.cursor,
-        seed: nil, groupID: target.groupID, direction: .undo, actionName: "Edit")
+        seed: currentSeed, groupID: target.groupID, direction: .undo, actionName: "Edit")
       entry.openingInverse = try makeEntry(snapshot: target.snapshot, cursor: target.cursor,
-        seed: nil, groupID: target.groupID, direction: .redo, actionName: "Edit")
+        seed: target.seed, groupID: target.groupID, direction: .redo, actionName: "Edit")
       registration.append(entry); inversePops.append(entry)
     }
     try input.session.withCanonicalOpening(subscription, ownerID: input.ownerID) { [self] in
