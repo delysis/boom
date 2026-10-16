@@ -1,0 +1,108 @@
+name: Blessenger source import
+on:
+  push:
+    branches: ['blessenger/port-20261016']
+    paths: ['.blessenger-import/**']
+permissions:
+  contents: read
+jobs:
+  import:
+    if: github.repository == 'delysis/boom' && github.ref == 'refs/heads/blessenger/port-20261016'
+    runs-on: macos-26
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - name: Verify and materialize the exact authored source
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python3 .blessenger-import/apply.py
+          rustup toolchain install 1.92.0 --profile minimal --component rustfmt --component clippy
+          rustup override set 1.92.0
+          cargo fmt --all
+          git diff --binary > evidence/formatting.patch
+          git add -u
+          git config user.name 'Blessenger source import'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Implement the native Blessenger conversation and speech port'
+          git push origin HEAD:refs/heads/blessenger/port-20261016
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          git rev-parse HEAD > evidence/commit.txt
+          git rev-parse 'HEAD^{tree}' > evidence/tree.txt
+          git archive --format=tar HEAD | gzip -n > evidence/source.tar.gz
+          shasum -a 256 evidence/source.tar.gz > evidence/source.sha256
+          echo 'admitted=true' >> "$GITHUB_OUTPUT"
+      - name: Rust policy regressions
+        if: steps.source.outputs.admitted == 'true'
+        id: rust
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p bloom-core --features chat-layout --lib 2>&1 | tee evidence/rust-tests.log
+          cargo clippy --locked -p bloom-core --features chat-layout --all-targets -- -D warnings 2>&1 | tee evidence/rust-clippy.log
+      - name: Swift core regressions
+        if: steps.source.outputs.admitted == 'true'
+        id: core
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          swift test --package-path Core 2>&1 | tee evidence/core-tests.log
+      - name: Prepare pinned native dependencies and resources
+        if: steps.source.outputs.admitted == 'true'
+        id: dependencies
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/bootstrap.sh 2>&1 | tee evidence/bootstrap.log
+          scripts/prepare-blessenger-assets.sh 2>&1 | tee evidence/catalog.log
+      - name: Compile native bridge and execute model-free Blessenger tests
+        if: steps.source.outputs.admitted == 'true' && steps.dependencies.outcome == 'success'
+        id: native
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$PWD/target/blessenger"
+          cargo rustc -p boom-attachment-ffi --release --locked --features boom-attachment-ffi/chat-layout --lib -- --print native-static-libs 2>&1 | tee evidence/rust-native-link.log
+          mkdir -p .build-support
+          python3 - <<'PY'
+          import hashlib,json,pathlib
+          root=pathlib.Path.cwd()
+          lib=root/'target/blessenger/release/libboom_attachment_ffi.a'
+          data={'libraryDirectory':str(lib.parent),'librarySHA256':hashlib.file_digest(lib.open('rb'),'sha256').hexdigest(),'edition':'blessenger'}
+          (root/'.build-support/RustProductBuild.json').write_text(json.dumps(data,sort_keys=True)+'\n')
+          PY
+          swift scripts/record-native-libs.swift evidence/rust-native-link.log .build-support/RustNativeLink.json
+          swift test --package-path App --jobs 3 --manifest-cache none --disable-automatic-resolution --disable-experimental-prebuilts --filter BlessengerTests 2>&1 | tee evidence/native-tests.log
+      - name: Require all executed component lanes
+        if: always() && steps.source.outputs.admitted == 'true'
+        env:
+          RUST_RESULT: ${{ steps.rust.outcome }}
+          CORE_RESULT: ${{ steps.core.outcome }}
+          DEPENDENCIES_RESULT: ${{ steps.dependencies.outcome }}
+          NATIVE_RESULT: ${{ steps.native.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' "Rust=$RUST_RESULT Core=$CORE_RESULT Dependencies=$DEPENDENCIES_RESULT Native=$NATIVE_RESULT" | tee evidence/results.txt
+          test "$RUST_RESULT" = success
+          test "$CORE_RESULT" = success
+          test "$DEPENDENCIES_RESULT" = success
+          test "$NATIVE_RESULT" = success
+      - name: Retain source and all failure evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: blessenger-port-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14
