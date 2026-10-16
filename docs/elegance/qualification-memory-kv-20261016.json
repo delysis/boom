@@ -1,0 +1,220 @@
+{
+  "schema": 1,
+  "date": "2026-10-16",
+  "source_commit": "b5c7b6ad25fde62218e7bccc43c07b2eb6848230",
+  "source_tree": "dc9d820fdb90645183649c7f05018eaa7db11a99",
+  "source_inventory_sha256": "b21f17896aceba950ef865a5eb604219f0df4d39b4e29f0587873712212af9af",
+  "executable_sha256": "e68c2d5445dcc5713bb47475914cd333a9300fe88bd517e440be9ad2d70f91ff",
+  "changes": [
+    "Observe AppKit text-content layer insertion and late asynchronous-drawing changes; preserve media renderers and pixel formats.",
+    "Reserve full rotating KV allocation steps, including growth after concatenation discards spare capacity.",
+    "Separate current physical cache row from historical batch provenance after interrupted scalar extraction.",
+    "Use consistent foreground diagnostic activation, retain frontmost-application evidence, and capture generation failures directly."
+  ],
+  "checks": {
+    "rust": {
+      "passed": 519,
+      "ignored": 1,
+      "failed": 0
+    },
+    "swift_core": {
+      "passed": 80,
+      "failed": 0
+    },
+    "swift_native": {
+      "total": 567,
+      "passed": 470,
+      "skipped": 97,
+      "failed": 0
+    },
+    "swift_testing": {
+      "passed": 10,
+      "failed": 0
+    },
+    "notices": {
+      "passed": 14,
+      "failed": 0
+    },
+    "focused_cache": {
+      "passed": 47,
+      "failed": 0
+    },
+    "format_clippy_swift_syntax_c_header_shell": "passed",
+    "signed_editor": {
+      "cycles": 1000,
+      "all_native_controls_passed": true,
+      "source_and_export_verified": true,
+      "all_graph_owners_released": true
+    },
+    "real_model": "passed",
+    "layout_transitions": 16,
+    "chrome_states": 8,
+    "development_signature": "deep strict verification passed",
+    "inventory_before_equals_after": true
+  },
+  "memory": {
+    "phases": {
+      "preparation": {
+        "samples": 58,
+        "maximum_graphics_bytes": 16384,
+        "maximum_process_bytes": 146244760
+      },
+      "steady-native-input-layout": {
+        "samples": 5346,
+        "maximum_graphics_bytes": 16384,
+        "maximum_process_bytes": 94733488
+      },
+      "verify-and-close": {
+        "samples": 56,
+        "maximum_graphics_bytes": 241074176,
+        "maximum_process_bytes": 332580112
+      },
+      "released-native-graph": {
+        "samples": 53,
+        "maximum_graphics_bytes": 241074176,
+        "maximum_process_bytes": 332629264
+      }
+    },
+    "verification_stages": [
+      {
+        "available": true,
+        "graphics_footprint_bytes": 16384,
+        "host_height": 846,
+        "host_width": 1190,
+        "physical_footprint_bytes": 45417672,
+        "plain_text_height": 0,
+        "resident_bytes": 121929728,
+        "stage": "before-markup-verification",
+        "text_height": 4934,
+        "text_width": 1020,
+        "uptime_seconds": 28778.920227041668,
+        "viewport_height": 846,
+        "viewport_width": 1020,
+        "window_backing_scale": 2,
+        "window_key": true,
+        "window_occlusion_visible": true,
+        "window_visible": true
+      },
+      {
+        "available": true,
+        "graphics_footprint_bytes": 16384,
+        "host_height": 846,
+        "host_width": 1190,
+        "physical_footprint_bytes": 52872368,
+        "plain_text_height": 0,
+        "resident_bytes": 124026880,
+        "stage": "after-markup-verification",
+        "text_height": 4934,
+        "text_width": 1020,
+        "uptime_seconds": 28779.238988750003,
+        "viewport_height": 846,
+        "viewport_width": 1020,
+        "window_backing_scale": 2,
+        "window_key": true,
+        "window_occlusion_visible": true,
+        "window_visible": true
+      },
+      {
+        "available": true,
+        "graphics_footprint_bytes": 241074176,
+        "host_height": 846,
+        "host_width": 1190,
+        "physical_footprint_bytes": 298632464,
+        "plain_text_height": 0,
+        "resident_bytes": 132005888,
+        "stage": "clipboard-bitmap-prepared",
+        "text_height": 4934,
+        "text_width": 1020,
+        "uptime_seconds": 28779.255689083337,
+        "viewport_height": 846,
+        "viewport_width": 1020,
+        "window_backing_scale": 2,
+        "window_key": true,
+        "window_occlusion_visible": true,
+        "window_visible": true
+      },
+      {
+        "available": true,
+        "graphics_footprint_bytes": 241074176,
+        "host_height": 846,
+        "host_width": 1190,
+        "physical_footprint_bytes": 304825616,
+        "plain_text_height": 0,
+        "resident_bytes": 148062208,
+        "stage": "after-media-verification",
+        "text_height": 4934,
+        "text_width": 1020.5,
+        "uptime_seconds": 28779.663079916667,
+        "viewport_height": 846,
+        "viewport_width": 1020.5,
+        "window_backing_scale": 2,
+        "window_key": true,
+        "window_occlusion_visible": true,
+        "window_visible": true
+      }
+    ],
+    "after_graph_release_graphics_bytes": 3588096,
+    "summary": {
+      "kernel_lifetime_peak_footprint_bytes": 332645648,
+      "maximum_sampled_current_footprint_bytes": 332629264,
+      "model_free": true,
+      "normal_release": true,
+      "sample_interval_ms": 20,
+      "samples": 5513,
+      "schema": 1,
+      "scope": "Normal App/file/native graph. Unsuspended scheduled paired input and synchronous layout; no cached-view raster in the timed input loop, Mach stack capture, forced draw/compositor or GPU inference. Post-loop verification encodes a 72x42 clipboard bitmap while sampling continues. After successful shutdown the fixture releases its graph and samples one more second. Memory probe overhead is included; setup/exports are distinct phases."
+    }
+  },
+  "reused_component_gates": {
+    "source_build_script": "/Users/george/Documents/Codex/2026-10-10/audit-delysis-boom-per-paste-github/work/source-stable-view-integration-55/scripts/build-macos.sh",
+    "original_script_sha256": "e3a3784be9e1b5a7ce29bb1e2cb9cd39d2ad7cf12153dbe26d344845d8d31f59",
+    "reused_log": "/Users/george/Documents/Codex/2026-10-15/pl/work/final-build.log",
+    "unchanged_files": 147,
+    "omitted_completed_commands": [
+      "(cd \"$HERE/Core\" && swift test)",
+      "(cd \"$HERE\" && cargo fmt --all -- --check && cargo test --workspace --locked \"${RUST_FEATURES[@]}\" && cargo clippy --workspace --locked \"${RUST_FEATURES[@]}\" --all-targets -- -D warnings)"
+    ],
+    "reason": "Only App Swift source/tests changed after completed Core, Rust test, format and strict Clippy gates. All native tests, release compilation, inventory equality, packaging and signing run again.",
+    "rust_passed": 519,
+    "rust_ignored": 1,
+    "swift_core_passed": 80,
+    "strict_clippy_and_fmt": "passed before successful Rust release build",
+    "rust_release_products": {
+      ".build-support/RustProductBuild.json": "bb898fc07b95a5636297437ee51354a74b43395694b26fe5750cda4c97f8f0c6",
+      ".build-support/RustNativeLink.json": "0d974ac19bb9ca889abad2cd13584ca6db9089bb64075e73295ebe4d4128beee",
+      "target/release/bloom-delivery": "fadc038fd2b54f88b691447598c2bfe5174a812dc5f566b636d6fd98111b614e"
+    },
+    "final_builder": "work/finish-validated-build.sh"
+  },
+  "failed_attempts_retained": [
+    "final-validation/editor: SecurityAgent held foreground; no key window within initial deadline",
+    "followup-validation/editor-01: login window prevented actual focus",
+    "followup-validation/model-01: later inline completion timed out",
+    "followup-validation/model-03: invalid physical cache row; captured eligible focused state",
+    "final-validation/kv-row-before.log: regression reproduced invalid row before repair",
+    "bloom-integrated/build.log: inventory guard rejected source changes during diagnosis",
+    "bloom-final/build.log: archived provenance-label assertion caught and corrected",
+    "followup-validation/editor-stages: controls completed but added diagnostic samples exceeded receipt bound"
+  ],
+  "limits": [
+    "Native events are programmatic; no hardware keyboard, IME-service or compositor-latency acceptance.",
+    "Memory figures are per phase; post-edit bitmap and media checks remain distinct from plain-text editing.",
+    "Development signing is not Developer ID distribution or notarization.",
+    "Explicitly skipped native cases are not represented as passed.",
+    "No hosted CI or broad model-quality/performance claim."
+  ],
+  "evidence_sha256": {
+    "bloom-validated/source-files.sha256": "b21f17896aceba950ef865a5eb604219f0df4d39b4e29f0587873712212af9af",
+    "bloom-validated/executable.sha256": "3915ebd6579420e3a6121dcd094c5026121b98e1ba3af7ea68b1453d6fecb9d6",
+    "bloom-validated/build.log": "0af567f0ce58ff63a3de3fbddaec68fdd894e41a2a639c50c4a0ccd9dfadcf5b",
+    "final-validation/editor-02/public-editor-workspace/fixture-receipt.json": "9f28e6fd2f27f96f51151d186a09fb5f354c31d18834135d962c323f67a77054",
+    "final-validation/editor-02/public-editor-workspace/memory-summary.json": "e76ddebb7a3004ce63effd00592d4e4c157192cb698c0b42ccbbe5b3e4a9e983",
+    "final-validation/editor-02/public-editor-workspace/memory-samples.jsonl": "5343de87393c609c8cb076aaccacb61943ee8d9a8dd79ee7bc75fdea91b836d2",
+    "final-validation/editor-02/public-editor-workspace/graphics-verification-stages.json": "ce1194908ec7d93dbe96d5dec540f109979afc0feee1db3282346f0df126f46b",
+    "final-validation/model/receipt.json": "3f4be0aa845fd8cc7fc5366d57d1130dc52ca2e7bb0a0561c4f16b04f17a5e01",
+    "final-validation/layout/receipt.json": "432d853bedffe154032702e811f57167b9fc96210fa93d672b5303e76a4a6da4",
+    "final-validation/layout/chrome-receipt.json": "90dffaaceb22b2e30eefdbef25e57de9d1cf6ace23aa2d598f5a681489ca2f5a",
+    "final-validation/kv-row-before.log": "246a5a9d3fd968e881f0f9f113489d4fa924bf8b75f9ac42a2f0945c771293b3",
+    "final-validation/kv-final-focused.log": "fdad7e2978ec93807425e853a9791dbbdd55e81c6cfd3a7cb643398e5cd369a1"
+  }
+}
