@@ -64,7 +64,12 @@ with open(sys.argv[3], 'w') as stream:
 PYBUILD
 swift "$HERE/scripts/record-native-libs.swift" "$OUT/rust-native-link.log" "$HERE/.build-support/RustNativeLink.json"
 # Use locked macro sources consistently instead of experimental prebuilts.
-(cd "$HERE/App" && swift test --manifest-cache none --disable-automatic-resolution --disable-experimental-prebuilts)
+(cd "$HERE/App" && swift build --build-tests --manifest-cache none --disable-automatic-resolution --disable-experimental-prebuilts)
+DEBUG_BIN="$(cd "$HERE/App" && swift build --show-bin-path --manifest-cache none --disable-automatic-resolution --disable-experimental-prebuilts)"
+"$HERE/scripts/build-mlx-metallib.sh" "$DEBUG_BIN/mlx.metallib"
+[[ -d "$DEBUG_BIN/BoomPackageTests.xctest/Contents/MacOS" ]]
+cp "$DEBUG_BIN/mlx.metallib" "$DEBUG_BIN/BoomPackageTests.xctest/Contents/MacOS/mlx.metallib"
+(cd "$HERE/App" && swift test --skip-build --manifest-cache none --disable-automatic-resolution --disable-experimental-prebuilts)
 (cd "$HERE/App" && swift build -c release --manifest-cache none --disable-automatic-resolution --disable-experimental-prebuilts)
 BIN="$(cd "$HERE/App" && swift build -c release --manifest-cache none --disable-automatic-resolution --disable-experimental-prebuilts --show-bin-path)"
 PRODUCT_NAME=Bloom
@@ -72,6 +77,8 @@ PRODUCT_NAME=Bloom
 APP="$OUT/$PRODUCT_NAME.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN/Boom" "$APP/Contents/MacOS/$PRODUCT_NAME"
+# The same exact shaders used by native tests accompany the release binary.
+cp "$DEBUG_BIN/mlx.metallib" "$APP/Contents/MacOS/mlx.metallib"
 # Keep package resources in the standard sealed location. Boom's supported
 # Gemma bundles include their tokenizer configuration; the Hub package's
 # GPT/T5 fallback resources are not part of Boom's model path.
