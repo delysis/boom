@@ -36,6 +36,20 @@ import Foundation
   private var call: BlessengerCall?
   private var callID: UUID?
   private var callOperation: CancellationFlag?
+  private struct AudioPreparation {
+    let captureID: UUID
+    let callID: UUID
+    let history: ChatRecord?
+    let profile: BlessengerProfile
+    let contacts: [BlessengerContact]
+    let historical: BlessengerMedia.History
+    let fittedHistory: [ChatMessage]
+    let plans: [ConsultationPlan]
+    let trace: BlessengerTrace
+    var observation: CausalAudioPrefix.Observation
+    var lastPrepared: Double
+  }
+  private var audioPreparation: AudioPreparation?
   enum NoteState { case idle, preparing, recording, stopping }
   @Published private(set) var noteState = NoteState.idle
   private let voiceNote = VoiceInput()
@@ -339,7 +353,7 @@ import Foundation
       do { try await performSend(flag: flag, replay: replay) } catch { report(error) }
     }
   }
-  private func performSend(flag: CancellationFlag, caller: BlessengerCallerTurn? = nil, replay: BlessengerReplay? = nil) async throws {
+  private func performSend(flag: CancellationFlag, caller: BlessengerCallerTurn? = nil, replay: BlessengerReplay? = nil, prefix: AudioPreparation? = nil) async throws {
     await inputCompletion.join()
     if caller == nil { try await flushDraft() }
     try flag.check()
@@ -366,6 +380,15 @@ import Foundation
     if let address = snapshot.blessenger!.addresses[captured.id] { routed.recipients = address.recipients }
     let contacts = try BlessengerPolicy.resolve(host: history?.id, draft: routed, state: snapshot, frozen: history != nil)
     let voices: [Voice?] = contacts.isEmpty ? [nil] : try contacts.map { try BlessengerPolicy.capturedVoice($0, state: snapshot) }
+    if let prefix {
+      guard let caller, prefix.callID == caller.callID, captured.attachments == [prefix.captureID],
+        prefix.profile == profile, prefix.contacts == contacts,
+        (prefix.history?.messages ?? []) == contextHistory,
+        (prefix.history?.instructions ?? "") == (history?.instructions ?? ""),
+        prefix.history == nil || prefix.history?.id == history?.id else {
+        throw BoomError.stale("The case changed while its caller audio was being prepared. The admitted audio is retained.")
+      }
+    }
     try profile.requireBinding(for: history, caller: caller != nil)
     let runner = try await model(for: profile); try flag.check()
     let resolvedProfile = try profile.resolvingModel(path: runner.source.path, identity: runner.identity)
@@ -380,7 +403,9 @@ import Foundation
     }
     let media = try await BlessengerMedia.prepare(captured.attachments, state: snapshot, store: store, runner: runner, flag: flag)
     let projectedHistory = BlessengerMedia.deliveredHistory(contextHistory, product: snapshot.blessenger!)
-    let historical = try await BlessengerMedia.history(projectedHistory, state: snapshot, store: store, runner: runner, flag: flag)
+    let historical: BlessengerMedia.History
+    if let prefix { historical = prefix.historical }
+    else { historical = try await BlessengerMedia.history(projectedHistory, state: snapshot, store: store, runner: runner, flag: flag) }
     let payloads = (historical.prepared.payloads + media.payloads).reduce(into: [WritingMediaData]()) { values, item in
       if !values.contains(where: { $0.reference.id == item.reference.id }) { values.append(item) }
     }
@@ -388,13 +413,23 @@ import Foundation
       if !values.contains(item) { values.append(item) }
     }
     let chatID = history?.id ?? UUID()
-    let fitted = try await runner.fittedRound(voices: voices, history: projectedHistory,
+    let fitted: (plans: [ConsultationPlan], history: [ChatMessage], omittedHistory: Int, context: String)
+    if let prefix {
+      guard media.context.isEmpty else { throw BoomError.stale("The final caller representation changed its prompt text.") }
+      fitted = (prefix.plans, prefix.fittedHistory, projectedHistory.count - prefix.fittedHistory.count, "")
+    } else {
+      // V2 carries an opaque untrusted source block, not V3 rendered-range bindings.
+      // Exact originals/representations remain in the independently validated
+      // turn receipts and final store transaction; do not mislabel them V3.
+      let result = try await runner.fittedRound(voices: voices, history: projectedHistory,
       instructions: history?.instructions ?? "", context: media.context, request: captured.text,
       routing: contacts.map(\.handle), images: [], media: payloads,
       reserves: voices.map { _ in profile.maximumTokens }, flag: flag,
       cacheOwner: PromptCacheOwner(namespace: namespace, entity: chatID, route: .consultation),
-      promptContract: .referenceHistoryV2, capturedSources: sourceRefs,
+      promptContract: .referenceHistoryV2,
       historyMedia: historical.occurrences, currentMedia: media.payloads.map { $0.reference.id })
+      fitted = (result.plans, result.history, result.omittedHistory, result.context)
+    }
     try flag.check()
     let admittedIDs = Set(fitted.plans.flatMap { $0.placedMediaIDs })
     let admittedPayloads = payloads.filter { admittedIDs.contains($0.reference.id) }
@@ -408,7 +443,7 @@ import Foundation
         generationPolicy: runner.generationPolicy, attemptID: UUID(), responseID: ids[index], media: admittedPayloads.map(\.reference))
     }
     let turn = BlessengerPreparedTurn(chatID: chatID, draft: captured, history: history, contacts: contacts,
-      profile: profile, sourceDigests: admittedSources, context: media.context, responseIDs: ids,
+      profile: profile, sourceDigests: admittedSources, context: fitted.context, responseIDs: ids,
       receipts: receipts, voices: voices, outputLimit: profile.maximumTokens, caller: caller, speech: speechVoice, previousQuestionID: previousQuestionID, resolvedProfile: resolvedProfile)
     try flag.check(); caller?.trace?.once("turn.admissionStarted")
     let next = try await store.blessengerAdmit(turn, flag: flag); accept(next)
@@ -432,7 +467,7 @@ import Foundation
         let registration = flag.onCancel { child.cancel() }
         group.addTask { [weak self] in
           await self?.runResponse(receipts[index], id: ids[index], chatID: chatID, media: admittedPayloads,
-            runner: runner, profile: profile, flag: child, voice: speechVoice, useMTP: useMTP, callerTrace: caller?.trace)
+            runner: runner, profile: profile, flag: child, voice: speechVoice, useMTP: useMTP, callerTrace: caller?.trace, audioPrefixID: prefix?.captureID)
           flag.removeCancellationHandler(registration)
         }
       }
@@ -440,7 +475,7 @@ import Foundation
     }
   }
   private func runResponse(_ input: ConsultationReceipt, id: UUID, chatID: UUID, media: [WritingMediaData],
-    runner: MLXGemmaRunner, profile: BlessengerProfile, flag: CancellationFlag, voice: BlessengerSpeechVoice?, useMTP: Bool, callerTrace: BlessengerTrace? = nil) async {
+    runner: MLXGemmaRunner, profile: BlessengerProfile, flag: CancellationFlag, voice: BlessengerSpeechVoice?, useMTP: Bool, callerTrace: BlessengerTrace? = nil, audioPrefixID: UUID? = nil) async {
     var receipt = input
     let identity = GenerationIdentity(kind: .consultation, operationID: input.operationID, recordID: id,
       attemptID: input.attemptID!, model: input.model, seed: input.seed,
@@ -472,7 +507,12 @@ import Foundation
         try await store.checkpoint(progress, identity: identity, stopReason: stop, stopTokenID: token)
       }
       let result: MLXGemmaRunner.Output
-      if useMTP {
+      if let audioPrefixID {
+        trace.once("audio.prefix.finalization")
+        result = try await runner.runPreparedAudio(id: audioPrefixID, plan: input.plan, media: media,
+          maxTokens: profile.maximumTokens, seed: input.seed, settings: ProductCore.sampling(profile.sampling),
+          useMTP: useMTP, flag: flag, onCheckpoint: checkpoint, onText: { continuation.yield($0) })
+      } else if useMTP {
         result = try await runner.runMTP(plan: input.plan, media: media, maxTokens: profile.maximumTokens,
           seed: input.seed, settings: ProductCore.sampling(profile.sampling), flag: flag,
           onCheckpoint: checkpoint, onText: { continuation.yield($0) })
@@ -576,6 +616,60 @@ import Foundation
       callPhase = .idle; callReady = false; callMuted = false
     }
   }
+  private func prepareCallerPrefix(_ chunk: BlessengerAudioSlice, callID: UUID,
+    lifetime: CancellationFlag, flag: CancellationFlag) async throws {
+    try lifetime.check(); try flag.check()
+    guard self.callID == callID, let runner else { throw CancellationError() }
+    do {
+      if audioPreparation?.captureID != chunk.captureID {
+        guard chunk.offset == 0 else { throw BoomError.stale("A new caller prefix did not begin at its first sample.") }
+        audioPreparation = nil
+        await runner.discardAudioPrefix(); try flag.check()
+        let (snapshot, route) = try await store.blessengerCallSnapshot(callID)
+        let history = snapshot.chats.first { $0.id == route.conversationID }
+        let profile = route.profile
+        try profile.requireBinding(for: history, caller: true)
+        guard profile.modelIdentity == runner.identity else { throw BoomError.stale("The call's model binding changed.") }
+        let voices: [Voice?] = route.recipients.isEmpty ? [nil]
+          : try route.recipients.map { try BlessengerPolicy.capturedVoice($0, state: snapshot) }
+        let projected = BlessengerMedia.deliveredHistory(history?.messages ?? [], product: snapshot.blessenger!)
+        let historical = try await BlessengerMedia.history(projected, state: snapshot, store: store, runner: runner, flag: flag)
+        // Only the placement of this provisional row is compiled. It is neither
+        // persisted nor evaluated. Final admitted PCM supplies its real digest.
+        let stub = try BlessengerWave.encode([Float](repeating: 0, count: 640), rate: 16_000)
+        let provisional = WritingMediaData(reference: WritingMediaReference(id: chunk.captureID,
+          name: "Caller audio.wav", rootDigest: Digest.sha256(stub), kind: "audio"), bytes: stub,
+          samples: [Float](repeating: 0, count: 640))
+        let payloads = historical.prepared.payloads + [provisional]
+        let trace = BlessengerTrace(); trace.once("audio.prefix.planning")
+        let fitted = try await runner.fittedRound(voices: voices, history: projected,
+          instructions: history?.instructions ?? "", context: "", request: "", routing: route.recipients.map(\.handle),
+          images: [], media: payloads, reserves: [profile.maximumTokens + CausalAudioPrefix.maximumSamples / 640 - 1],
+          flag: flag, cacheOwner: PromptCacheOwner(namespace: namespace, entity: history?.id ?? callID, route: .consultation),
+          promptContract: .referenceHistoryV2,
+          historyMedia: historical.occurrences, currentMedia: [chunk.captureID])
+        guard fitted.plans.count == 1 else { throw BoomError.invalid("A live call requires exactly one prepared response.") }
+        let selected = Set(fitted.plans[0].placedMediaIDs)
+        try lifetime.check(); try flag.check()
+        trace.once("audio.prefix.started")
+        let observation = try await runner.beginAudioPrefix(id: chunk.captureID, plan: fitted.plans[0],
+          media: payloads.filter { selected.contains($0.reference.id) }, maxTokens: profile.maximumTokens, flag: flag)
+        try lifetime.check(); try flag.check(); trace.once("audio.prefix.firstPrepared")
+        audioPreparation = AudioPreparation(captureID: chunk.captureID, callID: callID, history: history,
+          profile: profile, contacts: route.recipients, historical: historical, fittedHistory: fitted.history,
+          plans: fitted.plans, trace: trace, observation: observation, lastPrepared: ProcessInfo.processInfo.systemUptime)
+      }
+      guard var prepared = audioPreparation, prepared.captureID == chunk.captureID, prepared.callID == callID,
+        prepared.observation.preparedSamples == chunk.offset else { throw BoomError.stale("A caller prefix was superseded.") }
+      let observed = try await runner.appendAudioPrefix(chunk, maxTokens: prepared.profile.maximumTokens, flag: flag)
+      try lifetime.check(); try flag.check()
+      guard audioPreparation?.captureID == chunk.captureID else { throw CancellationError() }
+      prepared.observation = observed; prepared.lastPrepared = ProcessInfo.processInfo.systemUptime
+      audioPreparation = prepared
+    } catch {
+      await runner.discardAudioPrefix(); audioPreparation = nil; throw error
+    }
+  }
   func toggleCall() {
     if callInProgress { stopCall(); return }
     guard canCall else { return }
@@ -626,16 +720,22 @@ import Foundation
         try Task.checkCancellation(); try lifetime.check()
       }
       call.onInterrupt = { [weak self] in self?.callOperation?.cancel() }
+      call.onPrefix = { [weak self] chunk, flag in
+        guard let self else { throw CancellationError() }
+        try await self.prepareCallerPrefix(chunk, callID: route.id, lifetime: lifetime, flag: flag)
+      }
       call.onUtterance = { [weak self] clip, _, epoch, flag in
         guard let self, self.callID == route.id else { throw BoomError.stale("An admitted caller clip lost its still-owned route.") }
-        let trace = BlessengerTrace()
+        let prepared = self.audioPreparation?.captureID == clip.captureID ? self.audioPreparation : nil
+        let trace = prepared?.trace ?? BlessengerTrace()
+        if let prepared { trace.record("audio.prefix.lastPrepared", at: prepared.lastPrepared) }
         trace.record(clip.nativeInputClock ? "caller.voicedPacketEnd.native" : "caller.voicedPacketEnd.deliveryEstimate", at: clip.speechEndedUptime)
         if let time = clip.deliveredUptime { trace.record("capture.finalVoicedPacketDelivered", at: time) }
         trace.record("caller.turnAdmitted." + clip.decision, at: clip.admittedUptime)
         self.callOperation = flag
         defer { if self.callOperation === flag { self.callOperation = nil } }
         let imported = try await detachedWork {
-          try AttachmentProcessor.inspect(name: "Caller audio.wav", data: clip.wav())
+          try AttachmentProcessor.inspect(name: "Caller audio.wav", data: clip.wav(), id: clip.captureID)
         }
         // Captured authored audio is durable before cancellation can suppress
         // its model response. The joining call still owns this exact route.
@@ -645,7 +745,12 @@ import Foundation
         if self.state.selectedChat == turn.conversationID, self.draft.id != turn.conversationID {
           self.draft = turn.snapshot.blessenger!.draft(for: turn.conversationID); self.storedDraftVersion = self.draft.version
         }
-        try lifetime.check(); try flag.check(); try await self.performSend(flag: flag, caller: turn)
+        do {
+          try lifetime.check(); try flag.check(); try await self.performSend(flag: flag, caller: turn, prefix: prepared)
+        } catch {
+          await self.runner?.discardAudioPrefix(); self.audioPreparation = nil; throw error
+        }
+        await self.runner?.discardAudioPrefix(); self.audioPreparation = nil
       }
       do {
         try lifetime.check()
@@ -657,10 +762,12 @@ import Foundation
           await call.waitUntilEnded()
         } onCancel: { lifetime.cancel() }
       } catch {
-        call.stop(); await call.join(); await self.store.blessengerEndCall(route.id)
+        call.stop(); await call.join(); await self.runner?.discardAudioPrefix(); self.audioPreparation = nil
+        await self.store.blessengerEndCall(route.id)
         throw error
       }
-      call.stop(); await call.join(); await self.store.blessengerEndCall(route.id)
+      call.stop(); await call.join(); await self.runner?.discardAudioPrefix(); self.audioPreparation = nil
+        await self.store.blessengerEndCall(route.id)
     }
   }
   var completionContext: BlessengerCompletion.Context {

@@ -3,7 +3,15 @@ import BoomCore
 import Foundation
 import Darwin
 
+struct BlessengerAudioSlice: Sendable {
+  let captureID: UUID
+  let firstFrame: UInt64
+  let offset: Int
+  let samples: [Float]
+}
+
 struct BlessengerCallerClip: Sendable {
+  var captureID = UUID()
   let samples: [Float]
   let firstFrame: UInt64
   let endFrame: UInt64
@@ -30,6 +38,7 @@ final class BlessengerCaptureBuffer: @unchecked Sendable {
   private var ring = [Float](repeating: 0, count: 1_920_000)
   private var frame: UInt64 = 0
   private var start: UInt64?
+  private var captureID = UUID()
   private var speech = false
   private var high = 0, low = 0
   private var publishedPause: UInt64?
@@ -94,7 +103,7 @@ final class BlessengerCaptureBuffer: @unchecked Sendable {
       lastDeliveredUptime = now
       if !speech && high >= 3 {
         speech = true
-        if start == nil { start = frame > 2560 ? frame - 2560 : 0 }
+        if start == nil { start = frame > 2560 ? frame - 2560 : 0; captureID = UUID() }
         emit(.speech(frame: frame))
       }
     } else if rms < 0.006 {
@@ -119,6 +128,24 @@ final class BlessengerCaptureBuffer: @unchecked Sendable {
     enabled = !muted; start = nil; speech = false; high = 0; low = 0
     publishedPause = nil; events.removeAll(keepingCapacity: true)
   }
+  /// Snapshot only complete, immutable model rows. No zero-padding is admitted
+  /// before the final utterance boundary; a resumed pause keeps the same ID.
+  func nextPrefix(after identity: UUID?, samples submitted: Int) throws -> BlessengerAudioSlice? {
+    lock.lock(); defer { lock.unlock() }
+    guard !stopped, enabled, let start else { return nil }
+    guard frame - start < UInt64(ring.count), lastVoiced >= start else {
+      throw BoomError.stale("The caller prefix has left its bounded capture ring.")
+    }
+    let offset = identity == captureID ? submitted : 0
+    guard offset >= 0, offset % 640 == 0 else { throw BoomError.invalid("Misaligned audio-prefix cursor.") }
+    let available = Int(lastVoiced - start) / 640 * 640
+    guard offset <= available else { throw BoomError.stale("Audio prefix moved past captured speech.") }
+    let count = min(40_960, available - offset)
+    guard count > 0 else { return nil }
+    let lower = start + UInt64(offset)
+    return BlessengerAudioSlice(captureID: captureID, firstFrame: start, offset: offset,
+      samples: (lower..<(lower + UInt64(count))).map { ring[Int($0 % UInt64(ring.count))] })
+  }
   func semanticWindow(through end: UInt64) throws -> [Float] {
     lock.lock(); defer { lock.unlock() }
     guard !stopped, !speech, high == 0, let start, end == lastVoiced, end > start, end <= frame,
@@ -137,7 +164,7 @@ final class BlessengerCaptureBuffer: @unchecked Sendable {
       end - start < UInt64(ring.count) else { throw BoomError.stale("The caller resumed or the exact audio span is no longer available.") }
     let samples = (start..<end).map { ring[Int($0 % UInt64(ring.count))] }
     self.start = nil
-    return BlessengerCallerClip(samples: samples, firstFrame: start, endFrame: end,
+    return BlessengerCallerClip(captureID: captureID, samples: samples, firstFrame: start, endFrame: end,
       speechEndedUptime: ended, admittedUptime: ProcessInfo.processInfo.systemUptime, decision: decision,
       nativeInputClock: nativeInputClock, deliveredUptime: lastDeliveredUptime)
   }
@@ -174,6 +201,11 @@ struct BlessengerCallTransition: Decodable, Sendable {
   var onReady: (@MainActor () -> Void)?
   var onClassify: @Sendable ([Float]) async throws -> Float
   private let classifier: BlessengerTurnClassifier
+  private var prefixTask: Task<Void, Never>?
+  private var prefixFlag = CancellationFlag()
+  private var prefixID: UUID?
+  private var prefixSamples = 0
+  var onPrefix: (@MainActor (BlessengerAudioSlice, CancellationFlag) async throws -> Void)?
   private var classification: Task<Void, Never>?
   private var classifiedPause: UInt64?
   private var gate = BlessengerCallGate(call: UUID())
@@ -222,6 +254,7 @@ struct BlessengerCallTransition: Decodable, Sendable {
     do { try engine.start() } catch { engine.inputNode.removeTap(onBus: 0); throw error }
     self.capture = capture; gate = BlessengerCallGate(call: UUID())
     active = true; listening = true; modelReady = false; error = nil
+    prefixFlag = CancellationFlag(); prefixID = nil; prefixSamples = 0
     let call = gate.call
     preparation = Task {
       defer { preparation = nil }
@@ -250,6 +283,11 @@ struct BlessengerCallTransition: Decodable, Sendable {
             case .failure(let message): throw BoomError.unavailable(message)
             }
           }
+          if self.modelReady, self.responseFlags.isEmpty, self.prefixTask == nil,
+            !self.gate.muted, !self.gate.admitted, let onPrefix = self.onPrefix,
+            let chunk = try capture.nextPrefix(after: self.prefixID, samples: self.prefixSamples) {
+            self.preparePrefix(chunk, using: onPrefix)
+          }
           if let paused = self.pausedUptime, let frame = self.gate.pausedAt,
             !self.gate.admitted, !self.gate.speaking, !self.gate.muted {
             let elapsed = ProcessInfo.processInfo.systemUptime - paused
@@ -274,6 +312,23 @@ struct BlessengerCallTransition: Decodable, Sendable {
         } catch is CancellationError { break }
         catch { self.error = error.localizedDescription; self.stop(); break }
       }
+    }
+  }
+  private func preparePrefix(_ chunk: BlessengerAudioSlice,
+    using prepare: @escaping @MainActor (BlessengerAudioSlice, CancellationFlag) async throws -> Void) {
+    if prefixID != chunk.captureID {
+      prefixFlag.cancel(); prefixFlag = CancellationFlag()
+      prefixID = chunk.captureID; prefixSamples = 0
+    }
+    let flag = prefixFlag, lifetime = lifecycle
+    prefixTask = Task {
+      defer { prefixTask = nil }
+      do {
+        try flag.check(); try await prepare(chunk, flag); try flag.check()
+        guard lifecycle == lifetime, prefixID == chunk.captureID else { throw CancellationError() }
+        prefixSamples = chunk.offset + chunk.samples.count
+      } catch is CancellationError {}
+      catch { if lifecycle == lifetime { self.error = error.localizedDescription; stop() } }
     }
   }
   private func classify(_ capture: BlessengerCaptureBuffer, through frame: UInt64, call: UUID, epoch: UInt64) {
@@ -331,11 +386,12 @@ struct BlessengerCallTransition: Decodable, Sendable {
     gate = next.gate
     if next.interrupt { onInterrupt(); output.stop(); for flag in responseFlags { flag.cancel() } }
     if let clip {
-      let call = gate.call, epoch = gate.epoch, prior = response
+      let call = gate.call, epoch = gate.epoch, prior = response, prefix = prefixTask
       let flag = CancellationFlag(); responseFlags.append(flag)
       response = Task {
         defer { responseFlags.removeAll { $0 === flag } }
         if let prior { await prior.value }
+        if let prefix { await prefix.value }
         // Admission already happened. Even after hang-up or renewed speech,
         // retain this authored clip once before observing response cancellation.
         // The call route remains owned until join completes this chain.
@@ -349,11 +405,13 @@ struct BlessengerCallTransition: Decodable, Sendable {
   }
   func setMuted(_ value: Bool) {
     guard active else { return }
-    muted = value; capture?.mute(value); classification?.cancel(); classifiedPause = nil; pausedUptime = nil
+    muted = value; capture?.mute(value)
+    prefixFlag.cancel(); prefixTask?.cancel(); prefixID = nil; prefixSamples = 0
+    classification?.cancel(); classifiedPause = nil; pausedUptime = nil
     do { try advance(["kind": "mute", "muted": value]) } catch { self.error = error.localizedDescription; stop() }
   }
   func stop() {
-    lifecycle = UUID()
+    lifecycle = UUID(); prefixFlag.cancel(); prefixTask?.cancel()
     preparation?.cancel(); poll?.cancel(); classification?.cancel()
     for flag in responseFlags { flag.cancel() }
     guard active else { return }
@@ -371,6 +429,7 @@ struct BlessengerCallTransition: Decodable, Sendable {
   func join() async {
     if let poll { await poll.value }; if let preparation { await preparation.value }; if let response { await response.value }
     if let classification { await classification.value }; classification = nil
+    if let prefixTask { await prefixTask.value }; prefixTask = nil
     poll = nil; preparation = nil; response = nil
     output.engine.stop()
   }

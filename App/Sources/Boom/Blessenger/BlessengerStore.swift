@@ -350,6 +350,10 @@ extension WorkspaceStore {
     blessengerCall = call
     return call
   }
+  func blessengerCallSnapshot(_ id: UUID) throws -> (WorkspaceState, BlessengerCallContext) {
+    guard let call = blessengerCall, call.id == id else { throw BoomError.stale("The call route has ended.") }
+    return (try blessengerSnapshot(), call)
+  }
   func blessengerBindCall(_ id: UUID, resolved: BlessengerProfile) throws {
     guard var call = blessengerCall, call.id == id, call.lastEpoch == 0 else {
       throw BoomError.stale("The call changed while its model was prepared.")

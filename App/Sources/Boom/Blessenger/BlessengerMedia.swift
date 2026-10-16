@@ -65,6 +65,11 @@ enum BlessengerMedia {
           throw BoomError.unavailable("This checkpoint cannot receive the selected audio. Transcribe it explicitly or choose an audio-capable model; the original is retained.")
         }
         let samples = try await detachedWork { () throws -> [Float] in
+          // Our retained Float32 caller format is already the model's 16 kHz
+          // waveform. Do not resample/quantize it after incremental preparation.
+          if let exact = try? BlessengerWave.decode(bytes), exact.rate == 16_000 {
+            return exact.samples
+          }
           let reader = try await MemoryMedia(bytes: bytes).audioReader()
           var samples: [Float] = []
           while let buffer = try reader.next(flag: flag) {
