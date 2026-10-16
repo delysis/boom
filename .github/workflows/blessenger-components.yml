@@ -1,0 +1,47 @@
+name: Blessenger components
+
+on:
+  pull_request:
+    paths:
+      - 'Core/**'
+      - 'App/**'
+      - 'crates/**'
+      - 'RustBridge/**'
+      - 'scripts/**'
+      - '.github/workflows/blessenger-components.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  portable-core:
+    name: Portable core (not native acceptance)
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Capture immutable input
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          git rev-parse HEAD > evidence/commit.txt
+          git rev-parse 'HEAD^{tree}' > evidence/tree.txt
+          git archive --format=tar HEAD | gzip -n > evidence/source.tar.gz
+          shasum -a 256 evidence/source.tar.gz > evidence/source.sha256
+          swift --version > evidence/swift-version.txt
+      - name: Execute core tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          swift test --package-path Core 2>&1 | tee evidence/core-tests.log
+      - name: Preserve results including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: blessenger-components-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14
