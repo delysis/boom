@@ -14,6 +14,9 @@ func nativeEditEvent(_ event: String) {
   var onFocus: (() -> Void)?
   var onContentHeight: ((CGFloat) -> Void)?
   var minimumContentHeight: CGFloat = 50
+  var sendsOnReturn = false
+  var maximumUTF8Bytes: Int?
+  var issue: ((String) -> Void)?
   private let placeholder = NativeTextPlaceholder("Message")
 
   func preparePlaceholder(_ text: String) {
@@ -60,8 +63,9 @@ func nativeEditEvent(_ event: String) {
       guard affectedCharRange.location >= 0, affectedCharRange.length >= 0,
         affectedCharRange.location <= source.length,
         affectedCharRange.length <= source.length - affectedCharRange.location else { return false }
-      let removed = source.substring(with: affectedCharRange).utf8.count
-      guard string.utf8.count - removed <= maximumUTF8Bytes - min(maximumUTF8Bytes + 1, replacementString.utf8.count) else {
+      guard maximumUTF8Bytes >= 0, let range = Range(affectedCharRange, in: string) else { return false }
+      let retained = string.utf8.count - string[range].utf8.count
+      guard retained <= maximumUTF8Bytes, replacementString.utf8.count <= maximumUTF8Bytes - retained else {
         issue?("The message exceeds its input limit. Nothing was pasted or truncated."); return false
       }
     }
@@ -88,7 +92,11 @@ func nativeEditEvent(_ event: String) {
   }
 
   override func keyDown(with event: NSEvent) {
-    if event.keyCode == 36, event.modifierFlags.contains(.command), !hasMarkedText() {
+    // Inspect the composition state before native interpretation consumes Return.
+    // A Return committing marked text must never also submit that text.
+    let modifiers = event.modifierFlags.intersection([.command, .shift, .control, .option])
+    if isEditable, [36, 76].contains(event.keyCode), !hasMarkedText(),
+      modifiers == .command || (sendsOnReturn && modifiers.isEmpty) {
       onSend?()
       return
     }
@@ -206,6 +214,7 @@ struct ChatComposer: NSViewRepresentable {
   var lineSpacing: CGFloat = 0
   var onContentHeight: ((CGFloat) -> Void)? = nil
   var showsEditingActions = false
+  var onIssue: ((String) -> Void)? = nil
   var sendsOnReturn = false
   var maximumUTF8Bytes: Int? = nil
   var completionModel: WorkspaceModel? = nil
@@ -256,6 +265,9 @@ struct ChatComposer: NSViewRepresentable {
     view.onCancel = isEnabled ? onCancel : nil
     view.onAttachments = isEnabled ? onAttachments : nil
     view.onFocus = isEnabled ? onFocus : nil
+    view.sendsOnReturn = sendsOnReturn
+    view.maximumUTF8Bytes = maximumUTF8Bytes
+    view.issue = onIssue
     context.coordinator.onContentHeight = onContentHeight
     view.onContentHeight = { [weak coordinator = context.coordinator] height in coordinator?.measure(height) }
     view.registerForDraggedTypes(AttachmentInput.draggingTypes)
@@ -297,6 +309,9 @@ struct ChatComposer: NSViewRepresentable {
     view.onCancel = isEnabled ? onCancel : nil
     view.onAttachments = isEnabled ? onAttachments : nil
     view.onFocus = isEnabled ? onFocus : nil
+    view.sendsOnReturn = sendsOnReturn
+    view.maximumUTF8Bytes = maximumUTF8Bytes
+    view.issue = onIssue
     let source = context.coordinator.text.wrappedValue
     let version = currentTextVersion?() ?? textVersion
     if !view.nativeEditInProgress, !view.hasMarkedText() {

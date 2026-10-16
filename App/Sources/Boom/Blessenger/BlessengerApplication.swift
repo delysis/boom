@@ -18,7 +18,7 @@ import SwiftUI
     app.run()
     delegate = nil
   }
-  final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+  @MainActor final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: NSWindow?
     private var model: BlessengerModel?
     private var startup: Task<Void, Never>?

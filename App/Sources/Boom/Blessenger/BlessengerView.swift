@@ -10,6 +10,7 @@ struct BlessengerView: View {
   @State private var renameText = ""
   @State private var removeID: UUID?
   @State private var details = false
+  @State private var composerHeight: CGFloat = 28
   init(model: BlessengerModel) { self.model = model; audio = model.audio }
   var body: some View {
     HSplitView {
@@ -143,7 +144,7 @@ struct BlessengerView: View {
         BlessengerToField(query: Binding(get: { model.draft.recipientQuery }, set: model.editRecipientQuery), contacts: model.state.voices.map { BlessengerContact($0) },
           focus: model.recipientFocus) { contact in
           Task { await model.addContact(contact) }
-        }.frame(minWidth: 70, height: 26)
+        }.frame(minWidth: 70).frame(height: 26)
       }
       if model.draft.recipients.count > 1 {
         TextField("Group name", text: Binding(get: { model.draft.groupName ?? "" }, set: model.editGroupName)).textFieldStyle(.plain)
@@ -207,10 +208,13 @@ struct BlessengerView: View {
     HStack(alignment: .bottom, spacing: 10) {
       Button { model.pickAttachments() } label: { Image(systemName: "plus") }
         .buttonStyle(GlassControl()).accessibilityLabel("Add attachment")
-      ChatComposer(text: Binding(get: { model.draft.text }, set: model.editText), enabled: !model.navigating,
-        placeholder: "Message", focusID: model.composerFocus, minHeight: 28, maxHeight: 180,
-        onSubmit: { if model.draft.recipientQuery.isEmpty { model.send() } }, onAttachments: { inputs in Task { await model.importInputs(inputs) } },
+      ChatComposer(text: Binding(get: { model.draft.text }, set: model.editText), focusRequest: model.composerFocus,
+        onSend: { if model.draft.recipientQuery.isEmpty { model.send() } }, onCancel: { model.stop() },
+        onAttachments: { inputs in Task { await model.importInputs(inputs) } },
+        accessibilityLabel: "Message; Return sends, Shift Return inserts a line break",
+        onContentHeight: { composerHeight = min(180, max(28, $0)) },
         onIssue: { model.report(BoomError.invalid($0)) }, sendsOnReturn: true, maximumUTF8Bytes: 2_097_152)
+        .disabled(model.navigating).frame(height: composerHeight)
         .padding(.horizontal, 8).padding(.vertical, 5)
         .background(Color(nsColor: .controlBackgroundColor)).clipShape(RoundedRectangle(cornerRadius: 18))
       Button {

@@ -1034,7 +1034,7 @@ actor MLXGemmaRunner {
     onCheckpoint: @escaping @Sendable (GenerationProgress, String?, Int?) async throws -> Void,
     onText: @escaping @Sendable (String) -> Void) async throws -> Output {
     guard let assistant, let assistantIdentity else { throw BoomError.unavailable("The MTP assistant has not been loaded.") }
-    let policy = generationPolicy, prefill = try prefillParameters(nil, operationID: flag.operationID)
+    let policy = generationPolicy, prefill = try prefillParameters(nil, operationID: flag.operationID, policy: generationPolicy)
     return try await ownedOperation(flag: flag, background: false) {
       try await assistant.perform { drafter in
         try await self.container.perform { context in
