@@ -1,0 +1,131 @@
+diff --git a/App/Sources/Boom/Blessenger/BlessengerApplication.swift b/App/Sources/Boom/Blessenger/BlessengerApplication.swift
+index b5cdad1..9575ea1 100644
+--- a/App/Sources/Boom/Blessenger/BlessengerApplication.swift
++++ b/App/Sources/Boom/Blessenger/BlessengerApplication.swift
+@@ -18,7 +18,7 @@ import SwiftUI
+     app.run()
+     delegate = nil
+   }
+-  final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
++  @MainActor final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+     private var window: NSWindow?
+     private var model: BlessengerModel?
+     private var startup: Task<Void, Never>?
+diff --git a/App/Sources/Boom/Blessenger/BlessengerView.swift b/App/Sources/Boom/Blessenger/BlessengerView.swift
+index 6677ce3..ad75591 100644
+--- a/App/Sources/Boom/Blessenger/BlessengerView.swift
++++ b/App/Sources/Boom/Blessenger/BlessengerView.swift
+@@ -10,6 +10,7 @@ struct BlessengerView: View {
+   @State private var renameText = ""
+   @State private var removeID: UUID?
+   @State private var details = false
++  @State private var composerHeight: CGFloat = 28
+   init(model: BlessengerModel) { self.model = model; audio = model.audio }
+   var body: some View {
+     HSplitView {
+@@ -143,7 +144,7 @@ struct BlessengerView: View {
+         BlessengerToField(query: Binding(get: { model.draft.recipientQuery }, set: model.editRecipientQuery), contacts: model.state.voices.map { BlessengerContact($0) },
+           focus: model.recipientFocus) { contact in
+           Task { await model.addContact(contact) }
+-        }.frame(minWidth: 70, height: 26)
++        }.frame(minWidth: 70).frame(height: 26)
+       }
+       if model.draft.recipients.count > 1 {
+         TextField("Group name", text: Binding(get: { model.draft.groupName ?? "" }, set: model.editGroupName)).textFieldStyle(.plain)
+@@ -207,10 +208,13 @@ struct BlessengerView: View {
+     HStack(alignment: .bottom, spacing: 10) {
+       Button { model.pickAttachments() } label: { Image(systemName: "plus") }
+         .buttonStyle(GlassControl()).accessibilityLabel("Add attachment")
+-      ChatComposer(text: Binding(get: { model.draft.text }, set: model.editText), enabled: !model.navigating,
+-        placeholder: "Message", focusID: model.composerFocus, minHeight: 28, maxHeight: 180,
+-        onSubmit: { if model.draft.recipientQuery.isEmpty { model.send() } }, onAttachments: { inputs in Task { await model.importInputs(inputs) } },
++      ChatComposer(text: Binding(get: { model.draft.text }, set: model.editText), focusRequest: model.composerFocus,
++        onSend: { if model.draft.recipientQuery.isEmpty { model.send() } }, onCancel: { model.stop() },
++        onAttachments: { inputs in Task { await model.importInputs(inputs) } },
++        accessibilityLabel: "Message; Return sends, Shift Return inserts a line break",
++        onContentHeight: { composerHeight = min(180, max(28, $0)) },
+         onIssue: { model.report(BoomError.invalid($0)) }, sendsOnReturn: true, maximumUTF8Bytes: 2_097_152)
++        .disabled(model.navigating).frame(height: composerHeight)
+         .padding(.horizontal, 8).padding(.vertical, 5)
+         .background(Color(nsColor: .controlBackgroundColor)).clipShape(RoundedRectangle(cornerRadius: 18))
+       Button {
+diff --git a/App/Sources/Boom/ChatComposer.swift b/App/Sources/Boom/ChatComposer.swift
+index f969138..a1b1a9e 100644
+--- a/App/Sources/Boom/ChatComposer.swift
++++ b/App/Sources/Boom/ChatComposer.swift
+@@ -14,6 +14,9 @@ func nativeEditEvent(_ event: String) {
+   var onFocus: (() -> Void)?
+   var onContentHeight: ((CGFloat) -> Void)?
+   var minimumContentHeight: CGFloat = 50
++  var sendsOnReturn = false
++  var maximumUTF8Bytes: Int?
++  var issue: ((String) -> Void)?
+   private let placeholder = NativeTextPlaceholder("Message")
+ 
+   func preparePlaceholder(_ text: String) {
+@@ -60,8 +63,9 @@ func nativeEditEvent(_ event: String) {
+       guard affectedCharRange.location >= 0, affectedCharRange.length >= 0,
+         affectedCharRange.location <= source.length,
+         affectedCharRange.length <= source.length - affectedCharRange.location else { return false }
+-      let removed = source.substring(with: affectedCharRange).utf8.count
+-      guard string.utf8.count - removed <= maximumUTF8Bytes - min(maximumUTF8Bytes + 1, replacementString.utf8.count) else {
++      guard maximumUTF8Bytes >= 0, let range = Range(affectedCharRange, in: string) else { return false }
++      let retained = string.utf8.count - string[range].utf8.count
++      guard retained <= maximumUTF8Bytes, replacementString.utf8.count <= maximumUTF8Bytes - retained else {
+         issue?("The message exceeds its input limit. Nothing was pasted or truncated."); return false
+       }
+     }
+@@ -88,7 +92,11 @@ func nativeEditEvent(_ event: String) {
+   }
+ 
+   override func keyDown(with event: NSEvent) {
+-    if event.keyCode == 36, event.modifierFlags.contains(.command), !hasMarkedText() {
++    // Inspect the composition state before native interpretation consumes Return.
++    // A Return committing marked text must never also submit that text.
++    let modifiers = event.modifierFlags.intersection([.command, .shift, .control, .option])
++    if isEditable, [36, 76].contains(event.keyCode), !hasMarkedText(),
++      modifiers == .command || (sendsOnReturn && modifiers.isEmpty) {
+       onSend?()
+       return
+     }
+@@ -206,6 +214,7 @@ struct ChatComposer: NSViewRepresentable {
+   var lineSpacing: CGFloat = 0
+   var onContentHeight: ((CGFloat) -> Void)? = nil
+   var showsEditingActions = false
++  var onIssue: ((String) -> Void)? = nil
+   var sendsOnReturn = false
+   var maximumUTF8Bytes: Int? = nil
+   var completionModel: WorkspaceModel? = nil
+@@ -256,6 +265,9 @@ struct ChatComposer: NSViewRepresentable {
+     view.onCancel = isEnabled ? onCancel : nil
+     view.onAttachments = isEnabled ? onAttachments : nil
+     view.onFocus = isEnabled ? onFocus : nil
++    view.sendsOnReturn = sendsOnReturn
++    view.maximumUTF8Bytes = maximumUTF8Bytes
++    view.issue = onIssue
+     context.coordinator.onContentHeight = onContentHeight
+     view.onContentHeight = { [weak coordinator = context.coordinator] height in coordinator?.measure(height) }
+     view.registerForDraggedTypes(AttachmentInput.draggingTypes)
+@@ -297,6 +309,9 @@ struct ChatComposer: NSViewRepresentable {
+     view.onCancel = isEnabled ? onCancel : nil
+     view.onAttachments = isEnabled ? onAttachments : nil
+     view.onFocus = isEnabled ? onFocus : nil
++    view.sendsOnReturn = sendsOnReturn
++    view.maximumUTF8Bytes = maximumUTF8Bytes
++    view.issue = onIssue
+     let source = context.coordinator.text.wrappedValue
+     let version = currentTextVersion?() ?? textVersion
+     if !view.nativeEditInProgress, !view.hasMarkedText() {
+diff --git a/App/Sources/Boom/MLXGemmaRunner.swift b/App/Sources/Boom/MLXGemmaRunner.swift
+index 72bb2ef..6975b99 100644
+--- a/App/Sources/Boom/MLXGemmaRunner.swift
++++ b/App/Sources/Boom/MLXGemmaRunner.swift
+@@ -1034,7 +1034,7 @@ actor MLXGemmaRunner {
+     onCheckpoint: @escaping @Sendable (GenerationProgress, String?, Int?) async throws -> Void,
+     onText: @escaping @Sendable (String) -> Void) async throws -> Output {
+     guard let assistant, let assistantIdentity else { throw BoomError.unavailable("The MTP assistant has not been loaded.") }
+-    let policy = generationPolicy, prefill = try prefillParameters(nil, operationID: flag.operationID)
++    let policy = generationPolicy, prefill = try prefillParameters(nil, operationID: flag.operationID, policy: generationPolicy)
+     return try await ownedOperation(flag: flag, background: false) {
+       try await assistant.perform { drafter in
+         try await self.container.perform { context in
