@@ -1,4 +1,5 @@
 import AppKit
+import BoomCore
 import SwiftUI
 
 func nativeEditEvent(_ event: String) {
@@ -59,14 +60,11 @@ func nativeEditEvent(_ event: String) {
   }
   override func shouldChangeText(in affectedCharRange: NSRange, replacementString: String?) -> Bool {
     if let maximumUTF8Bytes, let replacementString {
-      let source = string as NSString
-      guard affectedCharRange.location >= 0, affectedCharRange.length >= 0,
-        affectedCharRange.location <= source.length,
-        affectedCharRange.length <= source.length - affectedCharRange.location else { return false }
-      guard maximumUTF8Bytes >= 0, let range = Range(affectedCharRange, in: string) else { return false }
-      let retained = string.utf8.count - string[range].utf8.count
-      guard retained <= maximumUTF8Bytes, replacementString.utf8.count <= maximumUTF8Bytes - retained else {
-        issue?("The message exceeds its input limit. Nothing was pasted or truncated."); return false
+      do {
+        try TextInputLimit.validateReplacement(in: string, range: affectedCharRange,
+          replacement: replacementString, maximumUTF8Bytes: maximumUTF8Bytes)
+      } catch {
+        issue?(error.localizedDescription); return false
       }
     }
     return super.shouldChangeText(in: affectedCharRange, replacementString: replacementString)
@@ -110,8 +108,8 @@ func nativeEditEvent(_ event: String) {
   override func performKeyEquivalent(with event: NSEvent) -> Bool {
     // Handle the active editor before the menu bar sees Command-Return.
     // Otherwise the writing command can consume a chat send or inline save.
-    if window?.firstResponder === self, event.keyCode == 36,
-      event.modifierFlags.contains(.command), !hasMarkedText() {
+    if isEditable, window?.firstResponder === self, [36, 76].contains(event.keyCode),
+      event.modifierFlags.intersection([.command, .shift, .control, .option]) == .command, !hasMarkedText() {
       onSend?()
       return true
     }
