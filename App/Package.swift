@@ -6,10 +6,22 @@ let productRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
   .deletingLastPathComponent()
 let buildURL = productRoot.appendingPathComponent(".build-support/RustProductBuild.json")
 let libraryDirectory: String
+let rustArchiveSettings: [CSetting]
 if FileManager.default.fileExists(atPath: buildURL.path) {
   let config = try JSONDecoder().decode([String: String].self, from: Data(contentsOf: buildURL))
   libraryDirectory = config["libraryDirectory"]!
-} else { libraryDirectory = productRoot.appendingPathComponent("target/release").path }
+  guard let hash = config["librarySHA256"], hash.utf8.count == 64,
+    hash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+    fatalError("Rebuild with scripts/build-macos.sh to record the Rust archive hash.")
+  }
+  // A changed external static archive is not otherwise a SwiftPM build input.
+  // Its digest changes the C shim's command and forces the native product to
+  // relink even when no Swift source changed. The build receipt retains it.
+  rustArchiveSettings = [.define("BLOOM_RUST_ARCHIVE_SHA256_" + hash)]
+} else {
+  libraryDirectory = productRoot.appendingPathComponent("target/release").path
+  rustArchiveSettings = []
+}
 let nativeLinkURL = productRoot.appendingPathComponent(".build-support/RustNativeLink.json")
 let nativeLinkFlags: [String]
 if FileManager.default.fileExists(atPath: nativeLinkURL.path) {
@@ -40,7 +52,7 @@ let package = Package(
       .product(name: "MLXHuggingFace", package: "MLXSwiftLM"),
       .product(name: "Tokenizers", package: "swift-transformers"),
     ], resources: [.process("Resources")]),
-    .target(name: "CAttachment", publicHeadersPath: "include"),
+    .target(name: "CAttachment", publicHeadersPath: "include", cSettings: rustArchiveSettings),
     .executableTarget(
       name: "Boom",
       dependencies: [
@@ -61,6 +73,7 @@ let package = Package(
             "-L" + libraryDirectory,
             "-lboom_attachment_ffi",
           ] + nativeLinkFlags.flatMap { ["-Xlinker", $0] }),
+        .linkedLibrary("bsm", .when(platforms: [.macOS])),
         .linkedFramework("AppKit"), .linkedFramework("Security"),
         .linkedFramework("SystemConfiguration"),
         .linkedFramework("AVFoundation"), .linkedFramework("Speech"),

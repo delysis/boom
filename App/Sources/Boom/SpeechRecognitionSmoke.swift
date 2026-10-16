@@ -25,7 +25,7 @@ import Foundation
       let receipt: [String: Any] = ["status": status, "observations": observations,
         "sourceInventorySHA256": Bundle.main.infoDictionary?["BoomSourceSHA256"] ?? "unavailable",
         "pid": ProcessInfo.processInfo.processIdentifier, "publicFixtureOnly": true,
-        "keychainLookups": VaultSession.shared.lookupCount, "error": error as Any? ?? NSNull()]
+        "error": error as Any? ?? NSNull()]
       try JSONSerialization.data(withJSONObject: receipt, options: [.prettyPrinted, .sortedKeys])
         .write(to: evidence.appendingPathComponent("receipt.json"), options: .atomic)
     }

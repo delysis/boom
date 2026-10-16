@@ -1,6 +1,5 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import Foundation
 import SwiftUI
 
@@ -32,8 +31,7 @@ import SwiftUI
     var receipt = ["status": "running", "source": Bundle.main.object(forInfoDictionaryKey: "BoomSourceSHA256") as? String ?? "unsealed", "semanticReview": "pending"]
     func saveReceipt() throws { try encoder.encode(receipt).write(to: evidence.appendingPathComponent("receipt.json"), options: .atomic) }
     try saveReceipt()
-    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: evidence.appendingPathComponent("public-workspace"),
-      testKey: SymmetricKey(data: Data(repeating: 0x71, count: 32))), loadModels: false)
+    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: evidence.appendingPathComponent("public-workspace")), loadModels: false)
     model.state.autocomplete = false
     func finish() async throws {
       for _ in 0..<6000 where model.isBusy { try await Task.sleep(for: .milliseconds(50)) }
@@ -99,9 +97,9 @@ import SwiftUI
       let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 1440, height: 1000))
       window.isReleasedWhenClosed = false; window.contentView = host; defer { window.close() }
       let text = link + "\nMara watched the recording and said, \""
-      model.updateDocument(text, id: document.id, caret: text.utf16.count)
+      try await NativeCheckEvidence.replacePublicDocument(model, text: text, id: document.id, caret: text.utf16.count)
       host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(200)); host.layoutSubtreeIfNeeded()
-      guard let editor = model.editor else { throw BoomError.invalid("Native manuscript surface unavailable.") }
+      guard let editor = model.pagedInput?.activeView else { throw BoomError.invalid("Native manuscript surface unavailable.") }
       window.makeFirstResponder(editor); editor.setSelectedRange(NSRange(location: text.utf16.count, length: 0))
       model.state.autocomplete = true; model.scheduleCompletion()
       for _ in 0..<1200 {

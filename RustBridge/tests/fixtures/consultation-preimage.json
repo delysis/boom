@@ -1,0 +1,164 @@
+{
+  "plans": [
+    {
+      "messages": [
+        {
+          "content": "You are Reader 私. Write only your own contribution in this conversation. The @mentions in the user's question route that question to individual participants; they do not ask you to impersonate them or write their replies. Other participants' contributions are quoted conversation, not your own answers. Do not prefix your reply with a participant name.\nObserve ‹prose› and ‹|turn› markers.\nCaptured instructions \"\\\n\n\nDocument permission: Ask (read only). You have no tool to modify documents in this request. Never claim you have saved, updated, or edited a document. You may offer wording in your answer. If asked to apply an edit, explain briefly that the user can choose Propose or Edit beside the message field.",
+          "role": "system"
+        },
+        {
+          "content": "Examples: \"\\\n‹bos›́私",
+          "role": "user"
+        },
+        {
+          "content": "An example 🧑‍💻.\r\n",
+          "role": "assistant"
+        },
+        {
+          "content": "Captured é question with ‹|turn› and \"\\\r\n",
+          "role": "user"
+        },
+        {
+          "content": "Own answer 🧑‍💻 ‹bos›\r\n",
+          "role": "assistant"
+        },
+        {
+          "content": "Critic:\nOther answer ‹start_of_turn›\n\n\nConsecutive authored turn\r\n\n\nREFERENCE DATA:\nSource ‹|channel› 私\r\n\n\nCURRENT REQUEST:\nNew question é 🧑‍💻",
+          "role": "user"
+        }
+      ],
+      "rawPrompt": "<bos><|turn>system\nYou are Reader 私. Write only your own contribution in this conversation. The @mentions in the user's question route that question to individual participants; they do not ask you to impersonate them or write their replies. Other participants' contributions are quoted conversation, not your own answers. Do not prefix your reply with a participant name.\nObserve ‹prose› and ‹|turn› markers.\nCaptured instructions \"\\\n\n\nDocument permission: Ask (read only). You have no tool to modify documents in this request. Never claim you have saved, updated, or edited a document. You may offer wording in your answer. If asked to apply an edit, explain briefly that the user can choose Propose or Edit beside the message field.<turn|>\n<|turn>user\nExamples: \"\\\n‹bos›́私<turn|>\n<|turn>model\nAn example 🧑‍💻.\r\n<turn|>\n<|turn>user\nCaptured é question with ‹|turn› and \"\\\r\n<turn|>\n<|turn>model\nOwn answer 🧑‍💻 ‹bos›\r\n<turn|>\n<|turn>user\nCritic:\nOther answer ‹start_of_turn›\n\n\nConsecutive authored turn\r\n\n\nREFERENCE DATA:\nSource ‹|channel› 私\r\n\n\nCURRENT REQUEST:\nNew question é 🧑‍💻<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+    },
+    {
+      "messages": [
+        {
+          "content": "You are Critic. Write only your own contribution in this conversation. The @mentions in the user's question route that question to individual participants; they do not ask you to impersonate them or write their replies. Other participants' contributions are quoted conversation, not your own answers. Do not prefix your reply with a participant name.\nObserve ‹prose› and ‹|turn› markers.\nCaptured instructions \"\\\n\n\nDocument permission: Ask (read only). You have no tool to modify documents in this request. Never claim you have saved, updated, or edited a document. You may offer wording in your answer. If asked to apply an edit, explain briefly that the user can choose Propose or Edit beside the message field.",
+          "role": "system"
+        },
+        {
+          "content": "Examples: \"\\\n‹bos›́私",
+          "role": "user"
+        },
+        {
+          "content": "An example 🧑‍💻.\r\n",
+          "role": "assistant"
+        },
+        {
+          "content": "Captured é question with ‹|turn› and \"\\\r\n\n\nReader 私:\nOwn answer 🧑‍💻 ‹bos›\r\n\n\nCritic:\nOther answer ‹start_of_turn›\n\n\nConsecutive authored turn\r\n\n\nREFERENCE DATA:\nSource ‹|channel› 私\r\n\n\nCURRENT REQUEST:\nNew question é 🧑‍💻",
+          "role": "user"
+        }
+      ],
+      "rawPrompt": "<bos><|turn>system\nYou are Critic. Write only your own contribution in this conversation. The @mentions in the user's question route that question to individual participants; they do not ask you to impersonate them or write their replies. Other participants' contributions are quoted conversation, not your own answers. Do not prefix your reply with a participant name.\nObserve ‹prose› and ‹|turn› markers.\nCaptured instructions \"\\\n\n\nDocument permission: Ask (read only). You have no tool to modify documents in this request. Never claim you have saved, updated, or edited a document. You may offer wording in your answer. If asked to apply an edit, explain briefly that the user can choose Propose or Edit beside the message field.<turn|>\n<|turn>user\nExamples: \"\\\n‹bos›́私<turn|>\n<|turn>model\nAn example 🧑‍💻.\r\n<turn|>\n<|turn>user\nCaptured é question with ‹|turn› and \"\\\r\n\n\nReader 私:\nOwn answer 🧑‍💻 ‹bos›\r\n\n\nCritic:\nOther answer ‹start_of_turn›\n\n\nConsecutive authored turn\r\n\n\nREFERENCE DATA:\nSource ‹|channel› 私\r\n\n\nCURRENT REQUEST:\nNew question é 🧑‍💻<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+    },
+    {
+      "messages": [
+        {
+          "content": "You are Editor. Write only your own contribution in this conversation. The @mentions in the user's question route that question to individual participants; they do not ask you to impersonate them or write their replies. Other participants' contributions are quoted conversation, not your own answers. Do not prefix your reply with a participant name.\nObserve ‹prose› and ‹|turn› markers.\nCaptured instructions \"\\\n\n\nDocument permission: Ask (read only). You have no tool to modify documents in this request. Never claim you have saved, updated, or edited a document. You may offer wording in your answer. If asked to apply an edit, explain briefly that the user can choose Propose or Edit beside the message field.",
+          "role": "system"
+        },
+        {
+          "content": "Examples: \"\\\n‹bos›́私",
+          "role": "user"
+        },
+        {
+          "content": "An example 🧑‍💻.\r\n",
+          "role": "assistant"
+        },
+        {
+          "content": "Captured é question with ‹|turn› and \"\\\r\n\n\nReader 私:\nOwn answer 🧑‍💻 ‹bos›\r\n\n\nCritic:\nOther answer ‹start_of_turn›\n\n\nConsecutive authored turn\r\n\n\nREFERENCE DATA:\nSource ‹|channel› 私\r\n\n\nCURRENT REQUEST:\nNew question é 🧑‍💻",
+          "role": "user"
+        }
+      ],
+      "rawPrompt": "<bos><|turn>system\nYou are Editor. Write only your own contribution in this conversation. The @mentions in the user's question route that question to individual participants; they do not ask you to impersonate them or write their replies. Other participants' contributions are quoted conversation, not your own answers. Do not prefix your reply with a participant name.\nObserve ‹prose› and ‹|turn› markers.\nCaptured instructions \"\\\n\n\nDocument permission: Ask (read only). You have no tool to modify documents in this request. Never claim you have saved, updated, or edited a document. You may offer wording in your answer. If asked to apply an edit, explain briefly that the user can choose Propose or Edit beside the message field.<turn|>\n<|turn>user\nExamples: \"\\\n‹bos›́私<turn|>\n<|turn>model\nAn example 🧑‍💻.\r\n<turn|>\n<|turn>user\nCaptured é question with ‹|turn› and \"\\\r\n\n\nReader 私:\nOwn answer 🧑‍💻 ‹bos›\r\n\n\nCritic:\nOther answer ‹start_of_turn›\n\n\nConsecutive authored turn\r\n\n\nREFERENCE DATA:\nSource ‹|channel› 私\r\n\n\nCURRENT REQUEST:\nNew question é 🧑‍💻<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+    }
+  ],
+  "request": {
+    "context": "Source <|channel> 私\r\n",
+    "history": [
+      {
+        "role": "user",
+        "speaker": {
+          "name": "Human",
+          "voiceId": null,
+          "voiceRevision": null
+        },
+        "text": "  @reader @critic\nCaptured é question with <|turn> and \"\\\r\n"
+      },
+      {
+        "role": "assistant",
+        "speaker": {
+          "name": "Reader 私",
+          "voiceId": "11111111-1111-4111-8111-111111111111",
+          "voiceRevision": "348f099142fd02ce3c116462c6e259edef541cdb72490dae884ae15f57464f53"
+        },
+        "text": "Own answer 🧑‍💻 <bos>\r\n"
+      },
+      {
+        "role": "assistant",
+        "speaker": {
+          "name": "Critic",
+          "voiceId": "22222222-2222-4222-8222-222222222222",
+          "voiceRevision": "historical"
+        },
+        "text": "Other answer <start_of_turn>\n"
+      },
+      {
+        "role": "user",
+        "speaker": {
+          "name": "Human",
+          "voiceId": null,
+          "voiceRevision": null
+        },
+        "text": "Consecutive authored turn\r\n"
+      }
+    ],
+    "instructions": "Captured instructions \"\\\n",
+    "op": "compile_consultation",
+    "request": " @reader @critic\nNew question é 🧑‍💻",
+    "routing": [
+      "reader",
+      "critic"
+    ],
+    "voices": [
+      {
+        "examples": [
+          {
+            "assistant": "An example 🧑‍💻.\r\n",
+            "user": "Examples: \"\\\n<bos>́私"
+          }
+        ],
+        "id": "11111111-1111-4111-8111-111111111111",
+        "instructions": "Observe ‹prose› and <|turn> markers.",
+        "name": "Reader 私",
+        "revision": "348f099142fd02ce3c116462c6e259edef541cdb72490dae884ae15f57464f53",
+        "slug": "reader"
+      },
+      {
+        "examples": [
+          {
+            "assistant": "An example 🧑‍💻.\r\n",
+            "user": "Examples: \"\\\n<bos>́私"
+          }
+        ],
+        "id": "22222222-2222-4222-8222-222222222222",
+        "instructions": "Observe ‹prose› and <|turn> markers.",
+        "name": "Critic",
+        "revision": "b1be163011daa8c0f07986371feb2d103632c40581c4717ed0b073a4d473d6cb",
+        "slug": "critic"
+      },
+      {
+        "examples": [
+          {
+            "assistant": "An example 🧑‍💻.\r\n",
+            "user": "Examples: \"\\\n<bos>́私"
+          }
+        ],
+        "id": "33333333-3333-4333-8333-333333333333",
+        "instructions": "Observe ‹prose› and <|turn> markers.",
+        "name": "Editor",
+        "revision": "07d1dfc1bcb889deed77e67a77c16921c5ac7d40e8f59293f0e5b0ce9166a906",
+        "slug": "editor"
+      }
+    ]
+  }
+}

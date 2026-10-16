@@ -1,137 +1,123 @@
+import AppKit
 import BoomCore
-import CryptoKit
 import XCTest
 @testable import Boom
 
 final class FolderImportTests: XCTestCase {
   @MainActor func testSelectedFileImportRetainsOriginalBytesThroughEditRelaunchAndBackupRestore() async throws {
+    _ = NSApplication.shared
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-selected-import-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
     let a = root.appendingPathComponent("chosen-a/notes.md"), b = root.appendingPathComponent("chosen-b/notes.md")
     for file in [a, b] { try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true) }
     let originals = [Data("\u{feff}# 章\r\nCafé 👩‍💻\nselected-import-canary".utf8), Data()]
     for (file, bytes) in zip([a, b], originals) { try bytes.write(to: file) }
-    let key = SymmetricKey(size: .bits256)
-    let store = try WorkspaceStore(rootOverride: root.appendingPathComponent("encrypted"), testKey: key)
+    let store = try WorkspaceStore(rootOverride: root.appendingPathComponent("workspace"))
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     try await model.importDocuments([a, b], flag: CancellationFlag())
-    let imported = model.documents.filter { model.state.importedFiles?[$0.id] != nil }
+    let sources = try await NativeCheckEvidence.readPublicDocuments(model: model)
+    let paths = Set([a.path, b.path])
+    let imported = sources.filter { paths.contains(model.state.importedFiles?[$0.id]?.path ?? "") }
     XCTAssertEqual(imported.count, 2)
-    let first = try XCTUnwrap(imported.first)
-    XCTAssertEqual(model.state.importedFiles?[first.id]?.path, "notes.md")
-    XCTAssertNil(model.state.importedFiles?[first.id]?.folderID, "Selected files remain in the ordinary document list.")
-    model.updateDocument("A changed manuscript. 🦋", id: first.id, caret: 0)
+    let first = try XCTUnwrap(imported.first { model.state.importedFiles?[$0.id]?.path == a.path })
+    XCTAssertNil(model.state.importedFiles?[first.id]?.folderID)
+    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 640, height: 480))
+    window.isReleasedWhenClosed = false; window.contentView = try XCTUnwrap(model.pagedViewport)
+    defer { window.close() }
+    window.showAsInvisibleNativeTestWindow()
+    XCTAssertTrue(window.makeFirstResponder(try XCTUnwrap(model.pagedInput?.activeView)))
+    try await NativeCheckEvidence.replacePublicDocument(model, text: "A changed manuscript. 🦋", id: first.id, caret: 0)
+    for (file, bytes) in zip([a, b], originals) {
+      let document = try XCTUnwrap(imported.first { model.state.importedFiles?[$0.id]?.path == file.path })
+      let actualRead1 = try await NativeCheckEvidence.readPublicOriginal(model: model, documentID: document.id)
+      XCTAssertEqual(actualRead1, bytes)
+      XCTAssertEqual(try Data(contentsOf: file), bytes)
+    }
     try await model.shutdown()
-    let relaunched = try WorkspaceStore(rootOverride: store.root, testKey: key)
-    let (state, documents) = try await relaunched.load().get()
+    let reopened = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    let documents = try await NativeCheckEvidence.readPublicDocuments(model: reopened)
     XCTAssertEqual(documents.first { $0.id == first.id }?.text, "A changed manuscript. 🦋")
-    XCTAssertEqual(state.importedFiles?[first.id]?.originalDigest, Digest.sha256(originals[0]))
-    for (document, bytes) in zip(imported, originals) {
-      XCTAssertEqual(try relaunched.vault.get(.attachment, id: document.id), bytes)
+    XCTAssertEqual(reopened.state.importedFiles?[first.id]?.originalDigest, Digest.sha256(originals[0]))
+    for (file, bytes) in zip([a, b], originals) {
+      let document = try XCTUnwrap(imported.first { reopened.state.importedFiles?[$0.id]?.path == file.path })
+      let actualRead2 = try await NativeCheckEvidence.readPublicOriginal(model: reopened, documentID: document.id)
+      XCTAssertEqual(actualRead2, bytes)
     }
-    for (file, bytes) in zip([a, b], originals) { XCTAssertEqual(try Data(contentsOf: file), bytes) }
-    for record in try FileManager.default.contentsOfDirectory(at: store.vault.root, includingPropertiesForKeys: nil) {
-      XCTAssertNil(try Data(contentsOf: record).range(of: Data("selected-import-canary".utf8)))
-    }
+    try await reopened.shutdown()
     let backup = root.appendingPathComponent("explicit.bloombackup")
-    try await relaunched.exportBackup(passphrase: "public selected import test", to: backup)
+    try await store.exportBackup(to: backup)
     for file in [a, b] { try FileManager.default.removeItem(at: file) }
-    let restored = try WorkspaceStore(rootOverride: root.appendingPathComponent("restored"), testKey: SymmetricKey(size: .bits256))
-    let (_, restoredDocuments) = try await restored.restoreBackup(passphrase: "public selected import test", from: backup)
-    XCTAssertEqual(restoredDocuments, documents)
-    for (document, bytes) in zip(imported, originals) {
-      XCTAssertEqual(try restored.vault.get(.attachment, id: document.id), bytes)
+    let restoredStore = try WorkspaceStore(rootOverride: root.appendingPathComponent("restored"))
+    try await restoredStore.restoreBackup(from: backup)
+    let restored = try await WorkspaceModel(storeOverride: restoredStore, loadModels: false)
+    let actualRead3 = try await NativeCheckEvidence.readPublicDocuments(model: restored)
+    XCTAssertEqual(actualRead3, documents)
+    for (file, bytes) in zip([a, b], originals) {
+      let document = try XCTUnwrap(imported.first { restored.state.importedFiles?[$0.id]?.path == file.path })
+      let actualRead4 = try await NativeCheckEvidence.readPublicOriginal(model: restored, documentID: document.id)
+      XCTAssertEqual(actualRead4, bytes)
     }
+    try await restored.shutdown()
   }
-  @MainActor func testInvalidLaterImportAndCancellationAdmitNoEarlierFile() async throws {
+
+  @MainActor func testInvalidLaterImportKeepsEarlierPublishedSourceAndCancellationAddsNothing() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-selected-invalid-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     let good = root.appendingPathComponent("good.md"), bad = root.appendingPathComponent("bad.md")
     try Data("Keep this original.".utf8).write(to: good); try Data([0xff, 0xfe, 0xff]).write(to: bad)
-    let store = try WorkspaceStore(rootOverride: root.appendingPathComponent("encrypted"), testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root.appendingPathComponent("workspace"))
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
-    try await model.flush()
-    let before = try FileManager.default.contentsOfDirectory(atPath: store.vault.root.path).sorted()
-    let documents = model.documents
-    do { try await model.importDocuments([good, bad], flag: CancellationFlag()); XCTFail("Invalid later file was admitted") } catch {}
+    do { try await model.importDocuments([good, bad], flag: CancellationFlag()); XCTFail("Invalid UTF-8 was admitted") } catch {}
+    let published = try await NativeCheckEvidence.readPublicDocuments(model: model)
+    let retained = try XCTUnwrap(published.first { model.state.importedFiles?[$0.id]?.path == good.path })
+    XCTAssertEqual(retained.text, "Keep this original.")
+    XCTAssertFalse((model.state.importedFiles ?? [:]).values.contains { $0.path == bad.path })
+    let before = model.documentIndices
     let cancelled = CancellationFlag(); cancelled.cancel()
     do { try await model.importDocuments([good], flag: cancelled); XCTFail("Cancelled import was admitted") } catch {}
-    XCTAssertEqual(model.documents, documents)
-    XCTAssertTrue((model.state.importedFiles ?? [:]).isEmpty)
-    XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: store.vault.root.path).sorted(), before)
+    XCTAssertEqual(model.documentIndices, before)
+    let actualRead5 = try await NativeCheckEvidence.readPublicOriginal(model: model, documentID: retained.id)
+    XCTAssertEqual(actualRead5, Data(retained.text.utf8))
     try await model.shutdown()
+    let actualRead6 = try await NativeCheckEvidence.readPublicDocuments(store: store)
+    XCTAssertEqual(actualRead6, published)
   }
-  func testOriginalCollisionRetainsEveryExistingCiphertext() async throws {
-    let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-original-collision-" + UUID().uuidString)
-    defer { try? FileManager.default.removeItem(at: root) }
-    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
-    let existing = UUID(), new = UUID()
-    try store.vault.put(Data("Existing original.".utf8), kind: .attachment, id: existing)
-    let before = try Data(contentsOf: store.vault.recordURL(.attachment, existing))
-    let files = [new, existing].map { FolderImport.File(id: $0, path: "notes.md", original: Data("Replacement".utf8), text: "Replacement") }
-    do { try await store.retainImportedOriginals(files, flag: CancellationFlag()); XCTFail("Colliding original was replaced") } catch {}
-    XCTAssertEqual(try Data(contentsOf: store.vault.recordURL(.attachment, existing)), before)
-    XCTAssertFalse(store.vault.exists(.attachment, new))
-  }
-  func testMissingImportedOriginalAndDuplicateFolderIdentityRejectLoadingWithoutReplacement() async throws {
-    let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-import-integrity-" + UUID().uuidString)
-    defer { try? FileManager.default.removeItem(at: root) }
-    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
-    let document = DocumentSnapshot(title: "Imported", text: "Private original.")
-    let folder = ImportedFolder(id: UUID(), name: "Chosen folder")
-    var state = WorkspaceState()
-    state.documents = [DocumentIndex(id: document.id, title: document.title)]
-    state.importedFolders = [folder]
-    state.importedFiles = [document.id: ImportedFile(folderID: folder.id, path: "Imported.md", originalDigest: document.revision)]
-    try await store.save(state, documents: [document])
-    let indexURL = store.vault.recordURL(.workspace, Vault.workspaceID)
-    let before = try Data(contentsOf: indexURL)
-    do { _ = try await store.load().get(); XCTFail("Missing originals must stop loading.") } catch {}
-    XCTAssertEqual(try Data(contentsOf: indexURL), before)
-    try store.vault.put(Data(document.text.utf8), kind: .attachment, id: document.id)
-    _ = try await store.load().get()
-    state.importedFolders = [folder, folder]
-    try await store.save(state, documents: [])
-    let duplicate = try Data(contentsOf: indexURL)
-    do { _ = try await store.load().get(); XCTFail("Duplicate folder identities must stop loading.") } catch {}
-    XCTAssertEqual(try Data(contentsOf: indexURL), duplicate)
-    XCTAssertEqual(try store.vault.get(.attachment, id: document.id), Data(document.text.utf8))
-  }
-  func testImportCapturesUnicodeOriginalsSkipsOutsideLinksAndNeverWritesSourceFiles() async throws {
+
+  func testFolderEnumerationKeepsUnicodeBytesSkipsOutsideLinksAndDoesNotWriteSources() throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-folder-import-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let source = root.appendingPathComponent("chosen")
-    let nested = source.appendingPathComponent("Drafts")
+    let source = root.appendingPathComponent("chosen"), nested = source.appendingPathComponent("Drafts")
     try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
-    let bytes = Data("# 章\r\nCafé 👩‍💻\noriginal-import-canary".utf8)
-    let file = nested.appendingPathComponent("章.md")
-    try bytes.write(to: file)
-    try Data().write(to: source.appendingPathComponent("empty.txt"))
+    let bytes = Data("# 章\r\nCafé 👩‍💻\noriginal-import-canary".utf8), file = nested.appendingPathComponent("章.md")
+    try bytes.write(to: file); try Data().write(to: source.appendingPathComponent("empty.txt"))
     let outside = root.appendingPathComponent("outside.md")
     try Data("outside-canary".utf8).write(to: outside)
     try FileManager.default.createSymbolicLink(at: source.appendingPathComponent("link.md"), withDestinationURL: outside)
-    let imported = try FolderImport.read(source, flag: CancellationFlag())
-    XCTAssertEqual(imported.map(\.path), ["Drafts/章.md", "empty.txt"])
-    let original = try XCTUnwrap(imported.first)
-    XCTAssertEqual(original.original, bytes)
-    let store = try WorkspaceStore(rootOverride: root.appendingPathComponent("encrypted"), testKey: SymmetricKey(size: .bits256))
-    let folder = ImportedFolder(id: UUID(), name: "chosen")
-    var state = WorkspaceState()
-    state.importedFolders = [folder]
-    state.importedFiles = [original.id: ImportedFile(folderID: folder.id, path: original.path,
-      originalDigest: Digest.sha256(bytes))]
-    let document = DocumentSnapshot(id: original.id, title: "章", text: original.text + "\nEdited inside Bloom.")
-    state.documents = [DocumentIndex(id: document.id, title: document.title)]
-    try store.vault.put(bytes, kind: .attachment, id: original.id)
-    try await store.save(state, documents: [document])
-    let loaded = try await store.load().get()
-    XCTAssertEqual(loaded.1, [document])
-    XCTAssertEqual(loaded.0.importedFiles?[original.id]?.path, original.path)
-    XCTAssertEqual(try store.vault.get(.attachment, id: original.id), bytes)
-    XCTAssertEqual(try Data(contentsOf: file), bytes, "Editing the imported document cannot mutate its source.")
-    for record in try FileManager.default.contentsOfDirectory(at: store.vault.root, includingPropertiesForKeys: nil) {
-      XCTAssertNil(try Data(contentsOf: record).range(of: Data("original-import-canary".utf8)))
-    }
+    let chosen = try FolderImport.chosenFiles(source, flag: CancellationFlag())
+    XCTAssertEqual(chosen.map(\.path), ["Drafts/章.md", "empty.txt"])
+    XCTAssertEqual(chosen.first?.url, file.standardizedFileURL.resolvingSymlinksInPath())
+    XCTAssertEqual(try Data(contentsOf: XCTUnwrap(chosen.first).url), bytes)
+    XCTAssertEqual(try Data(contentsOf: file), bytes)
+  }
+
+  func testPagedFolderEnumerationHasNoTextSizeLimitAndHonorsCancellation() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-paged-folder-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let large = root.appendingPathComponent("large.md")
+    XCTAssertTrue(FileManager.default.createFile(atPath: large.path, contents: nil))
+    let handle = try FileHandle(forWritingTo: large)
+    // A sparse real file proves enumeration does not read, decode, or apply
+    // the obsolete in-memory transport limit to paged source metadata.
+    try handle.truncate(atOffset: 1_073_741_824); try handle.close()
+    let chosen = try FolderImport.chosenFiles(root, flag: CancellationFlag())
+    XCTAssertEqual(chosen.map(\.path), ["large.md"])
+    XCTAssertEqual(try large.resourceValues(forKeys: [.fileSizeKey]).fileSize, 1_073_741_824)
+    let cancelled = CancellationFlag(); cancelled.cancel()
+    XCTAssertThrowsError(try FolderImport.chosenFiles(root, flag: cancelled))
+    let linkedRoot = root.appendingPathComponent("linked")
+    try FileManager.default.createSymbolicLink(at: linkedRoot, withDestinationURL: root)
+    XCTAssertThrowsError(try FolderImport.chosenFiles(linkedRoot, flag: CancellationFlag()))
   }
 }

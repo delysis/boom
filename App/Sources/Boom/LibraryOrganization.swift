@@ -17,8 +17,8 @@ struct ImportedDirectoryRows: View {
   let folderID: UUID
   let prefix: String
   @State private var expanded: Set<String> = []
-  private var entries: [(DocumentSnapshot, ImportedFile)] {
-    model.documents.compactMap { document in
+  private var entries: [(DocumentIndex, ImportedFile)] {
+    model.documentIndices.compactMap { document in
       guard let file = model.state.importedFiles?[document.id], file.folderID == folderID,
         file.path.hasPrefix(prefix), model.documentMatchesSearch(document) else { return nil }
       return (document, file)

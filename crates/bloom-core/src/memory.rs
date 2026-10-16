@@ -100,7 +100,7 @@ pub struct CacheConfiguration {
 }
 
 impl CacheConfiguration {
-    fn bytes(&self, tokens: u64, width: u64, prefill: Prefill) -> u64 {
+    fn row_bytes(&self, tokens: u64, prefill: Prefill) -> u64 {
         // Float16/bfloat16 K and V, including cache growth rounding, a prefill
         // chunk beside the sliding window, old/new allocation overlap, and
         // the single prefill row during batch expansion. K=V is deliberately
@@ -108,7 +108,7 @@ impl CacheConfiguration {
         let positions = tokens.div_ceil(256) * 256;
         let sliding = positions.min(self.sliding_window + u64::from(prefill.token_ceiling));
         let concrete = self.num_hidden_layers - self.num_kv_shared_layers;
-        let per_row = self.layer_types[..concrete as usize]
+        self.layer_types[..concrete as usize]
             .iter()
             .map(|kind| {
                 if kind == "full_attention" {
@@ -123,8 +123,10 @@ impl CacheConfiguration {
                     sliding * self.num_key_value_heads * self.head_dim * 4
                 }
             })
-            .sum::<u64>();
-        per_row * (2 * width + u64::from(width > 1))
+            .sum::<u64>()
+    }
+    fn bytes(&self, tokens: u64, width: u64, prefill: Prefill) -> u64 {
+        self.row_bytes(tokens, prefill) * (2 * width + u64::from(width > 1))
     }
     fn validate(&self) -> Result<(), Error> {
         require(
@@ -171,10 +173,235 @@ pub fn context_capacity(
     Ok(low)
 }
 
+/// Independent rows have two distinct padding extents: the longest cached
+/// prefix and the longest new suffix. Original parents are already in measured
+/// U. Reserve selected row hydration, padding/concatenation intermediates and
+/// final merge, plus old/new forward destinations. No estimated release credit.
+pub fn independent_kv_allocation(
+    config: &CacheConfiguration,
+    prompts: &[u64],
+    cached: &[u64],
+    outputs: &[u64],
+    prefill: Prefill,
+    initial: bool,
+    value_bytes: u64,
+) -> Result<u64, Error> {
+    config.validate()?;
+    prefill.validate()?;
+    let width = prompts.len();
+    require(
+        (2..=4).contains(&width)
+            && cached.len() == width
+            && outputs.len() == width
+            && matches!(value_bytes, 2 | 4),
+        "Invalid independent cache shape.",
+    )?;
+    let mut prefix = 0;
+    let mut suffix = 0;
+    let mut output = 0;
+    let mut hydration = 0;
+    for ((prompt, count), limit) in prompts.iter().zip(cached).zip(outputs) {
+        require(
+            *prompt > 0
+                && *count < *prompt
+                && (1..=4096).contains(limit)
+                && prompt.checked_add(*limit).is_some_and(|total| {
+                    total <= CONTEXT_CEILING.min(config.max_position_embeddings)
+                }),
+            "Independent row exceeds its actual context ceiling.",
+        )?;
+        prefix = prefix.max(*count);
+        suffix = suffix.max(prompt - count);
+        output = output.max(*limit);
+        if initial && *count > 0 {
+            hydration += config.row_bytes(*count, prefill);
+        }
+    }
+    // Bounds above cap every intermediate; the configured dimensions are also
+    // validated before this arithmetic. Even maximally ragged physical padding
+    // is distinct from each row's RoPE/accepted logical length.
+    let padded = prefix + suffix + output;
+    let forward = config.row_bytes(padded, prefill) * 2 * width as u64;
+    let merge = if initial && prefix > 0 {
+        config.row_bytes(prefix, prefill) * 3 * width as u64 + hydration
+    } else {
+        0
+    };
+    // Existing row algebra is for 2-byte values. A cold Gemma request reserves
+    // float32; after submission its real parent dtype supplies this multiplier.
+    forward
+        .checked_add(merge)
+        .and_then(|bytes| bytes.checked_mul(value_bytes / 2))
+        .ok_or_else(|| Error("Independent allocation overflowed.".into()))
+}
+
+/// Caller-supplied native shape/capacity bytes at a joined, measured boundary.
+/// Existing source parents are already in used_bytes; no release credit exists.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncrementalKvAllocation {
+    destination_bytes: u64,
+    zero_extension_bytes: u64,
+    hydration_bytes: u64,
+    shared_prefill_bytes: u64,
+    grows: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncrementalKvAdmission {
+    pub admitted: bool,
+    pub additional_bytes_upper_bound: u64,
+    pub required_bytes: u64,
+    pub scope: &'static str,
+}
+
+pub fn incremental_kv_admission(
+    application: u64,
+    used: u64,
+    reserve: u64,
+    layers: &[IncrementalKvAllocation],
+) -> Result<IncrementalKvAdmission, Error> {
+    require(
+        application <= APPLICATION_CEILING
+            && reserve == WORKING_RESERVE
+            && (1..=256).contains(&layers.len()),
+        "Invalid incremental native KV admission boundary.",
+    )?;
+    let checked_add = |a: u64, b: u64| {
+        a.checked_add(b)
+            .ok_or_else(|| Error("Native KV allocation bound overflowed.".into()))
+    };
+    let mut additional = 0;
+    for layer in layers {
+        require(
+            layer.destination_bytes > 0
+                && layer.zero_extension_bytes <= layer.destination_bytes
+                && layer.shared_prefill_bytes <= layer.destination_bytes,
+            "Invalid native KV allocation dimensions.",
+        )?;
+        // No-growth SliceUpdate may need a complete destination COW. Growth
+        // may hold zero extension + concatenate output + SliceUpdate output.
+        let update = if layer.grows {
+            checked_add(
+                checked_add(layer.destination_bytes, layer.destination_bytes)?,
+                layer.zero_extension_bytes,
+            )?
+        } else {
+            layer.destination_bytes
+        };
+        additional = checked_add(
+            additional,
+            checked_add(
+                checked_add(update, layer.hydration_bytes)?,
+                layer.shared_prefill_bytes,
+            )?,
+        )?;
+    }
+    incremental_kv_readmission(application, used, reserve, additional)
+}
+
+/// Scalar envelope was derived from actual native layers before graph creation.
+/// At an existing submission boundary, used includes queued Metal allocations.
+/// No source release, donation or prior GPU completion is credited.
+pub fn incremental_kv_readmission(
+    application: u64,
+    used: u64,
+    reserve: u64,
+    additional: u64,
+) -> Result<IncrementalKvAdmission, Error> {
+    require(
+        application <= APPLICATION_CEILING && reserve == WORKING_RESERVE && additional > 0,
+        "Invalid native KV readmission envelope.",
+    )?;
+    let required = used
+        .checked_add(additional)
+        .and_then(|v| v.checked_add(reserve))
+        .ok_or_else(|| Error("Native KV allocation bound overflowed.".into()))?;
+    Ok(IncrementalKvAdmission {
+        admitted: required <= application,
+        additional_bytes_upper_bound: additional,
+        required_bytes: required,
+        scope: "measured_submitted_boundary_allocation_horizon_with_operation_memory_watch",
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn incremental_admission_keeps_full_cow_and_true_parent_usage() -> Result<(), Error> {
+        let layer = IncrementalKvAllocation {
+            destination_bytes: 64,
+            zero_extension_bytes: 0,
+            hydration_bytes: 0,
+            shared_prefill_bytes: 0,
+            grows: false,
+        };
+        let used = 24 * GIB - WORKING_RESERVE - 64;
+        let fits = incremental_kv_admission(24 * GIB, used, WORKING_RESERVE, &[layer])?;
+        assert!(fits.admitted);
+        assert_eq!(fits.additional_bytes_upper_bound, 64);
+        let layer = IncrementalKvAllocation {
+            destination_bytes: 64,
+            zero_extension_bytes: 0,
+            hydration_bytes: 0,
+            shared_prefill_bytes: 0,
+            grows: false,
+        };
+        assert!(!incremental_kv_admission(24 * GIB, used + 1, WORKING_RESERVE, &[layer])?.admitted);
+        Ok(())
+    }
+    #[test]
+    fn incremental_growth_includes_extension_and_both_destinations() -> Result<(), Error> {
+        let layer = IncrementalKvAllocation {
+            destination_bytes: 96,
+            zero_extension_bytes: 32,
+            hydration_bytes: 16,
+            shared_prefill_bytes: 48,
+            grows: true,
+        };
+        let result = incremental_kv_admission(24 * GIB, 0, WORKING_RESERVE, &[layer])?;
+        assert_eq!(result.additional_bytes_upper_bound, 2 * 96 + 32 + 16 + 48);
+        Ok(())
+    }
+    #[test]
+    fn incremental_native_math_rejects_overflow_and_unsupported_bounds() {
+        let layer = IncrementalKvAllocation {
+            destination_bytes: u64::MAX,
+            zero_extension_bytes: 0,
+            hydration_bytes: 0,
+            shared_prefill_bytes: 0,
+            grows: true,
+        };
+        assert!(incremental_kv_admission(24 * GIB, 0, WORKING_RESERVE, &[layer]).is_err());
+        assert!(incremental_kv_admission(u64::MAX, 0, WORKING_RESERVE, &[]).is_err());
+        assert!(incremental_kv_admission(24 * GIB, 0, 0, &[]).is_err());
+        let layer = IncrementalKvAllocation {
+            destination_bytes: 0,
+            zero_extension_bytes: 0,
+            hydration_bytes: 0,
+            shared_prefill_bytes: 0,
+            grows: false,
+        };
+        assert!(incremental_kv_admission(24 * GIB, 0, WORKING_RESERVE, &[layer]).is_err());
+    }
+    #[test]
+    fn native_readmission_counts_prior_queued_allocations_without_release_credit()
+    -> Result<(), Error> {
+        let allowance = 128;
+        let used = 24 * GIB - WORKING_RESERVE - allowance;
+        assert!(incremental_kv_readmission(24 * GIB, used, WORKING_RESERVE, allowance)?.admitted);
+        assert!(
+            !incremental_kv_readmission(24 * GIB, used + 1, WORKING_RESERVE, allowance)?.admitted
+        );
+        assert!(
+            incremental_kv_readmission(24 * GIB, u64::MAX, WORKING_RESERVE, allowance).is_err()
+        );
+        assert!(incremental_kv_readmission(24 * GIB, 0, WORKING_RESERVE, 0).is_err());
+        Ok(())
+    }
     #[test]
     fn paired_weights_cannot_take_the_active_context_budget() -> Result<(), Error> {
         let config = gemma();
@@ -378,6 +605,43 @@ mod tests {
         assert!(admit_cache_probe(128 * GIB, 96 * GIB, GIB + 1).is_err());
         assert!(admit_cache_probe(8 * GIB, 8 * GIB, 128 << 20).is_err());
         assert!(admit_cache_probe(32 * GIB, GIB, 128 << 20).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn independent_budget_counts_ragged_padding_and_real_parent_overlap() -> Result<(), Error> {
+        let config = gemma();
+        let p = Prefill::default();
+        let prompts = [511, 512, 513];
+        let cold =
+            independent_kv_allocation(&config, &prompts, &[0, 0, 0], &[8, 8, 8], p, true, 2)?;
+        let ragged =
+            independent_kv_allocation(&config, &prompts, &[510, 0, 0], &[8, 8, 8], p, true, 2)?;
+        let next =
+            independent_kv_allocation(&config, &prompts, &[510, 0, 0], &[8, 8, 8], p, false, 2)?;
+        assert_eq!(
+            independent_kv_allocation(&config, &prompts, &[510, 0, 0], &[8, 8, 8], p, true, 4)?,
+            ragged * 2
+        );
+        assert!(
+            independent_kv_allocation(&config, &prompts, &[0, 0, 0], &[8, 8, 8], p, true, 1)
+                .is_err()
+        );
+        assert!(ragged > cold && ragged > next);
+        assert_eq!(next, config.row_bytes(510 + 513 + 8, p) * 6);
+        let used = 24 * GIB - WORKING_RESERVE - ragged;
+        assert!(incremental_kv_readmission(24 * GIB, used, WORKING_RESERVE, ragged)?.admitted);
+        assert!(!incremental_kv_readmission(24 * GIB, used + 1, WORKING_RESERVE, ragged)?.admitted);
+        for cached in [&[511, 0, 0][..], &[0, 0][..]] {
+            assert!(
+                independent_kv_allocation(&config, &prompts, cached, &[8, 8, 8], p, true, 2)
+                    .is_err()
+            );
+        }
+        assert!(
+            independent_kv_allocation(&config, &[16_384, 512], &[0, 0], &[1, 8], p, true, 2)
+                .is_err()
+        );
         Ok(())
     }
 }

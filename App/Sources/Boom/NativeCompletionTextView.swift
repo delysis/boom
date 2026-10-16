@@ -5,6 +5,7 @@ import BoomCore
 /// Suggestions never enter canonical storage until explicit acceptance.
 @MainActor protocol NativeCompletionClient: AnyObject {
   var completionDocument: DocumentSnapshot? { get }
+  var completionSourceIdentity: String? { get }
   var ghostStamp: GhostStamp? { get }
   var hasCompletionChoices: Bool { get }
   func takeGhost(documentID: UUID, caret: Int) -> String?
@@ -15,18 +16,25 @@ import BoomCore
   func invalidateGhost()
 }
 
+extension NativeCompletionClient {
+  var completionSourceIdentity: String? { completionDocument?.revision }
+}
+
 extension WorkspaceModel: NativeCompletionClient {
-  var completionDocument: DocumentSnapshot? { selectedDocument }
+  var completionDocument: DocumentSnapshot? { nil }
   var hasCompletionChoices: Bool { showingCandidates }
 }
 
 @MainActor class NativeCompletionTextView: NativeMediaTextView {
   weak var completionClient: (any NativeCompletionClient)?
   var documentID = UUID()
+  /// The display window uses local ranges; completion requests use document coordinates.
+  var completionCaretUTF16: Int { selectedRange().location }
   private var displayStorage: NSTextStorage?
   private var displayLayout: NSLayoutManager?
   private var displayContainer: NSTextContainer?
   private var visibleStamp: GhostStamp?
+  private var displayGhostLocation = 0
   private var displayGhostLength = 0
   var hasVisibleGhost: Bool { visibleStamp != nil }
   private struct AcceptedStep {
@@ -44,7 +52,7 @@ extension WorkspaceModel: NativeCompletionClient {
   func selectionChangedDuringGhost() { if !canReverseGhostBoundary { endGhostBoundary() } }
   private var canReverseGhostBoundary: Bool {
     guard let step = acceptedSteps.last else { return false }
-    return step.documentID == documentID && completionClient?.completionDocument?.revision == step.revision
+    return step.documentID == documentID && completionClient?.completionSourceIdentity == step.revision
       && selectedRange() == NSRange(location: step.caret, length: 0)
       && completionClient?.ghostSourcesRemainCurrent(step.sources, manuscriptID: documentID) == true
   }
@@ -54,6 +62,7 @@ extension WorkspaceModel: NativeCompletionClient {
     displayLayout = nil
     displayContainer = nil
     visibleStamp = nil
+    displayGhostLocation = 0
     displayGhostLength = 0
     needsDisplay = true
     completionDisplayDidChange()
@@ -71,7 +80,9 @@ extension WorkspaceModel: NativeCompletionClient {
       clearGhost()
       return
     }
-    if visibleStamp == stamp, let displayStorage {
+    if visibleStamp == stamp, displayGhostLocation == location, let displayStorage {
+      let trace = PerformanceTrace.begin("Editor.GhostUpdate")
+      defer { PerformanceTrace.end("Editor.GhostUpdate", trace) }
       displayStorage.beginEditing()
       displayStorage.replaceCharacters(
         in: NSRange(location: location, length: displayGhostLength), with: completion)
@@ -86,10 +97,12 @@ extension WorkspaceModel: NativeCompletionClient {
     }
     // A separate DISPLAY layout contains the ghost. Canonical textStorage,
     // accessibility value, clipboard, autosave and undo never contain it.
-    let copy = NSMutableAttributedString(attributedString: storage)
+    let snapshotTrace = PerformanceTrace.begin("Editor.GhostSnapshot")
+    let display = NSTextStorage(attributedString: storage)
     let attributes = ghostAttributes()
-    copy.insert(NSAttributedString(string: completion, attributes: attributes), at: location)
-    let display = NSTextStorage(attributedString: copy)
+    display.insert(NSAttributedString(string: completion, attributes: attributes), at: location)
+    PerformanceTrace.end("Editor.GhostSnapshot", snapshotTrace)
+    let graphTrace = PerformanceTrace.begin("Editor.GhostGraph")
     let layout = NSLayoutManager()
     layout.delegate = inlineMedia.layout
     let container = NSTextContainer(
@@ -102,7 +115,9 @@ extension WorkspaceModel: NativeCompletionClient {
     displayLayout = layout
     displayContainer = container
     visibleStamp = stamp
+    displayGhostLocation = location
     displayGhostLength = (completion as NSString).length
+    PerformanceTrace.end("Editor.GhostGraph", graphTrace)
     needsDisplay = true
     completionDisplayDidChange()
   }
@@ -113,8 +128,9 @@ extension WorkspaceModel: NativeCompletionClient {
   override func mediaChanged() {
     let stamp = visibleStamp
     let completion = displayStorage.flatMap { storage -> String? in
-      guard let stamp, stamp.caretUTF16 + displayGhostLength <= storage.length else { return nil }
-      return (storage.string as NSString).substring(with: NSRange(location: stamp.caretUTF16, length: displayGhostLength))
+      guard stamp != nil, displayGhostLocation <= storage.length,
+        displayGhostLength <= storage.length - displayGhostLocation else { return nil }
+      return (storage.string as NSString).substring(with: NSRange(location: displayGhostLocation, length: displayGhostLength))
     }
     clearGhost(); super.mediaChanged()
     if let completion, let stamp { showGhost(completion, stamp: stamp) }
@@ -136,11 +152,16 @@ extension WorkspaceModel: NativeCompletionClient {
     guard prepareTextLayout() else { return }
     guard let layout = displayLayout, let container = displayContainer, let stamp = visibleStamp,
       stamp.documentID == documentID, selectedRange().length == 0,
-      stamp.caretUTF16 == selectedRange().location, !hasMarkedText()
+      stamp.caretUTF16 == completionCaretUTF16, !hasMarkedText()
     else {
       super.draw(dirtyRect)
       return
     }
+    let trace = PerformanceTrace.begin("Editor.GhostDraw")
+    defer { PerformanceTrace.end("Editor.GhostDraw", trace) }
+    let observer = drawObservation
+    let started = observer.map { _ in ContinuousClock().now }
+    defer { if let observer, let started { observer(started, ContinuousClock().now) } }
     inlineMedia.positionViews()
     if drawsBackground { backgroundColor.setFill(); dirtyRect.fill() }
     container.size = textContainer?.size ?? container.size
@@ -158,13 +179,14 @@ extension WorkspaceModel: NativeCompletionClient {
   }
   @discardableResult func acceptNextGhostWord() -> Bool {
     guard !hasMarkedText(), selectedRange().length == 0 else { return false }
-    let position = selectedRange().location
+    let position = completionCaretUTF16
+    guard position != NSNotFound else { return false }
     guard let segment = completionClient?.takeGhostChunk(documentID: documentID, caret: position), !segment.accepted.isEmpty else { return false }
     movingGhostBoundary = true
     defer { movingGhostBoundary = false }
     insertText(segment.accepted, replacementRange: selectedRange())
-    if let document = completionClient?.completionDocument {
-      acceptedSteps.append(AcceptedStep(documentID: documentID, revision: document.revision,
+    if let revision = completionClient?.completionSourceIdentity {
+      acceptedSteps.append(AcceptedStep(documentID: documentID, revision: revision,
         caret: selectedRange().location, accepted: segment.accepted, previous: segment.whole, sources: segment.sources))
     }
     // Only this synchronous, validated word insertion advances the mutable
@@ -174,7 +196,7 @@ extension WorkspaceModel: NativeCompletionClient {
       guard let document, source.id == documentID, source.kind == "document" else { return source }
       return SourceReference(id: source.id, title: source.title, digest: document.revision, kind: source.kind)
     }
-    completionClient?.resumeGhost(segment.remaining, documentID: documentID, caret: selectedRange().location, sources: advanced)
+    completionClient?.resumeGhost(segment.remaining, documentID: documentID, caret: completionCaretUTF16, sources: advanced)
     return true
   }
   override func keyDown(with event: NSEvent) {
@@ -196,7 +218,7 @@ extension WorkspaceModel: NativeCompletionClient {
             defer { movingGhostBoundary = false }
             insertText("", replacementRange: range)
             completionClient?.resumeGhost(step.previous, documentID: documentID,
-              caret: selectedRange().location, sources: step.sources)
+              caret: completionCaretUTF16, sources: step.sources)
             return
           }
         }
@@ -209,7 +231,8 @@ extension WorkspaceModel: NativeCompletionClient {
     }
     if event.keyCode == 48, selectedRange().length == 0, !hasMarkedText(),
       event.modifierFlags.intersection([.shift, .control, .command, .option]).isEmpty,
-      let completion = completionClient?.takeGhost(documentID: documentID, caret: selectedRange().location)
+      completionCaretUTF16 != NSNotFound,
+      let completion = completionClient?.takeGhost(documentID: documentID, caret: completionCaretUTF16)
     {
       endGhostBoundary()
       let manager = undoManager

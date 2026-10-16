@@ -52,7 +52,6 @@ struct WorkspaceView: View {
     .background(Color(nsColor: BoomChrome.sidebarBackground))
     .environment(\.openURL, OpenURLAction { _ in .discarded })
     .sheet(isPresented: $model.showingModels) { ModelPickerView(model: model) }
-    .sheet(item: $model.backupRequest) { BackupPassphraseView(model: model, request: $0) }
     .sheet(item: $model.editingWritingExamples) { WritingExamplesView(model: model, request: $0) }
     .alert("Bloom", isPresented: Binding(
       get: { model.errorMessage != nil }, set: { if !$0 { model.dismissError() } })
@@ -66,16 +65,22 @@ struct ManuscriptPane: View {
   var body: some View {
     GeometryReader { pane in
       VStack(spacing: 0) {
-        if let document = model.selectedDocument {
-          GeometryReader { viewport in
-            ScrollView(.vertical) {
-              let width = min(WorkspaceGeometry.proseMaximumWidth, max(1, viewport.size.width))
-              MarkdownEditor(model: model, document: document,
-                minimumHeight: max(1, viewport.size.height))
-              .frame(width: width)
-              .frame(maxWidth: .infinity)
+        if let viewport = model.pagedViewport {
+          PagedManuscriptView(viewport: viewport)
+            .id(ObjectIdentifier(viewport))
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .overlay(alignment: .topTrailing) {
+              if let issue = model.nativeInputIssue {
+                Image(systemName: "exclamationmark.triangle.fill")
+                  .foregroundStyle(.orange)
+                  .frame(width: WorkspaceGeometry.controlSize, height: WorkspaceGeometry.controlSize)
+                  .contentShape(Circle())
+                  .help(issue)
+                  .accessibilityLabel("Input notice")
+                  .accessibilityValue(issue)
+                  .padding(8)
+              }
             }
-          }
         } else {
           Color.clear.accessibilityLabel("No document selected")
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -182,7 +187,7 @@ struct LibraryView: View {
   }
   private func chooseDocument(_ id: UUID) {
     if renameTarget != nil { commitRename() }
-    let visible = model.documents.filter { model.documentMatchesSearch($0) }.map(\.id)
+    let visible = model.documentIndices.filter { model.documentMatchesSearch($0) }.map(\.id)
     let modifiers = NSApp.currentEvent?.modifierFlags ?? []
     var selection = LibrarySelection(ids: model.selectedDocumentIDs, anchor: documentAnchor)
     let result = selection.click(
@@ -193,7 +198,7 @@ struct LibraryView: View {
     case .none: break
     case .open: model.selectDocument(id, preservingSelection: true)
     case .rename:
-      if let document = model.documents.first(where: { $0.id == id }) {
+      if let document = model.documentIndices.first(where: { $0.id == id }) {
         beginRename(.document(id), title: document.title)
       }
     }
@@ -236,7 +241,7 @@ struct LibraryView: View {
           heading("Documents") {
             do { try model.newDocument() } catch { model.report(error) }
           }
-          ForEach(model.documents.filter { model.state.importedFiles?[$0.id]?.folderID == nil && model.documentMatchesSearch($0) }) { document in
+          ForEach(model.documentIndices.filter { model.state.importedFiles?[$0.id]?.folderID == nil && model.documentMatchesSearch($0) }, id: \.id) { document in
             Group {
               if renameTarget == .document(document.id) {
                 editableRow(symbol: "doc.text", selected: true)
@@ -337,6 +342,7 @@ struct ChatPane: View {
   @StateObject private var voice = VoiceInput()
   @State private var composerFocusRequest = 0
   @State private var composerHeight: CGFloat = 36
+  @State private var pendingAttachmentHeight: CGFloat = 24
   @State private var voiceChatID: UUID?
   @State private var voiceDocumentID: UUID?
   @State private var voiceDraft = ""
@@ -373,7 +379,7 @@ struct ChatPane: View {
             Button("Detach document") { model.attachDocument(nil, to: chat.id) }
             Divider()
           }
-          ForEach(model.documents) { document in
+          ForEach(model.documentIndices, id: \.id) { document in
             Button(document.title) { model.attachDocument(document.id, to: chat.id) }
           }
         }
@@ -423,12 +429,18 @@ struct ChatPane: View {
         Button { model.cancel() } label: {
           Image(systemName: "stop.fill").frame(width: 24, height: 24)
         }.buttonStyle(.plain).accessibilityLabel("Stop local operation")
-      } else {
+      }
+      if !model.isBusy || model.canQueueConsultation {
         Button { model.send() } label: {
           Image(systemName: "arrow.up.circle.fill").font(.system(size: 24))
         }.buttonStyle(.plain).disabled(
-          model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && model.pendingAttachments.isEmpty
-        ).keyboardShortcut(.return, modifiers: .command).accessibilityLabel(model.authoredChatRole == nil ? "Send message" : "Add message")
+          !model.draftHasContent && model.pendingAttachments.isEmpty
+        ).overlay(alignment: .topTrailing) {
+          if model.pendingConsultationCount > 0 {
+            Text("\(model.pendingConsultationCount)").font(.caption2).monospacedDigit()
+          }
+        }.help(model.isBusy ? "Queue independent answer" : "Send message")
+        .keyboardShortcut(.return, modifiers: .command).accessibilityLabel(model.authoredChatRole == nil ? "Send message" : "Add message")
       }
     }
   }
@@ -440,7 +452,7 @@ struct ChatPane: View {
       Button("New chat") {
         do { try model.newChat() } catch { model.report(error) }
       }
-      if let document = model.selectedDocument {
+      if let document = model.selectedDocumentIndex {
         Button("New chat about \(document.title)") {
           do { try model.newChat(about: document.id) } catch { model.report(error) }
         }
@@ -467,7 +479,7 @@ struct ChatPane: View {
         Button("New chat") {
           do { try model.newChat() } catch { model.report(error) }
         }
-        if let document = model.selectedDocument {
+        if let document = model.selectedDocumentIndex {
           Button("New chat about \(document.title)") {
             do { try model.newChat(about: document.id) } catch { model.report(error) }
           }
@@ -548,11 +560,6 @@ struct ChatPane: View {
   private func needsSpeakerName(_ message: ChatMessage) -> Bool {
     message.speaker?.voiceID != nil || (model.selectedChat?.messages.contains { $0.speaker?.voiceID != nil } ?? false)
   }
-  private func visibleMessageText(_ message: ChatMessage) -> String {
-    if message.state == .pending { return message.text.isEmpty ? "…" : message.text }
-    if message.text.isEmpty, let failure = message.failure { return failure }
-    return message.text
-  }
   @ViewBuilder private func messageView(_ message: ChatMessage) -> some View {
     if model.editingChatMessage == message.id, let chat = model.selectedChat {
       VStack(alignment: .leading, spacing: 6) {
@@ -574,7 +581,7 @@ struct ChatPane: View {
               InlineAttachmentView(model: model, record: record)
             }
           }
-          NativeText(text: visibleMessageText(message), mediaModel: model)
+          NativeText(message: message, mediaModel: model)
         }
           .padding(.horizontal, 12).padding(.vertical, 9)
           .background(Color.primary.opacity(0.065), in: RoundedRectangle(cornerRadius: 12))
@@ -592,7 +599,7 @@ struct ChatPane: View {
             }
           }
         }
-        NativeText(text: visibleMessageText(message), mediaModel: model)
+        NativeText(message: message, mediaModel: model)
         ForEach(model.state.proposals.filter { $0.messageID == message.id }) { proposal in
           ProposalCard(model: model, proposal: proposal)
         }
@@ -689,7 +696,7 @@ struct ChatPane: View {
         if let chat = model.selectedChat, let documentID = chat.attachedDocumentID {
           HStack(spacing: 5) {
             Image(systemName: "doc.text")
-            Text("About " + (model.documents.first { $0.id == documentID }?.title ?? "missing document"))
+            Text("About " + (model.documentIndices.first { $0.id == documentID }?.title ?? "missing document"))
               .lineLimit(1)
             Button {
               model.attachDocument(nil, to: chat.id)
@@ -729,7 +736,7 @@ struct ChatPane: View {
         }
         if !model.pendingAttachments.isEmpty {
           ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
               ForEach(model.pendingAttachments, id: \.self) { id in
                 if let attachment = model.state.attachments.first(where: { $0.id == id }) {
                   InlineAttachmentView(model: model, record: attachment,
@@ -737,27 +744,30 @@ struct ChatPane: View {
                 }
               }
             }
-          }.frame(height: model.pendingAttachments.compactMap { id in
-            model.state.attachments.first(where: { $0.id == id }).map { record -> CGFloat in
-              switch record.kind {
-              case .audio: 44
-              case .image: 180
-              case .video, .pdf: 220
-              case .document: NativeScrollableText.height(of: record.text, width: 300)
-              case .unavailable: 24
-              }
+            .fixedSize(horizontal: false, vertical: true)
+            .onGeometryChange(for: CGFloat.self) { geometry in
+              ceil(geometry.size.height)
+            } action: { height in
+              guard height.isFinite, height > 0 else { return }
+              let actual = max(24, height)
+              if pendingAttachmentHeight != actual { pendingAttachmentHeight = actual }
             }
-          }.max() ?? 44)
+          }.frame(height: pendingAttachmentHeight)
         }
         if let role = model.authoredChatRole {
           HStack {
-            Text(role == .user ? "Writing a question" : "Writing an answer").font(.caption).foregroundStyle(.secondary)
+            Image(systemName: role == .user ? "bubble.left" : "bubble.left.fill")
+              .font(.caption).foregroundStyle(.secondary)
+              .help(role == .user ? "Writing a question" : "Writing an answer")
+              .accessibilityLabel(role == .user ? "Writing a question" : "Writing an answer")
             Spacer()
-            Button("Return to chat") { model.authoredChatRole = nil }.buttonStyle(.plain).font(.caption)
+            Button { model.authoredChatRole = nil } label: { Image(systemName: "arrow.uturn.backward") }
+              .buttonStyle(.plain).font(.caption).help("Return to chat").accessibilityLabel("Return to chat")
           }
         }
         if let issue = model.composerIssue {
-          Text(issue).font(.caption).foregroundStyle(.orange)
+          Image(systemName: "exclamationmark.circle").font(.caption).foregroundStyle(.orange)
+            .help(issue).accessibilityLabel("Composer issue").accessibilityValue(issue)
         }
         if model.settingUpModels {
           HStack(spacing: 8) { ProgressView().controlSize(.small).help(model.status); Spacer() }
@@ -785,7 +795,8 @@ struct ChatPane: View {
           onFocus: { model.noteInputFocus(.chat) },
           onContentHeight: { composerHeight = min(140, max(36, $0)) },
           completionModel: model, completionTarget: TextInputTarget(chatID: model.state.selectedChat,
-            documentID: model.state.selectedDocument)
+            documentID: model.state.selectedDocument), textVersion: model.draftVersion,
+          currentTextVersion: { model.draftVersion }
         ).frame(height: composerHeight)
         composerControls
       }.padding(WorkspaceGeometry.inputInset)

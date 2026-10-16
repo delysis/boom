@@ -1,6 +1,5 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import Foundation
 import SwiftUI
 
@@ -54,8 +53,6 @@ import SwiftUI
     let documents: [DocumentSnapshot]
     let origins: [UUID: ManuscriptOrigin]
   }
-  private static let key = SymmetricKey(data: Data(repeating: 0x5c, count: 32))
-  private static let passphrase = "public writing control fixture passphrase"
   static func run(arguments: [String]) async throws {
     func argument(_ name: String) throws -> String {
       guard arguments.filter({ $0 == name }).count == 1,
@@ -101,7 +98,7 @@ import SwiftUI
     }
   }
   private static func store(_ evidence: URL) throws -> WorkspaceStore {
-    try WorkspaceStore(rootOverride: evidence.appendingPathComponent("encrypted-workspace"), testKey: key)
+    try WorkspaceStore(rootOverride: evidence.appendingPathComponent("public-workspace"))
   }
   private static func capture(_ fixture: WritingEvaluation.Fixture, pack: URL, evidence: URL, record: Bool,
     requireParagraph: Bool) async throws {
@@ -116,8 +113,7 @@ import SwiftUI
       Set(documents.map(\.id)).count == documents.count else { throw BoomError.invalid("Use distinct manuscript and example identities.") }
     state.documents = documents.map { DocumentIndex(id: $0.id, title: $0.title) }
     state.selectedDocument = fixture.document.id; state.showChat = false
-    try await store.save(state, documents: documents)
-    let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    let model = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: documents)
     guard model.layout.isAuthor else { throw BoomError.unavailable("Use the author edition for this writing diagnostic.") }
     let host = NSHostingView(rootView: WorkspaceView(model: model))
     let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 1440, height: 900))
@@ -200,7 +196,7 @@ import SwiftUI
       leading_paragraph: alternatives.candidates[wordIndex].text.hasPrefix("\n\n"),
       accepted: word, expected_manuscript: expectedPartial),
       to: evidence.appendingPathComponent("word-acceptance-input.json"))
-    let manager = model.undoManager(fixture.document.id)
+    let manager = model.pagedCommands!.manager
     manager.groupsByEvent = false; manager.removeAllActions(); manager.beginUndoGrouping()
     model.acceptCandidateWord(wordIndex)
     manager.endUndoGrouping()
@@ -259,7 +255,7 @@ import SwiftUI
     editor.insertText(liveText, replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
     manager.endUndoGrouping()
     let example = fixture.examples[0]
-    model.updateDocument(example.text + "\nA later example revision.\n", id: example.id, caret: model.caret)
+    try await NativeCheckEvidence.replacePublicDocument(model, text: example.text + "\nA later example revision.\n", id: example.id, caret: model.caret)
     try await model.flush()
     guard !model.candidateIsCurrent else { throw BoomError.invalid("Changed manuscript or examples did not invalidate acceptance.") }
     model.dismissCandidates()
@@ -268,7 +264,7 @@ import SwiftUI
     model.selectCandidate(2)
     try await recorder?.checkpoint("Selected third captured alternative for branching")
     let branchReady: [String: String] = [
-      "busy": String(model.isBusy), "markedText": String(model.editor?.hasMarkedText() ?? false),
+      "busy": String(model.isBusy), "markedText": String(model.pagedInput?.activeView?.hasMarkedText() ?? false),
       "candidateState": model.candidates?.candidates[2].state.rawValue ?? "missing",
       "document": model.state.selectedDocument?.uuidString ?? "missing",
       "parentDigest": model.documents.first(where: { $0.id == fixture.document.id })?.revision ?? "missing",
@@ -321,7 +317,7 @@ import SwiftUI
       for width in [1440, 760] { try await render(model, width: width, dark: dark, evidence: evidence) }
     }
     try await model.shutdown()
-    try await store.exportBackup(passphrase: passphrase, to: evidence.appendingPathComponent("complete.bloombackup"))
+    try await store.exportBackup(to: evidence.appendingPathComponent("complete.bloombackup"))
     print("Real-model alternatives, native partial acceptance/Undo, captured branching and replay passed.")
   }
   private static func render(_ model: WorkspaceModel, width: Int, dark: Bool, evidence: URL) async throws {
@@ -338,10 +334,10 @@ import SwiftUI
     guard let png = bitmap.representation(using: .png, properties: [:]) else { throw BoomError.invalid("Native body render could not be encoded.") }
     try png.write(to: evidence.appendingPathComponent("body-\(width)-\(dark ? "dark" : "light").png"), options: .atomic)
   }
-  private static func editor(_ model: WorkspaceModel, documentID: UUID) async throws -> MarkdownTextView {
+  private static func editor(_ model: WorkspaceModel, documentID: UUID) async throws -> PagedNativeTextView {
     let start = ContinuousClock().now
     while start.duration(to: ContinuousClock().now) < .seconds(5) {
-      if let editor = model.editor, editor.documentID == documentID { return editor }
+      if let editor = model.pagedInput?.activeView, editor.session.sourceBaseRevision.documentID == documentID { return editor }
       try await Task.sleep(for: .milliseconds(25))
     }
     throw BoomError.invalid("The production native manuscript editor did not attach.")
@@ -352,7 +348,7 @@ import SwiftUI
     var clickedDuringGeneration = false
     var shortcutDuringGeneration = false
     while model.isBusy {
-      if phase == "alternatives", let editor = model.editor, let window = editor.window {
+      if phase == "alternatives", let editor = model.pagedInput?.activeView, let window = editor.window {
         guard editor.isEditable, window.canBecomeKey, window.makeFirstResponder(editor),
           window.firstResponder === editor else { throw BoomError.invalid("Generation took keyboard focus away from the native manuscript editor.") }
       }
@@ -360,7 +356,7 @@ import SwiftUI
         model.selectCandidate(1); selectedDuringGeneration = true
       }
       if phase == "alternatives", !clickedDuringGeneration, let stamp = model.ghostStamp,
-        let editor = model.editor, let document = model.selectedDocument {
+        let editor = model.pagedInput?.activeView, let document = model.selectedDocument {
         let range = editor.selectedRange()
         guard range.length == 0 else { throw BoomError.invalid("The public writing fixture lost its insertion point.") }
         let point = try NativeCaretProbe.point(at: range.location, in: editor)
@@ -375,7 +371,7 @@ import SwiftUI
       }
       if phase == "alternatives", !shortcutDuringGeneration, model.isBusy,
         let stamp = model.ghostStamp, let bundle = model.candidates,
-        let editor = model.editor, let window = editor.window, let document = model.selectedDocument {
+        let editor = model.pagedInput?.activeView, let window = editor.window, let document = model.selectedDocument {
         let range = editor.selectedRange()
         guard range.length == 0, let shortcut = NSEvent.keyEvent(with: .keyDown, location: .zero,
           modifierFlags: .control, timestamp: ProcessInfo.processInfo.systemUptime,
@@ -418,15 +414,15 @@ import SwiftUI
     let capture = try JSONDecoder().decode(Capture.self, from: Data(contentsOf: evidence.appendingPathComponent("capture.json")))
     let source = try store(evidence)
     try await verify(source, capture: capture)
-    let restored = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("restored-workspace"),
-      testKey: SymmetricKey(data: Data(repeating: 0x5d, count: 32)))
-    _ = try await restored.restoreBackup(passphrase: passphrase, from: evidence.appendingPathComponent("complete.bloombackup"))
+    let restored = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("restored-workspace"))
+    _ = try await restored.restoreBackup(from: evidence.appendingPathComponent("complete.bloombackup"))
     try await verify(restored, capture: capture)
     try receipt("passed", evidence: evidence)
-    print("Separate-process writing relaunch and complete passphrase restore preserved every manuscript, candidate and journal.")
+    print("Separate-process writing relaunch and complete file restore preserved every manuscript, candidate and journal.")
   }
   private static func verify(_ store: WorkspaceStore, capture: Capture) async throws {
-    let (state, documents) = try await store.load().get()
+    let state = try await store.loadState()
+    let documents = try await NativeCheckEvidence.readPublicDocuments(store: store)
     guard documents == capture.documents, Set(state.manuscriptOrigins.keys) == Set(capture.origins.keys),
       try capture.origins.allSatisfy({ try canonical(state.manuscriptOrigins[$0.key]) == canonical(Optional($0.value)) }) else {
       throw BoomError.invalid("Manuscripts or branch lineage changed across relaunch/restore.")

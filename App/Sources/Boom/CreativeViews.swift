@@ -1,3 +1,4 @@
+import AppKit
 import BoomCore
 import SwiftUI
 
@@ -9,6 +10,7 @@ struct ChatTextEditor: View {
   var completionModel: WorkspaceModel? = nil
   var completionTarget: TextInputTarget? = nil
   @State private var text: String
+  @State private var textVersion = UUID()
   @State private var failure: String?
   @State private var contentHeight: CGFloat = 22
   init(label: String, text: String, completionModel: WorkspaceModel? = nil,
@@ -19,10 +21,12 @@ struct ChatTextEditor: View {
   }
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
-      ChatComposer(text: $text, focusRequest: 1, onSend: commit, onCancel: cancel,
+      ChatComposer(text: Binding(get: { text }, set: { text = $0; textVersion = UUID() }),
+        focusRequest: 1, onSend: commit, onCancel: cancel,
         placeholder: "", accessibilityLabel: label, lineSpacing: 3,
         onContentHeight: { contentHeight = $0 }, showsEditingActions: true,
-        completionModel: completionModel, completionTarget: completionTarget)
+        completionModel: completionModel, completionTarget: completionTarget, textVersion: textVersion,
+        currentTextVersion: { textVersion })
         .frame(height: min(240, max(22, contentHeight)) + 32)
       if let failure { Text(failure).font(.caption).foregroundStyle(.red) }
     }.padding(8)
@@ -93,7 +97,7 @@ struct WritingAlternatives: View {
                 Text("The manuscript or cursor has changed. You can still branch from this captured continuation.")
                   .font(.caption).foregroundStyle(.secondary)
               }
-              NativeText(text: candidate.text.isEmpty ? emptyMessage(candidate) : candidate.text).accessibilityIdentifier("continuation-output")
+              NativeText(candidate: candidate).accessibilityIdentifier("continuation-output")
                 .frame(maxWidth: .infinity, alignment: .leading)
               if candidate.state == .cancelled || candidate.state == .failed {
                 Text(candidate.state == .cancelled ? "Generation stopped. This partial continuation has been retained." : "This attempt has been retained. Try another set.")
@@ -110,20 +114,15 @@ struct WritingAlternatives: View {
         .background(Color.primary.opacity(0.025))
         .popover(isPresented: $showingContext) {
           VStack(alignment: .leading, spacing: 10) {
-            Text(bundle.recipe.omittedPrefixCharacters == 0 ? "Complete preceding manuscript" : "\(bundle.recipe.omittedPrefixCharacters) earlier characters omitted")
+            Text((bundle.recipe.capture?.window.byteStart ?? 0) > 0 ? "Captured prefix"
+              : bundle.recipe.omittedPrefixCharacters == 0 ? "Complete preceding manuscript" : "\(bundle.recipe.omittedPrefixCharacters) earlier characters omitted")
               .font(.headline)
+            if let capture = bundle.recipe.capture { Text(capture.coverage).font(.caption.monospaced()) }
             Text("Text after the captured cursor was not supplied.").font(.caption)
             Text("Seed \(bundle.candidates[bundle.selected].seed) · \(bundle.recipe.profile.title)").font(.caption).foregroundStyle(.secondary)
             ScrollView { NativeText(text: bundle.recipe.prompt, presentation: .literal, pointSize: 12).frame(maxWidth: .infinity, alignment: .leading) }
           }.padding(18).frame(width: 520, height: 420)
         }
-    }
-  }
-  private func emptyMessage(_ candidate: WritingCandidate) -> String {
-    switch candidate.state {
-    case .pending: "Writing a continuation…"
-    case .cancelled: "Stopped before any prose was produced."
-    default: "The model ended this continuation before producing prose."
     }
   }
   private func useButton(_ bundle: CandidateBundle, _ candidate: WritingCandidate) -> some View {
@@ -141,9 +140,12 @@ struct WritingAlternatives: View {
         .disabled(model.isBusy || !model.candidateIsCurrent || candidate.state != .complete)
       Button("Branch from this continuation") { model.branchCandidate(bundle.selected) }
         .disabled(model.isBusy || candidate.state != .complete)
-      Button(candidate.batch == nil ? "Replay seed" : "Replay this set") { model.replayCandidate(bundle.selected) }
+      Button("Replay", systemImage: "arrow.counterclockwise") { model.replayCandidate(bundle.selected) }
         .disabled(!model.canReplayCandidate(bundle.selected))
-        .help("Replay is available when the original model settings are loaded")
+        .accessibilityLabel(candidate.batch == nil ? "Replay continuation" : "Replay alternatives")
+        .help(candidate.executionOrigin?.isConfirmedCold(promptTokens: candidate.promptTokens) == true
+          ? "Reproduce the saved run with the same model"
+          : "The original run cannot yet be reproduced")
       Divider()
       Button("Try three more") { model.exploreWriting() }.disabled(!model.canExploreWriting)
       Button("Supplied context…") { showingContext = true }
@@ -165,113 +167,236 @@ struct WritingExamplesRequest: Identifiable {
 struct WritingExamplesView: View {
   @ObservedObject var model: WorkspaceModel
   let request: WritingExamplesRequest
+  @State private var previewID: UUID?
+  @State private var previewHasProse = false
+  @State private var previewCapture: BoundedDocumentCapture?
+  @State private var preview: DocumentSnapshot?
   @State private var adding = false
+  @State private var importing = false
   @State private var title = ""
   @State private var prose = ""
+  @State private var proseVersion = UUID()
   @State private var failure: String?
+  @State private var showingFailure = false
+
+  private var included: [DocumentIndex] {
+    model.writingExampleIDs.compactMap { id in model.documentIndices.first { $0.id == id } }
+  }
+  private var available: [DocumentIndex] {
+    model.documentIndices.filter {
+      $0.id != request.manuscriptID && !model.writingExampleIDs.contains($0.id)
+    }
+  }
+  private var canChange: Bool {
+    !model.isBusy && model.state.selectedDocument == request.manuscriptID
+      && model.documentIndices.contains { $0.id == request.manuscriptID }
+  }
+  private var canAdd: Bool {
+    canChange && model.writingExampleIDs.count < 32 && prose.contains { !$0.isWhitespace }
+  }
+
   var body: some View {
-    VStack(alignment: .leading, spacing: 16) {
-      Text("Writing examples").font(.title2)
-      Text("Choose prose that suggests a voice or rhythm. Bloom reads these passages, in order, before your manuscript.")
-        .foregroundStyle(.secondary)
-      if !model.writingExampleIDs.isEmpty {
-        Text("Included, in this order").font(.headline)
-        ForEach(model.writingExampleIDs, id: \.self) { id in
-          if let document = model.documents.first(where: { $0.id == id }) {
-            HStack {
-              Text(document.title); Spacer()
-              Button { model.moveWritingExample(id, by: -1) } label: { Image(systemName: "arrow.up") }.help("Read earlier")
-                .disabled(model.writingExampleIDs.first == id)
-              Button { model.moveWritingExample(id, by: 1) } label: { Image(systemName: "arrow.down") }.help("Read later")
-                .disabled(model.writingExampleIDs.last == id)
-              Button("Remove") { model.toggleWritingExample(id) }
-            }
+    VStack(spacing: 0) {
+      HStack(spacing: 12) {
+        Text("Examples").font(.headline)
+          .help("Bloom reads the included passages in order before your manuscript.")
+          .accessibilityHint("Bloom reads the included passages in order before your manuscript.")
+        Text("\(model.writingExampleIDs.count)/32").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+          .accessibilityLabel("\(model.writingExampleIDs.count) of 32 examples")
+        Spacer()
+        if importing { ProgressView().controlSize(.small).accessibilityLabel("Importing examples") }
+        if let failure {
+          Button { showingFailure = true } label: { Image(systemName: "exclamationmark.triangle") }
+            .help(failure).accessibilityLabel("Example error").accessibilityHint(failure)
+        }
+        Button { adding = true; failure = nil } label: { Image(systemName: "square.and.pencil") }
+          .disabled(!canChange || adding || model.writingExampleIDs.count >= 32)
+          .help("New example").accessibilityLabel("New example")
+        Button(action: importExamples) { Image(systemName: "square.and.arrow.down") }
+          .disabled(!canChange || adding || model.writingExampleIDs.count >= 32)
+          .help("Import prose").accessibilityLabel("Import prose")
+      }.buttonStyle(.borderless).controlSize(.small).padding(16)
+      Divider()
+      if adding || !included.isEmpty || !available.isEmpty {
+        HStack(spacing: 0) {
+          selector.frame(width: 200).disabled(adding)
+          Divider()
+          Group {
+            if adding { draftEditor }
+            else { passagePreview }
+          }.frame(maxWidth: .infinity, maxHeight: .infinity)
+        }.frame(maxHeight: .infinity)
+      } else {
+        Image(systemName: "doc.text")
+          .font(.system(size: 28)).foregroundStyle(.tertiary)
+          .accessibilityLabel("No examples")
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+      }
+      Divider()
+      HStack {
+        if adding {
+          Button("Back", action: back).keyboardShortcut(.cancelAction)
+            .help("Keep the draft and return to examples").accessibilityLabel("Back to examples")
+        }
+        Spacer()
+        if adding {
+          Button("Add", action: addExample).disabled(!canAdd).keyboardShortcut(.defaultAction)
+        } else {
+          Button("Done") { model.editingWritingExamples = nil }.keyboardShortcut(.defaultAction)
+        }
+      }.padding(12)
+    }
+    .frame(width: 640, height: adding || !included.isEmpty || !available.isEmpty ? 400 : 176)
+    .onAppear { previewID = model.writingExampleIDs.first ?? available.first?.id }
+    .task(id: previewID) {
+      previewCapture = nil; preview = nil; previewHasProse = false
+      guard let id = previewID else { return }
+      do {
+        let capture = try await model.previewDocument(id)
+        try Task.checkCancellation()
+        guard previewID == id else { return }
+        previewCapture = capture
+        preview = capture.modelSnapshot
+        previewHasProse = capture.window.text.contains { !$0.isWhitespace }
+      } catch is CancellationError {} catch { failure = error.localizedDescription }
+    }
+    .onChange(of: model.writingExampleIDs) { _, ids in
+      if previewID == nil { previewID = ids.first ?? available.first?.id }
+    }
+    .onChange(of: model.isBusy) { _, busy in
+      if importing && !busy { importing = false; failure = model.writingIssue }
+    }
+    .onExitCommand {
+      if adding { back() } else { model.editingWritingExamples = nil }
+    }
+    .alert("Examples", isPresented: $showingFailure) {
+      Button("OK", role: .cancel) {}
+    } message: { Text(failure ?? "") }
+  }
+
+  private var selector: some View {
+    List(selection: $previewID) {
+      if !included.isEmpty {
+        Section("Included") {
+          ForEach(Array(included.enumerated()), id: \.element.id) { index, document in
+            includedRow(document, at: index)
           }
         }
       }
-      if adding {
-        TextField("Example title", text: $title).accessibilityLabel("Example title")
-        ChatComposer(text: $prose, focusRequest: 0, onSend: {}, onCancel: {},
-          placeholder: "Example prose", accessibilityLabel: "Example prose").frame(height: 180)
-          .accessibilityLabel("Example prose")
-        HStack {
-          Text("Paste the passage itself; its title is only for your library.").font(.caption).foregroundStyle(.secondary)
-          Spacer()
-          Button("Add example") {
-            do {
-              try model.addWritingExample(title: title, prose: prose, manuscriptID: request.manuscriptID)
-              title = ""; prose = ""; adding = false; failure = nil
-            } catch { failure = error.localizedDescription }
-          }.disabled(prose.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-        }
-      } else {
-        let available = model.documents.filter { $0.id != request.manuscriptID && !model.writingExampleIDs.contains($0.id) && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-        if available.isEmpty && model.writingExampleIDs.isEmpty {
-          Text("No passages added yet.").foregroundStyle(.secondary)
-        }
-        if !available.isEmpty {
-          Text("From your documents").font(.headline)
-          ScrollView {
-            VStack(alignment: .leading, spacing: 10) {
-              ForEach(available) { document in
-                Button { model.toggleWritingExample(document.id) } label: {
-                  HStack(alignment: .top) {
-                    Image(systemName: "plus.circle")
-                    VStack(alignment: .leading, spacing: 4) {
-                      Text(document.title).font(.headline)
-                      NativeText(text: String(document.text.prefix(140)), pointSize: 12, selectable: false)
-                        .frame(height: 36, alignment: .top).clipped()
-                    }
-                    Spacer()
-                  }.contentShape(Rectangle())
-                }.buttonStyle(.plain)
-              }
-            }
-          }.frame(maxHeight: 180)
-        }
-        HStack {
-          Button("Paste a passage…") { adding = true }
-          Button("Import prose…") { model.importWritingExamples(manuscriptID: request.manuscriptID) }
+      if !available.isEmpty {
+        Section("Documents") {
+          ForEach(available, id: \.id) { document in
+            Text(document.title).lineLimit(1).tag(document.id).help(document.title)
+          }
         }
       }
-      if let failure { Text(failure).foregroundStyle(.red).textSelection(.enabled) }
-      HStack {
-        if adding { Button("Back") { adding = false; failure = nil } }
-        Spacer()
-        Button("Done") { model.editingWritingExamples = nil }.keyboardShortcut(.defaultAction)
-      }
-    }.padding(24).frame(width: 580)
+    }.listStyle(.sidebar).accessibilityLabel("Writing examples and documents")
+  }
+
+  private func includedRow(_ document: DocumentIndex, at index: Int) -> some View {
+    HStack(spacing: 8) {
+      Text("\(index + 1)").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+        .frame(width: 18, alignment: .trailing)
+      Text(document.title).lineLimit(1)
+    }.tag(document.id).help(document.title)
+      .accessibilityLabel("Example \(index + 1), \(document.title)")
+  }
+
+  @ViewBuilder private var passagePreview: some View {
+    if let document = preview {
+      VStack(alignment: .leading, spacing: 12) {
+        HStack(spacing: 8) {
+          Text(document.title).font(.headline).lineLimit(1).help(document.title)
+          Spacer(minLength: 8)
+          if model.writingExampleIDs.contains(document.id) {
+            Button { move(document.id, by: -1) } label: { Image(systemName: "arrow.up") }
+              .disabled(!canChange || model.writingExampleIDs.first == document.id)
+              .help("Read earlier").accessibilityLabel("Move example earlier")
+            Button { move(document.id, by: 1) } label: { Image(systemName: "arrow.down") }
+              .disabled(!canChange || model.writingExampleIDs.last == document.id)
+              .help("Read later").accessibilityLabel("Move example later")
+            Button { remove(document.id) } label: { Image(systemName: "minus.circle") }
+              .disabled(!canChange)
+              .help("Remove from examples; keep the document").accessibilityLabel("Remove from examples")
+          } else {
+            Button { include(document) } label: { Image(systemName: "plus.circle") }
+              .disabled(!canChange || !previewHasProse || model.writingExampleIDs.count >= 32)
+              .help("Include as the last example").accessibilityLabel("Include example")
+          }
+        }.buttonStyle(.borderless).controlSize(.small)
+        WritingExamplePassage(document: document)
+          .help(previewCapture?.coverage ?? "")
+          .accessibilityLabel("Example prose").frame(maxWidth: .infinity, maxHeight: .infinity)
+      }.padding(16)
+    } else {
+      Color.clear.accessibilityLabel("No example selected")
+    }
+  }
+  private var draftEditor: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      TextField("Title", text: $title).textFieldStyle(.roundedBorder)
+        .accessibilityLabel("Example title").help("The title is only for your library.")
+      ChatComposer(text: Binding(get: { prose }, set: { prose = $0; proseVersion = UUID() }),
+        focusRequest: 1, onSend: addExample, onCancel: back,
+        placeholder: "Prose", accessibilityLabel: "Example prose", textVersion: proseVersion,
+        currentTextVersion: { proseVersion })
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }.padding(16)
+  }
+  private func back() { adding = false; failure = nil }
+  private func move(_ id: UUID, by delta: Int) {
+    guard canChange else { return }
+    model.moveWritingExample(id, by: delta)
+  }
+  private func remove(_ id: UUID) {
+    guard canChange, model.writingExampleIDs.contains(id) else { return }
+    model.toggleWritingExample(id)
+  }
+  private func include(_ document: DocumentSnapshot) {
+    guard canChange, document.id != request.manuscriptID,
+      !model.writingExampleIDs.contains(document.id), model.writingExampleIDs.count < 32,
+      model.documentIndices.contains(where: { $0.id == document.id }),
+      previewCapture?.textDigest == document.revision,
+      document.text.contains(where: { !$0.isWhitespace }) else { return }
+    model.toggleWritingExample(document.id)
+  }
+  private func addExample() {
+    guard canAdd else { return }
+    let enteredTitle = title, enteredProse = prose, enteredVersion = proseVersion
+    model.work("Adding example…") { flag in
+      do {
+        try flag.check()
+        try await model.addWritingExample(title: enteredTitle, prose: enteredProse, manuscriptID: request.manuscriptID)
+        previewID = model.writingExampleIDs.last
+        if proseVersion == enteredVersion { title = ""; prose = ""; proseVersion = UUID(); adding = false }
+        failure = nil
+      } catch { failure = error.localizedDescription; throw error }
+    }
+  }
+  private func importExamples() {
+    guard canChange, model.writingExampleIDs.count < 32 else { return }
+    failure = nil; model.writingIssue = nil; importing = true
+    model.importWritingExamples(manuscriptID: request.manuscriptID)
+    if !model.isBusy { importing = false }
   }
 }
 
-struct BackupRequest: Identifiable {
-  let id = UUID()
-  let url: URL
-  let restoring: Bool
-}
-struct BackupPassphraseView: View {
-  @ObservedObject var model: WorkspaceModel
-  let request: BackupRequest
-  @State private var passphrase = ""
-  @State private var confirmation = ""
-  var body: some View {
-    VStack(alignment: .leading, spacing: 16) {
-      Text(request.restoring ? "Restore complete backup" : "Encrypt complete backup").font(.title2)
-      Text("Documents, chats, voices, branches, continuations, originals and receipts are included. Model weights are kept separately.")
-        .font(.callout).foregroundStyle(.secondary)
-      SecureField("Backup passphrase", text: $passphrase)
-      if !request.restoring { SecureField("Repeat passphrase", text: $confirmation) }
-      Text(request.restoring ? "Restore requires a fresh workspace. Existing authored data is retained." : "Keep this passphrase safe. It is independent of this Mac's Keychain key.")
-        .font(.caption).foregroundStyle(.secondary)
-      HStack {
-        Spacer()
-        Button("Cancel") { model.backupRequest = nil }.keyboardShortcut(.cancelAction)
-        Button(request.restoring ? "Restore" : "Export backup") {
-          model.performBackup(request, passphrase: passphrase)
-          passphrase = ""; confirmation = ""
-        }.disabled(passphrase.utf8.count < 8 || (!request.restoring && passphrase != confirmation))
-          .keyboardShortcut(.defaultAction)
-      }
-    }.padding(24).frame(width: 470)
+/// Reuse the native reader/viewport; only the selected local source identity
+/// changes its text. Reorder and operation-status updates preserve the reader.
+private struct WritingExamplePassage: NSViewRepresentable {
+  let document: DocumentSnapshot
+  final class Coordinator {
+    var documentID: UUID?
+    var textVersion: UUID?
+  }
+  func makeCoordinator() -> Coordinator { Coordinator() }
+  func makeNSView(context: Context) -> NativeTextScrollView { NativeTextScrollView() }
+  func updateNSView(_ view: NativeTextScrollView, context: Context) {
+    let ownerChanged = context.coordinator.documentID != document.id
+    guard ownerChanged || context.coordinator.textVersion != document.textVersion else { return }
+    view.reader.setSource(document.text)
+    context.coordinator.documentID = document.id; context.coordinator.textVersion = document.textVersion
+    if ownerChanged { view.contentView.scroll(to: .zero); view.reflectScrolledClipView(view.contentView) }
+    view.needsLayout = true
   }
 }

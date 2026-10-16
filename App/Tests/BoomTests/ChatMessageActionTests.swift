@@ -1,6 +1,5 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import SwiftUI
 import XCTest
 @testable import Boom
@@ -23,7 +22,7 @@ final class ChatMessageActionTests: XCTestCase {
     _ = NSApplication.shared
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-message-actions-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root)
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     if model.selectedChat == nil { try model.newChat() }
     model.authorChatMessage(.user); model.draft = "A question."; model.send()
@@ -57,7 +56,7 @@ final class ChatMessageActionTests: XCTestCase {
       XCTAssertTrue(model.selectedChat?.messageVersions?.contains(original) == true)
     }
     try await model.shutdown()
-    let saved = try await store.load().get().0.chats.first { $0.id == chatID }
+    let saved = try await store.loadState().chats.first { $0.id == chatID }
     XCTAssertEqual(saved?.messages, model.selectedChat?.messages)
     XCTAssertEqual(saved?.messageVersions, originals)
   }
@@ -65,7 +64,7 @@ final class ChatMessageActionTests: XCTestCase {
     _ = NSApplication.shared
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-message-rail-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root)
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     if model.selectedChat == nil { try model.newChat() }
     model.authorChatMessage(.user); model.draft = "A question."; model.send()
@@ -117,7 +116,7 @@ final class ChatMessageActionTests: XCTestCase {
     _ = NSApplication.shared
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-message-time-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256)), loadModels: false)
+    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: root), loadModels: false)
     if model.selectedChat == nil { try model.newChat() }
     let chatID = try XCTUnwrap(model.state.selectedChat), index = try XCTUnwrap(model.state.chats.firstIndex { $0.id == chatID })
     let date = Date(timeIntervalSince1970: 1_700_000_000)

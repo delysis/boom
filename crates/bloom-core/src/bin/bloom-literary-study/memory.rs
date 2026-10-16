@@ -160,6 +160,13 @@ fn decode_rate(output: &Value) -> Result<f64> {
     Ok(tokens.saturating_sub(1) as f64 / (elapsed - first).max(0.000001))
 }
 
+fn kernel_sample(sample: &Value) -> Result<(u64, u64)> {
+    let current = integer(&sample["process_footprint_bytes"])?;
+    let maximum = integer(&sample["kernel_process_peak_footprint_bytes"])?;
+    require(current > 0 && maximum > 0, "Missing kernel accounting")?;
+    Ok((current, maximum))
+}
+
 pub(super) fn review(study: &Path) -> Result<()> {
     let registration = json_file(&study.join("registration.json"))?;
     let owner = json_file(&study.join("owner-result.json"))?;
@@ -194,6 +201,9 @@ pub(super) fn review(study: &Path) -> Result<()> {
         )?;
     }
     let mut peak = 0;
+    let mut reported_peak = 0;
+    let mut sampled_current_peak = 0;
+    let mut counter_order_discrepancies = Vec::new();
     let mut mlx_peak = 0;
     let mut count = 0;
     let mut previous = 0.0;
@@ -206,13 +216,16 @@ pub(super) fn review(study: &Path) -> Result<()> {
         let time = number(&sample["seconds"])?;
         require(time >= previous, "Memory sample time moved backwards")?;
         previous = time;
-        let current = integer(&sample["process_footprint_bytes"])?;
-        let maximum = integer(&sample["kernel_process_peak_footprint_bytes"])?;
-        require(
-            current > 0 && maximum >= current,
-            "Missing kernel accounting",
-        )?;
-        peak = peak.max(maximum);
+        let (current, maximum) = kernel_sample(&sample)?;
+        if current > maximum {
+            counter_order_discrepancies.push(json!({"row":count,"sample":sample}));
+        }
+        // Darwin reads the current ledger balance and lifetime maximum
+        // separately. Retain both, including unordered pairs, and bound every
+        // observed value. This matches the native sampler without a tolerance.
+        reported_peak = reported_peak.max(maximum);
+        sampled_current_peak = sampled_current_peak.max(current);
+        peak = peak.max(maximum).max(current);
         let mlx = integer(&sample["mlx_active_bytes"])?
             .checked_add(integer(&sample["mlx_cache_bytes"])?)
             .ok_or("Allocation overflow")?;
@@ -380,6 +393,9 @@ pub(super) fn review(study: &Path) -> Result<()> {
         &study.join("memory-review.json"),
         &json!({"status":"verified","source_inventory_sha256":registration["source_inventory_sha256"],
         "executable_sha256":registration["executable_sha256"],"models":registration["models"],"kernel_process_peak_bytes":peak,
+        "kernel_reported_high_watermark_bytes":reported_peak,"sampled_current_max_bytes":sampled_current_peak,
+        "kernel_bound_scope":"maximum of every positive raw current and reported lifetime maximum; no row discarded or numerical tolerance",
+        "counter_order_discrepancies":counter_order_discrepancies,
         "sampled_mlx_peak_bytes":mlx_peak,"sample_count":count,"phases":phases,"warm_first_token_seconds":first,
         "warm_decode_rates":rates,"typing_samples":typing.len(),"typing_max_seconds":typing_max,"cancellation_join_seconds":cancellation,
         "memory_budget_passed":memory_ok,"warm_first_token_passed":first_ok,"sustained_decode_passed":rate_ok,
@@ -392,6 +408,38 @@ pub(super) fn review(study: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unordered_kernel_counters_keep_the_larger_value_and_cannot_hide_over_budget_memory()
+    -> Result<()> {
+        let sample = json!({"process_footprint_bytes":4227420024_u64,"kernel_process_peak_footprint_bytes":4227403640_u64});
+        let (current, peak) = kernel_sample(&sample)?;
+        assert_eq!(current.max(peak), 4227420024);
+        assert_eq!(
+            sample["kernel_process_peak_footprint_bytes"],
+            4227403640_u64
+        );
+        let budget = 24_u64 << 30;
+        for (current, peak) in [(budget + 1, budget - 1), (budget - 1, budget + 1)] {
+            let (current, peak) = kernel_sample(
+                &json!({"process_footprint_bytes":current,"kernel_process_peak_footprint_bytes":peak}),
+            )?;
+            assert!(current.max(peak) > budget);
+        }
+        Ok(())
+    }
+    #[test]
+    fn absent_zero_or_noninteger_kernel_counters_still_refuse_review() {
+        for sample in [
+            json!({"process_footprint_bytes":0,"kernel_process_peak_footprint_bytes":1}),
+            json!({"process_footprint_bytes":1,"kernel_process_peak_footprint_bytes":0}),
+            json!({"process_footprint_bytes":1}),
+            json!({"kernel_process_peak_footprint_bytes":1}),
+            json!({"process_footprint_bytes":-1,"kernel_process_peak_footprint_bytes":1}),
+            json!({"process_footprint_bytes":1.5,"kernel_process_peak_footprint_bytes":2}),
+        ] {
+            assert!(kernel_sample(&sample).is_err());
+        }
+    }
     #[test]
     fn rate_excludes_first_token_and_rejects_impossible_intervals() {
         let output = json!({"first_token_seconds":2.0,"elapsed_seconds":12.0,"output_tokens":101});

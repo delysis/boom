@@ -131,7 +131,9 @@ enum RawWritingInput {
 
 extension WorkspaceModel {
   func writingMedia(in text: String, flag: CancellationFlag) async throws -> [WritingMediaData] {
-    let spans: [InlineMediaSpan] = try ProductCore.call(["op": "media_spans", "text": text])
+    let trace = PerformanceTrace.begin("Request.MediaInput")
+    defer { PerformanceTrace.end("Request.MediaInput", trace) }
+    let spans = try ProductCore.markdownMediaSpans(text)
     var records: [AttachmentRecord] = []
     for span in spans where !records.contains(where: { $0.id == span.id }) {
       guard let record = state.attachments.first(where: { $0.id == span.id }) else { throw BoomError.stale("A writing attachment was removed.") }

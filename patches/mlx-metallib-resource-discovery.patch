@@ -1,0 +1,27 @@
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+index 2f25f894e..d02b79e6e 100644
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -188,6 +188,22 @@ std::pair<MTL::Library*, NS::Error*> load_swiftpm_library(
+       }
+     }
+   }
++
++  // SwiftPM's testing helper loads the test executable with dlopen, so the
++  // test's .xctest bundle is not necessarily present in Bundle.main or
++  // Bundle::allBundles(). The metallib still lives in that executable's
++  // standard Contents/Resources tree. Resolve that path from this image,
++  // which also covers applications packaged in a normal .app bundle.
++  const auto executable_resource =
++      current_binary_dir() / ".." / "Resources" /
++      (std::string(SWIFTPM_BUNDLE) + ".bundle") / "Contents" / "Resources" /
++      (lib_name + ".metallib");
++  auto [resource_library, error] =
++      load_library_from_path(device, executable_resource.c_str());
++  if (resource_library != nullptr) {
++    return {resource_library, nullptr};
++  }
++  return {nullptr, error};
+ #endif
+   return {nullptr, nullptr};
+ }

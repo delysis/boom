@@ -1,0 +1,78 @@
+[
+  {
+    "directory": ".deps/MLXSwiftLM",
+    "revision": "9afc3b55f75a0d41a3d0c11330b9df6a036d24e4",
+    "patch": "patches/mlx-swift-lm-cohorts.patch",
+    "patchSHA256": "b181cf5e3ee38b191ceb4b3edc3e3b7806d81047261485eaf7f6e4e199e1d05b",
+    "files": [
+      {
+        "path": "Libraries/MLXLMCommon/BatchKVCache.swift",
+        "sha256": "169b0f79a9fa52cbd3cf2d9ebd1a0e7999d9b08dd9d6691b165b74975b6481b7"
+      },
+      {
+        "path": "Libraries/MLXLMCommon/Evaluate.swift",
+        "sha256": "3640bb59259ef45572239affdd6a8d436f4783e9981adf34a38136eb64f11020"
+      },
+      {
+        "path": "Libraries/MLXVLM/Models/Gemma4.swift",
+        "sha256": "7e19f05a13532a1b022e870fad5a840837ffda33e263818f9c7e90225d211a1f"
+      },
+      {
+        "path": "Libraries/MLXVLM/Models/Gemma4Assistant.swift",
+        "sha256": "bb78f07687e106a40bbcf7870f3387356d4678a40b0420fc84422147ff55564c"
+      },
+      {
+        "path": "Libraries/MLXLMCommon/PrefillParameters.swift",
+        "sha256": "c7f6a341fe21d7c3604ded6ab463efa6ebcd76a93df70826859a7c40822a467c"
+      }
+    ]
+  },
+  {
+    "directory": "App/.build/checkouts/mlx-swift",
+    "revision": "19601207e9a0de51e03ee6ec0c3c5f3784275075",
+    "patch": "patches/mlx-swift-ready-buffer.patch",
+    "patchSHA256": "5cfeffc124a0bb6f670a297d62cb9e1ac803fdd64adfa7936ad29155d97706fc",
+    "submodules": [
+      "Source/Cmlx/mlx",
+      "Source/Cmlx/mlx-c"
+    ],
+    "files": [
+      {
+        "path": "Source/MLX/MLXArray+Bytes.swift",
+        "sha256": "0641591f68e632b34cf71320b9640375d663c10c3bdf7aac7d634e2acd7f321b"
+      },
+      {
+        "path": "Source/Cmlx/include/mlx/c/array.h",
+        "sha256": "ca107802d1061ebeffeab9316555208a612e9e5d7e5486c0a010e25f9abbdb6e"
+      }
+    ]
+  },
+  {
+    "directory": "App/.build/checkouts/mlx-swift/Source/Cmlx/mlx",
+    "revision": "1f8e74e3f12f31365464a6867c6579f0e9b29d85",
+    "patch": "patches/mlx-metallib-resource-discovery.patch",
+    "patchSHA256": "3c000fa5b62030e0fc126b17966e9aac444105bd87bc4d9dce07fd1678b9b4e5",
+    "files": [
+      {
+        "path": "mlx/backend/metal/device.cpp",
+        "sha256": "9639fbe2ad3d086cc51d4dbd620151a08c4f28f649c10c00529f50551a7b6044"
+      }
+    ]
+  },
+  {
+    "directory": "App/.build/checkouts/mlx-swift/Source/Cmlx/mlx-c",
+    "revision": "ebc88f10caa1b625e6b581437a8dea6df8a70085",
+    "patch": "patches/mlx-c-ready-buffer.patch",
+    "patchSHA256": "9a91175bc7e7a0b5ccfe9c031348e98e15c474f444c3e4579604e7e7df680bde",
+    "files": [
+      {
+        "path": "mlx/c/array.cpp",
+        "sha256": "84b3be12134e2b9469becef40a064f3152d8f6836ccbff077fc1c55cdc1599bd"
+      },
+      {
+        "path": "mlx/c/array.h",
+        "sha256": "ca107802d1061ebeffeab9316555208a612e9e5d7e5486c0a010e25f9abbdb6e"
+      }
+    ]
+  }
+]

@@ -1,0 +1,104 @@
+--- a/Source/MLX/MLXArray+Bytes.swift
++++ b/Source/MLX/MLXArray+Bytes.swift
+@@ -2,6 +2,74 @@
+ 
+ import Cmlx
+ import Foundation
++
++/// Completed immutable MLX allocator-owned storage, with no computation graph.
++/// Acquire on the array's producer before its next functional update. The lease
++/// prevents donation, including slice assignment, until last release. External
++/// raw-pointer writes are outside this contract.
++public final class MLXReadyBuffer: @unchecked Sendable {
++    private let storage: mlx_ready_buffer
++    private let releaseCharge: @Sendable () -> Void
++    public let shape: [Int]
++    public let strides: [Int]
++    public let dtype: DType
++    /// Complete physical parent allocation, including padding and other rows.
++    public let allocationBytes: Int
++    public let byteOffset: Int
++
++    fileprivate init?(storage: mlx_ready_buffer, shape: [Int], strides: [Int], dtype: DType,
++        admitting: ((Int) -> (@Sendable () -> Void)?)?) {
++        let bytes = mlx_ready_buffer_size(storage)
++        let offset = mlx_ready_buffer_offset(storage)
++        guard bytes > 0, bytes <= Int.max, offset < bytes, shape.count == strides.count,
++            shape.allSatisfy({ $0 > 0 }), strides.allSatisfy({ $0 >= 0 }) else {
++            mlx_ready_buffer_free(storage); return nil
++        }
++        var last = Int(offset)
++        for (length, stride) in zip(shape, strides) {
++            let (elements, a) = (length - 1).multipliedReportingOverflow(by: stride)
++            let (extent, b) = elements.multipliedReportingOverflow(by: dtype.size)
++            let (end, c) = last.addingReportingOverflow(extent)
++            guard !a, !b, !c else { mlx_ready_buffer_free(storage); return nil }
++            last = end
++        }
++        let (end, overflow) = last.addingReportingOverflow(dtype.size)
++        guard !overflow, end <= bytes else { mlx_ready_buffer_free(storage); return nil }
++        let release = admitting?(Int(bytes))
++        if admitting != nil, release == nil { mlx_ready_buffer_free(storage); return nil }
++        self.storage = storage; releaseCharge = release ?? {}
++        self.shape = shape; self.strides = strides; self.dtype = dtype
++        allocationBytes = Int(bytes); byteOffset = Int(offset)
++    }
++
++    deinit {
++        mlx_ready_buffer_free(storage) // actual Data pin closes BEFORE its charge
++        releaseCharge()
++    }
++
++    /// Strides/byteOffset identify elements; allocation padding is not data.
++    public func withUnsafeBytes<R>(_ body: (UnsafeRawBufferPointer) throws -> R) rethrows -> R {
++        try body(UnsafeRawBufferPointer(start: mlx_ready_buffer_data(storage), count: allocationBytes))
++    }
++}
++
++extension MLXArray {
++    /// Ready-only metadata handoff. Nil means unscheduled, in-flight, failed or
++    /// externally managed storage. Custom/no-op weak deleters are not admitted.
++    /// Never evals, waits, acquires the evaluation lock or casts a dtype. Invoke
++    /// on the MLX producer, never concurrently with evaluation of this array.
++    /// Optional admission observes the exact physical allocation on this producer.
++    /// Nil declines; an accepted callback releases its byte charge only AFTER the
++    /// final C storage pin closes. It cannot receive or evaluate an array graph.
++    public func readyBuffer(admitting: ((Int) -> (@Sendable () -> Void)?)? = nil) -> MLXReadyBuffer? {
++        var storage = mlx_ready_buffer(ctx: nil)
++        guard mlx_array_try_ready_buffer(&storage, ctx) == 0 else { return nil }
++        let dimensions = ndim
++        let strideValues = dimensions == 0 ? [] : (0..<dimensions).map { Int(mlx_array_strides(ctx)![$0]) }
++        return MLXReadyBuffer(storage: storage, shape: shape, strides: strideValues, dtype: dtype,
++            admitting: admitting)
++    }
++}
+ 
+ // MARK: - Backing / Bytes
+ 
+--- a/Source/Cmlx/include/mlx/c/array.h
++++ b/Source/Cmlx/include/mlx/c/array.h
+@@ -38,6 +38,24 @@
+ typedef struct mlx_array_ {
+   void* ctx;
+ } mlx_array;
++
++/** Immutable completed storage, independent of the array graph. Acquire on the
++ * evaluation owner before its next mutation/submission. Retention prevents
++ * MLX's functional buffer donation until last release.
++ */
++typedef struct mlx_ready_buffer_ {
++  void* ctx;
++} mlx_ready_buffer;
++
++/** Return 0 only for completed, error-free MLX allocator-owned Metal storage. NEVER schedules,
++ * evaluates, waits or numerically converts. Unscheduled and evaluated/no-event
++ * arrays, empty layouts and unsupported backends return 1.
++ */
++int mlx_array_try_ready_buffer(mlx_ready_buffer* result, const mlx_array arr);
++void mlx_ready_buffer_free(mlx_ready_buffer buffer);
++const void* mlx_ready_buffer_data(mlx_ready_buffer buffer);
++size_t mlx_ready_buffer_size(mlx_ready_buffer buffer);
++size_t mlx_ready_buffer_offset(mlx_ready_buffer buffer);
+ 
+ static mlx_array mlx_array_empty;
+ 

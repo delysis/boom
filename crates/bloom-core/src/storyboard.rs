@@ -114,6 +114,10 @@ pub fn select(duration_ms: u64, probes: &[Probe]) -> Result<Selection, Error> {
             .last()
             .map(|(i, _)| i)
             .ok_or_else(|| Error("Storyboard coverage cannot advance.".into()))?;
+        require(
+            indices.len() < MAX_FRAMES,
+            "The available probes cannot cover this storyboard within sixteen frames.",
+        )?;
         indices.push(next);
     }
     cuts.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -279,6 +283,33 @@ impl Timeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn irregular_probe_coverage_never_exceeds_the_frame_budget() -> Result<(), Error> {
+        for spacing in [250, 1_000, 3_000, 5_000] {
+            let probes: Vec<_> = (0..60_000)
+                .step_by(spacing)
+                .map(|at_ms| Probe {
+                    at_ms,
+                    rgb: vec![0; 32 * 18 * 3],
+                })
+                .collect();
+            let selected = select(60_000, &probes);
+            if spacing == 3_000 {
+                assert!(selected.is_err());
+            } else {
+                let selected = selected?;
+                assert!(selected.indices.len() <= MAX_FRAMES);
+                assert!(
+                    selected
+                        .indices
+                        .windows(2)
+                        .all(|pair| { probes[pair[1]].at_ms - probes[pair[0]].at_ms <= GAP_MS })
+                );
+                assert!(60_000 - probes[*selected.indices.last().expect("frame")].at_ms <= GAP_MS);
+            }
+        }
+        Ok(())
+    }
     fn probes(colors: impl Fn(u64) -> [u8; 3], end: u64) -> Vec<Probe> {
         (0..end)
             .step_by(250)

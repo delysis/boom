@@ -14,6 +14,98 @@ struct GenerationIdentity: Codable, Equatable, Sendable {
   let generationPolicy: ModelGenerationPolicy?
   var batch: WritingBatchExecution? = nil
 }
+/// A durable observation of the admitted lookup, not a warm replay transcript.
+/// Absent metadata is unknown; a historical policy never implies a cold run.
+struct GenerationExecutionOrigin: Codable, Equatable, Sendable {
+  let schema: Int
+  let cacheAlgorithm: String
+  let cachedPromptTokens: Int
+  let cacheMissReason: String?
+  var independentCohort: IndependentTextCohortOrigin? = nil
+
+  func isValid(promptTokens: Int) -> Bool {
+    guard schema == 1, promptTokens > 0, promptTokens <= 16_384,
+      cachedPromptTokens >= 0, cachedPromptTokens < promptTokens,
+      Self.identifier(cacheAlgorithm),
+      independentCohort.map({ $0.isValid(promptTokens: promptTokens, cachedTokens: cachedPromptTokens) }) ?? true else { return false }
+    if cachedPromptTokens > 0 { return cacheMissReason == nil }
+    return cacheMissReason.map(Self.identifier) == true
+  }
+  func isConfirmedCold(promptTokens: Int) -> Bool {
+    isValid(promptTokens: promptTokens) && cachedPromptTokens == 0 && independentCohort == nil
+  }
+  private static func identifier(_ value: String) -> Bool {
+    !value.isEmpty && value.utf8.count <= 128 && value.utf8.allSatisfy {
+      (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0)
+        || $0 == 45 || $0 == 46 || $0 == 95
+    }
+  }
+}
+
+
+/// The actual fixed-cohort geometry binds heterogeneous execution. Digests bind
+/// other rows without copying their private prompts into this row's journal.
+/// These observations deliberately do not authorize a width-one seeded replay.
+struct IndependentTextCohortOrigin: Codable, Equatable, Sendable {
+  struct Row: Codable, Equatable, Sendable {
+    let operationID: UUID
+    let attemptID: UUID
+    let namespace: UUID
+    let recordID: UUID
+    let requestDigest: String
+    let preparedTokenDigest: String
+    let promptTokens: Int
+    let cachedTokens: Int
+    let seed: UInt64
+    let outputLimit: Int
+    let samplingDigest: String
+    let cacheParentID: UUID?
+    let cacheHistoryDigest: String
+    let cacheLengths: [Int]
+    let cachePadding: [Int]
+  }
+  let schema: Int
+  let cohortID: UUID
+  let row: Int
+  let rows: [Row]
+  let policyDigest: String
+  let promptWidth: Int
+  let maskDigest: String
+  let cacheWidths: [Int]
+  let prefill: PromptCacheGeometry
+
+  func isValid(promptTokens: Int, cachedTokens: Int) -> Bool {
+    func hash(_ value: String) -> Bool {
+      value.utf8.count == 64 && value.utf8.allSatisfy {
+        (48...57).contains($0) || (97...102).contains($0)
+      }
+    }
+    let nilID = UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+    guard schema == 1, cohortID != nilID, (2...4).contains(rows.count),
+      rows.indices.contains(row), hash(policyDigest), hash(maskDigest),
+      (1...16_384).contains(promptWidth), (1...128).contains(cacheWidths.count),
+      cacheWidths.allSatisfy({ (0...16_384).contains($0) }),
+      rows[row].promptTokens == promptTokens, rows[row].cachedTokens == cachedTokens,
+      Set(rows.map(\.attemptID)).count == rows.count,
+      (1...16_384).contains(prefill.tokenCeiling),
+      prefill.chunkStride.map({ (1...16_384).contains($0) }) ?? true else { return false }
+    let validRows = rows.allSatisfy { value in
+      value.operationID != nilID && value.attemptID != nilID && value.namespace != nilID
+        && value.recordID != nilID && hash(value.requestDigest) && hash(value.preparedTokenDigest)
+        && hash(value.samplingDigest) && hash(value.cacheHistoryDigest)
+        && (1...16_384).contains(value.promptTokens)
+        && (0..<value.promptTokens).contains(value.cachedTokens)
+        && (1...4096).contains(value.outputLimit)
+        && value.cacheLengths.count == cacheWidths.count && value.cachePadding.count == cacheWidths.count
+        && zip(cacheWidths.indices, cacheWidths).allSatisfy { index, width in
+          (0...width).contains(value.cacheLengths[index])
+            && value.cachePadding[index] == width - value.cacheLengths[index]
+        }
+    }
+    return validRows && promptWidth == rows.map({ $0.promptTokens - $0.cachedTokens }).max()
+  }
+}
+
 struct GenerationProgress: Codable, Sendable {
   let text: String
   let tokenIDs: [Int]
@@ -21,6 +113,7 @@ struct GenerationProgress: Codable, Sendable {
   let promptTokens: Int
   let firstTokenSeconds: Double?
   let elapsedSeconds: Double
+  var executionOrigin: GenerationExecutionOrigin? = nil
 }
 struct GenerationCheckpoint: Codable, Sendable {
   let schema: Int
@@ -33,7 +126,9 @@ struct GenerationCheckpoint: Codable, Sendable {
 extension ProductCore {
   static func generationCheckpoint(_ next: GenerationCheckpoint, expected: GenerationIdentity,
     previous: GenerationCheckpoint? = nil) throws -> GenerationCheckpoint {
-    try call(["op": "generation_checkpoint", "expected": object(expected),
+    let trace = PerformanceTrace.begin("Storage.CheckpointAdmission")
+    defer { PerformanceTrace.end("Storage.CheckpointAdmission", trace) }
+    return try call(["op": "generation_checkpoint", "expected": object(expected),
       "previous": try previous.map { try object($0) } ?? NSNull(), "next": object(next)])
   }
 }
@@ -44,17 +139,27 @@ extension WorkspaceStore {
   // final result after cancellation or the next attempt.
   func checkpoint(_ progress: GenerationProgress, identity: GenerationIdentity,
     stopReason: String?, stopTokenID: Int? = nil) throws {
-    let previous = try generationCheckpoint(identity: identity)
+    let trace = PerformanceTrace.begin("Storage.Checkpoint")
+    defer { PerformanceTrace.end("Storage.Checkpoint", trace) }
+    // The transition validator admits BOTH next and previous records. Reading
+    // the previous DTO here avoids admitting/encoding it through the bridge twice.
+    let previous = try readRawGenerationCheckpoint(attemptID: identity.attemptID)
     let next = try ProductCore.generationCheckpoint(
       GenerationCheckpoint(schema: 1, identity: identity, progress: progress, stopReason: stopReason, stopTokenID: stopTokenID),
       expected: identity, previous: previous)
     try vault.encode(next, kind: .generationJournal, id: identity.attemptID)
   }
   func generationCheckpoint(identity: GenerationIdentity) throws -> GenerationCheckpoint? {
-    guard vault.exists(.generationJournal, identity.attemptID) else { return nil }
-    return try ProductCore.generationCheckpoint(
-      vault.decode(GenerationCheckpoint.self, kind: .generationJournal, id: identity.attemptID),
-      expected: identity)
+    guard let raw = try readRawGenerationCheckpoint(attemptID: identity.attemptID) else { return nil }
+    return try ProductCore.generationCheckpoint(raw, expected: identity)
+  }
+  /// Decoded bytes remain untrusted until the caller's Rust admission succeeds.
+  /// No raw checkpoint escapes the store or authorizes a write by itself.
+  private func readRawGenerationCheckpoint(attemptID: UUID) throws -> GenerationCheckpoint? {
+    let trace = PerformanceTrace.begin("Storage.CheckpointRead")
+    defer { PerformanceTrace.end("Storage.CheckpointRead", trace) }
+    guard vault.exists(.generationJournal, attemptID) else { return nil }
+    return try vault.decode(GenerationCheckpoint.self, kind: .generationJournal, id: attemptID)
   }
   func consultationCheckpoint(id: UUID, receipt: ConsultationReceipt) throws -> GenerationCheckpoint? {
     let attemptID = receipt.attemptID ?? id
@@ -64,7 +169,9 @@ extension WorkspaceStore {
       operationID: receipt.operationID, recordID: receipt.responseID ?? id, attemptID: attemptID, model: receipt.model,
       seed: receipt.seed, requestDigest: Digest.sha256(receipt.plan.rawPrompt), maxTokens: journal.identity.maxTokens,
       generationPolicy: receipt.generationPolicy)
-    return try ProductCore.generationCheckpoint(journal, expected: expected)
+    let admitted = try ProductCore.generationCheckpoint(journal, expected: expected)
+    try validateExecutionOrigin(receipt.executionOrigin, journal: admitted)
+    return admitted
   }
   func writingCheckpoint(bundle: CandidateBundle, candidate: WritingCandidate) throws -> GenerationCheckpoint? {
     guard vault.exists(.generationJournal, candidate.id) else { return nil }
@@ -73,7 +180,14 @@ extension WorkspaceStore {
       recordID: bundle.id, attemptID: candidate.id, model: bundle.recipe.model,
       seed: candidate.seed, requestDigest: bundle.recipe.promptDigest, maxTokens: bundle.recipe.maxTokens,
       generationPolicy: bundle.recipe.generationPolicy, batch: candidate.batch)
-    return try ProductCore.generationCheckpoint(journal, expected: expected)
+    let admitted = try ProductCore.generationCheckpoint(journal, expected: expected)
+    try validateExecutionOrigin(candidate.executionOrigin, journal: admitted)
+    return admitted
+  }
+  private func validateExecutionOrigin(_ captured: GenerationExecutionOrigin?, journal: GenerationCheckpoint) throws {
+    guard captured == nil || captured == journal.progress.executionOrigin else {
+      throw BoomError.invalid("The recorded execution origin differs from its checkpoint; records retained.")
+    }
   }
 }
 
@@ -84,6 +198,7 @@ extension ConsultationReceipt {
   mutating func retain(_ progress: GenerationProgress) {
     promptDigest = progress.promptDigest; tokenIDs = progress.tokenIDs
     firstTokenSeconds = progress.firstTokenSeconds; elapsedSeconds = progress.elapsedSeconds
+    executionOrigin = progress.executionOrigin
   }
 }
 extension WritingCandidate {
@@ -109,5 +224,15 @@ extension WritingCandidate {
   mutating func retain(_ progress: GenerationProgress) {
     text = progress.text; promptTokens = progress.promptTokens
     tokenIDs = progress.tokenIDs; outputTokens = progress.tokenIDs.count
+    executionOrigin = progress.executionOrigin
+  }
+  func coldReplayPolicy(recipe: CompletionRecipe, loadedModel: String,
+    loadedPolicy: ModelGenerationPolicy) throws -> ModelGenerationPolicy {
+    guard state == .complete, recipe.model == loadedModel,
+      executionOrigin?.isConfirmedCold(promptTokens: promptTokens) == true else {
+      throw BoomError.unavailable("Seed replay requires a confirmed cold execution; saved output is retained.")
+    }
+    if let batch { try ProductCore.validateWritingBatch(batch, seed: seed) }
+    return try ProductCore.resolvedGenerationPolicy(recipe.generationPolicy, loaded: loadedPolicy)
   }
 }

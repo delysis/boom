@@ -184,17 +184,24 @@ enum ModelPacks {
       }
     }
   }
-  private static func verifyPublicFiles(_ directory: URL, files: [ModelFile]) throws {
+  private static func publicFileTarget(_ directory: URL, path: String) throws -> URL {
     let info = try directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
     guard info.isDirectory == true, info.isSymbolicLink != true else { throw BoomError.invalid("The model snapshot is not a real directory.") }
     let root = directory.resolvingSymlinksInPath()
     let blobs = directory.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("blobs").resolvingSymlinksInPath()
+    try DownloadPolicy.validateRelativePath(path)
+    let target = directory.appendingPathComponent(path).resolvingSymlinksInPath()
+    guard target.path.hasPrefix(root.path + "/") || target.path.hasPrefix(blobs.path + "/") else {
+      throw BoomError.invalid("Public checkpoint cache link escapes its snapshot and blob store.")
+    }
+    return target
+  }
+  private static func publicConfiguration(_ directory: URL) throws -> (sha256: String, bytes: Int64) {
+    try ModelInstaller.hashFile(publicFileTarget(directory, path: "config.json"), maxBytes: 4_194_304)
+  }
+  private static func verifyPublicFiles(_ directory: URL, files: [ModelFile]) throws {
     for file in files {
-      try DownloadPolicy.validateRelativePath(file.path)
-      let target = directory.appendingPathComponent(file.path).resolvingSymlinksInPath()
-      guard target.path.hasPrefix(root.path + "/") || target.path.hasPrefix(blobs.path + "/") else {
-        throw BoomError.invalid("Public checkpoint cache link escapes its snapshot and blob store.")
-      }
+      let target = try publicFileTarget(directory, path: file.path)
       let value = try ModelInstaller.hashFile(target, maxBytes: file.bytes)
       guard value.bytes == file.bytes, value.sha256 == file.sha256 else { throw BoomError.invalid("Cached public checkpoint changed: " + file.path) }
     }
@@ -221,7 +228,7 @@ enum ModelPacks {
       }
       return try admission(directory, purpose: purpose)
     }
-    let config = try ModelInstaller.hashFile(directory.appendingPathComponent("config.json"), maxBytes: 4_194_304)
+    let config = try publicConfiguration(directory)
     if let purpose = try catalog().publishedCheckpoints.first(where: {
       $0.files.contains(where: { $0.path == "config.json" && $0.sha256 == config.sha256 })
     })?.purpose { return try admission(directory, purpose: purpose) }
@@ -239,7 +246,7 @@ enum ModelPacks {
       let manifest = try verify(directory, purpose: purpose)
       return Admission(directory: directory, purpose: purpose, identity: specification.manifestDigest, weightBytes: manifest.weightBytes, kind: .convertedPack)
     }
-    let config = try ModelInstaller.hashFile(directory.appendingPathComponent("config.json"), maxBytes: 4_194_304)
+    let config = try publicConfiguration(directory)
     if let checkpoint = try publishedCheckpoints(purpose).first(where: {
       $0.files.contains(where: { $0.path == "config.json" && $0.sha256 == config.sha256 })
     }) {

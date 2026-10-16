@@ -1,6 +1,5 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import SwiftUI
 import XCTest
 @testable import Boom
@@ -14,7 +13,7 @@ final class TextInputCompletionTests: XCTestCase {
     _ = NSApplication.shared
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-input-" + UUID().uuidString)
     addTeardownBlock { try? FileManager.default.removeItem(at: root) }
-    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256)), loadModels: false)
+    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: root), loadModels: false)
     if model.selectedChat == nil { try model.newChat() }
     model.authorChatMessage(.user); model.draft = "A question."; model.send()
     model.authorChatMessage(.assistant); model.draft = "An answer."; model.send()
@@ -91,7 +90,12 @@ final class TextInputCompletionTests: XCTestCase {
   @MainActor func testCapturedContextPreservesSpeakersAndExcludesLaterTurnsAndTextAfterCaret() async throws {
     let model = try await model(), chat = try XCTUnwrap(model.selectedChat)
     let target = TextInputTarget(chatID: chat.id, documentID: nil, messageID: chat.messages[1].id)
-    let compiled = try model.inputContext(target, text: "A new answer. AFTER", caret: "A new answer.".utf16.count)
+    let document = DocumentSnapshot(title: "Public input", text: "A new answer. AFTER")
+    let prepared = try await model.prepareInputContext(target, document: document,
+      caret: "A new answer.".utf16.count, flag: CancellationFlag())
+    let compiled = try XCTUnwrap(prepared).raw
+    XCTAssertEqual(prepared?.digest, try model.inputContextDigest(target))
+    XCTAssertEqual(prepared?.stamp, try model.inputContextStamp(target))
     XCTAssertEqual(compiled, "You: A question.\n\nBloom: A new answer.")
     XCTAssertFalse(compiled.contains("AFTER")); XCTAssertFalse(compiled.contains("An answer."))
     let old = try model.inputContextDigest(target)

@@ -1,0 +1,708 @@
+--- /dev/null
++++ b/Libraries/MLXLMCommon/BatchKVCache.swift
+@@ -0,0 +1,458 @@
++// SPDX-License-Identifier: MIT
++// Batch padding and ring algorithms adapted from MIT-licensed mlx-lm/models/cache.py.
++// The existing dependency LICENSE retains the original Apple Inc. attribution.
++
++import Foundation
++import MLX
++
++/// Fixed-cohort caches retain an independent position and padding boundary per row.
++/// All mutation, extraction and evaluation belong to the model's existing producer.
++public protocol BatchKVCacheProtocol: BatchPositionedKVCache {
++    var batchSize: Int { get }
++    /// Existing producer only. Position arrays are actual cache state, not host
++    /// guesses; ready-only consumers may decline without evaluating them.
++    var rowPositionState: [MLXArray] { get }
++    func logicalOffset(row: Int) throws -> Int
++    func extract(row: Int, through position: Int) throws -> any KVCache
++    func extract(row: Int) throws -> any KVCache
++}
++
++private func rollRows(_ array: MLXArray, by shifts: MLXArray) -> MLXArray {
++    let count = array.dim(2)
++    guard count > 0 else { return array }
++    let positions = MLXArray(Int32(0) ..< Int32(count))[.newAxis, .newAxis, 0..., .newAxis]
++    let indices = (positions - shifts[0..., .newAxis, .newAxis, .newAxis]) % count
++    return takeAlong(array, indices, axis: 2)
++}
++
++private func checkBatchKV(_ keys: MLXArray, _ values: MLXArray, rows: Int) {
++    precondition(keys.ndim == 4 && values.ndim == 4)
++    precondition(keys.dim(0) == rows && values.dim(0) == rows)
++    precondition(keys.dim(1) == values.dim(1) && keys.dim(2) == values.dim(2))
++    precondition(keys.dim(2) > 0 && keys.dim(2) <= Int(Int32.max))
++}
++
++private func copyRow(_ array: MLXArray, row: Int, start: Int, end: Int) -> MLXArray {
++    // `take` lowers to Gather, which allocates out.nbytes() on CPU and Metal.
++    // Gathering on axis 0 also leaves the row output contiguous. Whole-slice
++    // assignment and contiguous(view) can return the original parent instead.
++    let interval = array[0..., 0..., start ..< end, 0...]
++    return take(interval, MLXArray([Int32(row)]), axis: 0)
++}
++
++private func copyBatchArray(_ array: MLXArray) -> MLXArray {
++    take(array, MLXArray(Int32(0) ..< Int32(array.dim(0))), axis: 0)
++}
++
++/// Full-attention cache. Cached prefixes are right-aligned; new suffixes are
++/// right-padded. `finalize()` moves that suffix padding to the left once.
++public final class BatchKVCache: BaseKVCache, BatchKVCacheProtocol {
++    public let batchSize: Int
++    public private(set) var batchOffset: MLXArray
++    private var leftPadding: MLXArray
++    private var ends: MLXArray?
++    private var keys: MLXArray?
++    private var values: MLXArray?
++    private let step = 256
++
++    public init(leftPadding: [Int]) {
++        precondition(!leftPadding.isEmpty && leftPadding.allSatisfy { (0 ... Int(Int32.max)).contains($0) })
++        batchSize = leftPadding.count
++        self.leftPadding = MLXArray(leftPadding.map(Int32.init))
++        batchOffset = -self.leftPadding
++        super.init()
++    }
++
++    public var rowPositionState: [MLXArray] { [batchOffset, leftPadding] }
++    public func logicalOffset(row: Int) throws -> Int {
++        guard (0..<batchSize).contains(row) else { throw KVCacheError(message: "Invalid cache row.") }
++        return batchOffset.asArray(Int.self)[row]
++    }
++    public override var ropeOffset: RoPEOffset { .batch(batchOffset + 0) }
++
++    public override func innerState() -> [MLXArray] {
++        [keys, values, batchOffset, leftPadding, ends].compactMap { $0 }
++    }
++
++    public override func prepare(lengths: [Int]?) {
++        guard let lengths else { return }
++        precondition(lengths.count == batchSize && lengths.allSatisfy { (0 ... Int(Int32.max)).contains($0) })
++        prepare(lengths: MLXArray(lengths.map(Int32.init)))
++    }
++
++    public override func prepare(lengths: MLXArray?) {
++        guard let lengths else { return }
++        precondition(lengths.shape == [batchSize] && ends == nil)
++        ends = batchOffset + lengths
++    }
++
++    public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
++        checkBatchKV(keys, values, rows: batchSize)
++        let previous = offset
++        let (next, overflow) = previous.addingReportingOverflow(keys.dim(2))
++        precondition(!overflow && next <= Int(Int32.max))
++        if self.keys == nil || next > self.keys!.dim(2) {
++            let capacity = ((keys.dim(2) + step - 1) / step) * step
++            let newKeys = MLXArray.zeros([batchSize, keys.dim(1), capacity, keys.dim(3)], dtype: keys.dtype)
++            let newValues = MLXArray.zeros([batchSize, values.dim(1), capacity, values.dim(3)], dtype: values.dtype)
++            if let oldKeys = self.keys, let oldValues = self.values {
++                self.keys = concatenated([oldKeys[.ellipsis, ..<previous, 0...], newKeys], axis: 2)
++                self.values = concatenated([oldValues[.ellipsis, ..<previous, 0...], newValues], axis: 2)
++            } else {
++                self.keys = newKeys
++                self.values = newValues
++            }
++        }
++        self.keys![.ellipsis, previous ..< next, 0...] = keys
++        self.values![.ellipsis, previous ..< next, 0...] = values
++        offset = next
++        batchOffset = batchOffset + keys.dim(2)
++        return (self.keys![.ellipsis, ..<offset, 0...], self.values![.ellipsis, ..<offset, 0...])
++    }
++
++    public override func finalize() {
++        guard let ends else { return }
++        let padding = maximum(batchOffset - ends, 0)
++        if let keys, let values {
++            self.keys = rollRows(keys[.ellipsis, ..<offset, 0...], by: padding)
++            self.values = rollRows(values[.ellipsis, ..<offset, 0...], by: padding)
++        }
++        batchOffset = batchOffset - padding
++        leftPadding = leftPadding + padding
++        self.ends = nil
++    }
++
++    public override func makeMask(n: Int, windowSize: Int?, returnArray: Bool) -> MLXFast.ScaledDotProductAttentionMaskMode {
++        let causal = createCausalMask(n: n, offset: offset, windowSize: windowSize)
++        let columns = MLXArray(Int32(0) ..< Int32(offset + n))[.newAxis, .newAxis, .newAxis, 0...]
++        return .array(causal & (columns .>= leftPadding[0..., .newAxis, .newAxis, .newAxis]))
++    }
++
++    public override var isTrimmable: Bool { true }
++    public override func trim(_ n: Int) -> Int {
++        let count = min(max(0, n), offset)
++        offset -= count
++        batchOffset = batchOffset - count
++        return count
++    }
++
++    public override var state: [MLXArray] {
++        get {
++            guard let keys, let values else { return [] }
++            return [keys[.ellipsis, ..<offset, 0...], values[.ellipsis, ..<offset, 0...], batchOffset, leftPadding]
++        }
++        set {
++            precondition(newValue.count == 4 && newValue[2].shape == [batchSize] && newValue[3].shape == [batchSize])
++            checkBatchKV(newValue[0], newValue[1], rows: batchSize)
++            keys = newValue[0]; values = newValue[1]
++            offset = newValue[0].dim(2); batchOffset = newValue[2]; leftPadding = newValue[3]
++            ends = nil
++        }
++    }
++
++    public override func copy() -> any KVCache {
++        let result = BatchKVCache(leftPadding: Array(repeating: 0, count: batchSize))
++        result.keys = keys.map(copyBatchArray); result.values = values.map(copyBatchArray)
++        result.offset = offset; result.batchOffset = batchOffset + 0
++        result.leftPadding = leftPadding + 0; result.ends = ends.map { $0 + 0 }
++        return result
++    }
++
++    public func extract(row: Int) throws -> any KVCache {
++        try extract(row: row, through: logicalOffset(row: row))
++    }
++    public func extract(row: Int, through position: Int) throws -> any KVCache {
++        let actual = try logicalOffset(row: row)
++        guard ends == nil, position >= 0, position <= actual else {
++            throw KVCacheError(message: "Extract a finalized known row prefix.")
++        }
++        let result = KVCacheSimple()
++        guard position > 0, let keys, let values else { return result }
++        let padding = leftPadding.asArray(Int.self)[row]
++        guard (0 ... offset).contains(padding), position <= offset - padding else {
++            throw KVCacheError(message: "Invalid batch padding.")
++        }
++        // The exact prefix excludes peers' later inert inputs. The raw copy
++        // retains its shared parent through the existing evaluation/join fence.
++        result.state = [copyRow(keys, row: row, start: padding, end: padding + position),
++            copyRow(values, row: row, start: padding, end: padding + position)]
++        return result
++    }
++}
++
++/// Sliding-attention cache, using the same chronological-prefill/ring-decode
++/// layout as mlx-lm BatchRotatingKVCache. No pinned prefix is supported here.
++public final class BatchRotatingKVCache: BaseKVCache, BatchKVCacheProtocol {
++    public let batchSize: Int
++    public private(set) var batchOffset: MLXArray
++    private var leftPadding: MLXArray
++    private var ends: MLXArray?
++    private var keys: MLXArray?
++    private var values: MLXArray?
++    private var index = 0
++    private var rotated = false
++    private let capacity: Int
++    private let step = 256
++    package var capacityOrigin = RotatingKVCache.CapacityOrigin.modelNative
++
++    public init(maxSize: Int, leftPadding: [Int]) {
++        precondition(maxSize > 0 && maxSize <= Int(Int32.max))
++        precondition(!leftPadding.isEmpty && leftPadding.allSatisfy { (0 ... Int(Int32.max)).contains($0) })
++        capacity = maxSize; batchSize = leftPadding.count
++        self.leftPadding = MLXArray(leftPadding.map(Int32.init))
++        batchOffset = -self.leftPadding
++        super.init()
++    }
++
++    public override var maxSize: Int? { capacity }
++    public var rowPositionState: [MLXArray] { [batchOffset, leftPadding] }
++    public func logicalOffset(row: Int) throws -> Int {
++        guard (0..<batchSize).contains(row) else { throw KVCacheError(message: "Invalid cache row.") }
++        return batchOffset.asArray(Int.self)[row]
++    }
++    public override var ropeOffset: RoPEOffset { .batch(batchOffset + 0) }
++    public override func innerState() -> [MLXArray] {
++        [keys, values, batchOffset, leftPadding, ends].compactMap { $0 }
++    }
++
++    public override func prepare(lengths: [Int]?) {
++        guard let lengths else { return }
++        precondition(lengths.count == batchSize && lengths.allSatisfy { (0 ... Int(Int32.max)).contains($0) })
++        prepare(lengths: MLXArray(lengths.map(Int32.init)))
++    }
++    public override func prepare(lengths: MLXArray?) {
++        guard let lengths else { return }
++        precondition(lengths.shape == [batchSize] && ends == nil)
++        ends = batchOffset + lengths
++    }
++
++    private func ordered(_ array: MLXArray) -> MLXArray {
++        rotated ? roll(array, shift: -index, axis: 2) : array[.ellipsis, ..<index, 0...]
++    }
++
++    private func updateConcat(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
++        if let oldKeys = self.keys, let oldValues = self.values {
++            var k = ordered(oldKeys), v = ordered(oldValues)
++            if let ends {
++                let padding = maximum(batchOffset - ends, 0)
++                k = rollRows(k, by: padding); v = rollRows(v, by: padding)
++                batchOffset = batchOffset - padding; leftPadding = leftPadding + padding
++            }
++            let trim = max(0, k.dim(2) - capacity + 1)
++            self.keys = concatenated([k[.ellipsis, trim..., 0...], keys], axis: 2)
++            self.values = concatenated([v[.ellipsis, trim..., 0...], values], axis: 2)
++            leftPadding = leftPadding - trim
++        } else {
++            self.keys = keys; self.values = values
++        }
++        offset += keys.dim(2); batchOffset = batchOffset + keys.dim(2)
++        index = self.keys!.dim(2); rotated = false
++        self.keys = depends(input: self.keys!, dependencies: [batchOffset, leftPadding])
++        return (self.keys!, self.values!)
++    }
++
++    private func updateOne(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
++        let filled = self.keys?.dim(2) ?? 0
++        if self.keys == nil || (!rotated && index >= filled && filled < capacity) {
++            let growth = min(step, capacity - filled)
++            let k = MLXArray.zeros([batchSize, keys.dim(1), growth, keys.dim(3)], dtype: keys.dtype)
++            let v = MLXArray.zeros([batchSize, values.dim(1), growth, values.dim(3)], dtype: values.dtype)
++            self.keys = self.keys.map { concatenated([$0, k], axis: 2) } ?? k
++            self.values = self.values.map { concatenated([$0, v], axis: 2) } ?? v
++        }
++        let trim = max(0, self.keys!.dim(2) - capacity)
++        if trim > 0 {
++            self.keys = self.keys![.ellipsis, trim..., 0...]
++            self.values = self.values![.ellipsis, trim..., 0...]
++            index = capacity; leftPadding = leftPadding - trim
++        }
++        if index == capacity { rotated = true; index = 0 }
++        if rotated { leftPadding = leftPadding - 1 }
++        self.keys![.ellipsis, index ..< index + 1, 0...] = keys
++        self.values![.ellipsis, index ..< index + 1, 0...] = values
++        index += 1; offset += 1; batchOffset = batchOffset + 1
++        self.keys = depends(input: self.keys!, dependencies: [batchOffset, leftPadding])
++        if !rotated && index < self.keys!.dim(2) {
++            return (self.keys![.ellipsis, ..<index, 0...], self.values![.ellipsis, ..<index, 0...])
++        }
++        return (self.keys!, self.values!)
++    }
++
++    public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
++        checkBatchKV(keys, values, rows: batchSize)
++        let (next, overflow) = offset.addingReportingOverflow(keys.dim(2))
++        precondition(!overflow && next <= Int(Int32.max))
++        return keys.dim(2) == 1 && ends == nil ? updateOne(keys: keys, values: values) : updateConcat(keys: keys, values: values)
++    }
++
++    public override func makeMask(n: Int, windowSize: Int?, returnArray: Bool) -> MLXFast.ScaledDotProductAttentionMaskMode {
++        let oldCount = min(capacity - 1, offset)
++        let columns = MLXArray(Int32(0) ..< Int32(oldCount + n))[.newAxis]
++        let queries = MLXArray(Int32(oldCount) ..< Int32(oldCount + n))[0..., .newAxis]
++        var padding = leftPadding
++        if let ends { padding = padding + maximum(batchOffset - ends, 0) }
++        let concatenate = n > 1 || ends != nil
++        padding = padding - max(0, index - capacity + (concatenate ? 1 : 0))
++        let willRotate = !concatenate && (rotated || index >= capacity)
++        if willRotate { padding = padding - 1 }
++        var mask = (queries .>= columns) & (queries .< columns + (windowSize ?? capacity))
++        mask = mask & (columns .>= padding[0..., .newAxis, .newAxis, .newAxis])
++        if willRotate { mask = roll(mask, shift: (index >= capacity ? 0 : index) + 1, axis: -1) }
++        return .array(mask)
++    }
++
++    public override func finalize() {
++        guard let ends else { return }
++        let padding = maximum(batchOffset - ends, 0)
++        if let keys, let values {
++            self.keys = rollRows(ordered(keys), by: padding)
++            self.values = rollRows(ordered(values), by: padding)
++            index = self.keys!.dim(2); rotated = false
++        }
++        batchOffset = batchOffset - padding; leftPadding = leftPadding + padding
++        self.ends = nil
++    }
++
++    public override var isTrimmable: Bool { !rotated && offset < capacity }
++    public override func isTrimmable(after positions: Int) -> Bool {
++        positions >= 0 && isTrimmable && positions < capacity - offset
++    }
++    public override func trim(_ n: Int) -> Int {
++        guard isTrimmable else { return 0 }
++        let count = min(max(0, n), min(offset, index))
++        offset -= count; index -= count; batchOffset = batchOffset - count
++        return count
++    }
++
++    public override var state: [MLXArray] {
++        get {
++            guard let keys, let values else { return [] }
++            return [keys, values, batchOffset, leftPadding]
++        }
++        set {
++            precondition(newValue.count == 4 && newValue[2].shape == [batchSize] && newValue[3].shape == [batchSize])
++            checkBatchKV(newValue[0], newValue[1], rows: batchSize)
++            keys = newValue[0]; values = newValue[1]
++            batchOffset = newValue[2]; leftPadding = newValue[3]; ends = nil
++        }
++    }
++    public override var metaState: [String] {
++        get { [String(capacity), String(offset), String(index), String(rotated), capacityOrigin.rawValue] }
++        set {
++            precondition(newValue.count == 5 && Int(newValue[0]) == capacity)
++            guard let offset = Int(newValue[1]), let index = Int(newValue[2]), let rotated = Bool(newValue[3]), let origin = RotatingKVCache.CapacityOrigin(rawValue: newValue[4]) else { preconditionFailure("Invalid batch cache metadata.") }
++            self.offset = offset; self.index = index; self.rotated = rotated; capacityOrigin = origin
++        }
++    }
++
++    public override func copy() -> any KVCache {
++        let result = BatchRotatingKVCache(maxSize: capacity, leftPadding: Array(repeating: 0, count: batchSize))
++        result.keys = keys.map(copyBatchArray); result.values = values.map(copyBatchArray)
++        result.offset = offset; result.index = index; result.rotated = rotated
++        result.batchOffset = batchOffset + 0; result.leftPadding = leftPadding + 0
++        result.ends = ends.map { $0 + 0 }; result.capacityOrigin = capacityOrigin
++        return result
++    }
++
++    public func extract(row: Int, through position: Int) throws -> any KVCache {
++        let actual = try logicalOffset(row: row)
++        guard ends == nil, position >= 0, position <= actual else {
++            throw KVCacheError(message: "Extract an actually retained row prefix.")
++        }
++        let result = RotatingKVCache(maxSize: capacity)
++        result.capacityOrigin = capacityOrigin
++        guard position > 0, let keys, let values else { return result }
++        let k = ordered(keys), v = ordered(values)
++        let padding = max(0, leftPadding.asArray(Int.self)[row])
++        let available = k.dim(2) - padding
++        let first = actual - available, wanted = max(0, position - capacity)
++        guard available >= 0, first >= 0, wanted >= first else {
++            throw KVCacheError(message: "This exact native prefix was overwritten; use retained disk coverage.")
++        }
++        let start = padding + wanted - first, count = position - wanted
++        guard count > 0, start >= 0, count <= k.dim(2) - start else {
++            throw KVCacheError(message: "Invalid retained row coordinates.")
++        }
++        result.state = [copyRow(k, row: row, start: start, end: start + count),
++            copyRow(v, row: row, start: start, end: start + count)]
++        result.metaState = ["0", String(capacity), "256", String(position), String(count), capacityOrigin.rawValue, "false"]
++        return result
++    }
++
++    /// Physical ring ranges for an ACTUALLY ready row position/padding pair.
++    /// The caller reads that pair from rowPositionState on the model producer;
++    /// this method never evaluates or creates a tensor view.
++    public func residentRanges(position: Int, padding: Int, after: Int,
++        through: Int? = nil) throws -> [(Int, Range<Int>)] {
++        let filled = keys?.dim(2) ?? 0
++        let held = rotated ? filled : index
++        let invalid = max(0, padding)
++        guard (ends == nil || through != nil), position >= 0, after >= 0, invalid <= held,
++            index >= 0, index <= filled, !rotated || filled == capacity,
++            position >= held - invalid, (0...position).contains(through ?? position) else {
++            throw KVCacheError(message: "Invalid ready row geometry.")
++        }
++        guard held > 0 else { return [] }
++        var logical = position - held
++        let firstValid = logical + invalid
++        let pieces = rotated ? [index..<filled, 0..<index] : [0..<held]
++        var result: [(Int, Range<Int>)] = []
++        for piece in pieces where !piece.isEmpty {
++            let lower = max(firstValid, max(after, logical))
++            let physicalEnd = logical + piece.count
++            // During preparation a short row's right-padding and later peers'
++            // inert inputs are physical cache positions, never its source data.
++            let upper = min(physicalEnd, through ?? position)
++            if lower < upper {
++                result.append((lower, (piece.lowerBound + lower - logical)..<(piece.lowerBound + upper - logical)))
++            }
++            logical = physicalEnd
++        }
++        return result
++    }
++
++    public func extract(row: Int) throws -> any KVCache {
++        try extract(row: row, through: logicalOffset(row: row))
++    }
++}
++
++/// Merge independent scalar caches, preserving their actual absolute positions.
++/// Only homogeneous unquantized full caches or keep=0 sliding caches are admitted.
++public func mergeBatchKVCache(_ caches: [any KVCache]) throws -> any BatchKVCacheProtocol {
++    guard !caches.isEmpty else { throw KVCacheError(message: "A batch needs at least one row.") }
++    let rotating = caches.first is RotatingKVCache
++    let capacity = caches.first?.maxSize
++    var rows: [(MLXArray, MLXArray)?] = []
++    for cache in caches {
++        guard cache.offset >= 0 && cache.offset <= Int(Int32.max) else { throw KVCacheError(message: "Invalid row offset.") }
++        if rotating {
++            guard let cache = cache as? RotatingKVCache, cache.maxSize == capacity, cache.preservedPrefixTokens == 0 else { throw KVCacheError(message: "Sliding batch rows require one capacity and no pinned prefix.") }
++            let row = cache.logicalView(tail: capacity!)
++            rows.append(row?.0.dim(2) == 0 ? nil : row)
++        } else {
++            guard cache is KVCacheSimple else { throw KVCacheError(message: "Unsupported batch cache family.") }
++            let state = cache.state
++            rows.append(state.isEmpty || state[0].dim(2) == 0 ? nil : (state[0], state[1]))
++        }
++    }
++    let lengths = rows.map { $0?.0.dim(2) ?? 0 }
++    let width = lengths.max()!
++    let padding = lengths.map { width - $0 }
++    var result: any BatchKVCacheProtocol = rotating ? BatchRotatingKVCache(maxSize: capacity!, leftPadding: padding) : BatchKVCache(leftPadding: padding)
++    guard let prototype = rows.compactMap({ $0 }).first else { return result }
++    let k0 = prototype.0, v0 = prototype.1
++    var keys = MLXArray.zeros([caches.count, k0.dim(1), width, k0.dim(3)], dtype: k0.dtype)
++    var values = MLXArray.zeros([caches.count, v0.dim(1), width, v0.dim(3)], dtype: v0.dtype)
++    for (i, row) in rows.enumerated() {
++        guard let (k, v) = row else { continue }
++        guard k.ndim == 4 && v.ndim == 4 && k.dim(0) == 1 && v.dim(0) == 1 && k.dim(1) == k0.dim(1) && v.dim(1) == v0.dim(1) && k.dim(3) == k0.dim(3) && v.dim(3) == v0.dim(3) && k.dtype == k0.dtype && v.dtype == v0.dtype else { throw KVCacheError(message: "Batch K/V row layouts differ.") }
++        keys[i ..< i + 1, 0..., padding[i]..., 0...] = k
++        values[i ..< i + 1, 0..., padding[i]..., 0...] = v
++    }
++    result.state = [keys, values, MLXArray(caches.map { Int32($0.offset) }), MLXArray(padding.map(Int32.init))]
++    if let result = result as? BatchRotatingKVCache, let first = caches.first as? RotatingKVCache {
++        guard caches.allSatisfy({ ($0 as? RotatingKVCache)?.capacityOrigin == first.capacityOrigin }) else { throw KVCacheError(message: "Batch row capacity origins differ.") }
++        result.metaState = [String(capacity!), String(width), String(width), "false", first.capacityOrigin.rawValue]
++    }
++    return result
++}
+--- a/Libraries/MLXLMCommon/Evaluate.swift
++++ b/Libraries/MLXLMCommon/Evaluate.swift
+@@ -879,7 +879,7 @@
+             // evaluate the remainder of the prompt -- this primes the pump
+             let token = step(previous: y)
+             y = .init(tokens: token)
+-            asyncEval(y.tokens)
++            asyncEval([y.tokens] + cache.flatMap { $0.innerState() })
+ 
+             // the model reported per-chunk progress; the remainder it left to us
+             // completes the prompt (models returning .logits report their own terminal)
+@@ -891,7 +891,7 @@
+             // carry the prefill state into decode, as step(previous:) does for later steps
+             self.state = result.state
+             y = .init(tokens: convertToToken(logits: result.logits))
+-            asyncEval(y.tokens)
++            asyncEval([y.tokens] + cache.flatMap { $0.innerState() })
+ 
+             break
+         }
+@@ -947,7 +947,7 @@
+             // unevaluated chain of those updates keeps every prior step's
+             // intermediates alive. Python mlx-lm settles cache state the same
+             // way in its generation loop.
+-            asyncEval([token] + cache.flatMap { $0.state })
++            asyncEval([token] + cache.flatMap { $0.innerState() })
+ 
+             // Periodically return freed buffers that cannot be reused (odd or
+             // monotonically growing sizes accumulate in the pool otherwise).
+--- a/Libraries/MLXVLM/Models/Gemma4.swift
++++ b/Libraries/MLXVLM/Models/Gemma4.swift
+@@ -9,6 +9,7 @@
+ private enum Gemma4Error: LocalizedError {
+     case multimodalTokenCountMismatch(kind: String, featureTokens: Int, promptTokens: Int)
+     case imagePlaceholderMismatch(images: Int, placeholders: Int)
++    case invalidTextBatch(String)
+ 
+     var errorDescription: String? {
+         switch self {
+@@ -18,6 +19,8 @@
+         case .imagePlaceholderMismatch(let images, let placeholders):
+             return
+                 "Gemma4 image placeholder mismatch: the request has \(images) images but the prompt contains at least \(placeholders) image placeholders."
++        case .invalidTextBatch(let reason):
++            return "Gemma4 text batch: \(reason)"
+         }
+     }
+ }
+@@ -230,15 +233,15 @@
+     return tokenTypeIds
+ }
+ 
+-private func gemma4TextOnlyPromptTokens(_ input: LMInput) -> MLXArray {
++private func gemma4TextOnlyPromptTokens(_ input: LMInput) throws -> MLXArray {
+     let tokens = input.text.tokens
+-    if tokens.ndim == 2, tokens.dim(0) == 1 {
+-        return tokens[0]
+-    }
+-    if tokens.ndim == 1 {
+-        return tokens
+-    }
+-    return tokens.flattened()
++    if tokens.ndim == 1, tokens.dim(0) > 0, tokens.dim(0) <= Int(Int32.max) {
++        return tokens.expandedDimensions(axis: 0)
++    }
++    guard tokens.ndim == 2, tokens.dim(0) > 0, tokens.dim(1) > 0, tokens.dim(1) <= Int(Int32.max) else {
++        throw Gemma4Error.invalidTextBatch("expected nonempty [B,L] tokens")
++    }
++    return tokens
+ }
+ 
+ private func gemma4PrepareTextOnly(
+@@ -247,15 +250,68 @@
+     prefill: PrefillParameters,
+     languageModel: Gemma4TextLanguageModel
+ ) throws -> PrepareResult {
+-    let y = gemma4TextOnlyPromptTokens(input).expandedDimensions(axis: 0)
++    let y = try gemma4TextOnlyPromptTokens(input)
+     let convertedCache = cache.map { $0 }
+     let totalPositions = y.dim(1)
+ 
++    // A fixed cohort uses right-padded suffixes after independently cached
++    // prefixes. Leading cache padding remains owned by the batch caches.
++    if y.dim(0) > 1 || cache.contains(where: { $0 is any BatchKVCacheProtocol }) {
++        guard !cache.isEmpty, cache.allSatisfy({ ($0 as? any BatchKVCacheProtocol)?.batchSize == y.dim(0) }) else {
++            throw Gemma4Error.invalidTextBatch("each layer requires a matching batch cache")
++        }
++        let lengths: [Int]
++        if var mask = input.text.mask {
++            if mask.ndim == 1 && y.dim(0) == 1 { mask = mask.expandedDimensions(axis: 0) }
++            guard mask.shape == y.shape else { throw Gemma4Error.invalidTextBatch("mask shape differs from tokens") }
++            lengths = mask.asType(.int32).sum(axis: 1).asArray(Int.self)
++            guard lengths.allSatisfy({ (1 ... totalPositions).contains($0) }) else {
++                throw Gemma4Error.invalidTextBatch("every admitted row needs a prompt token")
++            }
++            let expected = MLXArray(Int32(0) ..< Int32(totalPositions))[.newAxis, 0...]
++                .< MLXArray(lengths.map(Int32.init))[0..., .newAxis]
++            guard all(mask .== expected).item(Bool.self) else {
++                throw Gemma4Error.invalidTextBatch("suffix masks must be contiguous right padding")
++            }
++        } else {
++            lengths = Array(repeating: totalPositions, count: y.dim(0))
++        }
++        guard lengths.allSatisfy({ (1 ... totalPositions).contains($0) }) else {
++            throw Gemma4Error.invalidTextBatch("every admitted row needs a prompt token")
++        }
++        let rowLengths = MLXArray(lengths.map(Int32.init))
++        var lastLogits: MLXArray?
++        func forward(_ range: Range<Int>) {
++            prefill.observeTextForward?(range, y.dim(0), lengths)
++            let output = languageModel(y[0..., range], cache: convertedCache)
++            let indices = maximum(minimum(rowLengths - range.lowerBound - 1, range.count - 1), 0)
++                .reshaped([y.dim(0), 1, 1])
++            let selected = takeAlong(output.logits, indices, axis: 1)
++            if let previous = lastLogits {
++                lastLogits = which((rowLengths .> range.lowerBound).reshaped([y.dim(0), 1, 1]), selected, previous)
++            } else {
++                lastLogits = selected
++            }
++        }
++        return try withPreparedCache(cache, lengths: lengths) {
++            let processed = try prefill.forEachChunk(total: totalPositions) { range in
++                forward(range)
++                asyncEval([lastLogits!] + cache.flatMap { $0.innerState() })
++            }
++            if processed > 0 { eval(cache) }
++            forward(processed ..< totalPositions)
++            prefill.progress?(totalPositions, totalPositions)
++            return .logits(LMOutput(logits: lastLogits!))
++        }
++    }
++
+     let processed = try prefill.forEachChunk(total: totalPositions) { range in
++        prefill.observeTextForward?(range, y.dim(0), [totalPositions])
+         _ = languageModel(y[0..., range], cache: convertedCache)
+         asyncEval(cache)
+     }
+     if processed > 0 { eval(cache) }
++    prefill.observeTextForward?(processed..<totalPositions, y.dim(0), [totalPositions])
+     let result = languageModel(y[0..., processed...], cache: convertedCache)
+     prefill.progress?(totalPositions, totalPositions)
+     return .logits(result)
+@@ -787,7 +843,7 @@
+     @ModuleInfo(key: "q_norm") var qNorm: Gemma4RMSNormZeroShift
+     @ModuleInfo(key: "k_norm") var kNorm: Gemma4RMSNormZeroShift?
+     @ModuleInfo(key: "v_norm") var vNorm: Gemma4RMSNormNoScale?
+-    @ModuleInfo var rope: OffsetLayer
++    @ModuleInfo var rope: RoPELayer
+ 
+     init(config: Gemma4TextConfiguration, layerIdx: Int, kvSharedOnly: Bool = false) {
+         self.config = config
+@@ -846,18 +902,18 @@
+         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
+         cache: KVCache? = nil,
+         sharedKV: Gemma4SharedKVState? = nil,
+-        offset: Int? = nil
+-    ) -> (MLXArray, Gemma4SharedKVState?, Int) {
++        offset: RoPEOffset? = nil
++    ) -> (MLXArray, Gemma4SharedKVState?, RoPEOffset) {
+         let (batch, length, _) = (x.dim(0), x.dim(1), x.dim(2))
+ 
+         var queries = qProj(x).reshaped(batch, length, numHeads, headDim)
+         queries = qNorm(queries)
+ 
+-        let currentOffset: Int
++        let currentOffset: RoPEOffset
+         let kvState: Gemma4SharedKVState?
+ 
+         if let sharedKV {
+-            currentOffset = offset ?? 0
++            currentOffset = offset ?? .scalar(0)
+             kvState = sharedKV
+         } else {
+             // KV-owning path: K/V projections must be present. If they are nil
+@@ -868,7 +924,7 @@
+                 fatalError(
+                     "Gemma4 attention called without sharedKV on a KV-shared layer")
+             }
+-            currentOffset = cache?.offset ?? 0
++            currentOffset = cache?.ropeOffset ?? .scalar(0)
+             var keys = kProj(x).reshaped(batch, length, numKVHeads, headDim)
+             var values =
+                 if useKEqV {
+@@ -878,7 +934,7 @@
+                 }
+             keys = kNorm(keys).transposed(0, 2, 1, 3)
+             values = vNorm(values).transposed(0, 2, 1, 3)
+-            keys = rope(keys, offset: currentOffset)
++            keys = applyRotaryPosition(rope, to: keys, offset: currentOffset)
+             if let quantizedCache = cache as? QuantizedKVCacheProtocol {
+                 let (quantizedKeys, quantizedValues) = quantizedCache.updateQuantized(
+                     keys: keys, values: values)
+@@ -898,7 +954,7 @@
+         }
+ 
+         queries = queries.transposed(0, 2, 1, 3)
+-        queries = rope(queries, offset: currentOffset)
++        queries = applyRotaryPosition(rope, to: queries, offset: currentOffset)
+ 
+         guard let kvState else {
+             fatalError("Gemma4 attention expected a KV state")
+@@ -1004,8 +1060,8 @@
+         cache: KVCache? = nil,
+         perLayerInput: MLXArray? = nil,
+         sharedKV: Gemma4SharedKVState? = nil,
+-        offset: Int? = nil
+-    ) -> (MLXArray, Gemma4SharedKVState?, Int) {
++        offset: RoPEOffset? = nil
++    ) -> (MLXArray, Gemma4SharedKVState?, RoPEOffset) {
+         var residual = x
+         var h = inputLayerNorm(x)
+         let (attentionOutput, kvState, attentionOffset) = selfAttention(
+@@ -1283,7 +1339,7 @@
+         }
+ 
+         var h = h0
+-        var intermediates = [(kv: Gemma4SharedKVState?, offset: Int?)](
++        var intermediates = [(kv: Gemma4SharedKVState?, offset: RoPEOffset?)](
+             repeating: (nil, nil), count: config.hiddenLayers)
+         for (idx, layer) in layers.enumerated() {
+             let sourceIdx = layerIdxToCacheIdx[idx]
+--- a/Libraries/MLXVLM/Models/Gemma4Assistant.swift
++++ b/Libraries/MLXVLM/Models/Gemma4Assistant.swift
+@@ -310,7 +310,7 @@
+                 : .array(slidingMask)
+             let (out, _, _) = layer(
+                 h, mask: layerMask, cache: nil, perLayerInput: nil,
+-                sharedKV: kvState, offset: queryOffset)
++                sharedKV: kvState, offset: .scalar(queryOffset))
+             h = out
+         }
+ 
+--- a/Libraries/MLXLMCommon/PrefillParameters.swift
++++ b/Libraries/MLXLMCommon/PrefillParameters.swift
+@@ -34,6 +34,12 @@
+     /// The closure is retained for as long as the containing parameters (e.g.
+     /// by a stored `GenerateParameters`) — capture weakly anything long-lived.
+     public var progress: (@Sendable (_ processed: Int, _ total: Int) -> Void)?
++
++    /// Pinned text-only prepare observation immediately before the actual
++    /// language-model call. No tensor readback is performed by this callback.
++    /// The caller supplies host IDs; physical width and full valid row lengths
++    /// come from the actual admitted input/mask. Other prepare paths omit it.
++    public var observeTextForward: (@Sendable (Range<Int>, Int, [Int]) -> Void)? = nil
+ 
+     /// Strategy dividing the prompt into prefill forwards.
+     public enum Chunking: Sendable {

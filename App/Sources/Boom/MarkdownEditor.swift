@@ -2,37 +2,88 @@ import AppKit
 import BoomCore
 import SwiftUI
 
-@MainActor final class MarkdownTextView: NativeCompletionTextView, NSMenuDelegate, NativeTextStylingGuard {
+@MainActor class MarkdownTextView: NativeCompletionTextView, NSMenuDelegate, NativeTextStylingGuard {
+  /// Native command availability only. Writing still performs its actual
+  /// source, grapheme and budget admission when a request is captured.
+  static func hasAuthoredPrefix(_ document: DocumentSnapshot, caret: Int) -> Bool {
+    let text = document.text as NSString
+    let byteLimit = 2_097_152
+    guard caret > 0, caret <= text.length, text.length <= byteLimit else { return false }
+    // Each UTF-16 unit costs at most three UTF-8 bytes. Ordinary short sources
+    // need no whole-source encoding merely to decide whether a menu is enabled.
+    if text.length > byteLimit / 3, document.text.utf8.count > byteLimit { return false }
+    // Foundation's composed-sequence query can expose the interior of CRLF as
+    // a boundary, while Rust/Swift Character treat CRLF as one grapheme.
+    // Keep menu availability aligned with the authoritative prompt boundary.
+    if caret < text.length, text.character(at: caret - 1) == 0x0D, text.character(at: caret) == 0x0A {
+      return false
+    }
+    guard caret == text.length || text.rangeOfComposedCharacterSequence(at: caret).location == caret else {
+      return false
+    }
+    return text.rangeOfCharacter(from: CharacterSet.whitespacesAndNewlines.inverted, options: [],
+      range: NSRange(location: 0, length: caret)).location != NSNotFound
+  }
+
   weak var owner: WorkspaceModel? { didSet { completionClient = owner } }
   var documentUndo: UndoManager?
   var applyingExternal = false
+  private var documentTextVersion: UUID?
+  private var displayedSourceVersion: UUID?
+  func displays(_ document: DocumentSnapshot) -> Bool {
+    documentID == document.id && documentTextVersion == document.textVersion
+      && displayedSourceVersion == sourceVersion
+  }
+  /// Call only after assigning a captured model source or publishing a native
+  /// edit to that model. Status updates need no manuscript read or comparison.
+  func synchronized(with document: DocumentSnapshot) {
+    guard documentID == document.id else { return }
+    documentTextVersion = document.textVersion
+    displayedSourceVersion = sourceVersion
+  }
   override func setAccessibilityValue(_ value: Any?) {
-    guard isEditable, !hasMarkedText(), let value = value as? String, value != string else { return }
+    guard isEditable, !hasMarkedText(), let value = value as? String,
+      !(string as NSString).isEqual(to: value) else { return }
     insertText(value, replacementRange: NSRange(location: 0, length: string.utf16.count))
   }
   private var searchRanges: [NSRange] = []
   private var searchIdentity: String?
-  private let measurement = NativeTextMeasurement()
-  func manuscriptSize(width: CGFloat, minimumHeight: CGFloat) -> CGSize? {
-    guard width.isFinite, width > 0, let storage = textStorage, let container = textContainer else { return nil }
-    return CGSize(width: width, height: max(minimumHeight,
-      measurement.height(of: storage, width: width, insets: textContainerInset,
-        fragmentPadding: container.lineFragmentPadding), completionDisplayHeight))
+  override func completionDisplayDidChange() {
+    super.completionDisplayDidChange()
+    if isVerticallyResizable, prepareTextLayout() { sizeToFit() }
+    invalidateIntrinsicContentSize()
   }
-  override func completionDisplayDidChange() { super.completionDisplayDidChange(); invalidateIntrinsicContentSize() }
+  override func sizeToFit() {
+    super.sizeToFit()
+    if isVerticallyResizable, hasVisibleGhost, prepareTextLayout() {
+      let height = max(minSize.height, completionDisplayHeight, frame.height)
+      if height != frame.height { setFrameSize(NSSize(width: frame.width, height: height)) }
+    }
+  }
   override func setFrameSize(_ newSize: NSSize) {
     let changed = frame.width != newSize.width
     super.setFrameSize(newSize)
-    textContainer?.size = NSSize(width: max(1, newSize.width - textContainerInset.width * 2),
-      height: .greatestFiniteMagnitude)
+    if let container = textContainer {
+      let width = max(1, newSize.width - textContainerInset.width * 2)
+      if container.size.width != width {
+        container.size = NSSize(width: width, height: .greatestFiniteMagnitude)
+      }
+    }
     if changed { invalidateIntrinsicContentSize() }
   }
   func highlightSearch(_ ranges: [NSRange], identity: String?) {
     guard let layout = layoutManager, let storage = textStorage else { return }
+    let projected = ranges.filter { NSMaxRange($0) <= storage.length }
+    // Status and generation publications also update this native view. An
+    // empty search has no attribute work and must not request another paint.
+    if searchRanges.isEmpty, projected.isEmpty {
+      if identity == nil { searchIdentity = nil }
+      return
+    }
     for range in searchRanges where NSMaxRange(range) <= storage.length {
       layout.removeTemporaryAttribute(.backgroundColor, forCharacterRange: range)
     }
-    searchRanges = ranges.filter { NSMaxRange($0) <= storage.length }
+    searchRanges = projected
     for range in searchRanges {
       layout.addTemporaryAttribute(.backgroundColor, value: NSColor.systemYellow.withAlphaComponent(0.22),
         forCharacterRange: range)
@@ -41,9 +92,9 @@ import SwiftUI
     if identity == nil || !searchRanges.isEmpty { searchIdentity = identity }
     needsDisplay = true
   }
-  private let placeholder = NativeTextPlaceholder("Begin writing…")
+  private let placeholder = NativeTextPlaceholder("Prose")
   func preparePlaceholder() {
-    setAccessibilityPlaceholderValue("Begin writing…")
+    setAccessibilityPlaceholderValue("Prose")
   }
   override func draw(_ dirtyRect: NSRect) {
     super.draw(dirtyRect)
@@ -68,7 +119,7 @@ import SwiftUI
     // the same caret leaves the captured manuscript and continuation valid.
     if selectedRange() != previousSelection { endGhostBoundary() }
   }
-  private func wrapSelection(_ marker: String, placeholder: String = "") {
+  func wrapSelection(_ marker: String, placeholder: String = "") {
     finishComposition()
     clearGhost()
     let source = string as NSString
@@ -104,7 +155,7 @@ import SwiftUI
       location: selection.location + markerLength,
       length: chosen.isEmpty ? (content as NSString).length : selection.length))
   }
-  private func prefixLines(_ prefix: String) {
+  func prefixLines(_ prefix: String) {
     finishComposition()
     clearGhost()
     let source = string as NSString
@@ -203,10 +254,20 @@ import SwiftUI
     unmarkText()
   }
   override func unmarkText() {
+    let wasComposing = hasMarkedText()
     super.unmarkText()
-    guard !applyingExternal, !hasMarkedText() else { return }
+    guard wasComposing, !applyingExternal, !hasMarkedText() else { return }
+    compositionDidCommit()
+  }
+  func compositionDidCommit() {
+    if let document = owner?.documents.first(where: { $0.id == documentID }), displays(document) {
+      return
+    }
     MarkdownStyle.apply(to: self)
     owner?.updateDocument(string, id: documentID, caret: selectedRange().location)
+    if let document = owner?.documents.first(where: { $0.id == documentID }) {
+      synchronized(with: document)
+    }
   }
   override func resignFirstResponder() -> Bool {
     finishComposition()
@@ -257,139 +318,5 @@ import SwiftUI
       return true
     }
     return super.performDragOperation(sender)
-  }
-}
-
-struct MarkdownEditor: NSViewRepresentable {
-  @ObservedObject var model: WorkspaceModel
-  let document: DocumentSnapshot
-  let minimumHeight: CGFloat
-  func makeCoordinator() -> Coordinator { Coordinator(model: model) }
-  func makeNSView(context: Context) -> MarkdownTextView {
-    let storage = NSTextStorage()
-    let layout = NSLayoutManager()
-    let container = NSTextContainer(size: NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude))
-    storage.addLayoutManager(layout)
-    layout.addTextContainer(container)
-    container.widthTracksTextView = false
-    container.heightTracksTextView = false
-    let text = MarkdownTextView(frame: .zero, textContainer: container)
-    text.owner = model
-    text.setMedia(model: model)
-    text.documentID = document.id
-    text.documentUndo = model.undoManager(document.id)
-    text.delegate = context.coordinator
-    text.isRichText = false
-    text.importsGraphics = false
-    text.allowsUndo = true
-    text.isEditable = true
-    text.isSelectable = true
-    text.isVerticallyResizable = false
-    text.isHorizontallyResizable = false
-    text.autoresizingMask = [.width]
-    text.minSize = NSSize(width: 0, height: 0)
-    text.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-    text.textContainerInset = NSSize(width: 28, height: 28)
-    text.font = MarkdownStyle.body
-    text.backgroundColor = BoomChrome.documentBackground
-    text.isAutomaticQuoteSubstitutionEnabled = false
-    text.isAutomaticDashSubstitutionEnabled = false
-    text.isAutomaticTextReplacementEnabled = false
-    text.isAutomaticSpellingCorrectionEnabled = false
-    text.isAutomaticLinkDetectionEnabled = false
-    text.writingToolsBehavior = .none
-    text.isContinuousSpellCheckingEnabled = true
-    text.usesFindBar = false
-    text.usesFindPanel = false
-    text.registerForDraggedTypes(AttachmentInput.draggingTypes + [.string])
-    text.setAccessibilityLabel("Manuscript")
-    text.preparePlaceholder()
-    MarkdownStyle.apply(to: text)
-    context.coordinator.view = text
-    model.editor = text
-    text.setMedia(model: model)
-    text.isEditable = !model.editingLocked
-    update(text)
-    updateSearch(text)
-    return text
-  }
-  func updateNSView(_ text: MarkdownTextView, context: Context) {
-    model.editor = text
-    text.setMedia(model: model)
-    text.isEditable = !model.editingLocked
-    update(text)
-    updateSearch(text)
-  }
-  private func updateSearch(_ view: MarkdownTextView) {
-    guard !view.nativeEditInProgress, let document = model.selectedDocument,
-      view.documentID == document.id else { return }
-    let found = model.documentSearch[document.id]
-    let valid = !view.hasMarkedText() && view.string == document.text && found?.revision == document.revision
-      && found?.query == model.librarySearch
-    let ranges = valid ? found?.matches.ranges.map(\.native) ?? [] : []
-    view.highlightSearch(ranges, identity: model.librarySearch.isEmpty ? nil : document.id.uuidString + "\n" + model.librarySearch)
-  }
-  func sizeThatFits(
-    _ proposal: ProposedViewSize, nsView text: MarkdownTextView, context: Context
-  ) -> CGSize? {
-    guard let width = proposal.width else { return nil }
-    return text.manuscriptSize(width: width, minimumHeight: minimumHeight)
-  }
-  private func update(_ text: MarkdownTextView) {
-    // A representable can carry a prior render's value during an AppKit edit.
-    // AppKit publishes that edit through its delegate before another model
-    // snapshot may replace it. Resolve the live document after that boundary.
-    guard !text.nativeEditInProgress, let document = model.selectedDocument else { return }
-    // SwiftUI status/streaming updates must never overwrite in-flight marked text.
-    if text.documentID == document.id, text.hasMarkedText() { return }
-    if text.documentID != document.id || text.string != document.text {
-      text.applyingExternal = true
-      defer { text.applyingExternal = false }
-      let changedDocument = text.documentID != document.id
-      text.clearGhost()
-      text.endGhostBoundary()
-      text.documentID = document.id
-      text.documentUndo = model.undoManager(document.id)
-      let selection = changedDocument ? NSRange(location: 0, length: 0) : text.selectedRange()
-      text.string = document.text
-      MarkdownStyle.apply(to: text)
-      text.invalidateIntrinsicContentSize()
-      text.setSelectedRange(
-        NSRange(location: min(selection.location, (document.text as NSString).length), length: 0))
-    }
-  }
-  @MainActor final class Coordinator: NSObject, NSTextViewDelegate {
-    let model: WorkspaceModel
-    weak var view: MarkdownTextView?
-    init(model: WorkspaceModel) { self.model = model }
-    func undoManager(for view: NSTextView) -> UndoManager? {
-      (view as? MarkdownTextView)?.documentUndo
-    }
-    func textView(
-      _ textView: NSTextView, shouldSetSpellingState value: Int,
-      range affectedCharRange: NSRange
-    ) -> Int {
-      let text = textView.string as NSString
-      guard affectedCharRange.location < text.length else { return value }
-      let line = text.substring(with: text.lineRange(for: affectedCharRange))
-      return line.contains("](boom-attachment:") ? 0 : value
-    }
-    func textDidChange(_ notification: Notification) {
-      guard let view, !view.applyingExternal else { return }
-      if !view.movingGhostBoundary { view.endGhostBoundary() }
-      guard !view.hasMarkedText() else {
-        model.invalidateGhost()
-        return
-      }
-      MarkdownStyle.apply(to: view)
-      model.updateDocument(view.string, id: view.documentID, caret: view.selectedRange().location)
-      view.invalidateIntrinsicContentSize()
-    }
-    func textViewDidChangeSelection(_ notification: Notification) {
-      guard let view, !view.applyingExternal else { return }
-      if !view.movingGhostBoundary { view.selectionChangedDuringGhost() }
-      if view.selectedRange().length > 0 { model.invalidateGhost() }
-      model.movedCaret(view.selectedRange().location, hasMarkedText: view.hasMarkedText())
-    }
   }
 }

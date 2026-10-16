@@ -1,10 +1,9 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import SwiftUI
 
 /// Production inputs and real local weights in this process's own public,
-/// encrypted fixture. No user windows, Keychain, or network access is needed.
+/// file fixture. No user windows, Keychain, or network access is needed.
 @MainActor enum InputCompletionSmoke {
   static func run(arguments: [String]) async throws {
     guard let index = arguments.firstIndex(of: "--evidence"), index + 1 < arguments.count,
@@ -23,8 +22,7 @@ import SwiftUI
     }
     var receipt = ["status": "running", "source": Bundle.main.object(forInfoDictionaryKey: "BoomSourceSHA256") as? String ?? "unavailable"]
     try write(receipt, "receipt")
-    let store = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("public-workspace"),
-      testKey: SymmetricKey(data: Data(repeating: 0x71, count: 32)))
+    let store = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("public-workspace"))
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     if model.selectedChat == nil { try model.newChat() }
     model.authorChatMessage(.user); model.draft = "Suggest a title for a story set in a harbor. Answer in twelve words or fewer."; model.send()
@@ -49,9 +47,13 @@ import SwiftUI
       }
       text.keyDown(with: event)
     }
-    func finishSuggestion(_ completion: TextInputCompletion, count: Int) async throws -> CandidateBundle {
+    func finishSuggestion(_ completion: TextInputCompletion, count: Int, stage: String) async throws -> CandidateBundle {
       let started = ContinuousClock().now
       while true {
+        if completion.diagnosticState["attempt_stage"] == "failed" {
+          try write(completion.diagnosticState, stage + "-failed-state")
+          throw BoomError.unavailable(stage + ": " + (completion.diagnosticState["attempt_error"] ?? "unknown"))
+        }
         if let bundle = completion.bundle, bundle.candidates.count == count,
           bundle.candidates.allSatisfy({ $0.state != .pending }) {
           guard bundle.candidates.allSatisfy({ $0.state == .complete && !$0.tokenIDs.isEmpty && !$0.text.isEmpty }) else {
@@ -60,7 +62,8 @@ import SwiftUI
           return bundle
         }
         guard started.duration(to: ContinuousClock().now) < .seconds(90) else {
-          throw BoomError.unavailable("Input continuation timed out.")
+          try write(completion.diagnosticState, stage + "-timeout-state")
+          throw BoomError.unavailable(stage + " input continuation timed out.")
         }
         try await Task.sleep(for: .milliseconds(100))
       }
@@ -85,7 +88,7 @@ import SwiftUI
         text.setAccessibilityValue(authored)
         text.setSelectedRange(NSRange(location: authored.utf16.count, length: 0))
         completion.schedule(delay: .zero)
-        let single = try await finishSuggestion(completion, count: 1)
+        let single = try await finishSuggestion(completion, count: 1, stage: name + "-single")
         try write(single, name + "-single")
         guard text.string == authored, completion.ghostStamp != nil else { throw BoomError.invalid("Ghost text changed canonical input.") }
         var expected = authored, remainder = single.candidates[0].text
@@ -101,7 +104,7 @@ import SwiftUI
           guard text.string == step.0, completion.ghostText == step.1 else { throw BoomError.invalid("A real word reversal changed input bytes.") }
         }
         try key(125, text)
-        let alternatives = try await finishSuggestion(completion, count: 3)
+        let alternatives = try await finishSuggestion(completion, count: 3, stage: name + "-alternatives")
         try write(alternatives, name + "-alternatives")
         guard alternatives.recipe.promptDigest == single.recipe.promptDigest,
           alternatives.candidates[1].batch?.seeds.count == 2,
@@ -116,7 +119,15 @@ import SwiftUI
           completion.schedule(delay: .zero)
           let started = ContinuousClock().now
           while completion.bundle?.candidates.first?.outputTokens ?? 0 < 8 {
-            guard started.duration(to: ContinuousClock().now) < .seconds(90) else { throw BoomError.unavailable("Interruption fixture timed out.") }
+            let state = completion.diagnosticState
+            if state["attempt_stage"] == "failed" {
+              try write(state, "interruption-failed-state")
+              throw BoomError.unavailable("Input continuation failed: " + (state["attempt_error"] ?? "unknown"))
+            }
+            guard started.duration(to: ContinuousClock().now) < .seconds(90) else {
+              try write(completion.diagnosticState, "interruption-timeout-state")
+              throw BoomError.unavailable("Interruption fixture timed out.")
+            }
             try await Task.sleep(for: .milliseconds(50))
           }
           guard let interruptedID = completion.bundle?.id else { throw BoomError.invalid("Missing interruption identity.") }
@@ -154,7 +165,7 @@ import SwiftUI
         model.selectedChat?.messages.last == reply else { throw BoomError.invalid("Assistant branching regenerated the preserved reply.") }
       try write(model.selectedChat, "preserved-reply-branch")
       try await model.shutdown()
-      let saved = try await store.load().get().0
+      let saved = try await store.loadState()
       for id in saved.candidateIDs { _ = try await store.readCandidate(id) }
       model.refreshModelChoices()
       for _ in 0..<100 where model.modelChoices.isEmpty { try await Task.sleep(for: .milliseconds(50)) }
@@ -178,7 +189,7 @@ import SwiftUI
         guard let png = bitmap.representation(using: .png, properties: [:]) else { throw BoomError.invalid("Picker PNG unavailable.") }
         try png.write(to: evidence.appendingPathComponent("picker-" + name + ".png"))
       }
-      receipt["status"] = "passed"; receipt["window"] = "unshown"; receipt["keychain"] = "unused"
+      receipt["status"] = "passed"; receipt["window"] = "unshown"; receipt["workspaceStorage"] = "files"
       try write(receipt, "receipt")
     } catch {
       model.cancel(); try? await model.shutdown()

@@ -60,6 +60,9 @@ mod input_tests {
     #[test]
     fn attributed_input_is_raw_prose_and_caret_bound() {
         let history = [crate::PromptTurn {
+            context: None,
+            routing: None,
+            prompt_contract: None,
             role: "assistant".into(),
             text: "The harbor was quiet.".into(),
             speaker: crate::Speaker {
@@ -237,6 +240,10 @@ pub fn compile_media_prompt(text: &str, media: &[MediaReference]) -> Result<Medi
         };
         let start = byte_offsets[span.location];
         let end = byte_offsets[span.location + span.length];
+        require(
+            start >= cursor,
+            "Nested attachment links cannot be combined in this writing request.",
+        )?;
         prompt.push_str(&text[cursor..start]);
         prompt.push_str(&reference.prompt_content());
         ordered.push(reference.clone());
@@ -381,6 +388,39 @@ pub fn branch(recipe: &Recipe, continuation: &str) -> Result<String, Error> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn nested_attachment_ranges_are_a_typed_failure_not_a_panic() -> Result<(), Error> {
+        let reference = |id| MediaReference {
+            id: Uuid::from_u128(id),
+            name: "synthetic.png".into(),
+            root_digest: "a".repeat(64),
+            kind: "image".into(),
+            text: None,
+            source_digest: None,
+            frame_digests: None,
+            video: None,
+        };
+        let inner = reference(1);
+        let outer = reference(2);
+        let source = format!(
+            "👩‍💻 [![inner](boom-attachment:{})](boom-attachment:{}) after",
+            inner.id, outer.id
+        );
+        let result = compile_media_prompt(&source, &[inner.clone(), outer.clone()]);
+        assert!(result.is_err());
+        // A single granted reference is unambiguous; unsupported nesting must
+        // not cause all ordinary media compilation to be rejected.
+        assert_eq!(
+            compile_media_prompt(&source, &[outer])?.prompt,
+            "👩‍💻 <|image|> after"
+        );
+        assert!(
+            compile_media_prompt(&source, &[inner])?
+                .prompt
+                .contains("<|image|>")
+        );
+        Ok(())
+    }
     #[test]
     fn storyboard_sound_is_interleaved_and_invalid_timeline_is_rejected() -> Result<(), Error> {
         let mut video = MediaReference {

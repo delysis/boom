@@ -1,8 +1,8 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import Darwin
 import Foundation
+import SwiftUI
 
 /// Explicit public-fixture diagnostic. Uses the real WorkspaceModel send and
 /// Explore paths, with no visible window and no Keychain acceptance claim.
@@ -16,8 +16,6 @@ import Foundation
     let checkpoint: GenerationCheckpoint
     let fixture: Fixture
   }
-  // Only this isolated diagnostic uses a public, reproducible fixture key.
-  private static let key = SymmetricKey(data: Data(repeating: 0x58, count: 32))
   static func run(arguments: [String]) async throws {
     func argument(_ name: String) throws -> String {
       guard arguments.filter({ $0 == name }).count == 1,
@@ -33,7 +31,7 @@ import Foundation
     }
     let path = try argument("--evidence")
     guard path.hasPrefix("/") else { throw BoomError.invalid("Use an absolute diagnostic directory.") }
-    let evidence = URL(fileURLWithPath: path), root = evidence.appendingPathComponent("encrypted-workspace")
+    let evidence = URL(fileURLWithPath: path), root = evidence.appendingPathComponent("public-workspace")
     if action == "recover" {
       try await recover(evidence: evidence, root: root, purpose: purpose)
       return
@@ -44,7 +42,7 @@ import Foundation
     }
     try FileManager.default.createDirectory(at: evidence, withIntermediateDirectories: false,
       attributes: [.posixPermissions: 0o700])
-    let store = try WorkspaceStore(rootOverride: root, testKey: key)
+    let store = try WorkspaceStore(rootOverride: root)
     let document = DocumentSnapshot(title: "Public recovery manuscript",
       text: "The harbor lighthouse was built from stone that the masons brought from the hills. Every morning, the keeper climbed the spiral stair and looked across the water. On the morning the ferry failed to arrive, ")
     let voices = try [
@@ -56,12 +54,11 @@ import Foundation
     state.documents = [DocumentIndex(id: document.id, title: document.title)]
     state.selectedDocument = document.id; state.chats = [chat]; state.selectedChat = chat.id
     state.voices = voices; state.voiceVersions = voices
-    try await store.save(state, documents: [document])
     let fixture = Fixture(purpose: purpose, document: document, chatID: chat.id)
     try write(fixture, to: evidence.appendingPathComponent("fixture.json"))
     _ = NSApplication.shared
     NSApp.setActivationPolicy(.prohibited)
-    let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+    let model = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: [document])
     model.loadPack(pack, purpose: purpose)
     let started = ContinuousClock().now
     while model.isBusy {
@@ -69,16 +66,17 @@ import Foundation
       try await Task.sleep(for: .milliseconds(50))
     }
     if let error = model.errorMessage { throw BoomError.unavailable(error) }
-    let editor = MarkdownTextView(frame: NSRect(x: 0, y: 0, width: 600, height: 300))
-    defer { _ = editor }
+    let host = NSHostingView(rootView: WorkspaceView(model: model))
+    let window = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -5000, y: -5000, width: 600, height: 300))
+    window.isReleasedWhenClosed = false; window.contentView = host; defer { window.close() }
+    host.layoutSubtreeIfNeeded()
     if purpose == .consultation {
       model.draft = "@observer @skeptic Describe a harbor at dawn in twenty numbered observations. Write several sentences for each observation."
       model.send()
     } else {
       guard model.layout.isAuthor else { throw BoomError.unavailable("Use the author edition for writing recovery.") }
-      editor.documentID = document.id; editor.string = document.text
+      guard let editor = model.pagedInput?.activeView, window.makeFirstResponder(editor) else { throw BoomError.invalid("Actual writing recovery editor is unavailable.") }
       editor.setSelectedRange(NSRange(location: document.text.utf16.count, length: 0))
-      model.editor = editor; model.movedCaret(document.text.utf16.count, hasMarkedText: false)
       model.exploreWriting()
     }
     var markerWritten = false
@@ -126,13 +124,14 @@ import Foundation
   private static func recover(evidence: URL, root: URL, purpose: ModelPurpose, graceful: Bool = false) async throws {
     let marker = try JSONDecoder().decode(Marker.self, from: Data(contentsOf: evidence.appendingPathComponent("kill-ready.json")))
     guard marker.fixture.purpose == purpose else { throw BoomError.invalid("Recovery fixture purpose changed.") }
-    let store = try WorkspaceStore(rootOverride: root, testKey: key), id = marker.checkpoint.identity.attemptID
+    let store = try WorkspaceStore(rootOverride: root), id = marker.checkpoint.identity.attemptID
     let latest = try await store.generationCheckpoint(identity: marker.checkpoint.identity)
     guard let latest, latest.stopReason == (graceful ? "cancelled" : nil),
       latest.progress.tokenIDs.starts(with: marker.checkpoint.progress.tokenIDs) else {
       throw BoomError.invalid("The process did not stop during the captured generation.")
     }
-    let (state, documents) = try await store.load().get()
+    let state = try await store.loadState()
+    let documents = try await NativeCheckEvidence.readPublicDocuments(store: store)
     guard documents.first(where: { $0.id == marker.fixture.document.id })?.text == marker.fixture.document.text else {
       throw BoomError.invalid("Interrupted output entered or changed the manuscript.")
     }
@@ -155,14 +154,15 @@ import Foundation
         throw BoomError.invalid("Consultation checkpoint or unstarted participant was not recovered exactly.")
       }
     }
-    // Validate idempotent relaunch and an independent passphrase backup of the
+    // Validate idempotent relaunch and an independent file backup of the
     // recovered records. No user data or actual Keychain item participates.
-    _ = try await store.load().get()
+    _ = try await store.loadState()
     let backup = evidence.appendingPathComponent("recovered.bloombackup")
-    try await store.exportBackup(passphrase: "public recovery fixture passphrase", to: backup)
-    let restored = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("restored-workspace"),
-      testKey: SymmetricKey(size: .bits256))
-    let (restoredState, restoredDocuments) = try await restored.restoreBackup(passphrase: "public recovery fixture passphrase", from: backup)
+    try await store.exportBackup(to: backup)
+    let restored = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("restored-workspace"))
+    try await restored.restoreBackup(from: backup)
+    let restoredState = try await restored.loadState()
+    let restoredDocuments = try await NativeCheckEvidence.readPublicDocuments(store: restored)
     guard restoredDocuments.map(\.text) == documents.map(\.text),
       restoredState.chats.map(\.messages) == state.chats.map(\.messages),
       try restored.vault.decode(GenerationCheckpoint.self, kind: .generationJournal, id: id).progress.tokenIDs == latest.progress.tokenIDs else {
@@ -173,7 +173,7 @@ import Foundation
       "interruption": graceful ? "native_cancel" : "sigkill",
       "token_count": latest.progress.tokenIDs.count, "native_model_pipeline": true,
       "manuscript_unchanged": true, "captured_output_restored_exactly": true,
-      "passphrase_backup_restore": true, "real_keychain_qualified": false,
+      "file_backup_restore": true,
       "interactive_ui_qualified": false, "runtime_revision": ModelPacks.runtimeRevision], options: [.prettyPrinted, .sortedKeys])
       .write(to: evidence.appendingPathComponent("recovery.json"), options: .atomic)
     print("Real-model interrupted \(purpose.rawValue) recovered exactly.")

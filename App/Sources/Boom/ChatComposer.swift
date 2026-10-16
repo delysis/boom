@@ -24,6 +24,8 @@ func nativeEditEvent(_ event: String) {
     reportContentHeight()
   }
   func reportContentHeight() {
+    let trace = PerformanceTrace.begin("Editor.ComposerHeight")
+    defer { PerformanceTrace.end("Editor.ComposerHeight", trace) }
     guard prepareTextLayout() else { return }
     guard let layoutManager, let textContainer else { return }
     layoutManager.ensureLayout(for: textContainer)
@@ -63,6 +65,15 @@ func nativeEditEvent(_ event: String) {
     return super.resignFirstResponder()
   }
 
+  override func insertText(_ insertString: Any, replacementRange: NSRange) {
+    guard isEditable else { return }
+    super.insertText(insertString, replacementRange: replacementRange)
+  }
+  override func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+    guard isEditable else { return }
+    super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
+  }
+
   override func keyDown(with event: NSEvent) {
     if event.keyCode == 36, event.modifierFlags.contains(.command), !hasMarkedText() {
       onSend?()
@@ -93,7 +104,8 @@ func nativeEditEvent(_ event: String) {
     super.pasteAsPlainText(sender)
   }
   override func setAccessibilityValue(_ value: Any?) {
-    guard isEditable, !hasMarkedText(), let value = value as? String, value != string else { return }
+    guard isEditable, !hasMarkedText(), let value = value as? String,
+      !(string as NSString).isEqual(to: value) else { return }
     // Accessibility edits must take the same change/Undo path as typing, so
     // the displayed text and the bound draft cannot silently diverge.
     insertText(value, replacementRange: NSRange(location: 0, length: (string as NSString).length))
@@ -169,6 +181,7 @@ func nativeEditEvent(_ event: String) {
 }
 
 struct ChatComposer: NSViewRepresentable {
+  @Environment(\.isEnabled) private var isEnabled
   @Binding var text: String
   let focusRequest: Int
   let onSend: () -> Void
@@ -182,6 +195,8 @@ struct ChatComposer: NSViewRepresentable {
   var showsEditingActions = false
   var completionModel: WorkspaceModel? = nil
   var completionTarget: TextInputTarget? = nil
+  var textVersion: UUID? = nil
+  var currentTextVersion: (() -> UUID)? = nil
 
   func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
 
@@ -207,7 +222,7 @@ struct ChatComposer: NSViewRepresentable {
     view.drawsBackground = false
     view.isRichText = false
     view.allowsUndo = true
-    view.isEditable = true
+    view.isEditable = isEnabled
     view.isSelectable = true
     view.isVerticallyResizable = true
     view.isHorizontallyResizable = false
@@ -222,10 +237,10 @@ struct ChatComposer: NSViewRepresentable {
     view.isAutomaticSpellingCorrectionEnabled = false
     view.writingToolsBehavior = .none
     view.delegate = context.coordinator
-    view.onSend = onSend
-    view.onCancel = onCancel
-    view.onAttachments = onAttachments
-    view.onFocus = onFocus
+    view.onSend = isEnabled ? onSend : nil
+    view.onCancel = isEnabled ? onCancel : nil
+    view.onAttachments = isEnabled ? onAttachments : nil
+    view.onFocus = isEnabled ? onFocus : nil
     context.coordinator.onContentHeight = onContentHeight
     view.onContentHeight = { [weak coordinator = context.coordinator] height in coordinator?.measure(height) }
     view.registerForDraggedTypes(AttachmentInput.draggingTypes)
@@ -236,6 +251,8 @@ struct ChatComposer: NSViewRepresentable {
     MarkdownStyle.apply(to: view, bodyFont: NSFont.systemFont(ofSize: 14), lineSpacing: lineSpacing)
     context.coordinator.lineSpacing = lineSpacing
     context.coordinator.view = view
+    context.coordinator.currentTextVersion = currentTextVersion
+    context.coordinator.acknowledge(text, version: currentTextVersion?() ?? textVersion)
     configureCompletion(view, coordinator: context.coordinator)
 
     let scroll = NSScrollView()
@@ -244,41 +261,60 @@ struct ChatComposer: NSViewRepresentable {
     scroll.hasVerticalScroller = true
     scroll.autohidesScrollers = true
     scroll.documentView = view
-    return ChatInputView(scroll: scroll, editing: showsEditingActions, target: context.coordinator)
+    let input = ChatInputView(scroll: scroll, editing: showsEditingActions, target: context.coordinator)
+    input.saveButton?.isEnabled = isEnabled
+    input.cancelButton?.isEnabled = isEnabled
+    return input
   }
 
   func updateNSView(_ input: ChatInputView, context: Context) {
     guard let view = input.scroll.documentView as? ChatTextView else { return }
+    view.isEditable = isEnabled
+    input.saveButton?.isEnabled = isEnabled
+    input.cancelButton?.isEnabled = isEnabled
     view.setMedia(model: completionModel)
     context.coordinator.text = $text
+    context.coordinator.currentTextVersion = currentTextVersion
+    let styleChanged = context.coordinator.lineSpacing != lineSpacing
     context.coordinator.lineSpacing = lineSpacing
     context.coordinator.onContentHeight = onContentHeight
-    view.onSend = onSend
-    view.onCancel = onCancel
-    view.onAttachments = onAttachments
-    view.onFocus = onFocus
-    if view.string != text, !view.nativeEditInProgress, !view.hasMarkedText() {
-      view.endGhostBoundary(); context.coordinator.completion?.invalidateGhost()
-      view.string = text
-      MarkdownStyle.apply(to: view, bodyFont: NSFont.systemFont(ofSize: 14), lineSpacing: lineSpacing)
-      view.setSelectedRange(NSRange(location: (text as NSString).length, length: 0))
-      view.needsDisplay = true
+    view.onSend = isEnabled ? onSend : nil
+    view.onCancel = isEnabled ? onCancel : nil
+    view.onAttachments = isEnabled ? onAttachments : nil
+    view.onFocus = isEnabled ? onFocus : nil
+    let source = context.coordinator.text.wrappedValue
+    let version = currentTextVersion?() ?? textVersion
+    if !view.nativeEditInProgress, !view.hasMarkedText() {
+      let sourceChanged = !context.coordinator.displays(source, version: version)
+      if sourceChanged {
+        view.endGhostBoundary(); context.coordinator.completion?.invalidateGhost()
+        view.string = source
+        MarkdownStyle.apply(to: view, bodyFont: NSFont.systemFont(ofSize: 14), lineSpacing: lineSpacing)
+        view.setSelectedRange(NSRange(location: (source as NSString).length, length: 0))
+        view.needsDisplay = true
+      } else if styleChanged {
+        MarkdownStyle.apply(to: view, bodyFont: NSFont.systemFont(ofSize: 14), lineSpacing: lineSpacing)
+      }
+      context.coordinator.acknowledge(source, version: version)
+      // Typing, native layout, media and ghost changes report their own size.
+      // Unrelated workspace updates must not force the draft's full layout.
+      if sourceChanged || styleChanged { view.reportContentHeight() }
     }
-    view.reportContentHeight()
     configureCompletion(view, coordinator: context.coordinator)
-    context.coordinator.updateCompletion()
     context.coordinator.completion?.refresh()
-    if focusRequest != context.coordinator.appliedFocusRequest {
+    if isEnabled, focusRequest != context.coordinator.appliedFocusRequest {
       context.coordinator.appliedFocusRequest = focusRequest
-      DispatchQueue.main.async { [weak view] in
-        guard let view, let window = view.window else { return }
+      let request = focusRequest
+      DispatchQueue.main.async { [weak view, weak coordinator = context.coordinator] in
+        guard let view, view.isEditable, coordinator?.appliedFocusRequest == request,
+          let window = view.window else { return }
         window.makeFirstResponder(view)
       }
     }
   }
 
   private func configureCompletion(_ view: ChatTextView, coordinator: Coordinator) {
-    if let completionModel, let completionTarget {
+    if isEnabled, let completionModel, let completionTarget {
       if coordinator.completion?.model !== completionModel {
         coordinator.completion?.invalidateGhost()
         coordinator.completion = TextInputCompletion(model: completionModel, target: completionTarget)
@@ -305,13 +341,33 @@ struct ChatComposer: NSViewRepresentable {
     var onContentHeight: ((CGFloat) -> Void)?
     var completion: TextInputCompletion?
     var completionTarget: TextInputTarget?
+    var currentTextVersion: (() -> UUID)?
     private var measuredHeight: CGFloat = -1
+    private var heightPublicationPending = false
+    private var acknowledgedText: String?
+    private var acknowledgedTextVersion: UUID?
+    private var acknowledgedNativeVersion: UUID?
     init(text: Binding<String>) { self.text = text }
+    func acknowledge(_ source: String, version: UUID?) {
+      acknowledgedText = source; acknowledgedTextVersion = version
+      acknowledgedNativeVersion = view?.sourceVersion
+    }
+    func displays(_ source: String, version: UUID?) -> Bool {
+      guard let view, acknowledgedNativeVersion == view.sourceVersion else { return false }
+      if let version { return acknowledgedTextVersion == version }
+      // Generic bindings have no external change identity. Compare their last
+      // acknowledged immutable value exactly, never the live native buffer or
+      // canonical String equality. Versioned status updates skip this boundary.
+      guard let acknowledgedText else { return false }
+      return (acknowledgedText as NSString).isEqual(to: source)
+    }
     func textDidChange(_ notification: Notification) {
-      guard let view else { return }
+      guard let view, view.isEditable else { return }
       if !view.movingGhostBoundary { view.endGhostBoundary() }
       if !view.hasMarkedText() { MarkdownStyle.apply(to: view, bodyFont: NSFont.systemFont(ofSize: 14), lineSpacing: lineSpacing) }
-      text.wrappedValue = view.string
+      let source = view.string
+      text.wrappedValue = source
+      acknowledge(source, version: currentTextVersion?())
       view.needsDisplay = true
       view.reportContentHeight()
       updateCompletion()
@@ -323,7 +379,7 @@ struct ChatComposer: NSViewRepresentable {
     }
     func updateCompletion() {
       guard let view, let completionTarget else { return }
-      completion?.update(text: view.string, selection: view.selectedRange(),
+      completion?.update(selection: view.selectedRange(),
         marked: view.hasMarkedText(), target: completionTarget)
     }
     func measure(_ height: CGFloat) {
@@ -331,9 +387,12 @@ struct ChatComposer: NSViewRepresentable {
       measuredHeight = height
       // Layout can run during SwiftUI updates. Publish only the latest measured
       // height after that update, so typing and width changes remain native.
+      guard !heightPublicationPending else { return }
+      heightPublicationPending = true
       DispatchQueue.main.async { [weak self] in
-        guard let self, self.measuredHeight == height else { return }
-        self.onContentHeight?(height)
+        guard let self else { return }
+        self.heightPublicationPending = false
+        self.onContentHeight?(self.measuredHeight)
       }
     }
   }

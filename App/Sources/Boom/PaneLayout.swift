@@ -19,19 +19,9 @@ struct PaneLayout: NSViewRepresentable {
     return view
   }
   func updateNSView(_ view: ShadeSplitView, context: Context) {
-    let coordinator = context.coordinator
-    guard coordinator.panes.map(\.id) != panes.map(\.id) else { return }
-    coordinator.panes = panes
-    // Keep existing native editors and their first responder/Undo state.
-    for child in view.subviews { child.removeFromSuperview() }
-    for pane in panes {
-      let host = coordinator.hosts[pane.id] ?? NSHostingView(rootView: AnyView(pane.content.environment(\.openURL, OpenURLAction { _ in .discarded })))
-      coordinator.hosts[pane.id] = host
-      host.frame.size.width = pane.preferred
-      view.addSubview(host)
-    }
-    view.adjustSubviews()
+    context.coordinator.update(panes, in: view)
   }
+
   @MainActor final class ShadeSplitView: NSSplitView {
     override var dividerThickness: CGFloat { 0 }
     override func drawDivider(in rect: NSRect) {}
@@ -39,8 +29,48 @@ struct PaneLayout: NSViewRepresentable {
   @MainActor final class Coordinator: NSObject, NSSplitViewDelegate {
     var panes: [Pane] = []
     var hosts: [String: NSHostingView<AnyView>] = [:]
+    private var updatingPanes = false
+
+    func update(_ next: [Pane], in view: ShadeSplitView) {
+      guard panes.map(\.id) != next.map(\.id) else { return }
+      precondition(Set(next.map(\.id)).count == next.count, "Pane identities must be unique.")
+      updatingPanes = true
+      panes = next
+      let retained = Set(next.map(\.id))
+      // Detaching a focused host gives its first responder back to NSWindow.
+      // Keep every surviving pane attached, including its native editor/Undo.
+      for (id, host) in hosts where !retained.contains(id) && host.superview === view {
+        host.removeFromSuperview()
+      }
+      for pane in next {
+        let host = hosts[pane.id] ?? NSHostingView(rootView: AnyView(
+          pane.content.environment(\.openURL, OpenURLAction { _ in .discarded })))
+        hosts[pane.id] = host
+        if host.superview !== view {
+          host.frame.size.width = pane.preferred
+          view.addSubview(host)
+        }
+      }
+      // Reorder the existing siblings without removing them from the window.
+      // AppKit borrows this comparator/context only for the synchronous sort.
+      var order = Dictionary(uniqueKeysWithValues: next.enumerated().map {
+        (ObjectIdentifier(hosts[$0.element.id]!), $0.offset)
+      })
+      withUnsafeMutablePointer(to: &order) { pointer in
+        view.sortSubviews({ left, right, context in
+          guard let context else { return .orderedSame }
+          let order = context.assumingMemoryBound(to: [ObjectIdentifier: Int].self).pointee
+          guard let a = order[ObjectIdentifier(left)], let b = order[ObjectIdentifier(right)] else {
+            return .orderedSame
+          }
+          return a < b ? .orderedAscending : a > b ? .orderedDescending : .orderedSame
+        }, context: pointer)
+      }
+      updatingPanes = false
+      view.adjustSubviews()
+    }
     func splitView(_ splitView: NSSplitView, resizeSubviewsWithOldSize oldSize: NSSize) {
-      guard !panes.isEmpty else { return }
+      guard !updatingPanes, !panes.isEmpty, panes.count == splitView.subviews.count else { return }
       let flexible = panes.firstIndex { $0.maximum == .infinity } ?? panes.count - 1
       var widths = zip(panes, splitView.subviews).map { pane, view in
         min(pane.maximum, max(pane.minimum, view.frame.width))

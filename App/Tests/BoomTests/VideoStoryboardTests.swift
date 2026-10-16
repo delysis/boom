@@ -1,7 +1,6 @@
 import AppKit
 import AVFoundation
 import BoomCore
-import CryptoKit
 import XCTest
 @testable import Boom
 
@@ -88,8 +87,7 @@ final class VideoStoryboardTests: XCTestCase {
   @MainActor func testSharedDocumentAndChatPreparationCaptureSameEncryptedVideoTimeline() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-public-storyboard-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: root,
-      testKey: SymmetricKey(data: Data(repeating: 0x71, count: 32))), loadModels: false)
+    let model = try await WorkspaceModel(storeOverride: WorkspaceStore(rootOverride: root), loadModels: false)
     model.state.autocomplete = false
     if model.selectedChat == nil { try model.newChat() }
     let bytes = try fixture("scene-speech.mp4")
@@ -105,7 +103,7 @@ final class VideoStoryboardTests: XCTestCase {
     XCTAssertEqual(prompt.prompt.components(separatedBy: "<|audio|>").count - 1, writing[0].audioSegments.count)
     try await model.flush()
     XCTAssertEqual(try model.store.vault.get(.attachment, id: record.id), bytes)
-    let reopened = try await model.store.load().get().0
+    let reopened = try await model.store.loadState()
     XCTAssertEqual(reopened.attachments.first { $0.id == record.id }?.rootDigest, Digest.sha256(bytes))
     try await model.shutdown()
   }

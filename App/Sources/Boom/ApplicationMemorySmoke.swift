@@ -1,6 +1,5 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import Darwin
 import Foundation
 import Metal
@@ -9,7 +8,7 @@ import SwiftUI
 import Synchronization
 
 /// Explicit public fixtures, actual paired MLX allocations and production
-/// encrypted checkpoints. No shown window, user workspace, Keychain or network.
+/// file checkpoints. No shown window, user workspace, Keychain or network.
 @MainActor enum ApplicationMemorySmoke {
   final class Probe: @unchecked Sendable {
     private let lock = NSLock()
@@ -23,7 +22,10 @@ import Synchronization
     private var peak: UInt64 = 0
     private var samples = 0
     private var finished = false
-    init(_ url: URL) throws {
+    private let observeModelAllocations: Bool
+    private var currentPeak: UInt64 = 0
+    init(_ url: URL, observeModelAllocations: Bool = true) throws {
+      self.observeModelAllocations = observeModelAllocations
       source = DispatchSource.makeTimerSource(queue: queue)
       guard FileManager.default.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
         throw BoomError.unavailable("Memory sample ledger could not be created.")
@@ -43,15 +45,46 @@ import Synchronization
       guard !finished else { return }
       let sampledPhase = currentPhase(), seconds = elapsedSeconds()
       let suspendingSeconds = suspendingStarted.duration(to: SuspendingClock().now).timeInterval
-      let accounting = ModelResidency.memoryAccounting(), footprint = accounting.current
-      peak = max(peak, footprint, accounting.peak); samples += 1
+      var record: [String: Any] = ["seconds": seconds, "suspending_seconds": suspendingSeconds, "phase": sampledPhase]
+      let footprint: UInt64, lifetimePeak: UInt64
+      if observeModelAllocations {
+        // Preserve the existing paired-model accounting and allocator path.
+        let accounting = ModelResidency.memoryAccounting()
+        footprint = accounting.current; lifetimePeak = accounting.peak
+        record["process_footprint_bytes"] = footprint
+        record["kernel_process_peak_footprint_bytes"] = lifetimePeak
+        record["mlx_active_bytes"] = Memory.activeMemory; record["mlx_cache_bytes"] = Memory.cacheMemory
+        record["mlx_peak_active_bytes"] = Memory.peakMemory
+      } else {
+        var vm = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let capacity = Int(count)
+        let status = withUnsafeMutablePointer(to: &vm) { pointer in
+          pointer.withMemoryRebound(to: integer_t.self, capacity: capacity) {
+            task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+          }
+        }
+        let available = status == KERN_SUCCESS && Int(count) == capacity
+        record["vm_available"] = available; record["vm_kernel_result"] = status
+        record["vm_returned_count"] = count
+        if available {
+          footprint = vm.phys_footprint; lifetimePeak = UInt64(max(0, vm.ledger_phys_footprint_peak))
+          record["process_footprint_bytes"] = footprint
+          record["kernel_process_peak_footprint_bytes"] = lifetimePeak
+          record["process_resident_bytes"] = vm.resident_size
+          record["internal_bytes"] = vm.internal; record["compressed_bytes"] = vm.compressed
+          record["graphics_footprint_bytes"] = vm.ledger_tag_graphics_footprint
+          record["purgeable_nonvolatile_bytes"] = vm.ledger_purgeable_nonvolatile
+        } else {
+          // Raw status is retained; absent counters are unknown, never zero proof.
+          footprint = 0; lifetimePeak = 0
+          if failure == nil { failure = "Normal memory TASK_VM_INFO unavailable: result=\(status), count=\(count)." }
+        }
+      }
+      peak = max(peak, footprint, lifetimePeak); currentPeak = max(currentPeak, footprint); samples += 1
       do {
-        var bytes = try JSONSerialization.data(withJSONObject: [
-          "seconds": seconds, "suspending_seconds": suspendingSeconds,
-          "phase": sampledPhase, "process_footprint_bytes": footprint,
-          "kernel_process_peak_footprint_bytes": accounting.peak,
-          "mlx_active_bytes": Memory.activeMemory, "mlx_cache_bytes": Memory.cacheMemory,
-          "mlx_peak_active_bytes": Memory.peakMemory], options: [.sortedKeys])
+        guard observeModelAllocations || samples <= 40_000 else { throw BoomError.budget("Normal memory observations exceeded their fixed sample bound.") }
+        var bytes = try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys])
         bytes.append(0x0a); try handle.write(contentsOf: bytes)
       } catch { failure = error.localizedDescription }
     }
@@ -64,6 +97,7 @@ import Synchronization
         return (peak, samples)
       }
     }
+    func maximumSampledCurrentFootprint() -> UInt64 { queue.sync { currentPeak } }
     deinit { source.cancel(); try? handle.close() }
   }
   private actor TrialTrace {
@@ -174,7 +208,7 @@ import Synchronization
       "network_permission": "outbound denied by the invoking OS sandbox",
       "keychain_dialogs_qualified": false, "physical_keyboard_or_ime_qualified": false,
       "swap_before": swap(), "sample_interval_ms": 20,
-      "durable_encrypted_checkpoint_overhead_included": true,
+      "durable_file_checkpoint_overhead_included": true,
       "producer_priority_scope": "explicit operations request user-initiated task priority; autocomplete requests background priority; receipts record effective task priority, not OS thread QoS",
       "inference_activity_scope": "GPU lease through producer joining; explicit operations request user-initiated activity while allowing idle system sleep; autocomplete requests background activity",
       "clock_scope": "ContinuousClock includes system sleep; SuspendingClock excludes system sleep; recorded wall-clock gates are unchanged"]
@@ -183,20 +217,19 @@ import Synchronization
     try write(receipt, "receipt.json", evidence: evidence)
     let probe = try Probe(evidence.appendingPathComponent("memory-samples.jsonl"))
     var typing: Task<[Double], Error>?
+    var typingObservations: [[String: Any]] = []
     var model: WorkspaceModel?
     var window: NSWindow?
     do {
       guard let consultationPack = consultationPackOverride ?? ModelPacks.cached(.consultation) else {
         throw BoomError.unavailable("Both cached model packs are required.")
       }
-      let store = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("encrypted-workspace"),
-        testKey: SymmetricKey(data: Data(repeating: 0x6a, count: 32)))
+      let store = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("public-workspace"))
       let initialDocument = DocumentSnapshot(title: "Public memory and typing fixture", text: "Public fixture")
       var state = WorkspaceState(); state.autocomplete = false; state.showChat = false
       state.documents = [DocumentIndex(id: initialDocument.id, title: initialDocument.title)]
       state.selectedDocument = initialDocument.id
-      try await store.save(state, documents: [initialDocument])
-      let workspace = try await WorkspaceModel(storeOverride: store, loadModels: false); model = workspace
+      let workspace = try await NativeCheckEvidence.openPublicWorkspace(store: store, state: state, documents: [initialDocument]); model = workspace
       guard workspace.layout.isAuthor else { throw BoomError.unavailable("Use the author edition for this diagnostic.") }
       receipt["residency_scope"] = "production controller; keep both when context fits, otherwise release inactive weights and reload the same snapshot"
       let clock = ContinuousClock()
@@ -254,18 +287,21 @@ import Synchronization
         throw BoomError.budget("The runtime leaves insufficient context for the registered 4K trial.")
       }
       let short = try await writingPrefix(512)
-      workspace.updateDocument(try await writingPrefix(16_128), id: initialDocument.id, caret: 0)
+      try await NativeCheckEvidence.replacePublicDocument(workspace, text: try await writingPrefix(16_128), id: initialDocument.id, caret: 0)
       try await workspace.flush()
       guard let document = workspace.selectedDocument else { throw BoomError.invalid("Public document disappeared.") }
       let host = NSHostingView(rootView: WorkspaceView(model: workspace))
       let testWindow = ApplicationDelegate.workspaceWindow(frame: NSRect(x: -10_000, y: -10_000, width: 1190, height: 846))
       window = testWindow; testWindow.isReleasedWhenClosed = false; testWindow.contentView = host
       for _ in 0..<10 { host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(25)) }
-      guard let editor = workspace.editor, testWindow.makeFirstResponder(editor), editor.isEditable else {
+      guard let editor = workspace.pagedInput?.activeView, testWindow.makeFirstResponder(editor), editor.isEditable else {
         throw BoomError.invalid("The production offscreen editor did not accept keyboard focus.")
       }
+      guard editor.string.utf8.count <= PagedWorkingWindow.hardBytes else {
+        throw BoomError.budget("The paired-memory control exceeded its native editing-island bound.")
+      }
+      let initialIsland = Data(editor.string.utf8)
       workspace.isBusy = true
-      var typingObservations: [[String: Any]] = []
       typing = Task { @MainActor in
         var delays: [Double] = []
         while !Task.isCancelled {
@@ -280,7 +316,9 @@ import Synchronization
           let inserted = clock.now
           editor.insertText("", replacementRange: NSRange(location: 0, length: 1))
           let deleted = clock.now
+          let layoutTrace = PerformanceTrace.begin("Editor.HostLayout")
           host.layoutSubtreeIfNeeded()
+          PerformanceTrace.end("Editor.HostLayout", layoutTrace)
           let ended = clock.now
           delays.append(max(0, expected.duration(to: ended).timeInterval))
           typingObservations.append(["phase": phase,
@@ -291,7 +329,12 @@ import Synchronization
             "deletion_seconds": inserted.duration(to: deleted).timeInterval,
             "layout_seconds": deleted.duration(to: ended).timeInterval,
             "combined_seconds": delays.last!])
-          guard editor.string == document.text, editor.isEditable,
+          guard editor.string.utf8.elementsEqual(initialIsland), editor.isEditable,
+            workspace.pagedInput?.activeView === editor, workspace.pagedViewport?.textView === editor,
+            workspace.pagedSession === editor.session, editor.inputBinding?.state == .active,
+            editor.inputBinding?.identity.arenaID == editor.session.arenaID,
+            editor.boundedStorage.mutationFailure == nil,
+            workspace.pagedSelectedRecord?.document.id == document.id,
             testWindow.firstResponder === editor else { throw BoomError.invalid("Native typing changed fixture bytes or lost focus.") }
           if started.duration(to: clock.now) > .seconds(2) { throw BoomError.unavailable("Native typing stalled.") }
         }
@@ -424,6 +467,7 @@ import Synchronization
       receipt["peak_sampled_process_footprint_bytes"] = measured.0; receipt["memory_samples"] = measured.1
       receipt["typing_samples_seconds"] = typingDelays
       receipt["typing_observations"] = typingObservations
+      receipt["typing_observations_complete"] = true
       receipt["typing_scope"] = "offscreen production editor insertion, deletion, model update and layout plus main-actor scheduling; not physical keystrokes"
       receipt["maximum_typing_latency_seconds"] = typingDelays.max() ?? 0
       receipt["swap_after"] = swap()
@@ -446,6 +490,12 @@ import Synchronization
       if let model { model.isBusy = false; try await model.shutdown() }; window?.close()
       let measured = try probe.finish()
       receipt["peak_sampled_process_footprint_bytes"] = measured.0; receipt["memory_samples"] = measured.1
+      let typingDelays = typingObservations.compactMap { $0["combined_seconds"] as? Double }
+      receipt["typing_samples_seconds"] = typingDelays
+      receipt["typing_observations"] = typingObservations
+      receipt["typing_observations_complete"] = false
+      receipt["maximum_typing_latency_seconds"] = typingDelays.max() as Any? ?? NSNull()
+      receipt["typing_scope"] = "offscreen production editor insertion, deletion, model update and layout plus main-actor scheduling; not physical keystrokes"
       receipt["status"] = "failed"; receipt["error"] = String(describing: error); receipt["swap_after"] = swap()
       try write(receipt, "receipt.json", evidence: evidence); throw error
     }

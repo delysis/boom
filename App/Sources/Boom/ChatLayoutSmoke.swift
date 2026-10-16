@@ -1,6 +1,5 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import Foundation
 import SwiftUI
 
@@ -15,8 +14,7 @@ import SwiftUI
     let evidence = URL(fileURLWithPath: arguments[index + 1])
     guard !FileManager.default.fileExists(atPath: evidence.path) else { throw BoomError.invalid("Chat layout evidence already exists.") }
     try FileManager.default.createDirectory(at: evidence, withIntermediateDirectories: false)
-    let store = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("public-workspace"),
-      testKey: SymmetricKey(data: Data(repeating: 73, count: 32)))
+    let store = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("public-workspace"))
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     if model.selectedChat == nil { try model.newChat() }
     let texts = [
@@ -31,7 +29,7 @@ import SwiftUI
     }
     if let document = model.selectedDocument {
       model.state.autocomplete = false
-      model.updateDocument("# Public manuscript\n\n" + String(repeating: "The river turns past the old house. 👩🏽‍💻 café 日本語. ", count: 25),
+      try await NativeCheckEvidence.replacePublicDocument(model, text: "# Public manuscript\n\n" + String(repeating: "The river turns past the old house. 👩🏽‍💻 café 日本語. ", count: 25),
         id: document.id, caret: 0)
     }
     model.state.showLibrary = false; model.state.showChat = true
@@ -83,7 +81,7 @@ import SwiftUI
         }
       }
       observation["actionRails"] = rails.count
-      if let editor = model.editor, let container = editor.textContainer, let layout = editor.layoutManager {
+      if let editor = model.pagedInput?.activeView, let container = editor.textContainer, let layout = editor.layoutManager {
         layout.ensureLayout(for: container)
         let height = layout.usedRect(for: container).maxY + editor.textContainerInset.height * 2
         guard height <= editor.bounds.height + 1 else { throw BoomError.invalid("The manuscript exceeded its assigned frame.") }
@@ -130,9 +128,11 @@ import SwiftUI
           }
         }
       }
-      try await WorkspaceChromeCapture.run(evidence: evidence)
       guard !window.isVisible else { throw BoomError.invalid("The background layout fixture became visible.") }
       try await model.shutdown()
+      window.contentView = nil
+      window.close()
+      try await WorkspaceChromeCapture.run(evidence: evidence)
       try write("passed", observations: observations, evidence: evidence)
     } catch {
       try write("failed", observations: observations, evidence: evidence, error: error.localizedDescription)
@@ -143,7 +143,7 @@ import SwiftUI
     let receipt: [String: Any] = ["schema": 1, "status": status, "transitions": observations,
       "sourceInventorySHA256": Bundle.main.infoDictionary?["BoomSourceSHA256"] ?? "unavailable",
       "pid": ProcessInfo.processInfo.processIdentifier, "error": error as Any? ?? NSNull(),
-      "publicFixtureOnly": true, "keychainLookups": VaultSession.shared.lookupCount]
+      "publicFixtureOnly": true]
     try JSONSerialization.data(withJSONObject: receipt, options: [.prettyPrinted, .sortedKeys])
       .write(to: evidence.appendingPathComponent("receipt.json"), options: .atomic)
   }

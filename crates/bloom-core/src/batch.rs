@@ -23,10 +23,13 @@ impl Execution {
 }
 
 pub fn admit(width: usize, prompt: usize, output: usize, capacity: usize) -> Result<bool, Error> {
+    // Single consultation/document responses use the ordinary512/4096-token
+    // budgets; multi-row writing alternatives retain their256-token ceiling.
+    let output_ceiling = if width == 1 { 4096 } else { 256 };
     require(
         (1..=4).contains(&width)
             && prompt > 0
-            && (1..=256).contains(&output)
+            && (1..=output_ceiling).contains(&output)
             && (1..=16_384).contains(&capacity)
             && prompt
                 .checked_add(output)
@@ -118,6 +121,10 @@ mod tests {
         }
         assert!(admit(3, 0, 64, 1024).is_err());
         assert!(admit(3, 100, 257, 1024).is_err());
+        assert!(admit(1, 100, 512, 1024)?);
+        assert!(admit(1, 100, 4096, 8192)?);
+        assert!(admit(1, 100, 4097, 8192).is_err());
+        assert!(admit(1, 513, 512, 1024).is_err());
         assert!(admit(3, 100, 64, 16_385).is_err());
         Ok(())
     }

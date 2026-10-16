@@ -34,7 +34,7 @@ use mail_parser::{MessageParser, MimeHeaders};
 use path::logical_member_name;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek};
 use std::sync::Arc;
 
 const IMPLEMENTATION: &str = "attachment-native-inspect";
@@ -836,6 +836,23 @@ impl InspectionState {
     fn expand_zip(&mut self, parent: &ObjectId, depth: u16, bytes: &[u8]) {
         let summary = match zip_preflight::preflight(bytes) {
             Ok(summary) => summary,
+            Err(zip_preflight::ZipPreflightError::EndRecordAmbiguous) => {
+                let _ = self.set_status(
+                    parent,
+                    ObjectStatus::Partial {
+                        reasons: vec!["zip_end_record_ambiguous".to_string()],
+                    },
+                );
+                self.issue(
+                    "zip_end_record_ambiguous",
+                    IssueClass::Integrity,
+                    IssueSeverity::Blocked,
+                    Some(parent.clone()),
+                    "Multiple ZIP footer framings end at the captured input boundary. The original bytes are retained without choosing an interpretation.",
+                    true,
+                );
+                return;
+            }
             Err(zip_preflight::ZipPreflightError::MultiDiskUnsupported) => {
                 let _ = self.set_status(
                     parent,
@@ -891,15 +908,15 @@ impl InspectionState {
             );
             return;
         }
-        if summary.metadata_bytes > self.policy.limits.max_container_metadata_bytes {
+        if summary.allocation_metadata_bytes() > self.policy.limits.max_container_metadata_bytes {
             self.issue(
                 "container_metadata_limit_exceeded",
                 IssueClass::Budget,
                 IssueSeverity::Blocked,
                 Some(parent.clone()),
                 format!(
-                    "The ZIP central directory declares {} bytes, exceeding the configured {} byte container-metadata limit. It was not materialized.",
-                    summary.metadata_bytes, self.policy.limits.max_container_metadata_bytes
+                    "The ZIP directory and ZIP64 extensible data declare {} bytes, exceeding the configured {} byte container-metadata limit. They were not materialized.",
+                    summary.allocation_metadata_bytes(), self.policy.limits.max_container_metadata_bytes
                 ),
                 true,
             );
@@ -911,8 +928,28 @@ impl InspectionState {
             );
             return;
         }
-        let cursor = Cursor::new(bytes);
-        let mut archive = match zip::ZipArchive::new(cursor) {
+        if zip_preflight::validate_directory(bytes, summary).is_err() {
+            let _ = self.set_status(
+                parent,
+                ObjectStatus::Malformed {
+                    code: "zip_directory_metadata_invalid".to_string(),
+                },
+            );
+            self.issue("zip_directory_metadata_invalid", IssueClass::Integrity, IssueSeverity::Blocked,
+                Some(parent.clone()), "The ZIP directory extent or actual record count disagrees with its footer. No members were admitted.", true);
+            return;
+        }
+        let members_enabled = std::cell::Cell::new(false);
+        let cursor = zip_preflight::AdmittedZipCursor::new(bytes, summary, &members_enabled)
+            .expect("validated directory has a representable extent");
+        let config = zip::read::Config {
+            archive_offset: zip::read::ArchiveOffset::Known(
+                summary
+                    .archive_offset()
+                    .expect("validated directory has a known offset"),
+            ),
+        };
+        let mut archive = match zip::ZipArchive::with_config(config, cursor) {
             Ok(archive) => archive,
             Err(_) => {
                 let _ = self.set_status(
@@ -932,6 +969,7 @@ impl InspectionState {
                 return;
             }
         };
+        members_enabled.set(true);
         let entry_count = match u32::try_from(archive.len()) {
             Ok(count) => count,
             Err(_) => {
@@ -1068,11 +1106,11 @@ impl InspectionState {
         }
     }
 
-    fn process_zip_entry(
+    fn process_zip_entry<R: Read + Seek>(
         &mut self,
         parent: &ObjectId,
         depth: u16,
-        archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
+        archive: &mut zip::ZipArchive<R>,
         metadata: ZipEntryMetadata,
     ) -> Result<(), AttachmentError> {
         let child_depth = depth.saturating_add(1);
@@ -2114,6 +2152,8 @@ impl InspectionState {
             max_parts,
             self.policy.limits.max_container_metadata_bytes,
             self.budget.remaining_derived_bytes(),
+            self.policy.limits.max_parser_input_bytes,
+            || self.budget.check_deadline().is_ok(),
         ) {
             let _ = self.set_status(
                 parent,
@@ -2148,6 +2188,7 @@ impl InspectionState {
             );
             return;
         };
+        let message = mime_preflight::MessageOwner::new(message);
         let count = match u32::try_from(message.attachment_count()) {
             Ok(count) => count,
             Err(_) => {

@@ -27,9 +27,49 @@ pub struct Document {
 pub struct Authority {
     pub mode: Mode,
     pub target: Option<Document>,
+    #[serde(
+        default,
+        rename = "targetWindow",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub target_window: Option<crate::hashline::ContextTextWindow>,
 }
 
 impl Authority {
+    pub(crate) fn admit_target_range(&self, start: usize, end: usize) -> Result<(), Error> {
+        if let Some(window) = &self.target_window {
+            let target = self
+                .target
+                .as_ref()
+                .ok_or_else(|| Error("Missing captured target.".into()))?;
+            window.validate(&target.text)?;
+            require(
+                window
+                    .ranges
+                    .iter()
+                    .any(|range| start >= range.start && end <= range.end),
+                "The edit addresses target text outside the supplied working window.",
+            )?;
+        }
+        Ok(())
+    }
+    pub fn instructions_v3(&self) -> Result<String, Error> {
+        if self.mode == Mode::Ask {
+            return self.instructions();
+        }
+        let target = self
+            .target
+            .as_ref()
+            .ok_or_else(|| Error("Choose a document before requesting edits.".into()))?;
+        require(target.text.len() <= TEXT_LIMIT, "Document exceeds 2 MiB.")?;
+        Ok(crate::hashline::instructions_v3(
+            if self.mode == Mode::Edit {
+                "Edit: a valid patch will be applied by Bloom after validation."
+            } else {
+                "Propose: a valid patch will be shown for user review. It will not be applied automatically."
+            },
+        ))
+    }
     pub fn instructions(&self) -> Result<String, Error> {
         if self.mode == Mode::Ask {
             return Ok("Document permission: Ask (read only). You have no tool to modify documents in this request. Never claim you have saved, updated, or edited a document. You may offer wording in your answer. If asked to apply an edit, explain briefly that the user can choose Propose or Edit beside the message field.".into());
@@ -231,6 +271,7 @@ fn validate<'a>(
             boundaries.binary_search(&start).is_ok() && boundaries.binary_search(&end).is_ok(),
             "An edit cannot split a Unicode character.",
         )?;
+        authority.admit_target_range(start, end)?;
         edits.push(ByteEdit {
             start,
             end,
@@ -339,6 +380,7 @@ mod tests {
         let authority = Authority {
             mode: Mode::Edit,
             target: Some(document.clone()),
+            target_window: None,
         };
         (document, authority, patch)
     }

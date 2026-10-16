@@ -20,6 +20,83 @@ enum ProductCore {
   static func search(_ text: String, query: String) throws -> SearchMatches {
     try call(["op": "search", "text": text, "query": query])
   }
+  static func markdownSpans<T: Decodable>(_ text: String, as: T.Type = T.self) throws -> T {
+    try parseText(text, using: bloom_markdown_spans)
+  }
+  static func markdownMediaSpans(_ text: String) throws -> [InlineMediaSpan] {
+    try parseText(text, using: bloom_markdown_media_spans)
+  }
+  struct MarkupProjection {
+    let markdown: [MarkdownSpan]
+    let media: [InlineMediaSpan]
+    let hasWikiMarker: Bool
+    let hasAttachmentMarker: Bool
+  }
+  private static let attachmentMarker: [UInt8] = Array("[Attachment: ".utf8)
+  /// Exact ASCII eligibility shares the parser's already contiguous input.
+  /// General NSString literal searches would revisit foreign storage twice.
+  private static func markupMarkers(_ bytes: UnsafeBufferPointer<UInt8>) -> (wiki: Bool, attachment: Bool) {
+    var wiki = false, attachment = false, index = 0
+    while index < bytes.count {
+      if bytes[index] == 91 {
+        if index + 1 < bytes.count, bytes[index + 1] == 91 { wiki = true }
+        if !attachment, bytes.count - index >= attachmentMarker.count {
+          var matches = true
+          for offset in attachmentMarker.indices where bytes[index + offset] != attachmentMarker[offset] {
+            matches = false; break
+          }
+          attachment = matches
+        }
+        if wiki && attachment { break }
+      }
+      index += 1
+    }
+    return (wiki, attachment)
+  }
+  /// Both parsers borrow one UTF-8 representation. Their independent parser
+  /// options and failure behavior stay unchanged; the result retains no text.
+  static func markupProjection(_ text: String) -> MarkupProjection {
+    let projectionTrace = PerformanceTrace.begin("Editor.Projection")
+    defer { PerformanceTrace.end("Editor.Projection", projectionTrace) }
+    var source = text
+    let inputTrace = PerformanceTrace.begin("Bridge.InputUTF8")
+    return source.withUTF8 { bytes in
+      PerformanceTrace.end("Bridge.InputUTF8", inputTrace)
+      let markers = markupMarkers(bytes)
+      let markdown: [MarkdownSpan] = {
+        let trace = PerformanceTrace.begin("Editor.MarkdownParse")
+        defer { PerformanceTrace.end("Editor.MarkdownParse", trace) }
+        return (try? parseBorrowedText(bytes, using: bloom_markdown_spans)) ?? []
+      }()
+      let media: [InlineMediaSpan] = {
+        let trace = PerformanceTrace.begin("Editor.MediaParse")
+        defer { PerformanceTrace.end("Editor.MediaParse", trace) }
+        return (try? parseBorrowedText(bytes, using: bloom_markdown_media_spans)) ?? []
+      }()
+      return MarkupProjection(markdown: markdown, media: media,
+        hasWikiMarker: markers.wiki, hasAttachmentMarker: markers.attachment)
+    }
+  }
+  private static func parseText<T: Decodable>(_ text: String,
+    using parser: (UnsafePointer<UInt8>?, Int) -> BoomAttachmentBuffer) throws -> T {
+    // String owns the contiguous UTF-8 only for this synchronous call. The
+    // parser borrows it; no whole-document JSON escaping or request copy.
+    var source = text
+    let inputTrace = PerformanceTrace.begin("Bridge.InputUTF8")
+    return try source.withUTF8 { bytes in
+      PerformanceTrace.end("Bridge.InputUTF8", inputTrace)
+      return try parseBorrowedText(bytes, using: parser)
+    }
+  }
+  private static func parseBorrowedText<T: Decodable>(_ bytes: UnsafeBufferPointer<UInt8>,
+    using parser: (UnsafePointer<UInt8>?, Int) -> BoomAttachmentBuffer) throws -> T {
+    let buffer = {
+      let trace = PerformanceTrace.begin("Bridge.Execute")
+      defer { PerformanceTrace.end("Bridge.Execute", trace) }
+      return parser(bytes.baseAddress, bytes.count)
+    }()
+    return try response(buffer)
+  }
   static func layout() throws -> ProductLayout { try call(["op": "layout"]) }
   static func importedTexts(_ files: [ImportedText]) throws -> [ImportedText] {
     try call(["op": "validate_import", "files": object(files)])
@@ -27,32 +104,25 @@ enum ProductCore {
   static func importedDocuments(_ files: [ImportedText]) throws -> [ImportedText] {
     try call(["op": "validate_document_import", "files": object(files)])
   }
+  static func admitImportedTexts(_ files: [ImportedText], documents: Bool = false) throws {
+    var bytes = 0
+    for file in files {
+      let total = bytes.addingReportingOverflow(file.text.utf8.count)
+      guard !total.overflow else { throw BoomError.budget("Import size cannot be represented.") }
+      bytes = total.partialValue
+    }
+    try importBudget(files: files.count, bytes: bytes)
+    let operation = documents ? "admit_document_import" : "admit_import"
+    // Validate the complete path set together, then acknowledge bounded texts.
+    // Worst-case JSON escaping of eight MiB need not fit a sixteen-MiB request.
+    let paths = files.map { ImportedText(path: $0.path, text: "") }
+    let _: Bool = try call(["op": operation, "files": object(paths)])
+    for file in files {
+      let _: Bool = try call(["op": operation, "files": object([file])])
+    }
+  }
   static func importBudget(files: Int, bytes: Int) throws {
     let _: Bool = try call(["op": "validate_import_budget", "files": files, "bytes": bytes])
-  }
-  static func validateOriginals(_ state: WorkspaceState) throws {
-    let files = (state.importedFiles ?? [:]).map { id, file in
-      ["id": id.uuidString, "folderID": file.folderID.map { $0.uuidString as Any } ?? NSNull(),
-        "path": file.path, "originalDigest": file.originalDigest] as [String: Any]
-    }
-    let _: Bool = try call(["op": "validate_imported_originals", "documents": state.documents.map { $0.id.uuidString },
-      "folders": (state.importedFolders ?? []).map { $0.id.uuidString }, "files": files])
-  }
-  static func admitRestore(_ state: WorkspaceState, documents: [DocumentSnapshot], entries: [String], hasIndex: Bool) throws {
-    let _: Bool = try call(["op": "admit_restore", "state": object(state), "documents": object(documents),
-      "entries": entries, "hasIndex": hasIndex])
-  }
-  static func validateInventory(_ state: WorkspaceState, entries: [VaultInventoryEntry], hasIndex: Bool) throws {
-    let originals = state.attachments.map { ["id": $0.id.uuidString, "digest": $0.rootDigest] }
-    let imported = (state.importedFiles ?? [:]).map { ["id": $0.key.uuidString, "digest": $0.value.originalDigest] }
-    let replies = state.chats.flatMap { $0.messages + ($0.messageVersions ?? []) }.map { message in
-      ["id": message.id.uuidString, "role": message.role.rawValue, "state": message.state.rawValue,
-        "hasModel": message.provider != nil, "authored": message.authoredByUser == true,
-        "hasText": !message.text.isEmpty] as [String: Any]
-    }
-    let _: Bool = try call(["op": "validate_vault_inventory", "manifest": ["hasIndex": hasIndex,
-      "documents": state.documents.map { $0.id.uuidString }, "attachments": originals, "importedOriginals": imported,
-      "candidates": state.candidateIDs.map(\.uuidString), "replies": replies], "entries": object(entries)])
   }
   static func chatTitle(_ request: String, routing: [String]) throws -> String {
     try call(["op": "chat_title", "request": request, "routing": routing])
@@ -61,23 +131,43 @@ enum ProductCore {
     let ok: Bool
     let value: T?
     let error: Failure?
-    struct Failure: Decodable { let message: String }
+    struct Failure: Decodable { let code: String; let message: String }
   }
   static func call<T: Decodable>(_ request: [String: Any], as: T.Type = T.self) throws -> T {
-    let data = try JSONSerialization.data(withJSONObject: request)
-    let buffer = data.withUnsafeBytes {
-      bloom_core_request($0.bindMemory(to: UInt8.self).baseAddress, data.count)
-    }
+    let data = try {
+      let trace = PerformanceTrace.begin("Bridge.Encode")
+      defer { PerformanceTrace.end("Bridge.Encode", trace) }
+      return try JSONSerialization.data(withJSONObject: request)
+    }()
+    // A fitting request still carries immutable original prose for validation.
+    // Only this explicit windowed operation may use the bridge's bounded 64 MiB input.
+    let windowed = ["compile_consultation", "compile_consultation_compact"].contains(request["op"] as? String ?? "")
+      && (request["workingTextBytes"] is Int || request["workingRequestBytes"] is Int)
+    let limit = windowed ? 67_108_864 : 16_777_216
+    guard data.count <= limit else { throw BoomError.budget("Product request exceeds its bounded wire capacity.") }
+    let buffer = {
+      let trace = PerformanceTrace.begin("Bridge.Execute")
+      defer { PerformanceTrace.end("Bridge.Execute", trace) }
+      return data.withUnsafeBytes {
+        bloom_core_request($0.bindMemory(to: UInt8.self).baseAddress, data.count)
+      }
+    }()
     return try response(buffer)
   }
   private static func response<T: Decodable>(_ buffer: BoomAttachmentBuffer) throws -> T {
+    let trace = PerformanceTrace.begin("Bridge.Decode")
+    defer { PerformanceTrace.end("Bridge.Decode", trace) }
     defer { boom_attachment_free(buffer) }
-    guard let pointer = buffer.data, buffer.length > 0, buffer.length <= 16_777_216 else {
+    guard let pointer = buffer.data, buffer.length > 0, buffer.length <= 8_388_608 else {
       throw BoomError.invalid("Invalid product-core response.")
     }
     let response = try JSONDecoder().decode(
       Envelope<T>.self, from: Data(bytes: pointer, count: buffer.length))
     guard response.ok, let value = response.value else {
+      if let failure = response.error,
+        ["input_limit", "output_limit", "consultation_budget"].contains(failure.code) {
+        throw BoomError.budget(failure.message)
+      }
       throw BoomError.invalid(response.error?.message ?? "Product request failed.")
     }
     return value
@@ -101,22 +191,76 @@ enum ProductCore {
     try call(["op": "validate_chat_text", "text": text, "instructions": instructions])
   }
   static func prompt(
-    voice: Voice?, history: [ChatMessage], instructions: String, context: String, request: String, routing: [String], authority: CapturedDocumentAuthority = .readOnly
+    voice: Voice?, history: [ChatMessage], instructions: String, context: String, request: String, routing: [String], authority: CapturedDocumentAuthority = .readOnly,
+    promptContract: ConsultationPromptContract = .referenceHistoryV2,
+    renderedContext: RenderedReferenceContext? = nil, capturedSources: [SourceReference] = [],
+    workingTextBytes: Int? = nil, workingRequestBytes: Int? = nil
   ) throws -> ConsultationPlan {
     guard let plan = try consultationRound(voices: [voice], history: history, instructions: instructions,
-      context: context, request: request, routing: routing, authority: authority).first else { throw BoomError.invalid("Empty consultation round.") }
+      context: context, request: request, routing: routing, authority: authority,
+      promptContract: promptContract, renderedContext: renderedContext,
+      capturedSources: capturedSources, workingTextBytes: workingTextBytes,
+      workingRequestBytes: workingRequestBytes).first else { throw BoomError.invalid("Empty consultation round.") }
     return plan
   }
   static func consultationRound(
-    voices: [Voice?], history: [ChatMessage], instructions: String, context: String, request: String, routing: [String], authority: CapturedDocumentAuthority = .readOnly
+    voices: [Voice?], history: [ChatMessage], instructions: String, context: String, request: String, routing: [String], authority: CapturedDocumentAuthority = .readOnly,
+    promptContract: ConsultationPromptContract = .referenceHistoryV2,
+    renderedContext: RenderedReferenceContext? = nil, capturedSources: [SourceReference] = [],
+    workingTextBytes: Int? = nil, workingRequestBytes: Int? = nil
   ) throws -> [ConsultationPlan] {
     let turns = history.filter { $0.state == .complete }.map { message in
       PromptTurn(role: message.role.rawValue, text: message.text,
-        speaker: message.speaker ?? Speaker(name: message.role == .user ? "Human" : "Bloom"))
+        speaker: message.speaker ?? Speaker(name: message.role == .user ? "Human" : "Bloom"),
+        context: message.consultationPromptContract == .referenceHistoryV2
+          || message.consultationPromptContract == .referenceBindingsV3 ? message.context : nil,
+        routing: message.consultationRouting, promptContract: message.consultationPromptContract)
     }
-    return try call(["op": "compile_consultation", "authority": object(authority),
+    let compiled: CompactConsultation = try call(["op": "compile_consultation_compact", "authority": object(authority),
       "voices": try voices.map { try $0.map { try object($0) } ?? NSNull() },
-      "history": object(turns), "instructions": instructions, "context": context, "request": request, "routing": routing])
+      "history": object(turns), "instructions": instructions, "context": context, "request": request,
+      "routing": routing, "promptContract": promptContract.rawValue,
+      "renderedContext": try renderedContext.map { try object($0) } ?? NSNull(),
+      "capturedSources": try object(capturedSources), "workingTextBytes": workingTextBytes.map { $0 as Any } ?? NSNull(),
+      "workingRequestBytes": workingRequestBytes.map { $0 as Any } ?? NSNull()])
+    let expectedContract: ConsultationPromptContract? = promptContract == .textHistoryV1 ? nil : promptContract
+    guard compiled.schema == 1, compiled.plans.count == voices.count,
+      compiled.promptContract == expectedContract else {
+      throw BoomError.invalid("Inconsistent consultation reply.")
+    }
+    return try compiled.plans.map { plan in
+      ConsultationPlan(messages: try plan.messages.map { message in
+        guard ["system", "user", "assistant"].contains(message.role) else {
+          throw BoomError.invalid("Invalid consultation role.")
+        }
+        return ConsultationPlan.Message(role: message.role, content: try compiled.text(message.content))
+      }, rawPrompt: try compiled.text(plan.rawPrompt), promptContract: compiled.promptContract,
+        workingWindow: compiled.workingWindow)
+    }
+  }
+  private struct CompactConsultation: Decodable {
+    struct Plan: Decodable {
+      struct Message: Decodable { let role: String; let content: [Int] }
+      let messages: [Message]
+      let rawPrompt: [Int]
+    }
+    let schema: Int
+    let promptContract: ConsultationPromptContract?
+    let workingWindow: ConsultationWorkingWindow?
+    let texts: [String]
+    let plans: [Plan]
+    func text(_ references: [Int]) throws -> String {
+      var bytes = 0
+      for index in references {
+        guard texts.indices.contains(index) else { throw BoomError.invalid("Invalid consultation text reference.") }
+        let total = bytes.addingReportingOverflow(texts[index].utf8.count)
+        guard !total.overflow, total.partialValue <= 16_777_216 else {
+          throw BoomError.budget("Consultation prompt exceeds 16 MiB.")
+        }
+        bytes = total.partialValue
+      }
+      return references.map { texts[$0] }.joined()
+    }
   }
   static func authoredPrefix(_ document: DocumentSnapshot, caret: Int) throws -> String {
     try call(["op": "authored_prefix", "text": document.text, "caretUtf16": caret])
@@ -154,12 +298,21 @@ enum ProductCore {
       "controlTokenIds": controls, "tokenizerEos": tokenizerEOS.map { $0 as Any } ?? NSNull(),
       "prefillTokens": prefillTokens.map { $0 as Any } ?? NSNull()])
   }
-  static func admitGenerationPolicy(_ captured: ModelGenerationPolicy?, loaded: ModelGenerationPolicy) throws {
-    let _: Bool = try call(["op": "admit_generation_policy",
+  static func resolvedGenerationPolicy(_ captured: ModelGenerationPolicy?,
+    loaded: ModelGenerationPolicy) throws -> ModelGenerationPolicy {
+    try call(["op": "resolve_execution_policy",
       "captured": try captured.map { try object($0) } ?? NSNull(), "loaded": object(loaded)])
   }
+  /// This checks compatibility. Execution must use resolvedGenerationPolicy's
+  /// returned policy rather than the runner's current default.
+  static func admitGenerationPolicy(_ captured: ModelGenerationPolicy?, loaded: ModelGenerationPolicy) throws {
+    let effective = try resolvedGenerationPolicy(captured, loaded: loaded)
+    let _: Bool = try call(["op": "admit_generation_policy",
+      "captured": try captured.map { try object($0) } ?? NSNull(), "loaded": object(effective)])
+  }
   static func validateWritingRecipe(_ recipe: CompletionRecipe) throws {
-    let _: Bool = try call(["op": "validate_writing_recipe", "recipe": object(recipe)])
+    try recipe.capture?.admit()
+    let _: Bool = try call(["op": "validate_writing_recipe", "recipe": recipeModelObject(recipe)])
   }
   static func writingHistory(documentID: UUID, entries: [WritingHistoryEntry]) throws -> WritingHistoryPlan {
     try call(["op": "writing_history", "documentId": documentID.uuidString, "entries": object(entries)])
@@ -175,7 +328,17 @@ enum ProductCore {
     try call(["op": "writing_evaluation_plan", "fixtures": fixtures, "seeds": seeds])
   }
   static func branchWriting(_ recipe: CompletionRecipe, continuation: String) throws -> String {
-    try call(["op": "branch_writing", "recipe": object(recipe), "continuation": continuation])
+    guard recipe.capture?.isWholeSource != false else {
+      throw BoomError.denied("A range capture cannot be branched as a whole manuscript.")
+    }
+    return try call(["op": "branch_writing", "recipe": recipeModelObject(recipe), "continuation": continuation])
+  }
+  private static func recipeModelObject(_ recipe: CompletionRecipe) throws -> [String: Any] {
+    guard var value = try object(recipe) as? [String: Any] else { throw BoomError.invalid("Invalid writing recipe.") }
+    // The Rust planner validates the bounded text/prompt. File revision/range
+    // authority stays with the native owner and is rechecked before insertion.
+    value.removeValue(forKey: "capture")
+    return value
   }
   static func residencyBudget(physical: UInt64, metal: UInt64) throws -> UInt64 {
     try call(["op": "residency_budget", "physicalBytes": physical, "metalBytes": metal])
@@ -223,11 +386,33 @@ enum ProductCore {
       "status": response.statusCode, "contentRange": response.value(forHTTPHeaderField: "Content-Range") as Any? ?? NSNull(),
       "contentLength": length.flatMap(UInt64.init) as Any? ?? NSNull()])
   }
+  static func incrementalKVAdmission(application: UInt64, used: UInt64, reserve: UInt64,
+    layers: [ActiveNativeKVAllocation]) throws -> IncrementalKVAdmission {
+    try call(["op": "incremental_kv_admission", "applicationBytes": application,
+      "usedBytes": used, "workingReserveBytes": reserve, "layers": try object(layers)])
+  }
+  static func incrementalKVReadmission(application: UInt64, used: UInt64, reserve: UInt64,
+    allocation: UInt64) throws -> IncrementalKVAdmission {
+    try call(["op": "incremental_kv_readmission", "applicationBytes": application,
+      "usedBytes": used, "workingReserveBytes": reserve, "allocationBytesUpperBound": allocation])
+  }
+  static func independentKVAllocation(configuration: Data, prompts: [Int], cached: [Int],
+    outputs: [Int], prefill: PrefillGeometry, initial: Bool, valueBytes: Int) throws -> UInt64 {
+    try call(["op": "independent_kv_allocation", "configuration": JSONSerialization.jsonObject(with: configuration),
+      "prompts": prompts, "cached": cached, "outputs": outputs, "prefill": try object(prefill),
+      "initial": initial, "valueBytes": valueBytes])
+  }
   static func contextCapacity(configuration: Data, available: UInt64, width: Int,
     prefill: PrefillGeometry? = nil) throws -> Int {
     try call(["op": "context_capacity", "configuration": JSONSerialization.jsonObject(with: configuration),
       "availableBytes": available, "width": width, "prefill": try prefill.map { try object($0) } ?? NSNull()])
   }
+}
+struct IncrementalKVAdmission: Codable, Sendable {
+  let admitted: Bool
+  let additionalBytesUpperBound: UInt64
+  let requiredBytes: UInt64
+  let scope: String
 }
 struct FullContextInputs: Codable, Sendable {
   let contextTokens: Int
@@ -278,6 +463,7 @@ struct SearchMatches: Codable, Sendable {
 struct DocumentSearchMatches: Sendable {
   let query: String
   let revision: String
+  let textVersion: UUID
   let matches: SearchMatches
 }
 struct VoiceExchange: Codable, Equatable, Sendable {
@@ -307,6 +493,9 @@ struct PromptTurn: Codable, Sendable {
   let role: String
   let text: String
   let speaker: Speaker
+  var context: String? = nil
+  var routing: [String]? = nil
+  var promptContract: ConsultationPromptContract? = nil
 }
 private struct PinnableTurn: Codable {
   let role: String
@@ -314,7 +503,7 @@ private struct PinnableTurn: Codable {
   let state: String
   let speaker: Speaker?
 }
-enum ConsultationStyle: String, Codable, CaseIterable {
+enum ConsultationStyle: String, Codable, CaseIterable, Sendable {
   case separate = "Separate answers"
   case discuss = "Discuss together"
 }
@@ -355,6 +544,7 @@ struct CompletionRecipe: Codable, Sendable {
   let generationPolicy: ModelGenerationPolicy?
   var sourcePrompt: String? = nil
   var media: [WritingMediaReference]? = nil
+  var capture: BoundedDocumentCapture? = nil
 }
 struct WritingBatchExecution: Codable, Equatable, Sendable {
   var algorithm = "shared-prefill-fixed-batch-v1"
@@ -370,16 +560,34 @@ struct WritingEvaluationGroup: Codable, Sendable {
   let replayOf: String?
 }
 struct WritingCandidate: Codable, Identifiable, Sendable {
+  private enum CodingKeys: String, CodingKey {
+    case id, seed, text, state, promptTokens, outputTokens, tokenIDs, stopReason
+    case stopTokenID, batch, executionOrigin
+  }
+  /// The candidate owns this local display identity, including its empty-state text.
+  /// It is never encoded or used as generation, source or replay authority.
+  private(set) var readingVersion = UUID()
   let id: UUID
   let seed: UInt64
-  var text: String
-  var state: MessageState
+  var text: String { didSet { readingVersion = UUID() } }
+  var state: MessageState { didSet { readingVersion = UUID() } }
   var promptTokens: Int
   var outputTokens: Int
   var tokenIDs: [Int]
   var stopReason: String?
   var stopTokenID: Int? = nil
   var batch: WritingBatchExecution? = nil
+  var executionOrigin: GenerationExecutionOrigin? = nil
+
+  init(id: UUID, seed: UInt64, text: String, state: MessageState,
+    promptTokens: Int, outputTokens: Int, tokenIDs: [Int], stopReason: String?,
+    stopTokenID: Int? = nil, batch: WritingBatchExecution? = nil,
+    executionOrigin: GenerationExecutionOrigin? = nil) {
+    self.id = id; self.seed = seed; self.text = text; self.state = state
+    self.promptTokens = promptTokens; self.outputTokens = outputTokens; self.tokenIDs = tokenIDs
+    self.stopReason = stopReason; self.stopTokenID = stopTokenID
+    self.batch = batch; self.executionOrigin = executionOrigin
+  }
 }
 struct CandidateBundle: Codable, Identifiable, Sendable {
   let id: UUID
@@ -419,6 +627,8 @@ struct ConsultationPlan: Codable, Sendable {
   struct Message: Codable, Sendable { let role: String; let content: String }
   let messages: [Message]
   let rawPrompt: String
+  var promptContract: ConsultationPromptContract? = nil
+  var workingWindow: ConsultationWorkingWindow? = nil
 }
 struct ConsultationReceipt: Codable, Sendable {
   let operationID: UUID
@@ -440,6 +650,7 @@ struct ConsultationReceipt: Codable, Sendable {
   var previousAttemptID: UUID? = nil
   var responseID: UUID? = nil
   var media: [WritingMediaReference]? = nil
+  var executionOrigin: GenerationExecutionOrigin? = nil
 }
 
 struct WritingPrompt: Codable { let prompt: String; let digest: String; let totalCharacters: Int; let omittedCharacters: Int }

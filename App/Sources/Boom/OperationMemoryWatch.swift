@@ -10,7 +10,7 @@ final class OperationMemoryWatch: @unchecked Sendable {
   private let source: DispatchSourceTimer
   private var crossed = false
   var exceeded: Bool { lock.lock(); defer { lock.unlock() }; return crossed }
-  init(flag: CancellationFlag) throws {
+  init(flag: CancellationFlag, onExceeded: (@Sendable () -> Void)? = nil) throws {
     let limit = try ModelResidency.budget()
     try ModelResidency.check()
     source = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
@@ -19,6 +19,9 @@ final class OperationMemoryWatch: @unchecked Sendable {
       guard let self else { return }
       let used = max(ModelResidency.footprint(), UInt64(max(0, Memory.activeMemory + Memory.cacheMemory)))
       if used > limit {
+        // Revoke historical-KV permission before signalling generic cancellation.
+        // No manager/MLX operation occurs in this utility timer callback.
+        onExceeded?()
         lock.lock(); crossed = true; lock.unlock()
         flag.cancel()
       }

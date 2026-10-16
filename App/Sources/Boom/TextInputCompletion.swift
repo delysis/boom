@@ -19,6 +19,65 @@ struct TextInputCapture: Codable, Sendable {
   let caretUTF16: Int
 }
 
+/// Main-thread validity uses local ownership only. The encoded digest remains
+/// part of the captured generation; it is never replaced with this stamp.
+struct InputContextStamp: Equatable, Sendable {
+  struct Attachment: Equatable, Sendable {
+    let id: UUID
+    let rootDigest: String
+  }
+  let target: TextInputTarget
+  let chatVersion: UUID?
+  let pendingAttachments: [UUID]
+  let attachments: [Attachment]
+}
+
+/// Value snapshots share immutable String/Array storage until an author edits.
+/// Encoding, history projection and prompt compilation run on the worker.
+struct InputContextSnapshot: Sendable {
+  let stamp: InputContextStamp
+  let chat: ChatRecord?
+  let pendingAttachments: [UUID]
+
+  func digests(cachedChatDigest: String? = nil) throws -> (chat: String, context: String) {
+    let chatDigest: String
+    if let chat {
+      if let cachedChatDigest { chatDigest = cachedChatDigest }
+      else {
+        let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
+        chatDigest = Digest.sha256(try encoder.encode(chat))
+      }
+    } else { return ("", Digest.sha256("null")) }
+    return (chatDigest, Digest.sha256(chatDigest + stamp.attachments.map {
+      $0.id.uuidString + $0.rootDigest
+    }.joined()))
+  }
+  func compile(text: String, caret: Int) throws -> String {
+    let target = stamp.target
+    var messages = chat?.messages ?? []
+    var speaker = "You"
+    if let messageID = target.messageID {
+      guard let index = messages.firstIndex(where: { $0.id == messageID }) else { throw BoomError.stale("Message changed.") }
+      speaker = messages[index].speaker?.name ?? (messages[index].role == .user ? "You" : "Bloom")
+      messages = Array(messages[..<index])
+    }
+    if target.instructions { messages = [] }
+    let turns = messages.filter { $0.state == .complete }.map {
+      PromptTurn(role: $0.role.rawValue, text: Self.mediaLinks($0.directAttachments ?? []) + $0.text,
+        speaker: $0.speaker ?? Speaker(name: $0.role == .user ? "You" : "Bloom"))
+    }
+    let mediaIDs = target.instructions ? [] : target.messageID.flatMap { id in
+      chat?.messages.first(where: { $0.id == id }).map { $0.directAttachments ?? [] }
+    } ?? pendingAttachments
+    let context = [chat?.instructions ?? "", Self.mediaLinks(mediaIDs)].filter { !$0.isEmpty }.joined(separator: "\n")
+    return try ProductCore.inputContext(instructions: target.instructions ? "" : context,
+      history: turns, speaker: speaker, text: text, caret: caret)
+  }
+  private static func mediaLinks(_ ids: [UUID]) -> String {
+    ids.map { "[Attachment: media](boom-attachment:\($0.uuidString))\n" }.joined()
+  }
+}
+
 @MainActor private final class InputCandidateProgress {
   var bundle: CandidateBundle
   let publish: @MainActor (CandidateBundle) -> Void
@@ -46,63 +105,119 @@ struct TextInputCapture: Codable, Sendable {
   let id = UUID()
   private(set) var target: TextInputTarget
   private(set) var completionDocument: DocumentSnapshot?
+  private var documentSourceVersion: UUID?
+  private var stampedDocumentVersion: UUID?
   private(set) var ghostStamp: GhostStamp?
   private(set) var ghostText = ""
   private var epoch: UInt64 = 0
   private var caret = 0
   private var contextDigest: String?
+  private var contextStamp: InputContextStamp?
   private(set) var bundle: CandidateBundle?
   private var task: Task<Void, Never>?
   private var flag: CancellationFlag?
+  private var diagnosticScheduleCount = 0
+  private var diagnosticStartCount = 0
+  private var diagnosticAttemptStage = "idle"
+  private var diagnosticAttemptError: String?
   var hasCompletionChoices: Bool { bundle != nil && !ghostText.isEmpty }
 
   init(model: WorkspaceModel, target: TextInputTarget) {
     self.model = model; self.target = target
-    contextDigest = try? model.inputContextDigest(target)
+    if !model.isBusy { contextStamp = try? model.inputContextStamp(target) }
     model.registerInputCompletion(self)
   }
-  func update(text: String, selection: NSRange, marked: Bool, target: TextInputTarget) {
-    let next = DocumentSnapshot(id: id, title: "Chat input", text: text)
-    let changed = self.target != target || completionDocument?.revision != next.revision || caret != selection.location
-    self.target = target; completionDocument = next; caret = selection.location
+  func update(selection: NSRange, marked: Bool, target: TextInputTarget) {
+    guard let view else { model?.revokeInputJoinedRetentions(id); invalidateGhost(); return }
+    let sourceVersion = view.sourceVersion
+    let sourceChanged = completionDocument == nil || documentSourceVersion != sourceVersion
+    let changed = self.target != target || sourceChanged || caret != selection.location
+    if sourceChanged {
+      completionDocument = DocumentSnapshot(id: id, title: "Chat input", text: view.string)
+      documentSourceVersion = sourceVersion
+    }
+    if self.target != target { model?.revokeInputJoinedRetentions(id) }
+    self.target = target; caret = selection.location
     if changed || marked || selection.length != 0 {
       invalidateGhost()
-      if view?.movingGhostBoundary != true {
-        bundle = nil; contextDigest = try? model?.inputContextDigest(target); view?.endGhostBoundary()
+      if !view.movingGhostBoundary {
+        bundle = nil
+        if model?.isBusy == true { contextStamp = nil }
+        else { contextStamp = try? model?.inputContextStamp(target) }
+        view.endGhostBoundary()
       }
     }
-    if !marked, selection.length == 0, view?.movingGhostBoundary != true { schedule() }
+    if !marked, selection.length == 0, !view.movingGhostBoundary { schedule() }
   }
   func refresh() {
-    guard let model, let digest = try? model.inputContextDigest(target) else {
-      invalidateGhost(); bundle = nil; contextDigest = nil; view?.endGhostBoundary(); return
+    // A local ownership comparison keeps status/streaming refresh independent
+    // of the size of the stored chat. Encoding belongs to the captured worker.
+    if model?.isBusy == true { invalidateGhost(); return }
+    guard let model, let stamp = try? model.inputContextStamp(target) else {
+      invalidateGhost(); bundle = nil; contextStamp = nil; contextDigest = nil; view?.endGhostBoundary(); return
     }
-    if contextDigest != nil && contextDigest != digest {
+    if contextStamp != nil && contextStamp != stamp {
       invalidateGhost(); bundle = nil; view?.endGhostBoundary()
     }
-    contextDigest = digest
+    contextStamp = stamp
     guard !model.isBusy, model.state.autocomplete else { invalidateGhost(); return }
     schedule()
   }
   func invalidateGhost() {
     epoch &+= 1; flag?.cancel(); task?.cancel()
     flag = nil
-    ghostStamp = nil; ghostText = ""; view?.clearGhost()
+    ghostStamp = nil; stampedDocumentVersion = nil; ghostText = ""; view?.clearGhost()
   }
   func join() async { invalidateGhost(); if let task { await task.value } }
+  var joinedRetentionOwnerIsLive: Bool {
+    guard let model, view != nil else { return false }
+    if let id = target.chatID {
+      guard let chat = model.state.chats.first(where: { $0.id == id }) else { return false }
+      if let message = target.messageID, !chat.messages.contains(where: { $0.id == message }) { return false }
+    }
+    if let id = target.documentID, !model.documentIndices.contains(where: { $0.id == id }) { return false }
+    return true
+  }
   private var eligible: Bool {
     guard let model, !model.isBusy, model.state.autocomplete, model.inputCompletionRunner != nil,
       let view, view.window?.firstResponder === view, !view.hasMarkedText(),
-      view.selectedRange().length == 0, caret > 0, let document = completionDocument,
-      let prefix = try? ProductCore.authoredPrefix(document, caret: caret) else { return false }
-    return !prefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      view.selectedRange().length == 0, caret > 0, completionDocument != nil,
+      view.sourceVersion == documentSourceVersion else { return false }
+    return true
+  }
+  var diagnosticState: [String: String] {
+    ["eligible": String(eligible), "model": String(model != nil),
+      "model_busy": String(model?.isBusy == true),
+      "autocomplete": String(model?.state.autocomplete == true),
+      "runner": String(model?.inputCompletionRunner != nil),
+      "view": String(view != nil),
+      "first_responder": String(view?.window?.firstResponder === view),
+      "marked": String(view?.hasMarkedText() == true),
+      "selection": String(describing: view?.selectedRange()),
+      "caret": String(caret), "source_matches": String(view?.sourceVersion == documentSourceVersion),
+      "document": String(completionDocument != nil),
+      "ghost_stamp": String(ghostStamp != nil), "flag": String(flag != nil),
+      "ghost_boundary": String(view?.hasGhostBoundary == true),
+      "schedule_count": String(diagnosticScheduleCount),
+      "start_count": String(diagnosticStartCount),
+      "attempt_stage": diagnosticAttemptStage,
+      "attempt_error": diagnosticAttemptError ?? "none",
+      "bundle_state": String(describing: bundle?.candidates.first?.state),
+      "bundle_tokens": String(bundle?.candidates.first?.outputTokens ?? -1)]
   }
   func schedule(delay: Duration = .milliseconds(650)) {
-    guard eligible, ghostStamp == nil, flag == nil, view?.hasGhostBoundary != true else { return }
+    diagnosticScheduleCount += 1
+    guard eligible, ghostStamp == nil, flag == nil, view?.hasGhostBoundary != true else {
+      diagnosticAttemptStage = "schedule-ineligible"
+      return
+    }
     start(count: 1, previous: nil, delay: delay)
   }
   private func start(count: Int, previous: CandidateBundle?, delay: Duration) {
     guard eligible, let model, let document = completionDocument else { return }
+    diagnosticStartCount += 1
+    diagnosticAttemptStage = "scheduled"
+    diagnosticAttemptError = nil
     let capturedEpoch = epoch, target = target, capturedCaret = caret
     let previousTask = task
     flag?.cancel(); previousTask?.cancel()
@@ -110,21 +225,52 @@ struct TextInputCapture: Codable, Sendable {
     task = Task { [weak self, weak model] in
       defer { if let self, self.flag === operation { self.flag = nil } }
       if let previousTask { await previousTask.value }
+      self?.diagnosticAttemptStage = "prior-joined"
       do {
         try await Task.sleep(for: delay)
         try operation.check()
-        guard let self, let model, self.epoch == capturedEpoch, self.eligible else { return }
-        let digest = try model.inputContextDigest(target)
-        self.contextDigest = digest
+        guard let self, let model, self.epoch == capturedEpoch, self.eligible else {
+          self?.diagnosticAttemptStage = "preparation-admission-revoked"
+          return
+        }
+        self.diagnosticAttemptStage = "preparing-context"
+        // Full-prefix validation belongs to this captured operation, after the
+        // debounce, not every status, selection or native layout callback.
+        guard let prepared = try await model.prepareInputContext(target, document: document,
+          caret: capturedCaret, flag: operation), self.epoch == capturedEpoch, self.eligible,
+          self.completionDocument?.textVersion == document.textVersion,
+          (try? model.inputContextStamp(target)) == prepared.stamp else {
+          self.diagnosticAttemptStage = "prepared-context-revoked"
+          return
+        }
+        let digest = prepared.digest, raw = prepared.raw, capturedContext = prepared.stamp
+        self.contextDigest = digest; self.contextStamp = capturedContext
         let capture = TextInputCapture(chatID: target.chatID, messageID: target.messageID,
           contextDigest: digest, snapshot: document, caretUTF16: capturedCaret)
-        let raw = try model.inputContext(target, text: document.text, caret: capturedCaret)
         let compiled = DocumentSnapshot(id: document.id, title: document.title, text: raw)
+        self.diagnosticAttemptStage = "generating-candidates"
         let result = try await model.generateInputCandidates(document: compiled, capture: capture,
-          count: count, previous: previous, flag: operation) { [weak self] bundle in
+          count: count, previous: previous, flag: operation,
+          beforeCachePublication: { [weak self, weak model] in
+            guard let sourceOwner = self, let workspaceOwner = model else {
+              throw BoomError.stale("The input source changed before prompt-cache publication.")
+            }
+            try await MainActor.run {
+              try operation.check()
+              guard sourceOwner.epoch == capturedEpoch,
+                sourceOwner.completionDocument?.textVersion == document.textVersion,
+                sourceOwner.view?.sourceVersion == sourceOwner.documentSourceVersion,
+                sourceOwner.caret == capturedCaret, sourceOwner.target == target,
+                (try? workspaceOwner.inputContextStamp(target)) == capturedContext,
+                sourceOwner.view?.hasMarkedText() == false else {
+                throw BoomError.stale("The input source changed before prompt-cache publication.")
+              }
+            }
+          }) { [weak self] bundle in
             guard let self, self.epoch == capturedEpoch, !operation.isCancelled,
-              self.completionDocument?.revision == document.revision, self.caret == capturedCaret,
-              self.target == target, (try? self.model?.inputContextDigest(target)) == digest,
+              self.completionDocument?.textVersion == document.textVersion,
+              self.view?.sourceVersion == self.documentSourceVersion, self.caret == capturedCaret,
+              self.target == target, (try? self.model?.inputContextStamp(target)) == capturedContext,
               self.view?.hasMarkedText() == false else { operation.cancel(); return }
             var displayed = bundle
             if let prior = self.bundle, prior.id == bundle.id { displayed.selected = prior.selected }
@@ -132,16 +278,29 @@ struct TextInputCapture: Codable, Sendable {
             self.present(displayed.candidates[displayed.selected].text)
           }
         if self.epoch == capturedEpoch, !operation.isCancelled { self.bundle = result }
-      } catch is CancellationError {} catch {
+        self.diagnosticAttemptStage = "generation-finished"
+      } catch is CancellationError {
+        self?.diagnosticAttemptStage = "cancelled"
+      } catch {
+        self?.diagnosticAttemptStage = "failed"
+        self?.diagnosticAttemptError = String(describing: error)
         // A background suggestion can fail without interrupting authored text.
-        // The encrypted attempt and its failure remain available for diagnosis.
+        // The attempt and its failure remain available for diagnosis.
       }
     }
   }
   private func present(_ text: String) {
-    guard let document = completionDocument, let view, !text.isEmpty,
-      view.string == document.text, view.selectedRange() == NSRange(location: caret, length: 0),
-      let stamp = try? GhostStamp(document: document, caretUTF16: caret, epoch: epoch) else { return }
+    guard let document = completionDocument, let view, !text.isEmpty, !view.hasMarkedText(),
+      view.sourceVersion == documentSourceVersion,
+      view.selectedRange() == NSRange(location: caret, length: 0) else { return }
+    let stamp: GhostStamp
+    if let current = ghostStamp, stampedDocumentVersion == document.textVersion,
+      current.caretUTF16 == caret, current.epoch == epoch {
+      stamp = current
+    } else {
+      guard let captured = try? GhostStamp(document: document, caretUTF16: caret, epoch: epoch) else { return }
+      stamp = captured; stampedDocumentVersion = document.textVersion
+    }
     ghostText = text; ghostStamp = stamp; view.showGhost(text, stamp: stamp)
   }
   func takeGhost(documentID: UUID, caret: Int) -> String? {
@@ -159,8 +318,8 @@ struct TextInputCapture: Codable, Sendable {
     return CompletionSegment(accepted: chunk.accepted, remaining: chunk.remaining, whole: whole, sources: [])
   }
   func ghostSourcesRemainCurrent(_ sources: [SourceReference], manuscriptID: UUID) -> Bool {
-    guard let model, !model.isBusy, let contextDigest else { return false }
-    return (try? model.inputContextDigest(target)) == contextDigest
+    guard let model, !model.isBusy, let contextStamp else { return false }
+    return (try? model.inputContextStamp(target)) == contextStamp
   }
   func resumeGhost(_ text: String, documentID: UUID, caret: Int, sources: [SourceReference]) {
     guard completionDocument?.id == documentID, self.caret == caret,
@@ -170,7 +329,8 @@ struct TextInputCapture: Codable, Sendable {
   func navigateGhost(_ direction: Int) {
     guard eligible else { return }
     guard var current = bundle, current.input?.snapshot.revision == completionDocument?.revision,
-      current.input?.caretUTF16 == caret, current.input?.contextDigest == (try? model?.inputContextDigest(target))
+      current.input?.caretUTF16 == caret, current.input?.contextDigest == contextDigest,
+      ghostSourcesRemainCurrent([], manuscriptID: id)
     else { invalidateGhost(); start(count: 3, previous: nil, delay: .zero); return }
     if current.candidates.count == 1 {
       bundle = nil
@@ -184,54 +344,86 @@ struct TextInputCapture: Codable, Sendable {
 
 extension WorkspaceModel {
   var inputCompletionRunner: MLXGemmaRunner? { baseRunner ?? mlxRunner }
-  func inputContextDigest(_ target: TextInputTarget) throws -> String {
+  func inputContextStamp(_ target: TextInputTarget) throws -> InputContextStamp {
     guard target.chatID == state.selectedChat,
       target.chatID != nil || target.documentID == state.selectedDocument else { throw BoomError.stale("Input changed.") }
-    let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
-    guard let chat = selectedChat else { return Digest.sha256("null") }
-    let digest: String
-    if let cached = inputContextCache, cached.0 == chat { digest = cached.1 }
-    else { digest = Digest.sha256(try encoder.encode(chat)); inputContextCache = (chat, digest) }
     let pending = target.messageID == nil && !target.instructions ? pendingAttachments : []
-    return Digest.sha256(digest + pending.compactMap { id in state.attachments.first(where: { $0.id == id }).map { $0.id.uuidString + $0.rootDigest } }.joined())
+    return InputContextStamp(target: target, chatVersion: selectedChat?.contentVersion,
+      pendingAttachments: pending, attachments: pending.compactMap { id in state.attachments.first(where: { $0.id == id }).map {
+        InputContextStamp.Attachment(id: $0.id, rootDigest: $0.rootDigest)
+      } })
+  }
+  func captureInputContext(_ target: TextInputTarget) throws -> InputContextSnapshot {
+    InputContextSnapshot(stamp: try inputContextStamp(target), chat: selectedChat,
+      pendingAttachments: pendingAttachments)
+  }
+  fileprivate func cachedInputChatDigest(_ snapshot: InputContextSnapshot) -> String? {
+    guard let chat = snapshot.chat, let cached = inputContextCache,
+      cached.id == chat.id, cached.version == chat.contentVersion else { return nil }
+    return cached.digest
+  }
+  fileprivate func retainInputChatDigest(_ digest: String, snapshot: InputContextSnapshot) {
+    guard let chat = snapshot.chat,
+      (try? inputContextStamp(snapshot.stamp.target)) == snapshot.stamp else { return }
+    inputContextCache = (id: chat.id, version: chat.contentVersion, digest: digest)
+  }
+  func prepareInputContext(_ target: TextInputTarget, document: DocumentSnapshot,
+    caret: Int, flag: CancellationFlag
+  ) async throws -> (stamp: InputContextStamp, digest: String, raw: String)? {
+    let snapshot = try captureInputContext(target)
+    let cachedDigest = cachedInputChatDigest(snapshot)
+    let prepared = try await detachedWork { () -> (chatDigest: String, digest: String, raw: String)? in
+      try flag.check()
+      let prefix = try ProductCore.authoredPrefix(document, caret: caret)
+      guard !prefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+      let digests = try snapshot.digests(cachedChatDigest: cachedDigest)
+      try flag.check()
+      let raw = try snapshot.compile(text: document.text, caret: caret)
+      try flag.check()
+      return (digests.chat, digests.context, raw)
+    }
+    guard let prepared else { return nil }
+    try flag.check()
+    guard (try? inputContextStamp(target)) == snapshot.stamp else { throw BoomError.stale("Input changed.") }
+    retainInputChatDigest(prepared.chatDigest, snapshot: snapshot)
+    return (snapshot.stamp, prepared.digest, prepared.raw)
+  }
+  // Synchronous projections remain available for explicit fixture inspection.
+  // Native input callbacks use only inputContextStamp; generation uses a worker.
+  func inputContextDigest(_ target: TextInputTarget) throws -> String {
+    let snapshot = try captureInputContext(target)
+    let digests = try snapshot.digests(cachedChatDigest: cachedInputChatDigest(snapshot))
+    retainInputChatDigest(digests.chat, snapshot: snapshot)
+    return digests.context
   }
   func inputContext(_ target: TextInputTarget, text: String, caret: Int) throws -> String {
-    _ = try inputContextDigest(target)
-    let chat = selectedChat
-    var messages = chat?.messages ?? []
-    var speaker = "You"
-    if let messageID = target.messageID {
-      guard let index = messages.firstIndex(where: { $0.id == messageID }) else { throw BoomError.stale("Message changed.") }
-      speaker = messages[index].speaker?.name ?? (messages[index].role == .user ? "You" : "Bloom")
-      messages = Array(messages[..<index])
-    }
-    if target.instructions { messages = [] }
-    let turns = messages.filter { $0.state == .complete }.map {
-      PromptTurn(role: $0.role.rawValue, text: inputMediaLinks($0.directAttachments ?? []) + $0.text,
-        speaker: $0.speaker ?? Speaker(name: $0.role == .user ? "You" : "Bloom"))
-    }
-    let mediaIDs = target.instructions ? [] : target.messageID.flatMap { id in chat?.messages.first(where: { $0.id == id }).map { $0.directAttachments ?? [] } } ?? pendingAttachments
-    let context = [chat?.instructions ?? "", inputMediaLinks(mediaIDs)].filter { !$0.isEmpty }.joined(separator: "\n")
-    return try ProductCore.inputContext(instructions: target.instructions ? "" : context,
-      history: turns, speaker: speaker, text: text, caret: caret)
-  }
-  private func inputMediaLinks(_ ids: [UUID]) -> String {
-    ids.map { "[Attachment: media](boom-attachment:\($0.uuidString))\n" }.joined()
+    try captureInputContext(target).compile(text: text, caret: caret)
   }
   func generateInputCandidates(document: DocumentSnapshot, capture: TextInputCapture, count: Int,
     previous: CandidateBundle?, flag: CancellationFlag,
+    beforeCachePublication: @escaping @Sendable () async throws -> Void,
     publish: @escaping @MainActor (CandidateBundle) -> Void) async throws -> CandidateBundle {
     guard let runner = inputCompletionRunner, !isBusy else { throw CancellationError() }
     let seeds = (0..<count).map { _ in UInt64.random(in: .min ... .max) }
     let media = try await writingMedia(in: previous?.recipe.sourcePrompt ?? document.text, flag: flag)
+    let cacheOwner = PromptCacheOwner(namespace: inferenceCacheNamespace,
+      entity: capture.snapshot.id, route: .inputCompletion)
+    let pairedAdmission = makePairedContextAdmission(runner: runner,
+      purpose: baseRunner === runner ? .writing : .consultation, owner: cacheOwner, flag: flag) {
+      // The same captured target/text/caret/context validator used by successful
+      // cache publication also gates a peer release and the exact retry.
+      try await beforeCachePublication()
+    }
     let recipe: CompletionRecipe
     if let previous { recipe = previous.recipe }
     else {
       recipe = try await runner.completionRecipe(document: document, caret: document.text.utf16.count,
-        sources: media.map { $0.reference.source }, examples: [], profile: samplingProfile, maxTokens: 64, flag: flag, batchWidth: 3, media: media)
+        sources: media.map { $0.reference.source }, examples: [], profile: samplingProfile, maxTokens: 64, flag: flag, batchWidth: seeds.count, media: media,
+        cacheOwner: cacheOwner, pairedAdmission: pairedAdmission)
     }
     try flag.check(); try ProductCore.validateWritingRecipe(recipe)
     guard recipe.model == runner.identity else { throw BoomError.stale("Completion model changed.") }
+    let executionPolicy = try ProductCore.resolvedGenerationPolicy(recipe.generationPolicy, loaded: runner.generationPolicy)
     var bundle = previous ?? CandidateBundle(id: UUID(), recipe: recipe, origin: nil,
       candidates: [], selected: 0, input: capture)
     let start = bundle.candidates.count
@@ -256,8 +448,14 @@ extension WorkspaceModel {
       let orderedMedia = try (recipe.media ?? []).map { reference -> WritingMediaData in
         guard let payload = media.first(where: { $0.reference == reference }) else { throw BoomError.stale(reference.name) }; return payload
       }
+      // The input source ID survives glyph edits; textVersion identifies only a snapshot.
+      let joinedRetention = try makeJoinedRetentionRequest(owner: cacheOwner,
+        runner: runner, policy: executionPolicy, operationID: flag.operationID)
+      defer { finishJoinedRetentionRequest(joinedRetention) }
       let results = try await runner.runBatch(rawPrompt: recipe.prompt, media: orderedMedia, maxTokens: recipe.maxTokens,
         settings: recipe.settings, seeds: seeds, flag: flag, background: true,
+        cacheOwner: cacheOwner, executionPolicy: executionPolicy, joinedRetention: joinedRetention,
+        beforeCachePublication: beforeCachePublication, pairedAdmission: pairedAdmission,
         onCheckpoint: { updates in
           for update in updates {
             try await checkpointStore.checkpoint(update.progress, identity: generations[update.lane],
@@ -271,6 +469,7 @@ extension WorkspaceModel {
         bundle.candidates[index].promptTokens = result.promptTokens; bundle.candidates[index].outputTokens = result.outputTokens
         bundle.candidates[index].state = result.stopReason == "cancelled" ? .cancelled : (result.text.isEmpty ? .failed : .complete)
         bundle.candidates[index].stopReason = result.stopReason; bundle.candidates[index].stopTokenID = result.stopTokenID
+        bundle.candidates[index].executionOrigin = result.executionOrigin
       }
       try await saveInputCandidate(bundle)
       try flag.check(); publish(bundle)

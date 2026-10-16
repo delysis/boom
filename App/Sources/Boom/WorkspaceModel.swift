@@ -12,24 +12,29 @@ struct StoredProposal: Codable, Identifiable, Sendable {
   let messageID: UUID
   let patch: DocumentPatch
   let document: DocumentSnapshot
+  var capture: BoundedDocumentCapture? = nil
   let documents: [SourceReference]
   let attachments: [SourceReference]
   var status: String
   var appliedRevision: String? = nil
+  var targetWindow: ContextTextWindow? = nil
 }
 
 enum DocumentMergeConflict: Error { case changed }
 
-struct ConsultationReplay {
+struct ConsultationReplay: Sendable {
   let request: String
   let voice: Voice?
   let attachmentIDs: [UUID]
   let previousAttemptID: UUID?
+  let generationPolicy: ModelGenerationPolicy?
+  let promptContract: ConsultationPromptContract
 }
 
 enum AttachmentDestination {
   case chat(id: UUID)
-  case document(id: UUID, revision: String, range: NSRange)
+  case document(id: UUID, sessionID: UUID, arenaID: UUID, generation: UInt64, selectionEpoch: UInt64,
+    range: NSRange, selection: PagedNativeNavigationSelection)
 }
 struct CompletionSegment {
   let accepted: String
@@ -38,18 +43,92 @@ struct CompletionSegment {
   let sources: [SourceReference]
 }
 
+private struct BoundedConsultationContext: Sendable {
+  let captures: [BoundedDocumentCapture]
+  var omittedSources: Int = 0
+  let documents: [DocumentSnapshot]
+  init(captures: [BoundedDocumentCapture], omittedSources: Int = 0) {
+    self.captures = captures; self.omittedSources = omittedSources
+    documents = captures.map(\.modelSnapshot)
+  }
+  var sources: [SourceReference] { captures.map(\.source) }
+  var promptSources: [SourceReference] {
+    documents.map { SourceReference(id: $0.id, title: $0.title, digest: $0.revision, kind: "document") }
+  }
+}
+
 @MainActor final class WorkspaceModel: ObservableObject {
   enum InputPane: Equatable { case document, chat }
   @Published var state: WorkspaceState
-  @Published var documents: [DocumentSnapshot]
+  @Published private(set) var documentIndices: [DocumentIndex] = []
+  @Published private(set) var pagedViewport: PagedDocumentViewport?
+  @Published private(set) var pagedSelectedRecord: PagedDocumentRootRecord?
+  private(set) var pagedEngine: PagedTextEngineAdapter?
+  private(set) var pagedPublisher: PagedWorkspacePublisher?
+  private var pagedBackend: PagedNativeStorageBackend?
+  private(set) var pagedSession: PagedNativeSession?
+  private(set) var pagedInput: PagedNativeInputOwner?
+  private(set) var pagedCommands: PagedNativeUndoOwner?
+  private var pagedImported: PagedTextCustodiedValue<PagedTextImportedRevision>?
+  private var pagedInitialized: PagedTextCustodiedValue<PagedDocumentRootRecord>?
+  private var pagedFirstFailure: Error?
+  private var pagedTransition = false
+  private var pagedShutdownRequested = false
+  private var saveEntered = false
+  private var explicitSaveRequested = false
+  private var saveRequestID = UUID()
+  private var saveTaskID: UUID?
+  private var saveTaskWasEntered = false
+  private var captureCache: [UUID: BoundedDocumentCapture] = [:]
+  private var writingCapture: BoundedDocumentCapture?
+  var completionSourceIdentity: String? {
+    guard let session = pagedSession, pagedInput?.activeView?.inputBinding?.state == .active else { return nil }
+    return session.sessionID.uuidString + "/" + session.arenaID.uuidString + "/" + String(session.generation)
+  }
+  private var consultationCaptures: [UUID: BoundedDocumentCapture] = [:]
+  var usesPagedStorage: Bool { true }
+  var selectedDocumentID: UUID? { state.selectedDocument }
+  var selectedChatID: UUID? { state.selectedChat }
+  var themeName: String { state.theme }
+  var autocompleteEnabled: Bool { state.autocomplete }
+  var hasSelectedDocument: Bool { pagedSelectedRecord != nil }
+  private func preferredModel(_ purpose: String) -> String? { state.preferredModels?[purpose] }
+  /// Complete small request captures only. The library uses documentIndices;
+  /// a partial range is never returned as a whole DocumentSnapshot.
+  var documents: [DocumentSnapshot] { captureCache.values.compactMap { $0.completeSnapshot } }
   @Published var selectedDocumentIDs: Set<UUID> = []
   @Published var selectedChatIDs: Set<UUID> = []
   @Published var composerFocusEpoch = 0
-  @Published var draft = ""
+  @Published var draft = "" {
+    didSet {
+      draftHasContent = draft.unicodeScalars.contains { !CharacterSet.whitespacesAndNewlines.contains($0) }
+      draftVersion = UUID()
+      retainComposerDraft()
+    }
+  }
+  private(set) var draftHasContent = false
+  private(set) var draftVersion = UUID()
   @Published var mode: InteractionMode = .ask
-  @Published var pendingAttachments: [UUID] = []
+  @Published var pendingAttachments: [UUID] = [] { didSet { if pendingAttachments != oldValue { retainComposerDraft() } } }
   @Published var isBusy = false
+  @Published private(set) var pendingConsultationCount = 0
+  private struct PendingConsultation: Sendable {
+    let chat: ChatRecord
+    let request: String
+    let interaction: InteractionMode
+    let promptContract: ConsultationPromptContract
+    let selectedIDs: [UUID]
+    let style: ConsultationStyle
+    let replay: ConsultationReplay?
+    let userMessageID: UUID?
+  }
+  private var pendingConsultations: [PendingConsultation] = []
+  var canQueueConsultation: Bool {
+    canInfer && mode == .ask && consultationStyle == .separate && authoredChatRole == nil
+      && selectedChat != nil && !pagedShutdownRequested
+  }
   @Published var status = "Install a consultation model to begin"
+  @Published var nativeInputIssue: String?
   @Published var errorMessage: String?
   @Published var composerIssue: String?
   @Published var streamingText = ""
@@ -61,7 +140,7 @@ struct CompletionSegment {
   @Published var consultationStyle: ConsultationStyle = .separate
   @Published var showingChatInstructions: UUID?
   @Published var editingChatMessage: UUID?
-  @Published var authoredChatRole: Role?
+  @Published var authoredChatRole: Role? { didSet { if authoredChatRole != oldValue { retainComposerDraft() } } }
   @Published var samplingProfile: SamplingProfile = .standard
   @Published var candidates: CandidateBundle?
   @Published var showingCandidates = false
@@ -76,19 +155,37 @@ struct CompletionSegment {
     if message.state == .complete { speechOutput.speak(message.text) }
   }
   @Published var editingWritingExamples: WritingExamplesRequest?
-  @Published var editingLocked = false
-  @Published var backupRequest: BackupRequest?
-  @Published var writingExampleIDs: [UUID] = []
+  var openRestoredWorkspace: ((URL) -> Void)?
+  @Published var writingExampleIDs: [UUID] = [] {
+    didSet {
+      if writingExampleIDs != oldValue {
+        state.writingExampleIDs = writingExampleIDs
+        scheduleSave()
+      }
+    }
+  }
+  private var composerOwner: ComposerOwner?
+  var hasComposerOwner: Bool {
+    guard let composerOwner else { return false }
+    return composerOwner == selectedComposerOwner
+  }
+  private var restoringComposer = false
   let layout: ProductLayout
   @Published var librarySearch = "" { didSet { if oldValue != librarySearch { refreshSearch() } } }
   @Published private(set) var documentSearch: [UUID: DocumentSearchMatches] = [:]
+  @Published private(set) var matchingDocumentIDs: Set<UUID> = []
   @Published private(set) var matchingChatIDs: Set<UUID> = []
   @Published private(set) var matchingVoiceIDs: Set<UUID> = []
   @Published private(set) var searchIssue: String?
-  private var searchedQuery = ""
+  @Published private var searchedQuery = ""
   private var searchEpoch: UInt64 = 0
   private var searchTask: Task<Void, Never>?
+  private var visibleSearchTask: Task<Void, Never>?
   let store: WorkspaceStore
+  let inferenceCacheNamespace = UUID()
+  private var joinedRetentionEpoch = UUID()
+  private var joinedRetentionClosed = false
+  private var joinedRetentionGrants: [UUID: JoinedKVRetentionAuthorization] = [:]
   private(set) var mlxRunner: MLXGemmaRunner?
   private(set) var baseRunner: MLXGemmaRunner?
   private var modelDirectories: [ModelPurpose: URL] = [:]
@@ -104,15 +201,18 @@ struct CompletionSegment {
   var selectedMLXRunner: MLXGemmaRunner? { mlxRunner }
   var completionRunner: MLXGemmaRunner? { baseRunner }
   func documentAttachmentDestination(id: UUID, range: NSRange) -> AttachmentDestination? {
-    guard let document = documents.first(where: { $0.id == id }) else { return nil }
-    return .document(id: id, revision: document.revision, range: range)
+    guard selectedDocumentID == id, let session = pagedSession, let input = pagedInput,
+      let observation = try? input.observeSelection(), observation.range == range,
+      let selection = try? input.currentDocumentSelection() else { return nil }
+    return .document(id: id, sessionID: session.sessionID, arenaID: session.arenaID,
+      generation: session.generation, selectionEpoch: observation.selectionEpoch, range: range, selection: selection)
   }
   private func chatAttachmentDestination() throws -> AttachmentDestination {
     guard !isBusy else { throw BoomError.unavailable("Finish the current action before attaching a file.") }
     if let id = state.selectedChat, state.chats.contains(where: { $0.id == id }) {
       return .chat(id: id)
     }
-    scheduleSave()
+    retainComposerDraft()
     var next = state
     let chat = ChatRecord(attachedDocumentID: layout.isAuthor ? state.selectedDocument : nil)
     next.chats.append(chat)
@@ -120,6 +220,7 @@ struct CompletionSegment {
     next.showChat = true
     scheduleSave()
     state = next
+    transferDocumentDraftToChat()
     selectedChatIDs = [chat.id]
     compactPane = "chat"
     return .chat(id: chat.id)
@@ -141,20 +242,17 @@ struct CompletionSegment {
     catch { report(error) }
   }
   func chooseDocumentAttachmentFiles() {
-    guard let document = selectedDocument else {
-      report(BoomError.unavailable("Open a document before attaching a file to it."))
-      return
+    guard let id = selectedDocumentID, let view = pagedInput?.activeView,
+      let destination = documentAttachmentDestination(id: id, range: view.selectedRange()) else {
+      report(BoomError.unavailable("Open a document before attaching a file to it.")); return
     }
-    let range: NSRange
-    if let editor, editor.documentID == document.id { range = editor.selectedRange() }
-    else { range = NSRange(location: document.text.utf16.count, length: 0) }
-    guard let destination = documentAttachmentDestination(id: document.id, range: range) else { return }
     chooseAttachmentFiles(to: destination)
   }
   var canInfer: Bool { mlxRunner != nil || modelDirectories[.consultation] != nil }
   var inferenceName: String { canInfer ? "Gemma 4" : "No model" }
   var baseReady: Bool { baseRunner != nil || modelDirectories[.writing] != nil || (writingUsesConsultation && canInfer) }
   private var foreground: Task<Void, Never>?
+  private var recordingAttachmentTask: Task<Void, Error>?
   private var activeFlag: CancellationFlag?
   private var activeID: UUID?
   private var ghostTask: Task<Void, Never>?
@@ -163,7 +261,7 @@ struct CompletionSegment {
     init(_ value: TextInputCompletion) { self.value = value }
   }
   private var inputCompletions: [InputCompletionReference] = []
-  var inputContextCache: (ChatRecord, String)?
+  var inputContextCache: (id: UUID, version: UUID, digest: String)?
   func registerInputCompletion(_ input: TextInputCompletion) {
     inputCompletions.removeAll { $0.value == nil }
     inputCompletions.append(InputCompletionReference(input))
@@ -171,13 +269,78 @@ struct CompletionSegment {
   private func cancelInputCompletions() {
     for input in inputCompletions { input.value?.invalidateGhost() }
   }
+  func makeJoinedRetentionRequest(owner: PromptCacheOwner?, runner: MLXGemmaRunner,
+    policy: ModelGenerationPolicy, operationID: UUID) throws -> JoinedKVRetentionRequest? {
+    guard let owner, !joinedRetentionClosed, owner.namespace == inferenceCacheNamespace,
+      joinedRetentionOwnerIsLive(owner),
+      let binding = try runner.joinedRetentionBinding(owner: owner, workspaceEpoch: joinedRetentionEpoch,
+        operationID: operationID, policy: policy) else { return nil }
+    let auth = JoinedKVRetentionAuthorization(binding: binding)
+    joinedRetentionGrants[auth.id] = auth
+    return JoinedKVRetentionRequest(authorization: auth, checkpointIsDurable: true,
+      authorizeAfterJoin: { [weak self] in
+        guard let owner = self else { return false }
+        return await owner.authorizeJoinedRetention(auth, runner: runner)
+      })
+  }
+  func finishJoinedRetentionRequest(_ request: JoinedKVRetentionRequest?) {
+    guard let auth = request?.authorization else { return }
+    auth.revoke()
+    if joinedRetentionGrants[auth.id] === auth { joinedRetentionGrants.removeValue(forKey: auth.id) }
+  }
+  private func joinedRetentionOwnerIsLive(_ owner: PromptCacheOwner) -> Bool {
+    switch owner.route {
+    case .consultation: return state.chats.contains { $0.id == owner.entity }
+    case .writing: return documentIndices.contains { $0.id == owner.entity }
+    case .inputCompletion:
+      return inputCompletions.contains { $0.value?.id == owner.entity && $0.value?.joinedRetentionOwnerIsLive == true }
+    }
+  }
+  private func authorizeJoinedRetention(_ auth: JoinedKVRetentionAuthorization,
+    runner: MLXGemmaRunner) -> Bool {
+    let b = auth.binding
+    let current: MLXGemmaRunner?
+    switch b.owner.route {
+    case .consultation: current = mlxRunner
+    case .writing: current = baseRunner
+    case .inputCompletion: current = inputCompletionRunner
+    }
+    guard !joinedRetentionClosed, b.workspaceEpoch == joinedRetentionEpoch,
+      b.owner.namespace == inferenceCacheNamespace, joinedRetentionOwnerIsLive(b.owner),
+      joinedRetentionGrants[auth.id] === auth, current === runner,
+      b.runnerEpoch == runner.cacheRunnerEpoch, b.modelIdentity == runner.identity,
+      b.processorIdentity == runner.processorIdentity else { auth.revoke(); return false }
+    // This grants historical exact-token KV only. The old UI/source/checkpoint
+    // hooks still require the captured source, current flags, caret and UI epoch.
+    return auth.approve(binding: b)
+  }
+  private func revokeJoinedRetentions(runnerEpoch: UUID? = nil) {
+    let ids = joinedRetentionGrants.compactMap { id, grant in
+      runnerEpoch == nil || grant.binding.runnerEpoch == runnerEpoch ? id : nil
+    }
+    for id in ids { joinedRetentionGrants.removeValue(forKey: id)?.revoke() }
+    for runner in [mlxRunner, baseRunner, inputCompletionRunner].compactMap({ $0 })
+      where runnerEpoch == nil || runner.cacheRunnerEpoch == runnerEpoch {
+      runner.invalidatePromptCacheRetention(reason: "owner_or_model_revoked")
+    }
+  }
+  func revokeInputJoinedRetentions(_ id: UUID) {
+    let ids = joinedRetentionGrants.compactMap { key, grant in
+      grant.binding.owner.route == .inputCompletion && grant.binding.owner.entity == id ? key : nil
+    }
+    for key in ids { joinedRetentionGrants.removeValue(forKey: key)?.revoke() }
+    // Revoke this input's in-flight salvage grant, without discarding already
+    // valid historical KV owned by another input/document in this workspace.
+    // Full workspace, model, privacy and memory revocation still clear runners.
+  }
   private var writingFlag: CancellationFlag?
   private var ghostFlag: CancellationFlag?
   private var pressureWatch: MemoryPressureWatch?
-  private var saveTask: Task<Void, Never>?
-  private var exportTasks: [URL: (id: UUID, task: Task<Void, Never>)] = [:]
-  private var dirty = Set<UUID>()
-  private var undoManagers: [UUID: UndoManager] = [:]
+  private var saveTask: Task<Void, Error>?
+  private var exportTasks: [URL: (id: UUID, task: Task<Void, Never>, pagedResult: Task<URL, Error>?,
+    clipboardResult: Task<Void, Error>?)] = [:]
+  private var pagedExportTaskCount = 0
+  private static let maximumPagedExportTasks = 8
   private var ghostSources: [SourceReference] = []
   private var epoch: UInt64 = 0
   private(set) var caret = 0
@@ -218,32 +381,24 @@ struct CompletionSegment {
     layout = try ProductCore.layout()
     if let storeOverride { store = storeOverride }
     else { store = try await detachedWork { try WorkspaceStore() } }
-    let loaded = try await store.load().get()
-    self.state = loaded.0
-    self.documents = loaded.1
-    selectedDocumentIDs = Set(state.selectedDocument.map { [$0] } ?? [])
-    selectedChatIDs = Set(state.selectedChat.map { [$0] } ?? [])
-    if let chat = state.selectedChat { pendingAttachments = state.recordingDrafts?[chat] ?? [] }
-    if layout.isAuthor && documents.isEmpty { try newDocument() }
-    if state.chats.isEmpty && !layout.isAuthor { try newChat() }
-    if let id = state.selectedDocument {
-      let history = try await store.candidateHistory(for: id, ids: state.candidateIDs)
-      savedExplorations = history.explorations
-      latestSavedCandidate = history.latest
-      if let latest = history.latest { candidates = try await store.readCandidate(latest) }
-    }
+    state = WorkspaceState()
     compactPane = layout.primaryPane
-    #if BOOM_UI_TEST
-    if let index = state.chats.firstIndex(where: { $0.id == state.selectedChat }),
-      state.chats[index].messages.isEmpty {
-      state.chats[index].messages = [
-        ChatMessage(role: .user, text: "A sample request"),
-        ChatMessage(role: .assistant, text: "A sample reply."),
-      ]
-      scheduleSave()
+    do {
+      try await store.acquireExclusiveWorkspace()
+      state = try await store.loadState()
+      documentIndices = state.documents
+      try await openPagedWorkspace(reclaimCold: true)
+      selectedDocumentIDs = Set(state.selectedDocument.map { [$0] } ?? [])
+      selectedChatIDs = Set(state.selectedChat.map { [$0] } ?? [])
+      writingExampleIDs = state.writingExampleIDs ?? []
+      restoreComposerDraft()
+      if layout.isAuthor && documentIndices.isEmpty { try await createPagedDocument(flag: CancellationFlag()) }
+      if !layout.isAuthor && state.chats.isEmpty { try newChat() }
+      refreshContinuationHistory()
+      try await flush()
+    } catch {
+      throw WorkspacePagedStartupFailure(original: error, model: self)
     }
-    #endif
-    try await flush()
     pressureWatch = MemoryPressureWatch { [weak self] critical in
       Task { @MainActor in self?.handleMemoryPressure(critical: critical) }
     }
@@ -255,17 +410,33 @@ struct CompletionSegment {
     }
   }
   private func handleMemoryPressure(critical: Bool) {
+    revokeJoinedRetentions()
     if critical { cancel() }
     let inactive: ModelPurpose = writingFlag != nil ? .consultation : .writing
     Task {
       if critical || !writingUsesConsultation { await releaseRunner(inactive) }
+      await joinAndClearPromptCaches()
       await reclaimModelCache()
       await VideoPreparationCache.shared.release()
     }
     status = "Memory pressure released the inactive model. It will reload when needed."
   }
-  func documentMatchesSearch(_ document: DocumentSnapshot) -> Bool {
-    librarySearch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || searchedQuery != librarySearch || documentSearch[document.id] != nil
+  /// Stable published library value. Text callbacks never rebuild this array.
+  var selectedDocumentIndex: DocumentIndex? { documentIndices.first { $0.id == selectedDocumentID } }
+  func appendDocument(_ document: DocumentSnapshot) {
+    work("Creating document…") { [weak self] flag in
+      try await self?.importAuthoredDocument(document, selecting: false, flag: flag)
+    }
+  }
+  private func updateDocumentIndexTitle(_ id: UUID, title: String) {
+    guard let index = documentIndices.firstIndex(where: { $0.id == id }), documentIndices[index].title != title else { return }
+    documentIndices[index].title = title
+  }
+  func documentMatchesSearch(_ document: DocumentIndex) -> Bool { documentMatchesSearch(id: document.id) }
+  func documentMatchesSearch(_ document: DocumentSnapshot) -> Bool { documentMatchesSearch(id: document.id) }
+  private func documentMatchesSearch(id: UUID) -> Bool {
+    librarySearch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      || searchedQuery != librarySearch || matchingDocumentIDs.contains(id)
   }
   func chatMatchesSearch(_ chat: ChatRecord) -> Bool {
     librarySearch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || searchedQuery != librarySearch || matchingChatIDs.contains(chat.id)
@@ -274,52 +445,68 @@ struct CompletionSegment {
     librarySearch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || searchedQuery != librarySearch || matchingVoiceIDs.contains(voice.id)
   }
   private func refreshSearch() {
-    searchEpoch &+= 1; searchTask?.cancel()
+    let previous = searchTask
+    searchEpoch &+= 1; previous?.cancel()
     let query = librarySearch, identity = searchEpoch
+    documentSearch = [:]
+    searchedQuery = ""
+    matchingDocumentIDs = []; matchingChatIDs = []; matchingVoiceIDs = []
+    refreshVisibleSearch()
     searchIssue = nil
     if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-      searchedQuery = query; documentSearch = [:]; matchingChatIDs = []; matchingVoiceIDs = []
+      searchedQuery = query; matchingDocumentIDs = []; documentSearch = [:]
+      matchingChatIDs = []; matchingVoiceIDs = []
       return
     }
-    editor?.clearGhost()
-    let capturedDocuments = documents, capturedChats = state.chats, capturedVoices = state.voices
+    guard !pagedTransition, !pagedShutdownRequested else { return }
+    let headers = documentIndices, chats = state.chats, voices = state.voices
     let imported = state.importedFiles ?? [:]
     let folderNames = Dictionary(uniqueKeysWithValues: (state.importedFolders ?? []).map { ($0.id, $0.name) })
     searchTask = Task { [weak self] in
+      if let previous { await previous.value }
       do {
-        try await Task.sleep(nanoseconds: 120_000_000)
-        let results = try await detachedWork(priority: .utility) {
-          var documents: [UUID: DocumentSearchMatches] = [:], chats = Set<UUID>(), voices = Set<UUID>()
-          for document in capturedDocuments {
+        try Task.checkCancellation()
+        try await Task.sleep(for: .milliseconds(120))
+        let metadata = try await detachedWork(priority: .utility) {
+          var documentIDs = Set<UUID>(), chatIDs = Set<UUID>(), voiceIDs = Set<UUID>()
+          for document in headers {
             try Task.checkCancellation()
-            let matches = try ProductCore.search(document.text, query: query)
-            let importedPath = imported[document.id].map { file in
+            let path = imported[document.id].map { file in
               file.folderID.flatMap { folderNames[$0] }.map { $0 + "/" + file.path } ?? file.path
             } ?? ""
-            let title = try ProductCore.search(document.title + "\n" + importedPath, query: query)
-            if matches.hasMatches || title.hasMatches {
-              documents[document.id] = DocumentSearchMatches(query: query, revision: document.revision, matches: matches)
-            }
+            if try ProductCore.search(document.title + "\n" + path, query: query).hasMatches { documentIDs.insert(document.id) }
           }
-          for chat in capturedChats {
+          for chat in chats {
             try Task.checkCancellation()
             var found = try ProductCore.search(chat.title + "\n" + (chat.instructions ?? ""), query: query).hasMatches
             for message in chat.messages where !found {
               try Task.checkCancellation()
               found = try ProductCore.search(message.text, query: query).hasMatches
             }
-            if found { chats.insert(chat.id) }
+            if found { chatIDs.insert(chat.id) }
           }
-          for voice in capturedVoices {
+          for voice in voices {
             try Task.checkCancellation()
-            if try chats.contains(voice.id) || ProductCore.search(voice.name + "\n" + voice.slug + "\n" + voice.instructions, query: query).hasMatches {
-              voices.insert(voice.id)
+            if try chatIDs.contains(voice.id) || ProductCore.search(voice.name + "\n" + voice.slug + "\n" + voice.instructions, query: query).hasMatches {
+              voiceIDs.insert(voice.id)
             }
           }
-          return (documents, chats, voices)
+          return (documentIDs, chatIDs, voiceIDs)
         }
         guard let self, self.searchEpoch == identity else { return }
-        self.documentSearch = results.0; self.matchingChatIDs = results.1; self.matchingVoiceIDs = results.2
+        self.matchingDocumentIDs = metadata.0; self.matchingChatIDs = metadata.1; self.matchingVoiceIDs = metadata.2
+        let (engine, publisher) = try self.pagedOwners()
+        for header in headers where !metadata.0.contains(header.id) {
+          try Task.checkCancellation()
+          let read = try await engine.currentDocumentRecordRetaining(publisher, documentID: header.id)
+          let revision = read.value.document.revision
+          try await engine.abandonJoinedRootOutput(read.lease)
+          if try await self.sourceContains(query, revision: revision, engine: engine) {
+            guard self.searchEpoch == identity else { return }
+            self.matchingDocumentIDs.insert(header.id)
+          }
+        }
+        guard self.searchEpoch == identity else { return }
         self.searchedQuery = query
       } catch is CancellationError {} catch {
         guard let self, self.searchEpoch == identity else { return }
@@ -327,10 +514,81 @@ struct CompletionSegment {
       }
     }
   }
-  var selectedDocument: DocumentSnapshot? { documents.first { $0.id == state.selectedDocument } }
+  /// Match only the real bounded projection, after input has returned. Neither
+  /// this task nor its highlights grant source or replacement authority.
+  private func refreshVisibleSearch() {
+    let previous = visibleSearchTask
+    previous?.cancel()
+    let query = librarySearch, identity = searchEpoch
+    if let selectedDocumentID { documentSearch.removeValue(forKey: selectedDocumentID) }
+    visibleSearchTask = Task { [weak self] in
+      if let previous { await previous.value }
+      do {
+        try Task.checkCancellation()
+        guard let self, !self.pagedTransition, !self.pagedShutdownRequested else { return }
+        if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+          self.pagedInput?.activeView?.highlightSearch([], identity: nil)
+          return
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        guard let session = self.pagedSession, let view = self.pagedInput?.activeView,
+          !view.hasMarkedText(), self.searchEpoch == identity else { return }
+        let arena = session.arenaID, generation = session.generation
+        let documentID = self.selectedDocumentID, text = view.string
+        let textVersion = view.sourceVersion
+        let revision = session.logicalWindow.snapshot.rootID.uuidString
+        let matches = try await detachedWork(priority: .utility) {
+          try Task.checkCancellation()
+          return try ProductCore.search(text, query: query)
+        }
+        try Task.checkCancellation()
+        guard self.pagedSession === session, self.pagedInput?.activeView === view,
+          session.arenaID == arena, session.generation == generation,
+          self.selectedDocumentID == documentID, self.searchEpoch == identity,
+          view.sourceVersion == textVersion, !view.hasMarkedText() else { return }
+        view.highlightSearch(matches.ranges.map(\.native),
+          identity: documentID.map { $0.uuidString + "\n" + query })
+        if let documentID, matches.hasMatches {
+          self.documentSearch[documentID] = DocumentSearchMatches(query: query,
+            revision: revision, textVersion: textVersion, matches: matches)
+        }
+      } catch is CancellationError {} catch {
+        guard let self, self.searchEpoch == identity else { return }
+        self.searchIssue = error.localizedDescription
+      }
+    }
+  }
+  private func sourceContains(_ query: String, revision: PagedTextRevision,
+    engine: PagedTextEngineAdapter) async throws -> Bool {
+    var byte: UInt64 = 0, overlap = ""
+    while byte < revision.summary.bytes {
+      try Task.checkCancellation()
+      let read = try await engine.windowRetaining(revision, byteStart: byte,
+        maximumBytes: PagedTextWindow.maximumBytes, priority: .background)
+      let window = read.value
+      try await engine.abandonJoinedRootOutput(read.lease)
+      try Task.checkCancellation()
+      let end = window.byteStart + UInt64(window.text.utf8.count)
+      guard end > byte, end <= revision.summary.bytes else { throw BoomError.invalid("Search source did not advance its bounded window.") }
+      let previous = overlap
+      let result = try await detachedWork(priority: .utility) {
+        let found = try ProductCore.search(previous + window.text, query: query).hasMatches
+        // Literal query admission is <=512 UTF-8 bytes. Keeping 2048 bytes
+        // spans its possible Unicode case variants across a chunk boundary.
+        let tail = Array(window.text.utf8.suffix(2048))
+        let first = tail.firstIndex { $0 & 0xC0 != 0x80 } ?? tail.endIndex
+        return (found, String(decoding: tail[first...], as: UTF8.self))
+      }
+      if result.0 { return true }
+      overlap = result.1; byte = end
+      await Task.yield()
+    }
+    return false
+  }
+  var selectedDocument: DocumentSnapshot? { selectedDocumentID.flatMap { captureCache[$0]?.completeSnapshot } }
   var selectedChat: ChatRecord? { state.chats.first { $0.id == state.selectedChat } }
   var proposedForChat: [StoredProposal] {
-    state.proposals.filter { $0.chatID == state.selectedChat }
+    return state.proposals.filter { $0.chatID == state.selectedChat }
   }
   var voiceMatches: [Voice] {
     guard let range = draft.range(of: #"(?:^|\s)@([a-z0-9_-]*)$"#, options: .regularExpression)
@@ -338,69 +596,179 @@ struct CompletionSegment {
     let query = draft[range].trimmingCharacters(in: .whitespacesAndNewlines).dropFirst()
     return state.voices.filter { $0.slug.hasPrefix(query) }.prefix(6).map { $0 }
   }
-  func undoManager(_ id: UUID) -> UndoManager {
-    if let manager = undoManagers[id] { return manager }
-    let manager = UndoManager()
-    manager.levelsOfUndo = 100
-    undoManagers[id] = manager
-    return manager
-  }
   func report(_ error: Error) {
     errorMessage = error.localizedDescription
     status = error.localizedDescription
   }
   func dismissError() { errorMessage = nil }
-  func finishComposition() { editor?.finishComposition() }
+  func finishComposition() {
+    // Invoke the actual active input client; source/close admission still waits
+    // for its real unmark and any resulting edit before moving the root.
+    guard let view = pagedInput?.activeView, view.hasMarkedText() else { return }
+    view.unmarkText()
+  }
+  private var selectedComposerOwner: ComposerOwner? {
+    if let chat = state.selectedChat, state.chats.contains(where: { $0.id == chat }) {
+      return ComposerOwner(kind: .chat, id: chat)
+    }
+    if let document = state.selectedDocument, documentIndices.contains(where: { $0.id == document }) {
+      return ComposerOwner(kind: .document, id: document)
+    }
+    return nil
+  }
+  private func retainComposerDraft(schedule: Bool = true) {
+    guard !restoringComposer, let owner = composerOwner,
+      owner.kind == .chat ? state.chats.contains(where: { $0.id == owner.id })
+        : documentIndices.contains(where: { $0.id == owner.id }) else { return }
+    var drafts = (state.composerDrafts ?? []).filter { $0.owner != owner }
+    if !draft.isEmpty || !pendingAttachments.isEmpty {
+      drafts.append(ComposerDraft(owner: owner, text: draft, attachments: pendingAttachments,
+        authoredRole: authoredChatRole))
+    }
+    if !drafts.isEmpty || state.composerDrafts != nil { state.composerDrafts = drafts }
+    if schedule { scheduleSave() }
+  }
+  private func restoreComposerDraft() {
+    restoringComposer = true
+    defer { restoringComposer = false }
+    composerOwner = selectedComposerOwner
+    let retained = state.composerDrafts?.first { $0.owner == composerOwner }
+    draft = retained?.text ?? ""
+    pendingAttachments = retained?.attachments ?? (state.selectedChat.flatMap { state.recordingDrafts?[$0] } ?? [])
+    mode = .ask
+    authoredChatRole = retained?.authoredRole
+  }
+  private func transferDocumentDraftToChat() {
+    if let owner = composerOwner, owner.kind == .document {
+      state.composerDrafts?.removeAll { $0.owner == owner }
+    }
+    composerOwner = selectedComposerOwner
+    retainComposerDraft()
+  }
   func flush() async throws {
-    saveTask?.cancel()
-    saveTask = nil
-    let captured = documents.filter { dirty.contains($0.id) }
-    // The editable source is the chat; portable voice records are its immutable snapshots.
-    for voice in state.voices {
-      if let chat = state.chats.first(where: { $0.id == voice.id }) {
-        let revision = try ProductCore.pinnedVoice(chat, slug: voice.slug,
-          occupied: state.voices.filter { $0.id != chat.id }.map(\.slug))
-        retainVoice(revision)
+    if let failure = await joinWorkspaceSaveTasks() { throw failure }
+    let request = UUID(); saveRequestID = request
+    let task = startWorkspaceSave(request: request, expedited: true)
+    let outcome = await task.result
+    let followingFailure = await joinWorkspaceSaveTasks()
+    try outcome.get()
+    if let followingFailure { throw followingFailure }
+  }
+  func save() {
+    guard !pagedShutdownRequested, !pagedTransition else { return }
+    explicitSaveRequested = true
+    scheduleSave()
+  }
+  private func performWorkspaceFlush(retryFailedSave: Bool = false) async throws {
+    let trace = PerformanceTrace.begin("Workspace.Flush")
+    defer { PerformanceTrace.end("Workspace.Flush", trace) }
+    if let commands = pagedCommands { try await commands.joinPendingCommand() }
+    if let session = pagedSession {
+      if retryFailedSave {
+        try requirePagedOperation()
+        await session.joinPendingSave()
+        guard pagedSession === session else { throw BoomError.stale("The selected saver changed during Save.") }
+        if let identity = session.failedSaveIdentity {
+          _ = try await session.retryFailedSave(expectedIdentity: identity)
+        }
       }
+      _ = try await session.flush(through: session.generation)
     }
-    state.documents = documents.map { DocumentIndex(id: $0.id, title: $0.title) }
+    try await saveWorkspaceMetadata()
+  }
+  private func saveWorkspaceMetadata() async throws {
+    retainComposerDraft(schedule: false)
+    state.documents = documentIndices
     let snapshot = state
-    try await store.save(snapshot, documents: captured)
-    if !librarySearch.isEmpty { refreshSearch() }
-    for saved in captured where documents.first(where: { $0.id == saved.id })?.revision == saved.revision {
-      dirty.remove(saved.id)
-    }
+    try await store.saveState(snapshot)
   }
   func scheduleSave() {
-    saveTask?.cancel()
-    saveTask = Task { [weak self] in
+    guard !pagedShutdownRequested, !pagedTransition else { return }
+    let request = UUID(); saveRequestID = request
+    if saveEntered { return }
+    _ = startWorkspaceSave(request: request, expedited: explicitSaveRequested)
+  }
+  /// The existing saver owns every workspace write. Its token prevents an
+  /// older join from clearing a replacement; neither token nor saveEntered
+  /// is consulted by native input, selection or presentation.
+  private func startWorkspaceSave(request: UUID, expedited: Bool,
+    cancelSleepingPredecessor: Bool = true) -> Task<Void, Error> {
+    precondition(!saveEntered)
+    let previous = saveTask
+    let cancelledPrevious = cancelSleepingPredecessor && !saveTaskWasEntered
+    if cancelledPrevious { previous?.cancel() }
+    let id = UUID(); saveTaskID = id
+    // Immediate callers reserve the actual saver before their first yield.
+    saveEntered = expedited; saveTaskWasEntered = expedited
+    let task = Task<Void, Error> { [weak self] in
+      let preceding: Result<Void, Error>?
+      if let previous { preceding = await previous.result }
+      else { preceding = nil }
+      guard let self else { return }
+      var entered = expedited
+      defer {
+        if self.saveTaskID == id {
+          self.saveEntered = false
+          if !self.pagedShutdownRequested, !self.pagedTransition,
+            self.saveRequestID != request {
+            // The replacement retains this still-returning Task and joins
+            // its real result before entering the next save.
+            _ = self.startWorkspaceSave(request: self.saveRequestID,
+              expedited: self.explicitSaveRequested, cancelSleepingPredecessor: false)
+          }
+        }
+      }
       do {
-        try await Task.sleep(nanoseconds: 350_000_000)
-        try await self?.flush()
-      } catch is CancellationError {} catch { self?.report(error) }
+        if let preceding, case .failure(let error) = preceding,
+          !(cancelledPrevious && error is CancellationError) {
+          // The old actual task retains its error. A new metadata request
+          // does not retry native publication; Session's fence remains until
+          // an explicit Save supplies its exact failed identity below.
+          self.status = error.localizedDescription
+        }
+        if !expedited && !self.explicitSaveRequested {
+          try await Task.sleep(for: .milliseconds(350))
+        }
+        try Task.checkCancellation()
+        guard self.saveTaskID == id else { throw CancellationError() }
+        let explicit = self.explicitSaveRequested
+        self.explicitSaveRequested = false
+        self.saveEntered = true; self.saveTaskWasEntered = true; entered = true
+        try await self.performWorkspaceFlush(retryFailedSave: explicit)
+      } catch {
+        if entered || !(error is CancellationError) { self.status = error.localizedDescription }
+        throw error
+      }
     }
+    saveTask = task
+    return task
+  }
+  /// Drain the actual current and replacement handles. Only a known canceled
+  /// pre-entry sleeper is neutral; entered save errors are returned unchanged.
+  private func joinWorkspaceSaveTasks() async -> Error? {
+    var original: Error?
+    while let pending = saveTask, let id = saveTaskID {
+      let cancelledBeforeEntry = !saveTaskWasEntered
+      if cancelledBeforeEntry { pending.cancel() }
+      if case .failure(let error) = await pending.result,
+        !(cancelledBeforeEntry && error is CancellationError), original == nil {
+        original = error
+      }
+      if saveTaskID == id {
+        saveTask = nil; saveTaskID = nil; saveTaskWasEntered = false
+      }
+    }
+    return original
   }
   func newDocument() throws {
-    finishComposition()
-    cancel()
-    scheduleSave()
-    let document = DocumentSnapshot(title: "Untitled", text: "")
-    dirty.insert(document.id)
-    documents.append(document)
-    state.selectedDocument = document.id
-    mode = .ask
-    resetContinuationView()
-    selectedDocumentIDs = [document.id]
-    state.showDocument = true
-    compactPane = "document"
-    invalidateGhost()
-    scheduleSave()
+    try requirePagedOperation()
+    work("Creating document…") { [weak self] flag in try await self?.createPagedDocument(flag: flag) }
   }
   func newChat(about documentID: UUID? = nil) throws {
     finishComposition()
     cancel()
-    scheduleSave()
-    if let documentID, !documents.contains(where: { $0.id == documentID }) {
+    retainComposerDraft()
+    if let documentID, !documentIndices.contains(where: { $0.id == documentID }) {
       throw BoomError.invalid("The document for this chat no longer exists.")
     }
     let chat = ChatRecord(attachedDocumentID: documentID)
@@ -410,21 +778,19 @@ struct CompletionSegment {
     composerFocusEpoch &+= 1
     state.showChat = true
     compactPane = "chat"
-    pendingAttachments = []
-    draft = ""
-    mode = .ask
-    authoredChatRole = nil; showingChatInstructions = nil; editingChatMessage = nil
+    restoreComposerDraft()
+    showingChatInstructions = nil; editingChatMessage = nil
     scheduleSave()
   }
   private func ensureChatForSend() {
-    guard !isBusy, !draft.isEmpty, selectedChat == nil else { return }
+    guard !isBusy, draftHasContent, selectedChat == nil else { return }
     do { _ = try chatAttachmentDestination() }
     catch { report(error) }
   }
   func attachDocument(_ documentID: UUID?, to chatID: UUID) {
     guard !isBusy else { return }
     do {
-      if let documentID, !documents.contains(where: { $0.id == documentID }) {
+      if let documentID, !documentIndices.contains(where: { $0.id == documentID }) {
         throw BoomError.invalid("The selected document no longer exists.")
       }
       guard let index = state.chats.firstIndex(where: { $0.id == chatID }) else {
@@ -448,11 +814,13 @@ struct CompletionSegment {
         throw BoomError.invalid("Only your messages can be edited and continued.")
       }
       let nextChat = try original.branch(at: messageID, includeMessage: !editing)
+      retainComposerDraft()
       var next = state
       next.chats.append(nextChat)
       next.selectedChat = nextChat.id
       scheduleSave()
       state = next
+      restoreComposerDraft()
       selectedChatIDs = [nextChat.id]
       pendingAttachments = editing
         ? message.sources.filter { $0.kind == "attachment" }.map(\.id) : []
@@ -503,86 +871,63 @@ struct CompletionSegment {
   }
 
   func selectDocument(_ id: UUID, preservingSelection: Bool = false) {
-      guard documents.contains(where: { $0.id == id }) else { return }
-      finishComposition()
-      scheduleSave()
-      cancel()
-      state.selectedDocument = id
-      resetContinuationView()
-      if layout.isAuthor, selectedChat?.attachedDocumentID != id {
-        state.selectedChat = state.chats.last(where: { $0.attachedDocumentID == id })?.id
-        mode = .ask
-        draft = ""; pendingAttachments = []; showingChatInstructions = nil; editingChatMessage = nil
-      }
-      if !preservingSelection { selectedDocumentIDs = [id] }
-      state.showDocument = true
-        compactPane = "document"
-      caret = 0
-      invalidateGhost()
-      scheduleSave()
-      focusEditor(id)
+    guard !isBusy else { return }
+    cancel()
+    work("Opening document…") { [weak self] flag in
+      try await self?.selectPagedDocument(id, preservingSelection: preservingSelection, flag: flag)
+    }
   }
   func selectChat(_ id: UUID, preservingSelection: Bool = false) {
     guard state.chats.contains(where: { $0.id == id }) else { return }
     cancel()
+    retainComposerDraft()
     state.selectedChat = id
     if !preservingSelection { selectedChatIDs = [id] }
     composerFocusEpoch &+= 1
     state.showChat = true
     compactPane = "chat"
-    pendingAttachments = state.recordingDrafts?[id] ?? []
-    draft = ""
-    mode = .ask
-    authoredChatRole = nil; showingChatInstructions = nil; editingChatMessage = nil
+    restoreComposerDraft()
+    showingChatInstructions = nil; editingChatMessage = nil
     scheduleSave()
   }
   func focusEditor(_ id: UUID) {
-    DispatchQueue.main.async { [weak self] in
-      guard let self, self.state.selectedDocument == id, let editor = self.editor,
-        editor.documentID == id else { return }
-      editor.window?.makeFirstResponder(editor)
+    guard selectedDocumentID == id, let input = pagedInput, let view = input.activeView,
+      view.inputBinding?.state == .active else { return }
+    let identity = view.inputBinding?.identity, focusEpoch = composerFocusEpoch
+    // Target only this physical client after the normal representable mounts
+    // it; a later arena or composer focus request makes the callback inert.
+    DispatchQueue.main.async { [weak self, weak view] in
+      guard let self, let view, self.selectedDocumentID == id,
+        self.pagedInput === input, input.activeView === view,
+        view.inputBinding?.identity == identity, view.inputBinding?.state == .active,
+        self.composerFocusEpoch == focusEpoch else { return }
+      view.window?.makeFirstResponder(view)
     }
   }
   func deleteDocuments(_ ids: Set<UUID>) {
-    guard !isBusy, !ids.isEmpty else { return }
-    let targets = documents.filter { ids.contains($0.id) }
-    guard !targets.isEmpty, confirm(targets.count == 1 ? "Delete \(targets[0].title)?" : "Delete \(targets.count) documents?",
-      message: "Encrypted records move to macOS Trash after the library change is saved. Captured chat sources and receipts stay.") else { return }
-    finishComposition()
-    work("Deleting documents…") { [weak self] _ in
-      guard let self else { return }
-      try await self.flush()
-      self.documents.removeAll { ids.contains($0.id) }
-      self.state.importedFiles = self.state.importedFiles?.filter { !ids.contains($0.key) }
-      if self.state.selectedDocument.map(ids.contains) == true {
-        self.state.selectedDocument = self.documents.first?.id
-        self.caret = 0
-        self.resetContinuationView()
-      }
-      self.selectedDocumentIDs.subtract(ids)
-      self.invalidateGhost()
-      try await self.flush()
-      for document in targets {
-        try await self.store.trashDocument(document.id)
-        self.undoManagers.removeValue(forKey: document.id)
-      }
-      if self.documents.isEmpty { try self.newDocument() }
-    }
+    guard !isBusy, !ids.isEmpty,
+      confirm("Delete documents?", message: "The documents leave the library. Their retained source files and captured history stay in the workspace.") else { return }
+    work("Deleting documents…") { [weak self] flag in try await self?.trashPagedDocuments(ids, flag: flag) }
   }
   func deleteChats(_ ids: Set<UUID>) {
     guard !isBusy, !ids.isEmpty else { return }
     let targets = state.chats.filter { ids.contains($0.id) }
     let removesCurrent = state.selectedChat.map { ids.contains($0) } ?? false
+    let discardsDrafts = (state.composerDrafts ?? []).contains { $0.owner.kind == .chat && ids.contains($0.owner.id) }
+      || (state.recordingDrafts ?? [:]).contains { ids.contains($0.key) && !$0.value.isEmpty }
     guard !targets.isEmpty,
       confirm(
         targets.count == 1 ? "Delete \(targets[0].title)?" : "Delete \(targets.count) chats?",
         message: "Their messages and pinned voices will be removed from the library. Captured voice revisions and edit receipts stay."
-          + (removesCurrent && !draft.isEmpty ? " The unsent message will be discarded." : "")
+          + (discardsDrafts ? " Their unsent text and pending attachment selection will be discarded." : "")
       ) else { return }
-      scheduleSave()
+      revokeJoinedRetentions()
+      retainComposerDraft()
       var next = state
       next.chats.removeAll { ids.contains($0.id) }
       next.voices.removeAll { ids.contains($0.id) }
+      next.composerDrafts?.removeAll { $0.owner.kind == .chat && ids.contains($0.owner.id) }
+      next.recordingDrafts = next.recordingDrafts?.filter { !ids.contains($0.key) }
       if let selected = next.selectedChat, ids.contains(selected) {
         next.selectedChat = next.chats.first?.id
       }
@@ -591,19 +936,14 @@ struct CompletionSegment {
       selectedChatIDs.subtract(ids)
       if selectedChatIDs.isEmpty, let id = next.selectedChat { selectedChatIDs = [id] }
       if removesCurrent {
-        draft = ""
-        pendingAttachments = []
-        mode = .ask
+        restoreComposerDraft()
         composerFocusEpoch &+= 1
       }
   }
   func renameDocument(_ id: UUID, to proposedTitle: String) {
-    guard let index = documents.firstIndex(where: { $0.id == id }) else { return }
     let title = proposedTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !title.isEmpty else { return }
-    cancel()
-    documents[index].title = title
-    refreshSearch(); scheduleSave()
+    guard !isBusy, !title.isEmpty else { return }
+    work("Renaming document…") { [weak self] flag in try await self?.renamePagedDocument(id, to: title, flag: flag) }
   }
   func renameChat(_ id: UUID, to proposedTitle: String) {
     guard let index = state.chats.firstIndex(where: { $0.id == id }) else { return }
@@ -613,15 +953,7 @@ struct CompletionSegment {
     do { try applyChat(chat) } catch { composerIssue = error.localizedDescription }
   }
   func updateDocument(_ text: String, id: UUID, caret: Int) {
-    guard let index = documents.firstIndex(where: { $0.id == id }) else { return }
-    invalidateGhost()
-    documents[index].text = text
-    writingIssue = nil
-    refreshSearch()
-    dirty.insert(id)
-    self.caret = caret
-    scheduleSave()
-    scheduleCompletion()
+    report(BoomError.denied("Document edits belong to the native bounded editor."))
   }
   func movedCaret(_ caret: Int, hasMarkedText: Bool) {
     guard self.caret != caret || hasMarkedText else { return }
@@ -637,7 +969,7 @@ struct CompletionSegment {
     ghostText = ""
     ghostStamp = nil
     ghostSources = []
-    editor?.clearGhost()
+    pagedInput?.activeView?.clearGhost()
   }
   func toggle(_ pane: String) {
     guard layout.paneControls.contains(pane) else { return }
@@ -672,7 +1004,7 @@ struct CompletionSegment {
     let focused: InputPane?
     switch previous {
     case is ChatTextView: focused = .chat
-    case is MarkdownTextView: focused = .document
+    case is MarkdownTextView, is PagedNativeTextView: focused = .document
     case is NSTextField: focused = nil
     default: focused = lastInputPane
     }
@@ -692,7 +1024,7 @@ struct CompletionSegment {
       }
       switch target {
       case .document:
-        if let id = self.state.selectedDocument { self.focusEditor(id) }
+        if let id = self.selectedDocumentID { self.focusEditor(id) }
       case .chat: self.composerFocusEpoch &+= 1
       case nil: break
       }
@@ -707,10 +1039,10 @@ struct CompletionSegment {
     scheduleSave()
   }
   func insertReference(to id: UUID) {
-    guard let document = documents.first(where: { $0.id == id }), let editor else { return }
-    let link = "[[\(document.title)|\(id.uuidString)]]"
-    editor.insertText(link, replacementRange: editor.selectedRange())
-    editor.window?.makeFirstResponder(editor)
+    guard let document = documentIndices.first(where: { $0.id == id }),
+      let view = pagedInput?.activeView else { return }
+    view.window?.makeFirstResponder(view)
+    view.insertText("[[\(document.title)|\(id.uuidString)]]", replacementRange: view.selectedRange())
   }
   func insertVoice(_ persona: Voice) {
     if let range = draft.range(of: #"(?:^|\s)@[a-z0-9_-]*$"#, options: .regularExpression) {
@@ -723,6 +1055,7 @@ struct CompletionSegment {
   func work(_ label: String, after: (@MainActor () -> Void)? = nil,
     body: @escaping @MainActor (CancellationFlag) async throws -> Void) {
     guard !isBusy else { return }
+    let trace = PerformanceTrace.begin("Request.Work")
     cancelInputCompletions()
     invalidateGhost()
     let previousGhost = ghostTask
@@ -733,7 +1066,12 @@ struct CompletionSegment {
     isBusy = true
     status = label
     foreground = Task { [weak self] in
-      if let previousGhost { await previousGhost.value }
+      defer { PerformanceTrace.end("Request.Work", trace) }
+      if let previousGhost {
+        let joinTrace = PerformanceTrace.begin("Request.PreviousProducerJoin")
+        await previousGhost.value
+        PerformanceTrace.end("Request.PreviousProducerJoin", joinTrace)
+      }
       guard let self else { return }
       var completed = false
       defer {
@@ -745,6 +1083,7 @@ struct CompletionSegment {
           self.streamingChat = nil
           self.scheduleCompletion()
           if completed { after?() }
+          self.startPendingConsultations()
         }
       }
       do {
@@ -756,332 +1095,731 @@ struct CompletionSegment {
         self.status = "Stopped"
         do { try await self.flush() } catch { self.report(error) }
       } catch {
-        if flag.isCancelled || Task.isCancelled {
-          self.status = "Stopped"
-        } else {
-          self.report(error)
-        }
+        self.report(error)
         do { try await self.flush() } catch { self.report(error) }
       }
     }
   }
   func cancel() {
+    PerformanceTrace.event("Request.CancelRequested")
+    let hadPending = !pendingConsultations.isEmpty
+    for captured in pendingConsultations { finishPendingConsultation(captured, error: nil) }
+    pendingConsultations.removeAll(); pendingConsultationCount = 0
+    if hadPending { scheduleSave() }
     cancelInputCompletions()
     activeFlag?.cancel()
     foreground?.cancel()
     invalidateGhost()
   }
   func shutdown() async throws {
+    pagedShutdownRequested = true
+    for captured in pendingConsultations { finishPendingConsultation(captured, error: nil) }
+    pendingConsultations.removeAll(); pendingConsultationCount = 0
+    for operation in Array(exportTasks.values) {
+      operation.pagedResult?.cancel(); operation.clipboardResult?.cancel()
+    }
+    joinedRetentionClosed = true
+    revokeJoinedRetentions()
     speechOutput.stopSpeaking()
+    speechSetupTask?.cancel()
     modelPickerTask?.cancel()
     finishComposition()
     cancel()
+    await VoiceInput.cancelSpeechPreparationAndJoin()
+    if let speechSetupTask { await speechSetupTask.value }
+    speechSetupTask = nil
     for input in inputCompletions { await input.value?.join() }
-    saveTask?.cancel()
+    let priorSaveFailure = await joinWorkspaceSaveTasks()
     searchEpoch &+= 1; searchTask?.cancel()
+    if let searchTask { await searchTask.value }
+    if let recordingAttachmentTask {
+      recordingAttachmentTask.cancel()
+      do { try await recordingAttachmentTask.value } catch is CancellationError {}
+    }
     historyRequest = nil; historyTask?.cancel()
     if let historyTask { await historyTask.value }
     if let foreground { await foreground.value }
     if let ghostTask { await ghostTask.value }
-    if let mlxRunner { await mlxRunner.join() }
-    if let baseRunner { await baseRunner.join() }
+    await joinAndClearPromptCaches()
     for operation in Array(exportTasks.values) { await operation.task.value }
     await VideoPreparationCache.shared.release()
+    let followingSaveFailure = await joinWorkspaceSaveTasks()
+    if let priorSaveFailure { throw priorSaveFailure }
+    if let followingSaveFailure { throw followingSaveFailure }
     try await flush()
+    try await closePagedSelection()
+    guard pagedImported == nil, pagedInitialized == nil else {
+      throw BoomError.stale("A document import has not joined shutdown.")
+    }
+    if let engine = pagedEngine { try await engine.close() }
+    pagedPublisher = nil; pagedEngine = nil
+    try await store.releaseExclusiveWorkspace()
   }
+
   private func revalidate(_ sources: [SourceReference], attachments: [SourceReference]) throws {
     for source in sources {
       let attachment = state.attachments.first(where: { $0.id == source.id })
-      let digest = source.kind == "media" ? attachment?.rootDigest : source.kind == "attachment" ? attachment?.digest
-        : documents.first(where: { $0.id == source.id })?.revision
-      guard digest == source.digest else {
-        throw BoomError.stale(source.title)
-      }
+      let digest: String?
+      if source.kind == "media" { digest = attachment?.rootDigest }
+      else if source.kind == "attachment" { digest = attachment?.digest }
+      else if let record = pagedSelectedRecord, record.document.id == source.id { digest = try BoundedDocumentCapture.digest(record.document.revision) }
+      else { digest = (consultationCaptures[source.id] ?? captureCache[source.id])?.revisionDigest }
+      guard digest == source.digest else { throw BoomError.stale(source.title) }
     }
     for source in attachments {
-      guard state.attachments.first(where: { $0.id == source.id })?.digest == source.digest else {
-        throw BoomError.stale(source.title)
-      }
+      guard state.attachments.first(where: { $0.id == source.id })?.digest == source.digest else { throw BoomError.stale(source.title) }
     }
   }
   func send(replay: ConsultationReplay? = nil) {
+    let captureTrace = PerformanceTrace.begin("Request.ConsultationCapture")
+    defer { PerformanceTrace.end("Request.ConsultationCapture", captureTrace) }
     if replay == nil { ensureChatForSend() }
     if replay == nil && authoredChatRole != nil { appendAuthoredChatMessage(); return }
-    guard !isBusy, let chat = selectedChat, canInfer,
-      replay != nil || !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !pendingAttachments.isEmpty
-    else { if !canInfer && !isBusy { prepareModels() }; return }
-    let request = replay?.request ?? draft, interaction: InteractionMode = replay == nil ? mode : .propose, document = selectedDocument
+    guard (!isBusy || canQueueConsultation), let chat = selectedChat,
+      replay != nil || draftHasContent || !pendingAttachments.isEmpty else { return }
+    let request = replay?.request ?? draft, interaction: InteractionMode = replay == nil ? mode : .propose
+    let promptContract = replay?.promptContract ?? .referenceBindingsV3
     let selectedIDs = replay?.attachmentIDs ?? pendingAttachments, style = consultationStyle
-    do {
-      finishComposition()
-      let graph = try ContextGraph.resolveChat(request: request, attachedDocumentID: chat.attachedDocumentID,
-        editingDocumentID: interaction == .ask ? nil : document?.id, all: documents)
-      let slugs = try ReferenceParser.voices(request)
-      guard slugs.count <= 3 else { throw BoomError.budget("Consult at most three voices per turn.") }
-      guard interaction != .edit || slugs.count <= 1 else {
-        throw BoomError.denied("Edit grants one voice at a time. Use Propose to compare voices.")
+    let captured = PendingConsultation(chat: chat, request: request, interaction: interaction,
+      promptContract: promptContract, selectedIDs: selectedIDs, style: style, replay: replay, userMessageID: nil)
+    if isBusy {
+      // Requests are accepted visibly; generation is still owned by the same
+      // foreground lifetime. Captured history never acquires later answers.
+      guard replay == nil, canQueueConsultation else { return }
+      do { try enqueueIndependentQuestion(request, in: chat, attachments: selectedIDs) }
+      catch { composerIssue = error.localizedDescription }
+      return
+    }
+    work("Checking consultation context…") { [weak self] flag in
+      try await self?.performConsultation(captured, flag: flag)
+    }
+  }
+
+  func enqueueIndependentQuestion(_ request: String, in chat: ChatRecord, attachments selectedIDs: [UUID]) throws {
+    guard isBusy, activeFlag != nil, mode == .ask, consultationStyle == .separate,
+      !pagedShutdownRequested, state.chats.contains(where: { $0.id == chat.id }) else {
+      throw BoomError.stale("This question lost its actual foreground or chat owner.")
+    }
+    guard pendingConsultations.count < 16,
+      pendingConsultations.reduce(request.utf8.count, { $0 + $1.request.utf8.count }) <= 524_288 else {
+      throw BoomError.budget("The pending request budget is full.") // preserve unsent draft
+    }
+    let routing = try ReferenceParser.voices(request), id = UUID()
+    if let c = state.chats.firstIndex(where: { $0.id == chat.id }) {
+      state.chats[c].messages.append(ChatMessage(id: id, role: .user, text: request, state: .pending,
+        speaker: Speaker(name: "Human"), directAttachments: selectedIDs,
+        consultationRouting: routing, consultationPromptContract: .referenceBindingsV3))
+    }
+    var history = chat
+    history.messages = history.messages.filter { $0.state == .complete }
+    pendingConsultations.append(.init(chat: history, request: request, interaction: .ask,
+      promptContract: .referenceBindingsV3, selectedIDs: selectedIDs, style: .separate,
+      replay: nil, userMessageID: id))
+    pendingConsultationCount = pendingConsultations.count
+    if draft == request { draft = "" }
+    if pendingAttachments == selectedIDs { pendingAttachments = [] }
+    scheduleSave()
+  }
+
+  private func performConsultation(_ captured: PendingConsultation, flag: CancellationFlag,
+    ownedBy scopeOwner: CancellationFlag? = nil) async throws {
+    let ownerFlag = scopeOwner ?? flag
+    let chat = captured.chat, request = captured.request, interaction = captured.interaction
+    let promptContract = captured.promptContract, selectedIDs = captured.selectedIDs
+    let style = captured.style, replay = captured.replay
+    finishComposition()
+    let graph = try await captureChatContext(request: request, attachedDocumentID: chat.attachedDocumentID,
+      editingDocumentID: interaction == .ask ? nil : state.selectedDocument, flag: flag)
+    let document = interaction == .ask ? nil : graph.captures.first { $0.documentID == self.state.selectedDocument }?.modelSnapshot
+    for capture in graph.captures { consultationCaptures[capture.documentID] = capture }
+    let slugs = try ReferenceParser.voices(request)
+    guard slugs.count <= 3 else { throw BoomError.budget("Consult at most three voices per turn.") }
+    guard interaction != .edit || slugs.count <= 1 else {
+      throw BoomError.denied("Edit grants one voice at a time. Use Propose to compare voices.")
+    }
+    let voices: [Voice]
+    if let replay { voices = replay.voice.map { [$0] } ?? [] }
+    else { voices = try slugs.map { slug -> Voice in
+      guard let voice = self.state.voices.first(where: { $0.slug == slug }) else { throw BoomError.invalid("Unknown voice @\(slug).") }
+      return voice
+    } }
+    guard interaction == .ask || document != nil else { throw BoomError.denied("Choose a document before requesting edits.") }
+    let inherited = graph.documents.flatMap { AttachmentLink.ids(in: $0.text) }
+    let attachmentIDs = (selectedIDs + inherited).reduce(into: [UUID]()) { if !$0.contains($1) { $0.append($1) } }
+    guard attachmentIDs.count <= 8 else { throw BoomError.budget("At most eight attachments per turn.") }
+    var attachments = try attachmentIDs.map { id -> AttachmentRecord in
+      guard let record = self.state.attachments.first(where: { $0.id == id }) else { throw BoomError.stale("An attachment was removed.") }
+      return record
+    }
+    if attachments.contains(where: { $0.kind == .unavailable }) {
+      let issue = "An attachment can't be read locally. Its original has been kept."
+      composerIssue = issue
+      if captured.userMessageID != nil { throw BoomError.unavailable(issue) }
+      return
+    }
+    for index in attachments.indices where attachments[index].needsPreparation {
+      let captured = attachments[index]
+      let data = try await store.attachment(captured.id)
+      let prepared = try await preparedRecord(captured, data: data, automaticAudio: true, flag: flag)
+      guard let current = state.attachments.firstIndex(where: { $0.id == captured.id }),
+        state.attachments[current].digest == captured.digest else { throw BoomError.stale("The attachment changed.") }
+      state.attachments[current] = prepared; attachments[index] = prepared
+    }
+    let attachmentSources = attachments.map(\.reference), capturedSourceIdentities = graph.sources + attachmentSources
+    let attachmentText = promptContract == .referenceBindingsV3 ? "" : attachments.filter { !$0.text.isEmpty }.map {
+      "ATTACHMENT \($0.name)\nID \($0.id)\nDIGEST \($0.digest)\nCOVERAGE \($0.coverage)\n\($0.text)"
+    }.joined(separator: "\n\n")
+    let authority = CapturedDocumentAuthority(mode: interaction, target: document,
+      capture: interaction == .ask ? nil : graph.captures.first { $0.documentID == document?.id })
+    let capturedContext: String, capturedRenderedContext: RenderedReferenceContext?, capturedContextSources: [SourceReference]
+    let capturedAttachments = attachments
+    if promptContract == .referenceBindingsV3 {
+      let rendered = try await detachedWork {
+        try DocumentTools.renderedContext(graph.documents, attachments: capturedAttachments, authority: authority,
+          preferredDocumentID: chat.attachedDocumentID, omittedSources: graph.omittedSources)
       }
-      let voices: [Voice]
-      if let replay { voices = replay.voice.map { [$0] } ?? [] }
-      else { voices = try slugs.map { slug -> Voice in
-        guard let voice = state.voices.first(where: { $0.slug == slug }) else { throw BoomError.invalid("Unknown voice @\(slug).") }
-        return voice
-      } }
-      guard interaction == .ask || document != nil else { throw BoomError.denied("Choose a document before requesting edits.") }
-      let inherited = graph.documents.flatMap { AttachmentLink.ids(in: $0.text) }
-      let attachmentIDs = (selectedIDs + inherited).reduce(into: [UUID]()) { if !$0.contains($1) { $0.append($1) } }
-      guard attachmentIDs.count <= 8 else { throw BoomError.budget("At most eight attachments per turn.") }
-      let attachments = try attachmentIDs.map { id -> AttachmentRecord in
-        guard let record = state.attachments.first(where: { $0.id == id }) else { throw BoomError.stale("An attachment was removed.") }
-        return record
+      capturedRenderedContext = rendered; capturedContext = rendered.prompt
+      capturedContextSources = graph.promptSources + attachments.filter { !$0.text.isEmpty }.map(\.reference)
+    } else {
+      let documentContext = try await detachedWork { try DocumentTools.context(graph.documents, authority: authority) }
+      capturedContext = [documentContext, attachmentText].filter { !$0.isEmpty }.joined(separator: "\n\n")
+      capturedRenderedContext = nil; capturedContextSources = []
+    }
+    let instructions = chat.instructions ?? ""
+    let targets: [Voice?] = voices.isEmpty ? [nil] : voices.map(Optional.some)
+    let outputLimit = interaction == .ask ? 512 : 4096
+      // The accepted request retains its captured question/history and source
+      // while setup uses the SAME foreground operation and cancellation flag.
+      if !canInfer { try await prepareModels(flag: flag) }
+      let runner = try await self.runnerForGeneration(.consultation, flag: flag)
+      let executionPolicy = try ProductCore.resolvedGenerationPolicy(
+        replay?.generationPolicy ?? runner.generationPolicy, loaded: runner.generationPolicy)
+      // Exact replay starts cold; live turns may reuse only this chat's prefix.
+      let cacheOwner: PromptCacheOwner? = replay == nil
+        ? PromptCacheOwner(namespace: self.inferenceCacheNamespace, entity: chat.id, route: .consultation)
+        : nil
+      let provider = runner.identity
+      try await self.flush()
+      try await self.revalidateResponseSources(graph.sources, attachments: attachmentSources, targetID: authority.target?.id)
+      let media = try await self.consultationMedia(attachments, rawAudio: runner.supportsRawAudio, flag: flag)
+      let images = media.images
+      let reserves = targets.indices.map { index in
+        style == .discuss ? outputLimit * (index + 1) + 256 * index : outputLimit
       }
-      if attachments.contains(where: { $0.kind == .unavailable }) {
-        composerIssue = "An attachment can't be read locally. Its original has been kept."
-        return
+      let fitPairedAdmission = self.makePairedContextAdmission(runner: runner, purpose: .consultation,
+        owner: cacheOwner, flag: flag) { [weak self] in
+        guard let workspace = self else { throw CancellationError() }
+        try await workspace.validateConsultationAdmissionSource(chat: chat, sources: graph.sources,
+          attachments: attachmentSources, targetID: authority.target?.id,
+          requiredDocumentID: interaction == .ask ? nil : document?.id, flag: flag,
+          independentHistory: interaction == .ask && style == .separate, ownedBy: ownerFlag)
       }
-      if attachments.contains(where: { $0.needsPreparation }) {
-        prepareMediaForSend(attachments, chat: chat.id, request: request, interaction: interaction,
-          selectedIDs: selectedIDs, documentID: state.selectedDocument)
-        return
+      let fitted = try await runner.fittedRound(voices: targets, history: chat.messages,
+        instructions: instructions, context: capturedContext, request: request, routing: slugs,
+        images: images, media: media.media, reserves: reserves, flag: flag, authority: authority, cacheOwner: cacheOwner,
+        pairedAdmission: fitPairedAdmission, promptContract: promptContract,
+        renderedContext: capturedRenderedContext, capturedSources: capturedContextSources)
+      let context = fitted.context, renderedContext = fitted.renderedContext
+      let workingSources = fitted.capturedSources
+      let mediaIDs = Set(media.media.map { $0.reference.id })
+      let contextIDs = renderedContext.map { Set($0.bindings.map { $0.source.id }) }
+        ?? (context == capturedContext ? Set(graph.sources.map(\.id)) : [])
+      let suppliedIDs = contextIDs.union(mediaIDs)
+      let sources = capturedSourceIdentities.filter { suppliedIDs.contains($0.id) }
+      let plans = fitted.plans
+      try flag.check()
+      try await self.revalidateResponseSources(graph.sources, attachments: attachmentSources, targetID: authority.target?.id)
+      guard let index = self.state.chats.firstIndex(where: { $0.id == chat.id }) else { throw BoomError.stale("Chat was removed.") }
+      let replyIDs = targets.map { _ in UUID() }
+      if replay == nil && captured.userMessageID == nil {
+        self.state.chats[index].messages.append(ChatMessage(role: .user, text: request,
+          context: context, sources: sources, speaker: Speaker(name: "Human"), directAttachments: selectedIDs,
+          consultationRouting: slugs, consultationPromptContract: promptContract))
       }
-      let attachmentSources = attachments.map(\.reference), sources = graph.sources + attachmentSources
-      let attachmentText = attachments.filter { !$0.text.isEmpty }.map {
-        "ATTACHMENT \($0.name)\nID \($0.id)\nDIGEST \($0.digest)\nCOVERAGE \($0.coverage)\n\($0.text)"
-      }.joined(separator: "\n\n")
-      let authority = CapturedDocumentAuthority(mode: interaction, target: interaction == .ask ? nil : document)
-      let documentContext = try DocumentTools.context(graph.documents, authority: authority)
-      let context = [documentContext, attachmentText].filter { !$0.isEmpty }.joined(separator: "\n\n")
-      guard context.utf8.count <= 524_288 else { throw BoomError.budget("Combined reference context exceeds 512 KiB.") }
-      let instructions = chat.instructions ?? ""
-      let targets: [Voice?] = voices.isEmpty ? [nil] : voices.map(Optional.some)
-      let outputLimit = interaction == .ask ? 512 : 4096
-      work("Checking consultation context…") { [weak self] flag in
-        guard let self else { return }
-        let runner = try await self.runnerForGeneration(.consultation, flag: flag)
-        let provider = runner.identity
+      if let userID = captured.userMessageID,
+        let user = self.state.chats[index].messages.firstIndex(where: { $0.id == userID }) {
+        self.state.chats[index].messages[user].context = context
+        self.state.chats[index].messages[user].sources = sources
+        self.state.chats[index].messages[user].state = .complete
+      }
+      for (offset, voice) in targets.enumerated() {
+        self.state.chats[index].messages.append(ChatMessage(id: replyIDs[offset], role: .assistant,
+          text: "", sources: sources, state: .pending, provider: provider,
+          speaker: voice?.speaker ?? Speaker(name: "Bloom")))
+      }
+      if self.state.chats[index].title == "New chat" { self.state.chats[index].title = try ProductCore.chatTitle(request, routing: slugs) }
+      if replay == nil && self.draft == request { self.draft = "" }
+      if replay == nil && self.pendingAttachments == selectedIDs {
+        self.pendingAttachments = []
+        self.state.recordingDrafts?[chat.id] = (self.state.recordingDrafts?[chat.id] ?? []).filter { !selectedIDs.contains($0) }
+      }
+      self.streamingChat = chat.id
+      var round: [ChatMessage] = []
+      do {
         try await self.flush()
-        try await self.revalidateResponseSources(graph.sources, attachments: attachmentSources, targetID: authority.target?.id)
-        let media = try await self.consultationMedia(attachments, rawAudio: runner.supportsRawAudio, flag: flag)
-        let images = media.images
-        let reserves = targets.indices.map { index in
-          style == .discuss ? outputLimit * (index + 1) + 256 * index : outputLimit
+        // Separate voices answer the same captured history independently.
+        // Discussion rounds, document mutations, replay and media stay ordered.
+        if interaction == .ask, style == .separate, replay == nil,
+          images.isEmpty, media.media.isEmpty, targets.count > 1, let cacheOwner {
+          let vault = self.store.vault, checkpointStore = self.store
+          let rowFlags = targets.map { _ in CancellationFlag() }
+          let cancellation = flag.onCancel { for row in rowFlags { row.cancel() } }
+          defer { flag.removeCancellationHandler(cancellation) }
+          var receipts: [ConsultationReceipt] = []
+          var requests: [MLXGemmaRunner.IndependentTextRequest] = []
+          var grants: [JoinedKVRetentionRequest?] = []
+          defer { for grant in grants { self.finishJoinedRetentionRequest(grant) } }
+          for (row, voice) in targets.enumerated() {
+            let rowFlag = rowFlags[row], seed = UInt64.random(in: .min ... .max), attemptID = UUID()
+            let plan = plans[row], replyID = replyIDs[row]
+            var receipt = ConsultationReceipt(operationID: rowFlag.operationID, seed: seed, state: .pending,
+              failure: nil, model: provider, voice: voice, plan: plan, sources: sources,
+              promptDigest: Digest.sha256(plan.rawPrompt), tokenIDs: [], stopReason: "pending",
+              firstTokenSeconds: nil, elapsedSeconds: 0, generationPolicy: executionPolicy)
+            receipt.attemptID = attemptID; receipt.responseID = replyID
+            receipts.append(receipt)
+            let pending = receipt
+            try await detachedWork {
+              try vault.encode(pending, kind: .receipt, id: attemptID)
+              try vault.encode(pending, kind: .receipt, id: replyID)
+            }
+            let generation = GenerationIdentity(kind: .consultation, operationID: rowFlag.operationID,
+              recordID: replyID, attemptID: attemptID, model: provider, seed: seed,
+              requestDigest: Digest.sha256(plan.rawPrompt), maxTokens: outputLimit,
+              generationPolicy: executionPolicy)
+            let grant = try self.makeJoinedRetentionRequest(owner: cacheOwner, runner: runner,
+              policy: executionPolicy, operationID: rowFlag.operationID)
+            grants.append(grant)
+            let rowAdmission = self.makePairedContextAdmission(runner: runner, purpose: .consultation,
+              owner: cacheOwner, flag: rowFlag, sharingAttempt: fitPairedAdmission) { [weak self] in
+              guard let self else { throw CancellationError() }
+              try await self.validateConsultationAdmissionSource(chat: chat, sources: graph.sources,
+                attachments: attachmentSources, targetID: authority.target?.id,
+                requiredDocumentID: nil, flag: rowFlag, independentHistory: true, ownedBy: ownerFlag)
+            }
+            let deliveryTrace = PerformanceTrace.firstDelivery()
+            requests.append(.init(identity: generation, owner: cacheOwner, input: .consultation(plan),
+              settings: try ProductCore.sampling(.standard), flag: rowFlag, policy: executionPolicy,
+              joinedRetention: grant, pairedAdmission: rowAdmission, beforeCachePublication: { [weak self] in
+                guard let self else { throw CancellationError() }
+                try await self.revalidateResponseSources(graph.sources,
+                  attachments: attachmentSources, targetID: authority.target?.id)
+                try await MainActor.run {
+                  try flag.check(); try rowFlag.check()
+                  guard self.activeFlag === ownerFlag, self.state.chats.contains(where: { $0.id == chat.id }) else {
+                    throw BoomError.stale("The independent answer owner changed before cache publication.")
+                  }
+                }
+              }, onCheckpoint: { progress, stop, token in
+                try await checkpointStore.checkpoint(progress, identity: generation, stopReason: stop, stopTokenID: token)
+              }, onText: { [weak self] text in
+                Task { @MainActor in
+                  guard let self, self.activeFlag === ownerFlag, !rowFlag.isCancelled,
+                    let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
+                    let m = self.state.chats[c].messages.firstIndex(where: { $0.id == replyID }),
+                    self.state.chats[c].messages[m].state == .pending else { return }
+                  self.state.chats[c].messages[m].text = text; deliveryTrace?.published()
+                }
+              }))
+          }
+          let outputs = await runner.runIndependentText(requests)
+          try await self.finishIndependentConsultationAnswers(Array(zip(receipts, outputs)),
+            chatID: chat.id, authority: authority,
+            documentSources: try self.sourceReferences(for: graph.documents).filter { suppliedIDs.contains($0.id) },
+            attachments: attachmentSources.filter { suppliedIDs.contains($0.id) }, flag: flag)
+          return
         }
-        let fitted = try await runner.fittedRound(voices: targets, history: chat.messages,
-          instructions: instructions, context: context, request: request, routing: slugs,
-          images: images, media: media.media, reserves: reserves, flag: flag, authority: authority)
-        let plans = fitted.plans
-        try flag.check()
-        try await self.revalidateResponseSources(graph.sources, attachments: attachmentSources, targetID: authority.target?.id)
-        guard let index = self.state.chats.firstIndex(where: { $0.id == chat.id }) else { throw BoomError.stale("Chat was removed.") }
-        let replyIDs = targets.map { _ in UUID() }
-        if replay == nil {
-          self.state.chats[index].messages.append(ChatMessage(role: .user, text: request,
-            context: context, sources: sources, speaker: Speaker(name: "Human"), directAttachments: selectedIDs))
-        }
-        for (offset, voice) in targets.enumerated() {
-          self.state.chats[index].messages.append(ChatMessage(id: replyIDs[offset], role: .assistant,
-            text: "", sources: sources, state: .pending, provider: provider,
-            speaker: voice?.speaker ?? Speaker(name: "Bloom")))
-        }
-        if self.state.chats[index].title == "New chat" { self.state.chats[index].title = try ProductCore.chatTitle(request, routing: slugs) }
-        if replay == nil && self.draft == request { self.draft = "" }
-        if replay == nil && self.pendingAttachments == selectedIDs {
-          self.pendingAttachments = []
-          self.state.recordingDrafts?[chat.id] = (self.state.recordingDrafts?[chat.id] ?? []).filter { !selectedIDs.contains($0) }
-        }
-        self.streamingChat = chat.id
-        var round: [ChatMessage] = []
-        do {
-          try await self.flush()
-          for (offset, voice) in targets.enumerated() {
+        responses: for (offset, voice) in targets.enumerated() {
+          try flag.check()
+          self.status = voice.map { "Consulting @\($0.slug)…" } ?? "Generating locally…"
+          self.streamingText = ""
+          var plan: ConsultationPlan
+          if style == .discuss, !round.isEmpty {
+            plan = try ProductCore.prompt(voice: voice, history: fitted.history + round,
+              instructions: instructions, context: context, request: request, routing: slugs,
+              authority: authority, promptContract: promptContract,
+              renderedContext: renderedContext, capturedSources: workingSources, workingTextBytes: fitted.workingTextBytes,
+              workingRequestBytes: fitted.workingRequestBytes)
+          } else { plan = plans[offset] }
+          var responseAuthority = authority
+          responseAuthority.targetWindow = renderedContext?.bindings.first {
+            $0.source.id == authority.target?.id
+          }?.window
+          if renderedContext == nil, context != capturedContext, let target = authority.target {
+            responseAuthority.targetWindow = ContextTextWindow(digest: target.revision,
+              bytes: target.text.utf8.count, utf16: target.text.utf16.count, ranges: [])
+          }
+          var sourceDocuments = graph.documents
+          var responseSourceIDs = suppliedIDs
+          var previousAttemptID = replay?.previousAttemptID
+          while true {
             try flag.check()
-            self.status = voice.map { "Consulting @\($0.slug)…" } ?? "Generating locally…"
-            self.streamingText = ""
-            var plan: ConsultationPlan
-            if style == .discuss, !round.isEmpty {
-              plan = try ProductCore.prompt(voice: voice, history: fitted.history + round,
-                instructions: instructions, context: context, request: request, routing: slugs, authority: authority)
-            } else { plan = plans[offset] }
-            var responseAuthority = authority
-            var sourceDocuments = graph.documents
-            var previousAttemptID = replay?.previousAttemptID
-            while true {
-              try flag.check()
-              try await self.revalidateResponseSources(sourceDocuments.map { SourceReference(id: $0.id, title: $0.title, digest: $0.revision, kind: "document") }, attachments: attachmentSources, targetID: responseAuthority.target?.id)
-              guard interaction == .ask || self.state.selectedDocument == document?.id else { throw BoomError.stale("Active document changed.") }
-              let attemptSources = sourceDocuments.map {
-                SourceReference(id: $0.id, title: $0.title, digest: $0.revision, kind: "document")
-              } + attachmentSources
-              let seed = UInt64.random(in: .min ... .max), vault = self.store.vault
-              let attemptID = UUID()
-              var receipt = ConsultationReceipt(operationID: flag.operationID, seed: seed, state: .pending,
-                failure: nil, model: provider, voice: voice, plan: plan, sources: attemptSources,
-                promptDigest: Digest.sha256(plan.rawPrompt), tokenIDs: [], stopReason: "pending",
-                firstTokenSeconds: nil, elapsedSeconds: 0, generationPolicy: runner.generationPolicy)
-              let replyID = replyIDs[offset]
-              receipt.media = media.media.isEmpty ? nil : media.media.map(\.reference)
-              receipt.attemptID = attemptID; receipt.previousAttemptID = previousAttemptID; receipt.responseID = replyID
-              let pendingReceipt = receipt
-              try await detachedWork {
-                try vault.encode(pendingReceipt, kind: .receipt, id: attemptID)
-                try vault.encode(pendingReceipt, kind: .receipt, id: replyID)
+            try await self.revalidateResponseSources(try self.sourceReferences(for: sourceDocuments), attachments: attachmentSources, targetID: responseAuthority.target?.id)
+            guard interaction == .ask || self.state.selectedDocument == document?.id else { throw BoomError.stale("Active document changed.") }
+            let attemptSources = (try self.sourceReferences(for: sourceDocuments) + attachmentSources)
+              .filter { responseSourceIDs.contains($0.id) }
+            let seed = UInt64.random(in: .min ... .max), vault = self.store.vault
+            let attemptID = UUID()
+            var receipt = ConsultationReceipt(operationID: flag.operationID, seed: seed, state: .pending,
+              failure: nil, model: provider, voice: voice, plan: plan, sources: attemptSources,
+              promptDigest: Digest.sha256(plan.rawPrompt), tokenIDs: [], stopReason: "pending",
+              firstTokenSeconds: nil, elapsedSeconds: 0, generationPolicy: executionPolicy)
+            let replyID = replyIDs[offset]
+            receipt.media = media.media.isEmpty ? nil : media.media.map(\.reference)
+            receipt.attemptID = attemptID; receipt.previousAttemptID = previousAttemptID; receipt.responseID = replyID
+            let pendingReceipt = receipt
+            try await detachedWork {
+              try vault.encode(pendingReceipt, kind: .receipt, id: attemptID)
+              try vault.encode(pendingReceipt, kind: .receipt, id: replyID)
+            }
+            let checkpointStore = self.store
+            let generation = GenerationIdentity(kind: interaction == .ask ? .consultation : .documentResponse,
+              operationID: flag.operationID, recordID: replyID, attemptID: attemptID,
+              model: provider, seed: seed, requestDigest: Digest.sha256(plan.rawPrompt), maxTokens: outputLimit,
+              generationPolicy: executionPolicy)
+            let deliveryTrace = PerformanceTrace.firstDelivery()
+            let cacheSources = try self.sourceReferences(for: sourceDocuments)
+            let cacheTargetID = responseAuthority.target?.id
+            guard let admissionChat = self.state.chats.first(where: { $0.id == chat.id }) else {
+              throw BoomError.stale("The captured chat was removed.")
+            }
+            let generationPairedAdmission = self.makePairedContextAdmission(runner: runner, purpose: .consultation,
+              owner: cacheOwner, flag: flag, sharingAttempt: fitPairedAdmission) { [weak self] in
+              guard let workspace = self else { throw CancellationError() }
+              try await workspace.validateConsultationAdmissionSource(chat: admissionChat, sources: cacheSources,
+                attachments: attachmentSources, targetID: cacheTargetID,
+                requiredDocumentID: interaction == .ask ? nil : document?.id, flag: flag,
+                independentHistory: interaction == .ask && style == .separate, ownedBy: ownerFlag)
+            }
+            let joinedRetention = try self.makeJoinedRetentionRequest(owner: cacheOwner,
+              runner: runner, policy: executionPolicy, operationID: flag.operationID)
+            defer { self.finishJoinedRetentionRequest(joinedRetention) }
+            let delivery = MainActorTextDelivery { [weak self] text in
+              guard let self, self.activeFlag === ownerFlag, !flag.isCancelled else { return }
+              if interaction == .ask {
+                self.streamingText = text
+                if let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
+                  let m = self.state.chats[c].messages.firstIndex(where: { $0.id == replyIDs[offset] }),
+                  self.state.chats[c].messages[m].state == .pending {
+                  self.state.chats[c].messages[m].text = text
+                }
+                deliveryTrace?.published()
               }
-              let checkpointStore = self.store
-              let generation = GenerationIdentity(kind: interaction == .ask ? .consultation : .documentResponse,
-                operationID: flag.operationID, recordID: replyID, attemptID: attemptID,
-                model: provider, seed: seed, requestDigest: Digest.sha256(plan.rawPrompt), maxTokens: outputLimit,
-                generationPolicy: runner.generationPolicy)
-              let result = try await runner.run(plan: plan, images: images, media: media.media, maxTokens: outputLimit,
-                seed: seed, flag: flag, onCheckpoint: { progress, stop, token in
-                  try await checkpointStore.checkpoint(progress, identity: generation, stopReason: stop, stopTokenID: token)
-                }) { [weak self] text in
-                  Task { @MainActor in
-                    guard let self, self.activeFlag === flag, !flag.isCancelled else { return }
-                    if interaction == .ask {
-                      self.streamingText = text
-                      if let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
-                        let m = self.state.chats[c].messages.firstIndex(where: { $0.id == replyIDs[offset] }),
-                        self.state.chats[c].messages[m].state == .pending {
-                        self.state.chats[c].messages[m].text = text
-                      }
+            }
+            let result: MLXGemmaRunner.Output
+            do {
+              result = try await runner.run(plan: plan, images: images, media: media.media, maxTokens: outputLimit,
+                seed: seed, flag: flag, independentIdentity: generation, cacheOwner: cacheOwner, executionPolicy: executionPolicy,
+                joinedRetention: joinedRetention,
+                beforeCachePublication: { [weak self] in
+                  guard let self else { throw CancellationError() }
+                  try await self.revalidateResponseSources(cacheSources,
+                    attachments: attachmentSources, targetID: cacheTargetID)
+                  try await MainActor.run {
+                    try flag.check()
+                    guard self.activeFlag === ownerFlag,
+                      self.state.chats.contains(where: { $0.id == chat.id }),
+                      interaction == .ask || self.state.selectedDocument == document?.id else {
+                      throw BoomError.stale("The request owner changed before prompt-cache publication.")
                     }
                   }
-                }
-              receipt.promptDigest = result.promptDigest; receipt.tokenIDs = result.tokenIDs
-              receipt.stopReason = result.stopReason; receipt.firstTokenSeconds = result.firstTokenSeconds
-              receipt.stopTokenID = result.stopTokenID
-              receipt.elapsedSeconds = result.elapsedSeconds
-              if result.stopReason == "cancelled" { receipt.state = .cancelled }
-              let emittedReceipt = receipt
+                },
+                pairedAdmission: generationPairedAdmission,
+                onCheckpoint: { progress, stop, token in
+                  try await checkpointStore.checkpoint(progress, identity: generation, stopReason: stop, stopTokenID: token)
+                }) { text in delivery.submit(text) }
+            } catch {
+              await delivery.closeAndJoin()
+              throw error
+            }
+            await delivery.closeAndJoin()
+            receipt.promptDigest = result.promptDigest; receipt.tokenIDs = result.tokenIDs
+            receipt.stopReason = result.stopReason; receipt.firstTokenSeconds = result.firstTokenSeconds
+            receipt.stopTokenID = result.stopTokenID
+            receipt.elapsedSeconds = result.elapsedSeconds
+            receipt.executionOrigin = result.executionOrigin
+            if result.stopReason == "cancelled" { receipt.state = .cancelled }
+            let emittedReceipt = receipt
+            try await detachedWork {
+              try vault.encode(emittedReceipt, kind: .receipt, id: attemptID)
+              try vault.encode(emittedReceipt, kind: .receipt, id: replyID)
+            }
+            if interaction == .ask,
+              let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
+              let m = self.state.chats[c].messages.firstIndex(where: { $0.id == replyID }) {
+              self.state.chats[c].messages[m].text = result.text
+              deliveryTrace?.published()
+            }
+            try flag.check()
+            try await self.revalidateResponseSources(try self.sourceReferences(for: sourceDocuments), attachments: attachmentSources, targetID: responseAuthority.target?.id)
+            guard interaction == .ask || self.state.selectedDocument == document?.id else { throw BoomError.stale("Active document changed.") }
+            var issue: String?
+            var refreshContext = false
+            if interaction != .ask {
+              let capturedAuthority = responseAuthority
+              let parsed = try await detachedWork { try DocumentTools.response(result.text, authority: capturedAuthority) }
+              issue = parsed.issue
+              if issue == nil, let patch = parsed.edits.first, let base = responseAuthority.target,
+                let current = responseAuthority.capture?.modelSnapshot {
+                do { _ = try await detachedWork { try DocumentTools.validate(patch,
+                  grant: DocumentGrant(mode: interaction, snapshot: base), current: current,
+                  targetWindow: capturedAuthority.targetWindow) } }
+                catch { issue = error.localizedDescription; refreshContext = current.revision != base.revision }
+              }
+            }
+            var message: ChatMessage?
+            if issue == nil {
+              guard !result.text.isEmpty else { throw BoomError.unavailable("The model ended before producing an answer.") }
+              let pending = ChatMessage(id: replyID, role: .assistant, text: "", sources: attemptSources,
+                state: .pending, provider: provider, speaker: voice?.speaker ?? Speaker(name: "Bloom"))
+              do {
+                let completed = try await self.finishConsultationResponse(result.text, pending: pending,
+                  chatID: chat.id, authority: responseAuthority,
+                  documentSources: try self.sourceReferences(for: sourceDocuments).filter { responseSourceIDs.contains($0.id) },
+                  attachments: attachmentSources.filter { responseSourceIDs.contains($0.id) }, recovering: true)
+                if completed.state == .failed {
+                  issue = completed.failure
+                  refreshContext = self.pagedSession?.generation != responseAuthority.capture?.generation
+                } else { message = completed }
+              } catch is DocumentMergeConflict {
+                issue = "Intervening manuscript changes conflict with this attempt."
+                refreshContext = true
+              }
+            }
+            if let issue {
+              // Fail the joined producer privately. Never add malformed output
+              // to history, or let a retry overwrite an earlier attempt journal.
+              receipt.state = .failed; receipt.failure = issue
+              let failedReceipt = receipt
               try await detachedWork {
-                try vault.encode(emittedReceipt, kind: .receipt, id: attemptID)
-                try vault.encode(emittedReceipt, kind: .receipt, id: replyID)
+                try vault.encode(failedReceipt, kind: .receipt, id: attemptID)
+                try vault.encode(failedReceipt, kind: .receipt, id: replyID)
               }
-              if interaction == .ask,
-                let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
-                let m = self.state.chats[c].messages.firstIndex(where: { $0.id == replyID }) {
-                self.state.chats[c].messages[m].text = result.text
-              }
-              try flag.check()
-              try await self.revalidateResponseSources(sourceDocuments.map { SourceReference(id: $0.id, title: $0.title, digest: $0.revision, kind: "document") }, attachments: attachmentSources, targetID: responseAuthority.target?.id)
-              guard interaction == .ask || self.state.selectedDocument == document?.id else { throw BoomError.stale("Active document changed.") }
-              var issue: String?
-              var refreshContext = false
-              if interaction != .ask {
-                let capturedAuthority = responseAuthority
-                let parsed = try await detachedWork { try DocumentTools.response(result.text, authority: capturedAuthority) }
-                issue = parsed.issue
-                if issue == nil, let patch = parsed.edits.first, let base = responseAuthority.target,
-                  let current = self.selectedDocument {
-                  do { _ = try await detachedWork { try DocumentTools.validate(patch,
-                    grant: DocumentGrant(mode: interaction, snapshot: base), current: current) } }
-                  catch { issue = error.localizedDescription; refreshContext = current.revision != base.revision }
+              previousAttemptID = attemptID
+              self.status = "Preparing document changes…"
+              if refreshContext {
+                guard let targetID = authority.target?.id, self.state.selectedDocument == targetID else {
+                  throw BoomError.stale("Choose the original document before requesting a fresh proposal.")
                 }
-              }
-              var message: ChatMessage?
-              if issue == nil {
-                guard !result.text.isEmpty else { throw BoomError.unavailable("The model ended before producing an answer.") }
-                let pending = ChatMessage(id: replyID, role: .assistant, text: "", sources: attemptSources,
-                  state: .pending, provider: provider, speaker: voice?.speaker ?? Speaker(name: "Bloom"))
-                do {
-                  let completed = try await self.finishConsultationResponse(result.text, pending: pending,
-                    chatID: chat.id, authority: responseAuthority, documentSources: sourceDocuments.map {
-                      SourceReference(id: $0.id, title: $0.title, digest: $0.revision, kind: "document")
-                    }, attachments: attachmentSources, recovering: true)
-                  if completed.state == .failed {
-                    issue = completed.failure
-                    refreshContext = self.selectedDocument?.revision != responseAuthority.target?.revision
-                  } else { message = completed }
-                } catch is DocumentMergeConflict {
-                  issue = "Intervening manuscript changes conflict with this attempt."
-                  refreshContext = true
-                }
-              }
-              if let issue {
-                // Fail the joined producer privately. Never add malformed output
-                // to history, or let a retry overwrite an earlier attempt journal.
-                receipt.state = .failed; receipt.failure = issue
-                let failedReceipt = receipt
-                try await detachedWork {
-                  try vault.encode(failedReceipt, kind: .receipt, id: attemptID)
-                  try vault.encode(failedReceipt, kind: .receipt, id: replyID)
-                }
-                previousAttemptID = attemptID
-                self.status = "Preparing document changes…"
-                if refreshContext {
-                  guard let current = self.selectedDocument, current.id == authority.target?.id else {
-                    throw BoomError.stale("The granted document is no longer open.")
+                let refreshedGraph = try await self.captureChatContext(request: request,
+                  attachedDocumentID: chat.attachedDocumentID, editingDocumentID: targetID, flag: flag)
+                self.consultationCaptures = Dictionary(uniqueKeysWithValues: refreshedGraph.captures.map { ($0.documentID, $0) })
+                guard let freshTarget = refreshedGraph.captures.first(where: { $0.documentID == targetID }) else { throw BoomError.stale("The refreshed target was removed.") }
+                responseAuthority = CapturedDocumentAuthority(mode: interaction, target: freshTarget.modelSnapshot, capture: freshTarget)
+                sourceDocuments = refreshedGraph.documents
+                let fullContext: String, refreshedContext: RenderedReferenceContext?, refreshedSources: [SourceReference]
+                let refreshedDocuments = sourceDocuments, refreshedAuthority = responseAuthority
+                if promptContract == .referenceBindingsV3 {
+                  let rendered = try await detachedWork {
+                    try DocumentTools.renderedContext(refreshedDocuments, attachments: capturedAttachments, authority: refreshedAuthority,
+                      preferredDocumentID: chat.attachedDocumentID, omittedSources: refreshedGraph.omittedSources)
                   }
-                  responseAuthority = CapturedDocumentAuthority(mode: interaction, target: current)
-                  sourceDocuments = try ContextGraph.resolveChat(request: request,
-                    attachedDocumentID: chat.attachedDocumentID, editingDocumentID: current.id,
-                    all: self.documents).documents
-                  let recapturedContext = try DocumentTools.context(sourceDocuments, authority: responseAuthority)
-                  let fullContext = [recapturedContext, attachmentText].filter { !$0.isEmpty }.joined(separator: "\n\n")
-                  let refreshed = try await runner.fittedRound(voices: [voice], history: fitted.history + round,
-                    instructions: instructions, context: fullContext, request: request, routing: slugs,
-                    images: images, media: media.media, reserves: [outputLimit], flag: flag, authority: responseAuthority)
-                  guard let refreshedPlan = refreshed.plans.first else { throw BoomError.invalid("Missing captured response plan.") }
-                  plan = refreshedPlan
+                  refreshedContext = rendered; fullContext = rendered.prompt
+                  refreshedSources = refreshedGraph.promptSources
+                    + attachments.filter { !$0.text.isEmpty }.map(\.reference)
+                } else {
+                  let recapturedContext = try await detachedWork { try DocumentTools.context(refreshedDocuments, authority: refreshedAuthority) }
+                  fullContext = [recapturedContext, attachmentText].filter { !$0.isEmpty }.joined(separator: "\n\n")
+                  refreshedContext = nil; refreshedSources = []
                 }
-                continue
+                guard let refitChat = self.state.chats.first(where: { $0.id == chat.id }) else {
+                  throw BoomError.stale("The captured chat was removed.")
+                }
+                let refitSources = try self.sourceReferences(for: sourceDocuments)
+                let refitTargetID = responseAuthority.target?.id
+                let refitPairedAdmission = self.makePairedContextAdmission(runner: runner, purpose: .consultation,
+                  owner: cacheOwner, flag: flag, sharingAttempt: fitPairedAdmission) { [weak self] in
+                  guard let workspace = self else { throw CancellationError() }
+                  try await workspace.validateConsultationAdmissionSource(chat: refitChat, sources: refitSources,
+                    attachments: attachmentSources, targetID: refitTargetID,
+                    requiredDocumentID: document?.id, flag: flag)
+                }
+                let refreshed = try await runner.fittedRound(voices: [voice], history: fitted.history + round,
+                  instructions: instructions, context: fullContext, request: request, routing: slugs,
+                  images: images, media: media.media, reserves: [outputLimit], flag: flag,
+                  authority: responseAuthority, cacheOwner: cacheOwner,
+                  pairedAdmission: refitPairedAdmission, promptContract: promptContract,
+                  renderedContext: refreshedContext, capturedSources: refreshedSources)
+                guard let refreshedPlan = refreshed.plans.first else { throw BoomError.invalid("Missing captured response plan.") }
+                plan = refreshedPlan
+                let refreshedIDs = refreshed.renderedContext.map { Set($0.bindings.map { $0.source.id }) }
+                  ?? (refreshed.context == fullContext ? Set(refitSources.map(\.id)) : [])
+                responseSourceIDs = refreshedIDs.union(mediaIDs)
+                responseAuthority.targetWindow = refreshed.renderedContext?.bindings.first {
+                  $0.source.id == responseAuthority.target?.id
+                }?.window
+                if refreshed.renderedContext == nil, refreshed.context != fullContext, let target = responseAuthority.target {
+                  responseAuthority.targetWindow = ContextTextWindow(digest: target.revision,
+                    bytes: target.text.utf8.count, utf16: target.text.utf16.count, ranges: [])
+                }
               }
-              guard let message else { throw BoomError.invalid("Missing completed answer.") }
-              round.append(message)
-              receipt.state = message.state
-              receipt.failure = message.failure
-              let completedReceipt = receipt
-              try await detachedWork {
-                try vault.encode(completedReceipt, kind: .receipt, id: attemptID)
-                try vault.encode(completedReceipt, kind: .receipt, id: replyID)
+              continue
+            }
+            guard let message else { throw BoomError.invalid("Missing completed answer.") }
+            round.append(message)
+            receipt.state = message.state
+            receipt.failure = message.failure
+            let completedReceipt = receipt
+            try await detachedWork {
+              try vault.encode(completedReceipt, kind: .receipt, id: attemptID)
+              try vault.encode(completedReceipt, kind: .receipt, id: replyID)
+            }
+            self.streamingText = ""
+            if interaction == .ask { self.status = "Local answer · \(result.promptTokens) prompt tokens" }
+            try await self.flush()
+            break
+          }
+        }
+      } catch {
+        if let chatIndex = self.state.chats.firstIndex(where: { $0.id == chat.id }) {
+          for message in self.state.chats[chatIndex].messages.indices where replyIDs.contains(self.state.chats[chatIndex].messages[message].id)
+            && self.state.chats[chatIndex].messages[message].state == .pending {
+            self.state.chats[chatIndex].messages[message].state = flag.isCancelled ? .cancelled : .failed
+            self.state.chats[chatIndex].messages[message].failure = flag.isCancelled ? nil : "Bloom couldn't finish this answer. You can try again."
+          }
+        }
+        let vault = self.store.vault, failedIDs = replyIDs, reason = error.localizedDescription
+        let checkpointStore = self.store
+        let ending: MessageState = flag.isCancelled ? .cancelled : .failed
+        do {
+          let restored: [(UUID, GenerationCheckpoint)] = try await detachedWork {
+            var restored: [(UUID, GenerationCheckpoint)] = []
+            for id in failedIDs where vault.exists(.receipt, id) {
+              var receipt = try vault.decode(ConsultationReceipt.self, kind: .receipt, id: id)
+              if receipt.state == .pending {
+                if let journal = try await checkpointStore.consultationCheckpoint(id: id, receipt: receipt) {
+                  receipt.retain(journal); restored.append((id, journal))
+                }
+                receipt.state = ending; receipt.failure = reason; receipt.stopReason = ending.rawValue
+                if let attemptID = receipt.attemptID { try vault.encode(receipt, kind: .receipt, id: attemptID) }
+                try vault.encode(receipt, kind: .receipt, id: id)
               }
-              self.streamingText = ""
-              if interaction == .ask { self.status = "Local answer · \(result.promptTokens) prompt tokens" }
-              try await self.flush()
-              break
+            }
+            return restored
+          }
+          for (id, journal) in restored where journal.identity.kind == .consultation {
+            if let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
+              let m = self.state.chats[c].messages.firstIndex(where: { $0.id == id }),
+              self.state.chats[c].messages[m].state == ending {
+              self.state.chats[c].messages[m].text = journal.progress.text
             }
           }
-        } catch {
-          if let chatIndex = self.state.chats.firstIndex(where: { $0.id == chat.id }) {
-            for message in self.state.chats[chatIndex].messages.indices where replyIDs.contains(self.state.chats[chatIndex].messages[message].id)
-              && self.state.chats[chatIndex].messages[message].state == .pending {
-              self.state.chats[chatIndex].messages[message].state = flag.isCancelled ? .cancelled : .failed
-              self.state.chats[chatIndex].messages[message].failure = flag.isCancelled ? nil : "Bloom couldn't finish this answer. You can try again."
-            }
+        } catch { self.report(error) }
+        self.scheduleSave()
+        self.composerIssue = flag.isCancelled ? nil : "Bloom couldn't finish this answer. You can try again."
+        self.status = flag.isCancelled ? "Cancelled" : "Answer interrupted"
+      }
+  }
+  /// Receive already joined separate-answer rows without letting one empty
+  /// delivery rewrite another row's actual completed journal or response.
+  func finishIndependentConsultationAnswers(
+    _ prepared: [(ConsultationReceipt, Result<MLXGemmaRunner.Output, Error>)],
+    chatID: UUID, authority: CapturedDocumentAuthority,
+    documentSources: [SourceReference], attachments: [SourceReference], flag: CancellationFlag
+  ) async throws {
+    guard authority.mode == .ask else { throw BoomError.invalid("Independent answers require read-only authority.") }
+    for (original, result) in prepared {
+      try flag.check()
+      try await revalidateResponseSources(documentSources, attachments: attachments, targetID: authority.target?.id)
+      guard let replyID = original.responseID, let attemptID = original.attemptID else {
+        throw BoomError.stale("The independent answer lost its original attempt.")
+      }
+      func pendingPosition() throws -> (Int, Int) {
+        guard let chat = state.chats.firstIndex(where: { $0.id == chatID }),
+          let index = state.chats[chat].messages.firstIndex(where: { $0.id == replyID && $0.state == .pending }) else {
+          throw BoomError.stale("The pending independent response disappeared.")
+        }
+        return (chat, index)
+      }
+      _ = try pendingPosition()
+      var receipt = original
+      var failure: Error?
+      switch result {
+      case .failure(let error):
+        failure = error
+        if let journal = try await store.consultationCheckpoint(id: replyID, receipt: receipt) {
+          receipt.retain(journal)
+          receipt.stopReason = journal.stopReason ?? (error is CancellationError ? "cancelled" : "failed")
+        } else { receipt.stopReason = error is CancellationError ? "cancelled" : "failed" }
+      case .success(let output):
+        receipt.promptDigest = output.promptDigest; receipt.tokenIDs = output.tokenIDs
+        receipt.stopReason = output.stopReason; receipt.stopTokenID = output.stopTokenID
+        receipt.firstTokenSeconds = output.firstTokenSeconds; receipt.elapsedSeconds = output.elapsedSeconds
+        receipt.executionOrigin = output.executionOrigin
+        if output.text.isEmpty { failure = BoomError.unavailable("The model ended before producing an answer.") }
+        else {
+          let emitted = receipt, vault = store.vault
+          try await detachedWork {
+            try vault.encode(emitted, kind: .receipt, id: attemptID)
+            try vault.encode(emitted, kind: .receipt, id: replyID)
           }
-          let vault = self.store.vault, failedIDs = replyIDs, reason = error.localizedDescription
-          let checkpointStore = self.store
-          let ending: MessageState = flag.isCancelled ? .cancelled : .failed
-          do {
-            let restored: [(UUID, GenerationCheckpoint)] = try await detachedWork {
-              var restored: [(UUID, GenerationCheckpoint)] = []
-              for id in failedIDs where vault.exists(.receipt, id) {
-                var receipt = try vault.decode(ConsultationReceipt.self, kind: .receipt, id: id)
-                if receipt.state == .pending {
-                  if let journal = try await checkpointStore.consultationCheckpoint(id: id, receipt: receipt) {
-                    receipt.retain(journal); restored.append((id, journal))
-                  }
-                  receipt.state = ending; receipt.failure = reason; receipt.stopReason = ending.rawValue
-                  if let attemptID = receipt.attemptID { try vault.encode(receipt, kind: .receipt, id: attemptID) }
-                  try vault.encode(receipt, kind: .receipt, id: id)
-                }
-              }
-              return restored
-            }
-            for (id, journal) in restored where journal.identity.kind == .consultation {
-              if let c = self.state.chats.firstIndex(where: { $0.id == chat.id }),
-                let m = self.state.chats[c].messages.firstIndex(where: { $0.id == id }),
-                self.state.chats[c].messages[m].state == ending {
-                self.state.chats[c].messages[m].text = journal.progress.text
-              }
-            }
-          } catch { self.report(error) }
-          self.scheduleSave()
-          self.composerIssue = flag.isCancelled ? nil : "Bloom couldn't finish this answer. You can try again."
-          self.status = flag.isCancelled ? "Cancelled" : "Answer interrupted"
+          let (chat, index) = try pendingPosition()
+          state.chats[chat].messages[index].text = output.text
+          let pending = state.chats[chat].messages[index]
+          try flag.check()
+          try await revalidateResponseSources(documentSources, attachments: attachments, targetID: authority.target?.id)
+          let message = try await finishConsultationResponse(output.text,
+            pending: pending, chatID: chatID, authority: authority,
+            documentSources: documentSources, attachments: attachments)
+          receipt.state = message.state; receipt.failure = message.failure
+          status = "Local answer · \(output.promptTokens) prompt tokens"
         }
       }
-    } catch { report(error) }
+      if let failure {
+        receipt.state = failure is CancellationError ? .cancelled : .failed
+        receipt.failure = failure.localizedDescription
+        let journal = try await store.consultationCheckpoint(id: replyID, receipt: receipt)
+        let (chat, index) = try pendingPosition()
+        state.chats[chat].messages[index].state = receipt.state
+        state.chats[chat].messages[index].failure = receipt.failure
+        if let journal { state.chats[chat].messages[index].text = journal.progress.text }
+      }
+      let finished = receipt, vault = store.vault
+      try await detachedWork {
+        try vault.encode(finished, kind: .receipt, id: attemptID)
+        try vault.encode(finished, kind: .receipt, id: replyID)
+      }
+      try await flush()
+    }
+  }
+  private func startPendingConsultations() {
+    guard !isBusy, !pagedShutdownRequested, !pendingConsultations.isEmpty else { return }
+    let ready = Array(pendingConsultations.prefix(4))
+    work("Consulting…") { [weak self] flag in
+      guard let self else { return }
+      // Leave accepted questions in the existing queue until this real body
+      // enters. Stop before its first turn can still disposition every message.
+      self.pendingConsultations.removeAll { queued in
+        ready.contains { $0.userMessageID == queued.userMessageID }
+      }
+      self.pendingConsultationCount = self.pendingConsultations.count
+      // The same foreground Task joins every prepared request. Their actual
+      // runner submits ready compatible rows into its existing GPU wait queue.
+      let requests = ready.map { _ in CancellationFlag() }
+      let cancellation = flag.onCancel { for request in requests { request.cancel() } }
+      defer { flag.removeCancellationHandler(cancellation) }
+      await withTaskGroup(of: Void.self) { group in
+        for (captured, request) in zip(ready, requests) {
+          group.addTask { @MainActor in
+            do {
+              try await self.performConsultation(captured, flag: request, ownedBy: flag)
+              self.finishPendingConsultation(captured,
+                error: BoomError.unavailable("The captured question did not enter generation."))
+            }
+            catch is CancellationError { self.finishPendingConsultation(captured, error: nil) }
+            catch { self.finishPendingConsultation(captured, error: error); self.report(error) }
+          }
+        }
+      }
+    }
+  }
+  private func finishPendingConsultation(_ captured: PendingConsultation, error: Error?) {
+    guard let id = captured.userMessageID,
+      let chat = state.chats.firstIndex(where: { $0.id == captured.chat.id }),
+      let message = state.chats[chat].messages.firstIndex(where: { $0.id == id }),
+      state.chats[chat].messages[message].state == .pending else { return }
+    state.chats[chat].messages[message].state = error == nil ? .cancelled : .failed
+    state.chats[chat].messages[message].failure = error?.localizedDescription
   }
   func finishConsultationResponse(_ text: String, pending: ChatMessage, chatID: UUID,
     authority: CapturedDocumentAuthority, documentSources: [SourceReference], attachments: [SourceReference], recovering: Bool = false
@@ -1097,14 +1835,15 @@ struct CompletionSegment {
       answer = envelope.reply
       responseIssue = envelope.issue
       if responseIssue == nil, let patch = envelope.edits.first {
-        guard let document = authority.target, let current = selectedDocument else {
+        guard let document = authority.target, let capture = authority.capture, state.selectedDocument == capture.documentID else {
           throw BoomError.stale("The captured document is no longer open.")
         }
-        do { _ = try await detachedWork { try DocumentTools.validate(patch, grant: DocumentGrant(mode: authority.mode, snapshot: document), current: current) } }
+        do { _ = try await detachedWork { try DocumentTools.validate(patch, grant: DocumentGrant(mode: authority.mode, snapshot: document), current: capture.modelSnapshot,
+          targetWindow: authority.targetWindow) } }
         catch { responseIssue = "No document changes: \(error.localizedDescription)"; answer = text }
         if responseIssue == nil {
           let proposal = StoredProposal(id: UUID(), chatID: chatID, messageID: pending.id,
-            patch: patch, document: document, documents: documentSources, attachments: attachments, status: "pending")
+            patch: patch, document: document, capture: capture, documents: documentSources, attachments: attachments, status: "pending", targetWindow: authority.targetWindow)
           state.proposals.append(proposal)
           try await flush()
           if authority.mode == .edit {
@@ -1134,106 +1873,64 @@ struct CompletionSegment {
     return message
   }
   private func revalidateOnDisk(_ sources: [SourceReference], attachments: [SourceReference]) async throws {
-    try revalidate(sources, attachments: attachments)
-    for source in sources where !["media", "attachment"].contains(source.kind) { try await store.checkDisk(source.id) }
-    try revalidate(sources, attachments: attachments)
-  }
-  private func revalidateResponseSources(_ sources: [SourceReference], attachments: [SourceReference],
-    targetID: UUID?) async throws {
-    // The target's captured revision is checked by the Rust three-way merge.
-    // Other sources, attachments and out-of-process disk writes remain guarded.
-    let independent = sources.filter { $0.id != targetID }
-    try await revalidateOnDisk(independent, attachments: attachments)
-    if let targetID {
-      guard documents.contains(where: { $0.id == targetID }) else { throw BoomError.stale("The granted document was removed.") }
-      try await store.checkDisk(targetID)
+    let (engine, publisher) = try pagedOwners()
+    for source in sources where source.kind == "document" || source.kind == "writing-example" {
+      let read = try await engine.currentDocumentRecordRetaining(publisher, documentID: source.id)
+      let digest = try BoundedDocumentCapture.digest(read.value.document.revision)
+      try await engine.abandonJoinedRootOutput(read.lease)
+      guard digest == source.digest else { throw BoomError.stale(source.title) }
     }
+    try revalidate(sources.filter { $0.kind == "media" || $0.kind == "attachment" }, attachments: attachments)
+  }
+  private func revalidateResponseSources(_ sources: [SourceReference], attachments: [SourceReference], targetID: UUID?) async throws {
+    let trace = PerformanceTrace.begin("Request.SourceValidation")
+    defer { PerformanceTrace.end("Request.SourceValidation", trace) }
+    // The authorized editing target can change while its response is being
+    // prepared. Its bounded captured range and patch validation govern that
+    // change; unrelated referenced documents and attachments still require
+    // their original identities and digests.
+    let stableSources = sources.filter { !($0.kind == "document" && $0.id == targetID) }
+    try await revalidateOnDisk(stableSources, attachments: attachments)
+    if let targetID, !documentIndices.contains(where: { $0.id == targetID }) { throw BoomError.stale("The granted document was removed.") }
   }
   private func commit(_ proposal: StoredProposal) async throws {
-    try await revalidateResponseSources(proposal.documents, attachments: proposal.attachments, targetID: proposal.document.id)
-    let grant = DocumentGrant(mode: .propose, snapshot: proposal.document)
-    var resolution: (DocumentSnapshot, DocumentSnapshot, [ValidatedEdit])?
-    while resolution == nil {
-      try Task.checkCancellation()
-      guard state.selectedDocument == proposal.document.id, let current = selectedDocument else {
-        throw BoomError.stale("Choose the original document before accepting this proposal.")
-      }
-      if editor?.hasMarkedText() == true {
-        try await Task.sleep(for: .milliseconds(50))
-        continue
-      }
-      let planned: (DocumentSnapshot, [ValidatedEdit])
-      do { planned = try await detachedWork { try DocumentTools.plan(proposal.patch, grant: grant, current: current) } }
-      catch {
-        if current.revision != proposal.document.revision { throw DocumentMergeConflict.changed }
-        throw error
-      }
-      guard selectedDocument?.id == current.id, selectedDocument?.revision == current.revision else { continue }
-      resolution = (current, planned.0, planned.1)
+    guard state.selectedDocument == proposal.document.id, let originalCapture = proposal.capture,
+      let commands = pagedCommands, let session = pagedSession else {
+      throw BoomError.stale("Choose the captured document before accepting its proposal.")
     }
-    guard let (current, updated, nativeEdits) = resolution else { throw BoomError.stale("The document changed.") }
-    if updated.text == current.text {
+    try await revalidateResponseSources(proposal.documents, attachments: proposal.attachments, targetID: originalCapture.documentID)
+    let current = try await selectedPagedRecord(originalCapture.documentID)
+    let capture: BoundedDocumentCapture
+    if current == originalCapture.record,
+      originalCapture.generation == nil || session.generation == originalCapture.generation {
+      capture = originalCapture
+    } else {
+      // A changed partial window cannot prove where its old boundaries moved.
+      // A whole-source capture can be refreshed and rebased by the planner.
+      guard originalCapture.isWholeSource else { throw DocumentMergeConflict.changed }
+      let refreshed = try await captureDocument(originalCapture.documentID)
+      guard refreshed.isWholeSource, refreshed.record == current else { throw DocumentMergeConflict.changed }
+      capture = refreshed
+    }
+    let document = capture.modelSnapshot
+    let planned = try await detachedWork {
+      try DocumentTools.plan(proposal.patch, grant: DocumentGrant(mode: .propose, snapshot: proposal.document), current: document,
+        targetWindow: proposal.targetWindow)
+    }
+    if planned.1.isEmpty {
       if let index = state.proposals.firstIndex(where: { $0.id == proposal.id }) { state.proposals[index].status = "already present" }
-      status = "The document already contains these changes"
       return
     }
-    editingLocked = true
-    let capturedEditor = editor
-    capturedEditor?.isEditable = false
-    defer { editingLocked = false; capturedEditor?.isEditable = true }
-    // Persist the actual pre-merge manuscript before its prepared journal, so
-    // crash recovery and native Undo refer to the user's latest authored text.
-    try await flush()
-    let journal = DocumentEditJournal(
-      schema: 1, proposalID: proposal.id, documentID: current.id, beforeRevision: current.revision,
-      afterRevision: updated.revision, phase: "prepared", capturedRevision: proposal.document.revision)
-    let vault = store.vault
-    try await detachedWork { try vault.encode(journal, kind: .editJournal, id: proposal.id) }
-    try Task.checkCancellation()
-    try await store.saveDocument(updated)
-    if let editor, editor.documentID == updated.id {
-      editor.replaceDocument(updated.text, action: "Apply proposed edit", edits: nativeEdits)
-    } else {
-      registerDocumentUndo(current)
-      if let index = documents.firstIndex(where: { $0.id == updated.id }) {
-        documents[index] = updated
-        dirty.remove(updated.id)
-      }
-    }
+    let edits = try planned.1.map(capture.absoluteEdit)
+    let installed = try await commands.applyCapturedEdits(expected: current, edits: edits, actionName: "Apply proposed edit")
+    pagedSelectedRecord = installed
+    captureCache.removeValue(forKey: capture.documentID)
     invalidateGhost()
     if let index = state.proposals.firstIndex(where: { $0.id == proposal.id }) {
       state.proposals[index].status = "applied"
-      state.proposals[index].appliedRevision = updated.revision
+      state.proposals[index].appliedRevision = try BoundedDocumentCapture.digest(installed.document.revision)
     }
-    // Updating the UI precedes this second journal write: a disk-full receipt
-    // failure must not leave an old buffer poised to overwrite the applied file.
-    // The already-durable prepared journal is sufficient for restart recovery.
-    do {
-      let finalJournal = DocumentEditJournal(
-          schema: 1, proposalID: proposal.id, documentID: current.id,
-          beforeRevision: current.revision, afterRevision: updated.revision, phase: "file_written", capturedRevision: proposal.document.revision)
-      try await detachedWork { try vault.encode(finalJournal, kind: .editJournal, id: proposal.id) }
-      status = "Document edited"
-    } catch {
-      throw BoomError.unavailable(
-        "The document edit was applied, but its final journal mark could not be saved. The prepared recovery receipt was retained. "
-          + error.localizedDescription)
-    }
-  }
-  private func registerDocumentUndo(_ previous: DocumentSnapshot) {
-    let manager = undoManager(previous.id)
-    manager.beginUndoGrouping()
-    manager.registerUndo(withTarget: self) { owner in
-      guard !owner.editingLocked, let index = owner.documents.firstIndex(where: { $0.id == previous.id }) else { return }
-      let current = owner.documents[index]
-        owner.dirty.insert(previous.id)
-        owner.registerDocumentUndo(current)
-        owner.documents[index] = previous
-        owner.invalidateGhost()
-        owner.scheduleSave()
-    }
-    manager.setActionName("Document edit")
-    manager.endUndoGrouping()
+    try await flush(); status = "Document edited"
   }
   func accept(_ id: UUID) {
     guard !isBusy, let proposal = state.proposals.first(where: { $0.id == id }), proposal.status == "pending" else { return }
@@ -1252,7 +1949,9 @@ struct CompletionSegment {
           vault.exists(.receipt, proposal.messageID) ? try vault.decode(ConsultationReceipt.self, kind: .receipt, id: proposal.messageID) : nil
         }
         let replay = ConsultationReplay(request: question.text, voice: receipt?.voice,
-          attachmentIDs: proposal.attachments.map(\.id), previousAttemptID: receipt?.attemptID)
+          attachmentIDs: proposal.attachments.map(\.id), previousAttemptID: receipt?.attemptID,
+          generationPolicy: receipt?.generationPolicy,
+          promptContract: receipt?.plan.promptContract ?? .textHistoryV1)
         self.status = "Preparing a fresh proposal…"
         let operation = self.foreground
         Task { @MainActor [weak self] in
@@ -1272,18 +1971,18 @@ struct CompletionSegment {
   }
   func canUndo(_ proposal: StoredProposal) -> Bool {
     guard !isBusy, proposal.status == "applied", state.selectedDocument == proposal.document.id,
-      let current = selectedDocument, undoManager(current.id).canUndo else { return false }
-    if let applied = proposal.appliedRevision { return current.revision == applied }
-    guard let applied = try? DocumentTools.apply(proposal.patch,
-      grant: DocumentGrant(mode: .propose, snapshot: proposal.document), current: proposal.document) else { return false }
-    return current.revision == applied.revision
+      let current = pagedSelectedRecord, pagedCommands?.manager.canUndo == true else { return false }
+    return proposal.appliedRevision == (try? BoundedDocumentCapture.digest(current.document.revision))
   }
   func undoProposal(_ proposal: StoredProposal) {
-    guard canUndo(proposal) else { return }
-    undoManager(proposal.document.id).undo()
-    if let index = state.proposals.firstIndex(where: { $0.id == proposal.id }) {
-      state.proposals[index].status = "undone"
-      scheduleSave()
+    guard canUndo(proposal), let commands = pagedCommands else { return }
+    commands.request(.undo)
+    work("Undoing document edit…") { [weak self] _ in
+      guard let self else { return }
+      try await commands.joinPendingCommand()
+      if let index = self.state.proposals.firstIndex(where: { $0.id == proposal.id }) {
+        self.state.proposals[index].status = "undone"
+      }
     }
   }
   func chatVoice(_ id: UUID) -> Voice? { state.voices.first { $0.id == id } }
@@ -1411,7 +2110,7 @@ struct CompletionSegment {
       catch { self?.report(error) }
       if self?.exportTasks[target]?.id == id { self?.exportTasks[target] = nil }
     }
-    exportTasks[target] = (id, task)
+    exportTasks[target] = (id, task, nil, nil)
   }
   func importVoice() {
     guard !isBusy else { return }
@@ -1435,34 +2134,35 @@ struct CompletionSegment {
     }
   }
   func scheduleCompletion() {
-    // An open tray retains its captured choices for branching after edits.
-    // Background suggestions must not replace the visible bundle.
-    guard editor?.hasGhostBoundary != true, !showingCandidates, librarySearch.isEmpty, state.autocomplete, showsDocument, !isBusy, baseReady, caret > 0,
-      let document = selectedDocument, let editor, editor.selectedRange().length == 0,
-      editor.window?.firstResponder === editor,
-      !editor.hasMarkedText(), !candidateIsCurrent || ghostText.isEmpty else { return }
+    guard !showingCandidates, librarySearch.isEmpty, state.autocomplete, showsDocument, !isBusy, baseReady,
+      let id = selectedDocumentID, let view = pagedInput?.activeView,
+      (try? pagedInput?.currentDocumentSelection().utf16Length) == 0,
+      view.selectedRange().length == 0, view.window?.firstResponder === view,
+      !view.hasMarkedText(), caret > 0, !candidateIsCurrent || ghostText.isEmpty else { return }
     let previous = ghostTask
     ghostFlag?.cancel(); previous?.cancel()
-    let capturedEpoch = epoch, offset = caret, profile = samplingProfile
+    let capturedEpoch = epoch, absoluteCaret = UInt64(caret), profile = samplingProfile
     let flag = CancellationFlag(); ghostFlag = flag
     ghostTask = Task { [weak self] in
       if let previous { await previous.value }
       do {
-        try await Task.sleep(nanoseconds: 650_000_000)
-        guard let self, self.epoch == capturedEpoch, !self.isBusy, !self.showingCandidates,
-          self.editor?.hasGhostBoundary != true else { return }
-        try await self.generateCandidates(document: document, offset: offset, profile: profile,
-          count: 1, maxTokens: 64, flag: flag)
+        try await Task.sleep(for: .milliseconds(650))
+        guard let self, self.epoch == capturedEpoch, !self.isBusy, !self.showingCandidates else { return }
+        let capture = try await self.captureDocument(id, prefixAt: absoluteCaret)
+        guard self.epoch == capturedEpoch else { return }
+        self.writingCapture = capture
+        try await self.generateCandidates(document: capture.modelSnapshot,
+          offset: capture.localCaret(absoluteCaret), profile: profile, count: 1, maxTokens: 64, flag: flag, capture: capture)
       } catch is CancellationError {} catch {
         if let self, self.epoch == capturedEpoch { self.status = "Autocomplete: " + error.localizedDescription }
       }
     }
   }
   var canExploreWriting: Bool {
-    guard baseReady, !isBusy, let document = selectedDocument, caret > 0,
-      editor?.selectedRange().length == 0, editor?.hasMarkedText() != true,
-      let prefix = try? ProductCore.authoredPrefix(document, caret: caret) else { return false }
-    return !prefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    guard baseReady, !isBusy, hasSelectedDocument, caret > 0, let view = pagedInput?.activeView,
+      (try? pagedInput?.currentDocumentSelection().utf16Length) == 0,
+      view.selectedRange().length == 0, !view.hasMarkedText() else { return false }
+    return true
   }
   func setAutocomplete(_ enabled: Bool) {
     state.autocomplete = enabled
@@ -1470,33 +2170,36 @@ struct CompletionSegment {
     if enabled { scheduleCompletion() }
   }
   func exploreWriting() {
-    guard canExploreWriting, let document = selectedDocument else { return }
-    let offset = caret, profile = samplingProfile
+    guard canExploreWriting, let id = selectedDocumentID else { return }
+    let absoluteCaret = UInt64(caret), profile = samplingProfile
     writingIssue = nil; showingCandidates = true
     work("Exploring continuations…") { [weak self] flag in
       guard let self else { return }
       do {
-        try await self.generateCandidates(document: document, offset: offset, profile: profile,
-          count: 3, maxTokens: 256, flag: flag)
+        let capture = try await self.captureDocument(id, prefixAt: absoluteCaret)
+        self.writingCapture = capture
+        try await self.generateCandidates(document: capture.modelSnapshot,
+          offset: capture.localCaret(absoluteCaret), profile: profile, count: 3, maxTokens: 256, flag: flag, capture: capture)
       } catch is CancellationError { throw CancellationError() }
       catch { self.writingIssue = error.localizedDescription }
     }
   }
   func openWritingExamples() {
-    guard !isBusy, let document = selectedDocument else { return }
-    editingWritingExamples = WritingExamplesRequest(manuscriptID: document.id)
+    guard !isBusy, let id = selectedDocumentID else { return }
+    editingWritingExamples = WritingExamplesRequest(manuscriptID: id)
   }
   func moveWritingExample(_ id: UUID, by delta: Int) {
     guard let index = writingExampleIDs.firstIndex(of: id), writingExampleIDs.indices.contains(index + delta) else { return }
     writingExampleIDs.swapAt(index, index + delta); invalidateGhost()
   }
-  func addWritingExample(title: String, prose: String, manuscriptID: UUID) throws {
+  func addWritingExample(title: String, prose: String, manuscriptID: UUID) async throws {
     guard state.selectedDocument == manuscriptID, writingExampleIDs.count < 32 else { throw BoomError.stale("Choose the original manuscript and at most 32 examples.") }
     let validated = try ProductCore.writingExample(title: title, text: prose)
     let document = DocumentSnapshot(title: validated.title, text: validated.text)
-    documents.append(document); dirty.insert(document.id)
+    try await importAuthoredDocument(document, selecting: false, flag: CancellationFlag())
+    guard state.selectedDocument == manuscriptID else { throw BoomError.stale("The manuscript changed while importing the example.") }
     writingExampleIDs.append(document.id)
-    invalidateGhost(); scheduleSave()
+    invalidateGhost(); try await flush()
   }
   func importWritingExamples(manuscriptID: UUID) {
     guard !isBusy, state.selectedDocument == manuscriptID else { return }
@@ -1517,13 +2220,13 @@ struct CompletionSegment {
           }
         }
         guard self.state.selectedDocument == manuscriptID, self.writingExampleIDs.count + imported.count <= 32 else { throw BoomError.stale("The manuscript changed, or the selection exceeds 32 examples.") }
-        for example in imported { try self.addWritingExample(title: example.title, prose: example.text, manuscriptID: manuscriptID) }
+        for example in imported { try await self.addWritingExample(title: example.title, prose: example.text, manuscriptID: manuscriptID) }
       } catch { self.writingIssue = error.localizedDescription }
     }
   }
   private func generateCandidates(document: DocumentSnapshot, offset: Int, profile: SamplingProfile,
     count: Int, maxTokens: Int, flag: CancellationFlag, previous: CandidateBundle? = nil,
-    replay: WritingCandidate? = nil) async throws {
+    replay: WritingCandidate? = nil, capture: BoundedDocumentCapture? = nil) async throws {
     let capturedEpoch = epoch
     let runner = try await runnerForGeneration(.writing, flag: flag)
     if let execution = replay?.batch, let seed = replay?.seed {
@@ -1533,25 +2236,60 @@ struct CompletionSegment {
       ?? (0..<count).map { _ in UInt64.random(in: .min ... .max) }
     try ProductCore.admitWritingBatch(width: seeds.count, prompt: 1, output: maxTokens, capacity: 16_384)
     try await flush()
-    let authored = try ProductCore.authoredPrefix(document, caret: offset)
-    let mediaText = previous?.recipe.sourcePrompt ?? ([authored] + writingExampleIDs.compactMap { id in documents.first(where: { $0.id == id })?.text }).joined(separator: "\n\n")
+    let authored = try await detachedWork { try ProductCore.authoredPrefix(document, caret: offset) }
+    let capturedExamples = writingExampleIDs
+    var exampleCaptures: [BoundedDocumentCapture] = []
+    if previous == nil {
+      for id in capturedExamples { try flag.check(); exampleCaptures.append(try await captureDocument(id, maximumBytes: 16_384)) }
+    }
+    let examples = exampleCaptures.map(\.modelSnapshot)
+    let mediaText = previous?.recipe.sourcePrompt ?? ([authored] + examples.map(\.text)).joined(separator: "\n\n")
     let media = try await writingMedia(in: mediaText, flag: flag)
-    let recipe: CompletionRecipe
+    let fitOwner: PromptCacheOwner? = replay == nil
+      ? PromptCacheOwner(namespace: inferenceCacheNamespace, entity: document.id, route: .writing) : nil
+    let retainedCapture = capture ?? previous?.recipe.capture
+    let admissionSources = previous?.recipe.sources ?? ([retainedCapture?.source].compactMap { $0 }
+      + exampleCaptures.map(\.source) + media.map { $0.reference.source })
+    let pairedAdmission = makePairedContextAdmission(runner: runner, purpose: .writing,
+      owner: fitOwner, flag: flag) { [weak self] in
+      guard let workspace = self else { throw CancellationError() }
+      if replay == nil {
+        try await workspace.validateWritingAdmissionSource(document: document, offset: offset,
+          examples: capturedExamples, sources: admissionSources, capturedEpoch: capturedEpoch, flag: flag, capture: retainedCapture)
+      } else {
+        try await MainActor.run {
+          try flag.check()
+          guard workspace.epoch == capturedEpoch, workspace.selectedDocumentID == document.id else {
+            throw BoomError.stale("The replay owner changed.")
+          }
+        }
+      }
+    }
+    var recipe: CompletionRecipe
     if let previous { recipe = previous.recipe }
     else {
-      let examples = try writingExampleIDs.map { id in
-        guard let value = documents.first(where: { $0.id == id }) else { throw BoomError.stale("An example was removed.") }
-        return value
-      }
-      let sources = ([document] + examples).map { SourceReference(id: $0.id, title: $0.title, digest: $0.revision, kind: "document") } + media.map { $0.reference.source }
+      let sources = admissionSources
       try await revalidateOnDisk(sources, attachments: [])
       recipe = try await runner.completionRecipe(document: document, caret: offset,
         sources: sources, examples: examples.map(\.text), profile: profile,
-        maxTokens: maxTokens, flag: flag, batchWidth: seeds.count, media: media)
+        maxTokens: maxTokens, flag: flag, batchWidth: seeds.count, media: media,
+        cacheOwner: fitOwner, pairedAdmission: pairedAdmission)
     }
-    try ProductCore.validateWritingRecipe(recipe)
+    recipe.capture = retainedCapture
+    let capturedRecipe = recipe
+    try await detachedWork { try ProductCore.validateWritingRecipe(capturedRecipe) }
     guard recipe.model == runner.identity else { throw BoomError.stale("Replay requires the original writing model.") }
-    try ProductCore.admitGenerationPolicy(recipe.generationPolicy, loaded: runner.generationPolicy)
+    let executionPolicy: ModelGenerationPolicy
+    if let replay {
+      executionPolicy = try replay.coldReplayPolicy(recipe: recipe,
+        loadedModel: runner.identity, loadedPolicy: runner.generationPolicy)
+    } else {
+      executionPolicy = try ProductCore.resolvedGenerationPolicy(recipe.generationPolicy, loaded: runner.generationPolicy)
+    }
+    // Only recorded cold attempts may replay until exact warm ancestry exists.
+    let cacheOwner: PromptCacheOwner? = replay == nil
+      ? PromptCacheOwner(namespace: inferenceCacheNamespace, entity: recipe.document.id, route: .writing)
+      : nil
     var bundle = CandidateBundle(id: replay == nil ? previous?.id ?? UUID() : UUID(), recipe: recipe,
       origin: previous?.origin ?? state.manuscriptOrigins[document.id],
       candidates: replay == nil ? previous?.candidates ?? [] : [],
@@ -1583,9 +2321,26 @@ struct CompletionSegment {
       let orderedMedia = try (recipe.media ?? []).map { reference -> WritingMediaData in
         guard let payload = media.first(where: { $0.reference == reference }) else { throw BoomError.stale(reference.name) }; return payload
       }
+      let deliveryTrace = PerformanceTrace.firstDelivery()
+      let joinedRetention = try makeJoinedRetentionRequest(owner: cacheOwner,
+        runner: runner, policy: executionPolicy, operationID: flag.operationID)
+      defer { finishJoinedRetentionRequest(joinedRetention) }
       let results = try await runner.runBatch(rawPrompt: recipe.prompt, media: orderedMedia, maxTokens: recipe.maxTokens,
           settings: recipe.settings, seeds: seeds, flag: flag, background: maxTokens == 64 && !showingCandidates,
-          onCheckpoint: { [weak self] updates in
+          cacheOwner: cacheOwner, executionPolicy: executionPolicy, joinedRetention: joinedRetention,
+          beforeCachePublication: { [weak self, recipe = capturedRecipe] in
+            guard let self else { throw CancellationError() }
+            if replay == nil { try await self.revalidateOnDisk(recipe.sources, attachments: []) }
+            try await MainActor.run {
+              try flag.check()
+              guard self.writingFlag === flag, self.epoch == capturedEpoch,
+                self.state.selectedDocument == recipe.document.id else {
+                throw BoomError.stale("The writing source changed before prompt-cache publication.")
+              }
+            }
+          },
+          pairedAdmission: pairedAdmission,
+          onCheckpoint: { [weak self, recipe = capturedRecipe] updates in
             for update in updates {
               try await checkpointStore.checkpoint(update.progress, identity: generations[update.lane],
                 stopReason: update.stopReason, stopTokenID: update.stopTokenID)
@@ -1610,6 +2365,7 @@ struct CompletionSegment {
                 }
               }
               owner.candidates = snapshot
+              if updates.contains(where: { !$0.progress.text.isEmpty }) { deliveryTrace?.published() }
               if owner.epoch == capturedEpoch, let selected = updates.first(where: { startIndex + $0.lane == snapshot.selected }) {
                 owner.showCandidateGhost(selected.progress.text, recipe: recipe, epoch: capturedEpoch)
               }
@@ -1625,6 +2381,7 @@ struct CompletionSegment {
         bundle.candidates[index].tokenIDs = result.tokenIDs
         bundle.candidates[index].stopReason = result.stopReason
         bundle.candidates[index].stopTokenID = result.stopTokenID
+        bundle.candidates[index].executionOrigin = result.executionOrigin
       }
       if let current = candidates, current.id == bundle.id, bundle.candidates.indices.contains(current.selected) {
         bundle.selected = current.selected
@@ -1639,7 +2396,7 @@ struct CompletionSegment {
       refreshContinuationHistory()
       try flag.check()
       status = "\(bundle.candidates.count) continuation\(bundle.candidates.count == 1 ? "" : "s") · "
-        + (recipe.omittedPrefixCharacters == 0 ? "full preceding manuscript" : "\(recipe.omittedPrefixCharacters) earlier characters omitted")
+        + (recipe.capture?.isWholeSource == true && recipe.omittedPrefixCharacters == 0 ? "full preceding manuscript" : "captured source range")
     } catch {
       if let current = candidates, current.id == bundle.id { bundle = current }
       for index in bundle.candidates.indices where bundle.candidates[index].state == .pending {
@@ -1698,47 +2455,52 @@ struct CompletionSegment {
     else if let id = latestSavedCandidate { reviewContinuation(id) }
   }
   func reviewContinuation(_ id: UUID) {
-    guard !isBusy, let document = selectedDocument, state.candidateIDs.contains(id) else { return }
-    let capturedCaret = caret
+    guard !isBusy, let documentID = selectedDocumentID, state.candidateIDs.contains(id) else { return }
+    let generation = pagedSession?.generation, capturedCaret = caret
     work("Opening continuations…") { [weak self] flag in
       guard let self else { return }
-      let capturedEpoch = self.epoch
-      let bundle = try await self.store.readCandidate(id)
+      let capturedEpoch = self.epoch, bundle = try await self.store.readCandidate(id)
       try flag.check()
-      guard self.activeFlag === flag, self.selectedDocument == document,
-        self.caret == capturedCaret, self.epoch == capturedEpoch else { throw CancellationError() }
-      guard bundle.recipe.document.id == document.id else {
-        throw BoomError.invalid("These continuations belong to another manuscript.")
-      }
+      guard self.activeFlag === flag, self.selectedDocumentID == documentID,
+        self.pagedSession?.generation == generation, self.caret == capturedCaret, self.epoch == capturedEpoch,
+        bundle.recipe.document.id == documentID else { throw BoomError.stale("The continuation source changed.") }
       self.candidates = bundle; self.showingCandidates = true; self.writingIssue = nil
       self.refreshContinuationHistory()
     }
   }
   func dismissCandidates() { invalidateGhost(); showingCandidates = false; candidates = nil }
   private func showCandidateGhost(_ text: String, recipe: CompletionRecipe, epoch: UInt64) {
-    guard let document = selectedDocument, document.id == recipe.document.id,
-      document.revision == recipe.document.revision, caret == recipe.caretUTF16,
-      let stamp = try? GhostStamp(document: document, caretUTF16: caret, epoch: epoch),
-      stamp.accepts(document: document, caretUTF16: caret, epoch: self.epoch,
-        hasMarkedText: editor?.hasMarkedText() ?? true), let visible = GemmaPrompt.visibleCompletion(text)
-    else { return }
+    guard let capture = recipe.capture, let session = pagedSession, let view = pagedInput?.activeView,
+      selectedDocumentID == capture.documentID, session.generation == capture.generation,
+      (try? pagedInput?.currentDocumentSelection().utf16Length) == 0,
+      session.sealedRevision == capture.record.document.revision, self.epoch == epoch,
+      view.completionCaretUTF16 >= 0, view.completionCaretUTF16 != NSNotFound, recipe.caretUTF16 >= 0,
+      UInt64(view.completionCaretUTF16) == capture.window.utf16Start + UInt64(recipe.caretUTF16),
+      let identity = completionSourceIdentity, !view.hasMarkedText(),
+      let visible = GemmaPrompt.visibleCompletion(text) else { return }
+    guard let stamp = try? GhostStamp(documentID: capture.documentID, revision: identity,
+      caretUTF16: view.completionCaretUTF16, epoch: epoch) else { return }
     ghostSources = recipe.sources; ghostStamp = stamp; ghostText = visible
-    editor?.showGhost(visible, stamp: stamp)
+    view.showGhost(visible, stamp: stamp)
   }
   var candidateIsCurrent: Bool {
-    guard let recipe = candidates?.recipe, let document = selectedDocument else { return false }
-    return document.id == recipe.document.id && document.revision == recipe.document.revision
-      && caret == recipe.caretUTF16 && (try? revalidate(recipe.sources, attachments: [])) != nil
-      && editor?.hasMarkedText() != true
+    guard let recipe = candidates?.recipe, let capture = recipe.capture, let session = pagedSession,
+      (try? pagedInput?.currentDocumentSelection().utf16Length) == 0,
+      selectedDocumentID == capture.documentID, session.generation == capture.generation,
+      session.sealedRevision == capture.record.document.revision,
+      let view = pagedInput?.activeView, !view.hasMarkedText(), view.selectedRange().length == 0,
+      view.completionCaretUTF16 >= 0, view.completionCaretUTF16 != NSNotFound, recipe.caretUTF16 >= 0,
+      UInt64(view.completionCaretUTF16) == capture.window.utf16Start + UInt64(recipe.caretUTF16) else { return false }
+    return (try? revalidate(recipe.sources, attachments: [])) != nil
   }
   func selectCandidate(_ index: Int) {
     guard let bundle = candidates, bundle.candidates.indices.contains(index) else { return }
     candidates?.selected = index
-    ghostText = ""; ghostStamp = nil; ghostSources = []; editor?.clearGhost()
+    ghostText = ""; ghostStamp = nil; ghostSources = []; pagedInput?.activeView?.clearGhost()
     if candidateIsCurrent { showCandidateGhost(bundle.candidates[index].text, recipe: bundle.recipe, epoch: epoch) }
   }
   func replayCandidate(_ index: Int) {
-    guard !isBusy, let bundle = candidates, bundle.recipe.document.id == state.selectedDocument,
+    guard canReplayCandidate(index), let bundle = candidates, bundle.recipe.document.id == state.selectedDocument,
       bundle.candidates.indices.contains(index) else { return }
     showingCandidates = true
     work("Replaying this seed…") { [weak self] flag in
@@ -1753,56 +2515,83 @@ struct CompletionSegment {
       bundle.candidates[index].state == .complete,
       bundle.recipe.model == (baseRunner?.identity ?? writingModelIdentity),
       let policy = baseRunner?.generationPolicy ?? writingGenerationPolicy else { return false }
-    do { try ProductCore.admitGenerationPolicy(bundle.recipe.generationPolicy, loaded: policy); return true }
-    catch { return false }
+    do {
+      _ = try bundle.candidates[index].coldReplayPolicy(recipe: bundle.recipe,
+        loadedModel: baseRunner?.identity ?? writingModelIdentity ?? "", loadedPolicy: policy)
+      return true
+    } catch { return false }
   }
   func acceptCandidateWord(_ index: Int) {
     guard !isBusy, candidateIsCurrent, let bundle = candidates, bundle.candidates.indices.contains(index),
-      bundle.candidates[index].state == .complete, let editor else { return }
-    editor.window?.makeFirstResponder(editor)
-    selectCandidate(index)
-    _ = editor.acceptNextGhostWord()
+      bundle.candidates[index].state == .complete, let view = pagedInput?.activeView else { return }
+    view.window?.makeFirstResponder(view); selectCandidate(index)
+    _ = view.acceptNextGhostWord()
   }
   func acceptCandidate(_ index: Int) {
     guard candidateIsCurrent, let bundle = candidates, bundle.candidates.indices.contains(index),
-      bundle.candidates[index].state == .complete, let editor else { return }
+      bundle.candidates[index].state == .complete, let view = pagedInput?.activeView else { return }
     let text = bundle.candidates[index].text
     cancel(); showingCandidates = false
-    editor.window?.makeFirstResponder(editor)
-    editor.insertText(text, replacementRange: NSRange(location: bundle.recipe.caretUTF16, length: 0))
+    view.window?.makeFirstResponder(view)
+    view.insertText(text, replacementRange: view.selectedRange())
   }
   func branchCandidate(_ index: Int) {
     guard !isBusy, let bundle = candidates, bundle.candidates.indices.contains(index),
-      bundle.candidates[index].state == .complete, editor?.hasMarkedText() != true else { return }
-    do {
-      let snapshot = bundle.recipe.document
-      let text = try ProductCore.branchWriting(bundle.recipe, continuation: bundle.candidates[index].text)
-      let document = DocumentSnapshot(title: snapshot.title + " · branch", text: text)
-      state.manuscriptOrigins[document.id] = ManuscriptOrigin(documentID: snapshot.id, revision: snapshot.revision,
-        bundleID: bundle.id, candidateID: bundle.candidates[index].id)
-      documents.append(document); dirty.insert(document.id); selectDocument(document.id)
-      showingCandidates = false; scheduleSave()
-    } catch { report(error) }
+      bundle.candidates[index].state == .complete, let capture = bundle.recipe.capture else { return }
+    let continuation = bundle.candidates[index].text
+    work("Branching document…") { [weak self] flag in
+      guard let self else { return }
+      let (engine, _) = try self.pagedOwners()
+      let id = UUID()
+      try await self.withTemporaryDocumentFile { url in
+        try await detachedWork {
+          guard FileManager.default.createFile(atPath: url.path, contents: nil,
+            attributes: [.posixPermissions: 0o600]) else { throw BoomError.unavailable("Could not create a branch stream.") }
+        }
+        let file = try await detachedWork { try FileHandle(forWritingTo: url) }
+        var closeAttempted = false
+        do {
+          try await engine.export(capture.record.document.revision, to: file)
+          closeAttempted = true
+          do { try await detachedWork { try file.close() } }
+          catch { throw WorkspacePagedImportFailure(original: BoomError.unavailable("Branch stream did not close."), cleanup: error, url: url) }
+        } catch {
+          let original = error
+          if !closeAttempted {
+            do { try await detachedWork { try file.close() } }
+            catch { throw WorkspacePagedImportFailure(original: original, cleanup: error, url: url) }
+          }
+          throw original
+        }
+        try await self.importPagedDocument(url, title: capture.title + " · branch", documentID: id, recordImportedSource: false, flag: flag)
+        let position = capture.window.utf16Start + UInt64(bundle.recipe.caretUTF16)
+        guard let commands = self.pagedCommands else { throw BoomError.stale("The branch lost its native command owner.") }
+        await Task.yield()
+        guard let mounted = self.pagedInput?.activeView, let window = mounted.window,
+          window.isKeyWindow, window.makeFirstResponder(mounted), window.firstResponder === mounted else {
+          throw BoomError.stale("The branch has not received its native editor focus.")
+        }
+        try await commands.navigate(toUTF16: position, selectingUTF16: PagedNativeNavigationSelection(utf16Offset: position, utf16Length: 0))
+        guard let view = self.pagedInput?.activeView else { throw BoomError.stale("The branch lost its editor.") }
+        view.insertText(continuation, replacementRange: view.selectedRange())
+        if let error = view.boundedStorage.mutationFailure { throw error }
+        self.state.manuscriptOrigins[id] = ManuscriptOrigin(documentID: capture.documentID, revision: capture.revisionDigest,
+          bundleID: bundle.id, candidateID: bundle.candidates[index].id)
+        try await self.flush()
+      }
+      self.showingCandidates = false
+    }
   }
   func takeGhost(documentID: UUID, caret: Int) -> String? {
-    guard let d = selectedDocument, d.id == documentID, let stamp = ghostStamp,
-      stamp.accepts(
-        document: d, caretUTF16: caret, epoch: epoch, hasMarkedText: editor?.hasMarkedText() ?? true
-      ), !ghostText.isEmpty
-    else {
-      invalidateGhost()
-      return nil
+    guard selectedDocumentID == documentID, let stamp = ghostStamp, let identity = completionSourceIdentity,
+      (try? pagedInput?.currentDocumentSelection().utf16Length) == 0,
+      let view = pagedInput?.activeView,
+      stamp.accepts(documentID: documentID, revision: identity, caretUTF16: caret, epoch: epoch, hasMarkedText: view.hasMarkedText()),
+      view.completionCaretUTF16 == caret, !ghostText.isEmpty,
+      ghostSourcesRemainCurrent(ghostSources, manuscriptID: documentID) else {
+      invalidateGhost(); return nil
     }
-    do {
-      try revalidate(ghostSources, attachments: [])
-    } catch {
-      status = error.localizedDescription
-      invalidateGhost()
-      return nil
-    }
-    let value = ghostText
-    invalidateGhost()
-    return value
+    let value = ghostText; invalidateGhost(); return value
   }
   func takeGhostChunk(documentID: UUID, caret: Int) -> CompletionSegment? {
     let sources = ghostSources
@@ -1814,18 +2603,15 @@ struct CompletionSegment {
   func ghostSourcesRemainCurrent(_ sources: [SourceReference], manuscriptID: UUID) -> Bool {
     (try? revalidate(sources.filter { $0.id != manuscriptID }, attachments: [])) != nil
   }
-  func resumeGhost(_ text: String, documentID: UUID, caret: Int,
-    sources: [SourceReference]) {
-    guard !text.isEmpty, let document = selectedDocument, document.id == documentID,
-      self.caret == caret, editor?.selectedRange().location == caret,
-      editor?.selectedRange().length == 0, editor?.string == document.text,
-      (try? revalidate(sources, attachments: [])) != nil,
-      let stamp = try? GhostStamp(document: document, caretUTF16: caret, epoch: epoch)
-    else { return }
-    ghostSources = sources
-    ghostStamp = stamp
-    ghostText = text
-    editor?.showGhost(text, stamp: stamp)
+  func resumeGhost(_ text: String, documentID: UUID, caret: Int, sources: [SourceReference]) {
+    guard !text.isEmpty, selectedDocumentID == documentID, let view = pagedInput?.activeView,
+      (try? pagedInput?.currentDocumentSelection().utf16Length) == 0,
+      view.completionCaretUTF16 == caret, view.selectedRange().length == 0, !view.hasMarkedText(),
+      ghostSourcesRemainCurrent(sources, manuscriptID: documentID), let identity = completionSourceIdentity else { return }
+    self.caret = caret
+    guard let stamp = try? GhostStamp(documentID: documentID, revision: identity, caretUTF16: caret, epoch: epoch) else { return }
+    ghostSources = sources; ghostStamp = stamp; ghostText = text
+    view.showGhost(text, stamp: stamp)
   }
   func navigateGhost(_ direction: Int) {
     guard let bundle = candidates, candidateIsCurrent else { exploreWriting(); return }
@@ -1841,41 +2627,29 @@ struct CompletionSegment {
       selectCandidate((bundle.selected + direction + bundle.candidates.count) % bundle.candidates.count)
     }
   }
-  private func selectImportedDocument(_ id: UUID) {
-    state.selectedDocument = id; selectedDocumentIDs = [id]; state.showDocument = true
-    caret = 0; resetContinuationView()
-    state.selectedChat = nil; draft = ""; pendingAttachments = []
-    showingChatInstructions = nil; editingChatMessage = nil
-    compactPane = "document"; invalidateGhost(); focusEditor(id)
-  }
   func importFolder() {
     guard !isBusy, layout.isAuthor else { return }
-    finishComposition()
-    let panel = NSOpenPanel()
-    panel.canChooseFiles = false; panel.canChooseDirectories = true
-    panel.prompt = "Import"; panel.message = "Copy Markdown and text files into Bloom's encrypted library."
+    let panel = NSOpenPanel(); panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.prompt = "Import"
     guard panel.runModal() == .OK, let root = panel.url else { return }
     work("Importing folder…") { [weak self] flag in
       guard let self else { return }
-      let scope = root.startAccessingSecurityScopedResource()
-      defer { if scope { root.stopAccessingSecurityScopedResource() } }
-      let files = try await detachedWork { try FolderImport.read(root, flag: flag) }
-      try flag.check()
-      try await self.store.retainImportedOriginals(files, flag: flag)
-      try flag.check()
+      let scoped = root.startAccessingSecurityScopedResource()
+      defer { if scoped { root.stopAccessingSecurityScopedResource() } }
+      let files = try await detachedWork { try FolderImport.chosenFiles(root, flag: flag) }
       let folder = ImportedFolder(id: UUID(), name: root.lastPathComponent)
       self.state.importedFolders = (self.state.importedFolders ?? []) + [folder]
-      for file in files {
-        let title = URL(fileURLWithPath: file.path).deletingPathExtension().lastPathComponent
-        self.documents.append(DocumentSnapshot(id: file.id, title: title, text: file.text))
-        self.dirty.insert(file.id)
-        self.state.importedFiles = self.state.importedFiles ?? [:]
-        self.state.importedFiles?[file.id] = ImportedFile(folderID: folder.id, path: file.path,
-          originalDigest: Digest.sha256(file.original))
+      for chosen in files {
+        try flag.check()
+        let id = UUID()
+        try await self.importPagedDocument(chosen.url, title: chosen.url.deletingPathExtension().lastPathComponent,
+          documentID: id, selecting: false, flag: flag)
+        if let imported = self.state.importedFiles?[id] {
+          self.state.importedFiles?[id] = ImportedFile(folderID: folder.id, path: chosen.path,
+            originalDigest: imported.originalDigest, originalRevision: imported.originalRevision)
+        }
       }
-      if let first = files.first { self.selectImportedDocument(first.id) }
       try await self.flush()
-      self.status = "Imported \(files.count) documents into encrypted storage"
+      self.status = "Imported \(files.count) documents"
     }
   }
   func importDocument() {
@@ -1892,66 +2666,334 @@ struct CompletionSegment {
     }
   }
   func importDocuments(_ urls: [URL], flag: CancellationFlag) async throws {
-    let imported = try await detachedWork { try DocumentImport.read(urls, flag: flag) }
-    try flag.check()
-    try await store.retainImportedOriginals(imported, flag: flag)
-    try flag.check()
-    state.importedFiles = state.importedFiles ?? [:]
-    for file in imported {
-      let document = DocumentSnapshot(id: file.id,
-        title: URL(fileURLWithPath: file.path).deletingPathExtension().lastPathComponent, text: file.text)
-      dirty.insert(document.id); documents.append(document)
-      state.importedFiles?[file.id] = ImportedFile(folderID: nil, path: file.path, originalDigest: Digest.sha256(file.original))
+    for url in urls {
+      try flag.check()
+      try await importPagedDocument(url, title: url.deletingPathExtension().lastPathComponent, flag: flag)
     }
-    if let first = imported.first { selectImportedDocument(first.id) }
-    try await flush()
   }
   func exportDocument(_ id: UUID? = nil) {
-    finishComposition()
-    guard let d = documents.first(where: { $0.id == (id ?? state.selectedDocument) }) else {
-      return
-    }
-    let panel = NSSavePanel()
-    panel.nameFieldStringValue = d.title + ".md"
+    guard let documentID = id ?? selectedDocumentID,
+      let index = documentIndices.first(where: { $0.id == documentID }) else { return }
+    let panel = NSSavePanel(); panel.nameFieldStringValue = index.title + ".md"
     guard panel.runModal() == .OK, let url = panel.url else { return }
-    exportFile(to: url) { Data(d.text.utf8) }
+    do { _ = try exportPagedDocument(to: url, documentID: documentID) } catch { report(error) }
   }
-  func revealDocument(_ id: UUID) {
-    NSWorkspace.shared.activateFileViewerSelecting([store.documentURL(id)])
-  }
-  private func insertAttachmentLinks(
-    _ attachments: [AttachmentRecord], into destination: AttachmentDestination
-  ) throws {
-    guard case .document(let id, let revision, let range) = destination else {
-      throw BoomError.invalid("A document destination is required for Markdown links.")
+  /// The existing export task registry owns the real producer before any
+  /// await. Same-destination operations join in order, and shutdown joins the
+  /// observer only after its actual producer completes. Failed results remain
+  /// reachable here, including any unreleased source/file-publication custody.
+  @discardableResult
+  func exportPagedDocument(to url: URL, documentID: UUID? = nil,
+    cancellation: PagedTextCancellation = PagedTextCancellation()) throws -> Task<URL, Error> {
+    try requirePagedOperation()
+    guard let documentID = documentID ?? selectedDocumentID else { throw BoomError.stale("No source is selected for export.") }
+    let target = url.standardizedFileURL, id = UUID()
+    guard pagedExportTaskCount < Self.maximumPagedExportTasks,
+      exportTasks[target] != nil || exportTasks.count < Self.maximumPagedExportTasks else {
+      throw BoomError.budget("The existing export registry has eight pending or retained destinations.")
     }
-    guard let index = documents.firstIndex(where: { $0.id == id }) else {
-      throw BoomError.stale("The attachment's document was removed.")
+    let (engine, publisher) = try pagedOwners()
+    let selected = pagedSelectedRecord?.document.id == documentID
+    let session = selected ? pagedSession : nil
+    guard !selected || session != nil else { throw BoomError.stale("The selected source has no actual native session.") }
+    let generation = session?.generation, previous = exportTasks[target]
+    pagedExportTaskCount += 1
+    let producer = Task<URL, Error> { [weak self] in
+      try await withTaskCancellationHandler {
+        if let previous {
+          await previous.task.value
+          if let result = previous.pagedResult { _ = try await result.value }
+          if let result = previous.clipboardResult { try await result.value }
+        }
+        try Task.checkCancellation()
+        if cancellation.isCancelled { throw CancellationError() }
+        guard let self, self.pagedEngine === engine, self.pagedPublisher === publisher else {
+          throw BoomError.stale("The captured export lost its actual ordinary workspace owners.")
+        }
+        if let failure = self.pagedFirstFailure { throw failure }
+        guard !self.pagedTransition else { throw BoomError.stale("A source transition preceded this export capture.") }
+        var captured: PagedDocumentRootRecord?
+        if let session, let generation {
+          guard self.pagedSession === session, session.generation == generation else {
+            throw BoomError.stale("Later source input preceded this export capture.")
+          }
+          let revision = try await session.flush(through: generation)
+          let record = session.sealedRootRecord
+          guard self.pagedSession === session, session.generation == generation,
+            session.sealedGeneration == generation, record.document.revision == revision else {
+            throw BoomError.stale("The exported native prefix changed before its actual full-record capture.")
+          }
+          captured = record
+        }
+        if captured == nil {
+          let read = try await engine.currentDocumentRecordRetaining(publisher, documentID: documentID)
+          captured = read.value
+          try await engine.abandonJoinedRootOutput(read.lease)
+        }
+        guard let captured, captured.document.id == documentID else { throw BoomError.stale("Actual export admission returned another source.") }
+        return try await self.store.exportPagedDocument(captured,
+          engine: engine, publisher: publisher, to: target, cancellation: cancellation)
+      } onCancel: {
+        cancellation.cancel()
+        previous?.pagedResult?.cancel()
+        previous?.clipboardResult?.cancel()
+      }
+    }
+    let observer = Task { [weak self] in
+      defer { self?.pagedExportTaskCount -= 1 }
+      do {
+        _ = try await producer.value
+        if self?.exportTasks[target]?.id == id { self?.exportTasks[target] = nil }
+      } catch {
+        self?.report(error)
+        // The same registry result retains the original failure/lease/path;
+        // a new same-destination request joins and propagates it without replay.
+      }
+    }
+    exportTasks[target] = (id, observer, producer, nil)
+    return producer
+  }
+  func cancelExport(to url: URL) {
+    // Cancel the actual source/coordination task. Its scoped handler also
+    // cancels this same destination's entered predecessor and explicit token.
+    exportTasks[url.standardizedFileURL]?.pagedResult?.cancel()
+    exportTasks[url.standardizedFileURL]?.clipboardResult?.cancel()
+  }
+  /// The actual native client supplies the complete logical selection. The
+  /// immutable capture includes accepted dirty text; the existing export task
+  /// retains it without waiting for or borrowing a saved document record.
+  func copyDocumentSelection(from view: PagedNativeTextView, cutting: Bool) {
+    do {
+      try requirePagedOperation()
+      guard let input = pagedInput, input.activeView === view, let commands = pagedCommands,
+        let session = pagedSession, view.session === session, !view.hasMarkedText(),
+        !cutting || view.isEditable else { throw BoomError.stale("Clipboard selection has another native input client.") }
+      let selection = try input.currentDocumentSelection()
+      guard selection.utf16Length > 0 else { return }
+      let observed = try input.observeSelection()
+      let (engine, publisher) = try pagedOwners()
+      let clipboardIntent = ClipboardIntent.begin()
+      _ = try commands.requestDocumentClipboard(selection, cutting: cutting) { [weak self] captured in
+        guard let self, self.pagedInput === input, input.activeView === view,
+          self.pagedSession === session, try input.observeSelection() == observed,
+          try input.currentDocumentSelection() == selection,
+          captured.source.sourceRevision.documentID == self.selectedDocumentID else {
+          throw BoomError.stale("The clipboard selection changed before its immutable source capture.")
+        }
+        try session.admitLogicalRead(captured)
+        guard clipboardIntent.isCurrent else { throw BoomError.stale("A newer clipboard request is already present.") }
+        let snapshot = captured.source
+        guard selection.utf16Offset <= snapshot.summary.utf16,
+          selection.utf16Length <= snapshot.summary.utf16 - selection.utf16Offset else {
+          throw BoomError.stale("Clipboard selection exceeds its captured logical source.")
+        }
+        let cancellation = CancellationFlag()
+        let start = try await engine.logicalPosition(snapshot, utf16Offset: selection.utf16Offset,
+          cancellation: cancellation).bytes
+        let end = try await engine.logicalPosition(snapshot,
+          utf16Offset: selection.utf16Offset + selection.utf16Length, cancellation: cancellation).bytes
+        guard start < end, end <= snapshot.summary.bytes else {
+          throw BoomError.invalid("Clipboard endpoints did not name the selected logical bytes.")
+        }
+        try Task.checkCancellation()
+        let result = try self.publishClipboardSelection(snapshot: snapshot, engine: engine,
+          publisher: publisher, start: start, end: end, intent: clipboardIntent)
+        if cutting {
+          try await withTaskCancellationHandler { try await result.value } onCancel: { result.cancel() }
+          try Task.checkCancellation()
+          guard clipboardIntent.isLatest else { throw BoomError.stale("A newer clipboard request superseded this Cut.") }
+        }
+      }
+    } catch {
+      status = error.localizedDescription
+      PerformanceTrace.event("Editor.ManagedAdmission")
+    }
+  }
+
+  /// File paste enters the same physical command fence as selected-source
+  /// replacement. Its imported tree stays live until the real mounted result
+  /// joins; no manuscript-sized String or clipboard buffer is constructed.
+  @discardableResult
+  func pasteDocumentTextFile(_ clipboard: PagedClipboardTextFile, from view: PagedNativeTextView)
+    throws -> Task<PagedNativeLogicalSnapshot, Error> {
+    try requirePagedOperation(); try clipboard.admitCurrent()
+    guard let input = pagedInput, input.activeView === view, let commands = pagedCommands,
+      let session = pagedSession, view.session === session, view.isEditable, !view.hasMarkedText() else {
+      throw BoomError.stale("Text paste has another physical document input client.")
+    }
+    let selected = try input.currentDocumentSelection(), observed = try input.observeSelection()
+    let (engine, _) = try pagedOwners()
+    return try commands.requestDocumentImportedReplacement(selected, importing: { [weak self] captured in
+      guard let self, self.pagedInput === input, input.activeView === view,
+        self.pagedSession === session, captured.source.sourceRevision.documentID == self.selectedDocumentID,
+        try input.observeSelection() == observed, try input.currentDocumentSelection() == selected else {
+        throw BoomError.stale("Text paste changed before capturing its original source and selection.")
+      }
+      try session.admitLogicalRead(captured)
+      try clipboard.admitCurrent(); try Task.checkCancellation()
+      let scoped = clipboard.url.startAccessingSecurityScopedResource()
+      defer { if scoped { clipboard.url.stopAccessingSecurityScopedResource() } }
+      let opened = try await detachedWork { try clipboard.open() }
+      let cancellation = PagedTextCancellation()
+      var imported: PagedTextCustodiedValue<PagedTextImportedRevision>?
+      var closeAttempted = false
+      do {
+        let output = try await withTaskCancellationHandler {
+          try await engine.importUTF8Retaining(documentID: captured.source.sourceRevision.documentID, from: opened.file,
+            expectedBytes: opened.expectedBytes, cancellation: cancellation, priority: .foreground)
+        } onCancel: { cancellation.cancel() }
+        imported = output
+        try await detachedWork { try opened.admit() }
+        closeAttempted = true
+        try await detachedWork { try opened.close() }
+        try Task.checkCancellation()
+        guard self.pagedInput === input, self.pagedSession === session, input.activeView === view,
+          try input.observeSelection() == observed, try input.currentDocumentSelection() == selected else {
+          throw BoomError.stale("Text paste changed while its immutable file tree was imported.")
+        }
+        return output
+      } catch {
+        var original: Error = error
+        if !closeAttempted {
+          closeAttempted = true
+          do { try await detachedWork { try opened.close() } }
+          catch { original = WorkspacePagedImportFailure(original: original, cleanup: error, url: clipboard.url) }
+        }
+        if let imported {
+          do { try await engine.abandonJoinedRootOutput(imported.lease) }
+          catch { throw PagedTextCustodyHandoffFailure(original: original, handoff: error, lease: imported.lease) }
+        }
+        throw original
+      }
+    }, discard: { lease in try await engine.abandonJoinedRootOutput(lease) })
+  }
+
+  private func publishClipboardSelection(snapshot: PagedNativeLogicalSnapshot,
+    engine: PagedTextEngineAdapter, publisher: PagedWorkspacePublisher,
+    start: UInt64, end: UInt64, intent: ClipboardIntent) throws -> Task<Void, Error> {
+    guard pagedExportTaskCount < Self.maximumPagedExportTasks else {
+      throw BoomError.budget("Eight file publications are already owned.")
+    }
+    let cache = try FileManager.default.url(for: .cachesDirectory, in: .userDomainMask,
+      appropriateFor: nil, create: false)
+    let directory = cache.appendingPathComponent("Bloom/Clipboard", isDirectory: true)
+      .appendingPathComponent(publisher.storeID.uuidString.lowercased(), isDirectory: true)
+    guard exportTasks[directory] != nil || exportTasks.count < Self.maximumPagedExportTasks else {
+      throw BoomError.budget("Eight file publication destinations are already owned.")
+    }
+    let target = directory.appendingPathComponent("Selection-" + UUID().uuidString.lowercased() + ".txt")
+    let previous = exportTasks[directory], id = UUID()
+    pagedExportTaskCount += 1
+    let producer = Task<Void, Error> { [self] in
+      var preparedFile: URL?
+      do {
+        if let previous {
+          await previous.task.value
+          // Join the actual previous producer; its retained failure belongs to
+          // that request and must not poison this newer Copy.
+          if let result = previous.clipboardResult { _ = await result.result }
+        }
+        try Task.checkCancellation()
+        let pasteboard = NSPasteboard.general
+        guard intent.isCurrent else {
+          throw BoomError.stale("A newer clipboard item is already present.")
+        }
+        let retained = (pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+        let cancellation = CancellationFlag()
+        if end - start <= UInt64(PagedTextWindow.maximumBytes) {
+          let bytes = try await engine.logicalBytes(snapshot, byteRange: start..<end, cancellation: cancellation)
+          guard UInt64(bytes.count) == end - start, let text = String(data: bytes, encoding: .utf8) else {
+            throw BoomError.invalid("Clipboard text did not contain the complete selected logical range.")
+          }
+          try Task.checkCancellation()
+          guard intent.isCurrent else { throw BoomError.stale("The clipboard changed while selected text was read.") }
+          pasteboard.clearContents()
+          guard pasteboard.writeObjects([text as NSString]) else { throw BoomError.unavailable("The selected text was not written to the clipboard.") }
+          status = "Copied"
+        } else {
+          try await detachedWork { try Self.prepareClipboardDirectory(directory, retaining: retained) }
+          let file = try await ExplicitFileExport.write(to: target, stream: { handle in
+            try await engine.exportLogical(snapshot, to: handle, byteRange: start..<end, cancellation: cancellation)
+          })
+          preparedFile = file
+          try Task.checkCancellation()
+          guard intent.isCurrent else { throw BoomError.stale("The clipboard changed while the selected file was prepared.") }
+          try PagedClipboardTextFile.write(file, to: pasteboard)
+          status = "Copied file"
+        }
+      } catch {
+        let original = error
+        if let preparedFile {
+          throw ExplicitStreamExportFailure(original: original, cleanup: nil,
+            retainedDirectory: nil, publishedURL: preparedFile)
+        }
+        throw original
+      }
+    }
+    let observer = Task { [weak self] in
+      defer { self?.pagedExportTaskCount -= 1 }
+      do {
+        try await producer.value
+        if self?.exportTasks[directory]?.id == id { self?.exportTasks[directory] = nil }
+      } catch {
+        self?.status = error.localizedDescription
+        PerformanceTrace.event("Editor.ManagedAdmission")
+      }
+    }
+    exportTasks[directory] = (id, observer, nil, producer)
+    return producer
+  }
+
+  nonisolated private static func prepareClipboardDirectory(_ directory: URL, retaining: [URL]) throws {
+    let manager = FileManager.default
+    try manager.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+    let values = try directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+    guard values.isDirectory == true, values.isSymbolicLink != true else { throw BoomError.invalid("Clipboard cache is not an ordinary directory.") }
+    let files = try manager.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+    guard files.count <= 8 else { throw BoomError.budget("Clipboard cache contains unexpected retained files.") }
+    for file in files {
+      let name = file.deletingPathExtension().lastPathComponent
+      guard file.pathExtension == "txt", name.hasPrefix("Selection-"),
+        UUID(uuidString: String(name.dropFirst("Selection-".count))) != nil else {
+        throw BoomError.invalid("Clipboard cache contains an unknown file.")
+      }
+      let attributes = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+      guard attributes.isRegularFile == true, attributes.isSymbolicLink != true else { throw BoomError.invalid("Clipboard cache contains a link or non-file.") }
+      if !retaining.contains(file) { try manager.removeItem(at: file) }
+    }
+    guard files.filter({ retaining.contains($0) }).count <= 1 else {
+      throw BoomError.budget("Clipboard cache retains more than one published selection.")
+    }
+    // At most the still-published previous file and this action's staging
+    // output survive. The next large copy removes inactive owned files; the
+    // current clipboard file remains usable after the application exits.
+  }
+
+  func revealDocument(_ id: UUID) {
+    NSWorkspace.shared.activateFileViewerSelecting([store.root.appendingPathComponent("documents/" + id.uuidString.lowercased(), isDirectory: true)])
+  }
+  private func insertAttachmentLinks(_ attachments: [AttachmentRecord], into destination: AttachmentDestination) throws {
+    guard case .document(let id, let sessionID, let arenaID, let generation, let selectionEpoch, let range, let selection) = destination,
+      state.selectedDocument == id, let session = pagedSession, let input = pagedInput,
+      session.sessionID == sessionID, session.arenaID == arenaID, session.generation == generation,
+      let view = input.activeView, !view.hasMarkedText(),
+      let observation = try? input.observeSelection(), observation.selectionEpoch == selectionEpoch,
+      observation.range == range, try input.currentDocumentSelection() == selection else {
+      throw BoomError.stale("The attachment insertion target changed. Its original files were retained.")
     }
     guard !attachments.isEmpty else { return }
     let links = attachments.map { attachment in
       let name = attachment.name.replacingOccurrences(of: "\\", with: "\\\\")
-        .replacingOccurrences(of: "]", with: "\\]")
-        .replacingOccurrences(of: "\n", with: " ")
+        .replacingOccurrences(of: "]", with: "\\]").replacingOccurrences(of: "\n", with: " ")
       return "[Attachment: \(name)](boom-attachment:\(attachment.id.uuidString))"
     }.joined(separator: "\n") + "\n"
-    let current = documents[index]
-    let insertion = current.revision == revision
-      ? Range(range, in: current.text) : nil
-    guard let replacement = insertion else { throw BoomError.stale("The attachment insertion target changed. Its original bytes were retained.") }
-    // Media occupy their own paragraph while retaining the exact source on
-    // both sides of the captured paste range.
-    let prefix = current.text[..<replacement.lowerBound]
-    let value = (prefix.isEmpty || prefix.hasSuffix("\n") ? "" : "\n") + links
-    if state.selectedDocument == id, let editor, editor.documentID == id,
-      editor.string == current.text,
-      let native = NSRange(replacement, in: current.text) as NSRange? {
-      editor.insertText(value, replacementRange: native)
-    } else {
-      documents[index].text.replaceSubrange(replacement, with: value)
-      dirty.insert(id)
-      scheduleSave()
-    }
+    let source = view.string as NSString
+    let origin = try session.documentCoordinates().utf16Start
+    let startsParagraph = selection.utf16Offset == 0
+      || selection.utf16Offset == origin + UInt64(range.location) && range.location > 0
+        && source.substring(with: NSRange(location: range.location - 1, length: 1)) == "\n"
+    view.insertText((startsParagraph ? "" : "\n") + links, replacementRange: range)
+    if let error = view.boundedStorage.mutationFailure { throw error }
   }
   func chooseAttachmentFiles(to destination: AttachmentDestination) {
     guard !isBusy else { return }
@@ -1968,8 +3010,8 @@ struct CompletionSegment {
     case .chat(let id):
       guard state.selectedChat == id else { report(BoomError.stale("Chat changed.")); return }
       alreadyPending = pendingAttachments.count
-    case .document(let id, _, _):
-      guard documents.contains(where: { $0.id == id }) else {
+    case .document(let id, _, _, _, _, _, _):
+      guard documentIndices.contains(where: { $0.id == id }) else {
         report(BoomError.stale("Document was removed.")); return
       }
       alreadyPending = 0
@@ -2062,18 +3104,29 @@ struct CompletionSegment {
     composerIssue = nil
   }
   /// A captured recording is an original attachment, not a transcription action.
-  /// Admission and encrypted storage can finish while model preparation runs.
+  /// File admission can finish while model preparation runs.
   func attachRecordedAudio(_ data: Data, chatID: UUID?, documentID: UUID?) async throws {
-    guard !isBusy || settingUpModels, state.selectedChat == chatID,
+    guard !pagedTransition, !pagedShutdownRequested, recordingAttachmentTask == nil,
+      !isBusy || settingUpModels, state.selectedChat == chatID,
       state.selectedDocument == documentID, pendingAttachments.count < 8 else {
       throw BoomError.stale("The recording's conversation changed.")
     }
+    let task = Task { @MainActor in try await self.persistRecordedAudio(data, chatID: chatID, documentID: documentID) }
+    recordingAttachmentTask = task
+    defer { recordingAttachmentTask = nil }
+    try await withTaskCancellationHandler {
+      try await task.value
+    } onCancel: { task.cancel() }
+  }
+  private func persistRecordedAudio(_ data: Data, chatID: UUID?, documentID: UUID?) async throws {
     let imported = try await detachedWork {
       guard try ProductCore.admitMedia(data).rawValue == "wav" else {
         throw BoomError.invalid("The recording is not local PCM audio.")
       }
       return try AttachmentProcessor.inspect(name: "Recording.wav", data: data)
     }
+    try Task.checkCancellation()
+    guard !pagedTransition, !pagedShutdownRequested else { throw CancellationError() }
     let vault = store.vault
     try await detachedWork {
       try vault.put(imported.original, kind: .attachment, id: imported.record.id)
@@ -2084,8 +3137,10 @@ struct CompletionSegment {
       throw BoomError.stale("The recording's conversation changed.")
     }
     if state.selectedChat == nil {
+      retainComposerDraft()
       let chat = ChatRecord(attachedDocumentID: layout.isAuthor ? documentID : nil)
       state.chats.append(chat); state.selectedChat = chat.id; selectedChatIDs = [chat.id]
+      transferDocumentDraftToChat()
     }
     var record = imported.record
     record.text = ""; record.coverage = "Audio"; record.awaitingTranscription = true
@@ -2137,6 +3192,8 @@ struct CompletionSegment {
     }
   }
   func consultationMedia(_ records: [AttachmentRecord], rawAudio: Bool, flag: CancellationFlag) async throws -> (images: [Data], media: [WritingMediaData]) {
+    let trace = PerformanceTrace.begin("Request.MediaInput")
+    defer { PerformanceTrace.end("Request.MediaInput", trace) }
     let readable = records.filter { !($0.kind == .audio && !rawAudio) }
     let links = readable.map { "[Attachment: media](boom-attachment:\($0.id))" }.joined(separator: "\n")
     let payloads = try await writingMedia(in: links, flag: flag)
@@ -2196,43 +3253,129 @@ struct CompletionSegment {
     updated.coverage = "Partial native transform"
     return updated
   }
-  private func releaseRunner(_ purpose: ModelPurpose) async {
-    if purpose == .consultation {
-      if let old = mlxRunner { await old.join() }
-      mlxRunner = nil; modelReady = false
-    } else {
-      if let old = baseRunner { await old.join() }
-      baseRunner = nil
+  @discardableResult
+  private func releaseRunner(_ purpose: ModelPurpose, expectedEpoch: UUID? = nil) async -> Bool {
+    let current = purpose == .consultation ? mlxRunner : baseRunner
+    guard let old = current else {
+      if expectedEpoch == nil {
+        if purpose == .consultation { mlxRunner = nil; modelReady = false } else { baseRunner = nil }
+        residentModelWeights.removeValue(forKey: purpose)
+      }
+      return false
     }
+    guard expectedEpoch == nil || old.cacheRunnerEpoch == expectedEpoch else { return false }
+    revokeJoinedRetentions(runnerEpoch: old.cacheRunnerEpoch)
+    if expectedEpoch != nil { await old.cancelAndJoin() } else { await old.join() }
+    guard (purpose == .consultation ? mlxRunner : baseRunner) === old else { return false }
+    await old.clearPromptCache()
+    guard (purpose == .consultation ? mlxRunner : baseRunner) === old else { return false }
+    if purpose == .consultation { mlxRunner = nil; modelReady = false }
+    else { baseRunner = nil }
     residentModelWeights.removeValue(forKey: purpose)
+    return true
   }
-  private func reclaimModelCache() async {
-    await GenerationCoordinator.shared.enter()
+  private func joinAndClearPromptCaches() async {
+    let consultation = mlxRunner, writing = baseRunner
+    if let consultation { await consultation.join(); await consultation.clearPromptCache() }
+    if let writing, writing !== consultation { await writing.join(); await writing.clearPromptCache() }
+  }
+  private func reclaimModelCache(background: Bool = false) async {
+    await GenerationCoordinator.shared.enter(background: background)
     // Releasing native Metal allocations may block. Retain the GPU lease,
     // but let the main actor continue handling manuscript input.
     await InferenceExecutor.shared.perform { _ in MLX.Memory.clearCache() }
     await GenerationCoordinator.shared.leave()
   }
-  private func releaseInactiveModel(for purpose: ModelPurpose) async {
-    // Return from releaseRunner before clearing the allocator: its local strong
-    // reference must be gone so discarded model weights can actually reclaim.
-    await releaseRunner(purpose == .consultation ? .writing : .consultation)
-    await reclaimModelCache()
+  @discardableResult
+  private func releaseInactiveModel(for purpose: ModelPurpose, expectedEpoch: UUID? = nil) async -> Bool {
+    // releaseRunner's last strong local must leave before allocator reclamation.
+    let released = await releaseRunner(purpose == .consultation ? .writing : .consultation,
+      expectedEpoch: expectedEpoch)
+    if released || expectedEpoch == nil { await reclaimModelCache(background: expectedEpoch != nil) }
+    return released
   }
-  private func pairHasContext() async throws -> Bool {
-    guard let writing = baseRunner, let consultation = mlxRunner else { return true }
-    if writing === consultation { return true }
-    return try ProductCore.retainResidentPair(writing: await writing.contextLength(batchWidth: 3),
-      consultation: await consultation.contextLength)
+  /// Only captured production callers opt in. A nil controller retains normal
+  /// admission, and a nil cache owner still uses actual cold admission.
+  func makePairedContextAdmission(runner: MLXGemmaRunner, purpose: ModelPurpose,
+    owner: PromptCacheOwner?, flag: CancellationFlag, sharingAttempt: PairedContextAdmission? = nil,
+    validateSource: @escaping @Sendable () async throws -> Void) -> PairedContextAdmission {
+    let workspaceEpoch = joinedRetentionEpoch
+    return PairedContextAdmission(sharingAttempt: sharingAttempt) { [weak self] request in
+      guard let workspace = self else { throw CancellationError() }
+      return try await workspace.reclaimPreparedPeer(request, runner: runner, purpose: purpose,
+        owner: owner, flag: flag, workspaceEpoch: workspaceEpoch, validateSource: validateSource)
+    }
   }
-  private func retainPairIfUseful(for purpose: ModelPurpose) async throws {
-    guard try await !pairHasContext() else { return }
-    await releaseInactiveModel(for: purpose)
-    status = "The inactive model was released to preserve context. It will reload when needed."
+  private func reclaimPreparedPeer(_ request: PreparedPairedAdmissionRequest,
+    runner: MLXGemmaRunner, purpose: ModelPurpose, owner: PromptCacheOwner?, flag: CancellationFlag,
+    workspaceEpoch: UUID, validateSource: @escaping @Sendable () async throws -> Void) async throws -> Bool {
+    func validateOwner() throws {
+      try flag.check()
+      do { try ModelResidency.check() }
+      catch { flag.cancel(); throw error }
+      guard !joinedRetentionClosed, joinedRetentionEpoch == workspaceEpoch,
+        (purpose == .consultation ? mlxRunner : baseRunner) === runner,
+        request.operationID == flag.operationID, request.runnerEpoch == runner.cacheRunnerEpoch,
+        request.modelIdentity == runner.identity, request.processorIdentity == runner.processorIdentity,
+        request.owner == owner, owner == nil || owner?.namespace == inferenceCacheNamespace,
+        owner == nil || joinedRetentionOwnerIsLive(owner!) else {
+        throw BoomError.stale("The captured request or loaded model changed before paired-model reclamation.")
+      }
+      _ = try ProductCore.resolvedGenerationPolicy(request.policy, loaded: runner.generationPolicy)
+    }
+    try validateOwner(); try await validateSource(); try validateOwner()
+    // Keep only scalar peer identity across release. Retaining its actor here
+    // would pin weights while its release function clears the allocator pool.
+    func inactiveEpoch() -> UUID? {
+      guard let inactive = purpose == .consultation ? baseRunner : mlxRunner,
+        inactive !== runner else { return nil }
+      return inactive.cacheRunnerEpoch
+    }
+    guard let peerEpoch = inactiveEpoch() else { return false }
+    // This callback is invoked only after the failing prepared operation has
+    // exited its executor/container/coordinator lease. cancelAndJoin never runs
+    // beneath the target lease, nor beneath a cache/admission lock.
+    let released = await releaseInactiveModel(for: purpose, expectedEpoch: peerEpoch)
+    try validateOwner(); try await validateSource(); try validateOwner()
+    if released { status = "The inactive model was released to preserve context. It will reload when needed." }
+    return released
+  }
+  private func validateConsultationAdmissionSource(chat: ChatRecord, sources: [SourceReference],
+    attachments: [SourceReference], targetID: UUID?, requiredDocumentID: UUID?, flag: CancellationFlag,
+    independentHistory: Bool = false, ownedBy scopeOwner: CancellationFlag? = nil) async throws {
+    func check() throws {
+      try flag.check()
+      guard let current = state.chats.first(where: { $0.id == chat.id }), activeFlag === (scopeOwner ?? flag),
+        (independentHistory || state.selectedChat == chat.id),
+        (independentHistory ? current.instructions == chat.instructions
+          && current.attachedDocumentID == chat.attachedDocumentID
+          && chat.messages.filter({ $0.state == .complete }).allSatisfy({ message in
+            current.messages.first(where: { $0.id == message.id }) == message
+          }) : current.contentVersion == chat.contentVersion),
+        requiredDocumentID == nil || state.selectedDocument == requiredDocumentID else {
+        throw BoomError.stale("The captured consultation changed before paired-model reclamation.")
+      }
+    }
+    try check(); try await revalidateResponseSources(sources, attachments: attachments, targetID: targetID); try check()
+  }
+  private func validateWritingAdmissionSource(document: DocumentSnapshot, offset: Int,
+    examples: [UUID], sources: [SourceReference], capturedEpoch: UInt64, flag: CancellationFlag,
+    capture: BoundedDocumentCapture?) async throws {
+    func check() throws {
+      try flag.check()
+      guard let capture, caret >= 0, caret != NSNotFound, offset >= 0,
+        epoch == capturedEpoch, state.selectedDocument == document.id,
+        pagedSession?.generation == capture.generation,
+        UInt64(caret) == capture.window.utf16Start + UInt64(offset), writingExampleIDs == examples else {
+        throw BoomError.stale("The captured writing source changed.")
+      }
+    }
+    try check(); try await revalidateOnDisk(sources, attachments: []); try check()
   }
   func runnerForGeneration(_ purpose: ModelPurpose, flag: CancellationFlag) async throws -> MLXGemmaRunner {
+    let trace = PerformanceTrace.begin("Request.ModelReady")
+    defer { PerformanceTrace.end("Request.ModelReady", trace) }
     try flag.check()
-    try await retainPairIfUseful(for: purpose)
     if let runner = purpose == .consultation ? mlxRunner : baseRunner { return runner }
     if writingUsesConsultation {
       if purpose == .writing {
@@ -2262,58 +3405,61 @@ struct CompletionSegment {
     if canInfer && (!layout.isAuthor || baseReady) { return }
     work("Preparing Bloom on this Mac…") { [weak self] flag in
       guard let self else { return }
-      self.settingUpModels = true
-      defer { self.settingUpModels = false }
-      do {
-        // A retry joins and releases a partially loaded setup before planning;
-        // it never admits a replacement on top of unaccounted resident weights.
-        await self.releaseRunner(.writing)
-        await self.releaseRunner(.consultation)
-        await self.reclaimModelCache()
-        try flag.check()
-        guard let device = MTLCreateSystemDefaultDevice() else { throw BoomError.unavailable("Metal is unavailable.") }
-        let writing = self.layout.isAuthor
-        let choices = try await detachedWork { try ModelPacks.setupChoices(writing: writing) }
-        let disk = try await detachedWork { try ModelPacks.availableDiskBytes() }
-        let candidates = choices.map { choice in
-          let candidate = choice.candidate
-          return ModelSetupCandidate(identity: candidate.identity, purpose: candidate.purpose,
-            weightBytes: candidate.weightBytes, diskBytes: candidate.diskBytes, cached: candidate.cached,
-            rank: self.state.preferredModels?[candidate.purpose.rawValue] == candidate.identity ? 0 : candidate.rank + 1)
-        }
-        let plan = try ProductCore.modelSetup(physical: ProcessInfo.processInfo.physicalMemory,
-          metal: device.recommendedMaxWorkingSetSize, resident: ModelResidency.footprint(), disk: disk,
-          writing: writing, candidates: candidates)
-        self.writingUsesConsultation = plan.reuseConsultation
-        for identity in [plan.consultation, plan.writing].compactMap({ $0 }) {
-          try flag.check()
-          guard let choice = choices.first(where: { $0.candidate.identity == identity }) else {
-            throw BoomError.invalid("The model setup decision is absent from its catalog.")
-          }
-          let directory: URL
-          if let cached = choice.directory {
-            directory = cached
-            self.status = "Opening \(choice.candidate.purpose.rawValue) model…"
-          } else if let checkpoint = choice.checkpoint {
-            self.status = "Downloading a local model…"
-            directory = try await ModelPacks.installPublished(checkpoint, flag: flag) { progress in
-              Task { @MainActor in
-                guard self.activeFlag === flag, !flag.isCancelled else { return }
-                self.status = progress
-              }
-            }
-          } else { throw BoomError.invalid("The selected model has no local files or download.") }
-          _ = try await self.openModel(directory, purpose: choice.candidate.purpose, flag: flag)
-        }
-        if plan.reuseConsultation, let runner = self.mlxRunner { self.useConsultationForWriting(runner) }
-        self.status = "Ready · models stay on this Mac"
-      } catch is CancellationError { throw CancellationError() }
+      do { try await self.prepareModels(flag: flag) }
+      catch is CancellationError { throw CancellationError() }
       catch {
         try flag.check()
         self.modelSetupIssue = error.localizedDescription
         self.status = "Model setup needs attention"
       }
     }
+  }
+  private func prepareModels(flag: CancellationFlag) async throws {
+    modelSetupIssue = nil
+    settingUpModels = true
+    defer { settingUpModels = false }
+    // A retry joins and releases a partially loaded setup before planning;
+    // it never admits a replacement on top of unaccounted resident weights.
+    await self.releaseRunner(.writing)
+    await self.releaseRunner(.consultation)
+    await self.reclaimModelCache()
+    try flag.check()
+    guard let device = MTLCreateSystemDefaultDevice() else { throw BoomError.unavailable("Metal is unavailable.") }
+    let writing = self.layout.isAuthor
+    let choices = try await detachedWork { try ModelPacks.setupChoices(writing: writing) }
+    let disk = try await detachedWork { try ModelPacks.availableDiskBytes() }
+    let candidates = choices.map { choice in
+      let candidate = choice.candidate
+      return ModelSetupCandidate(identity: candidate.identity, purpose: candidate.purpose,
+        weightBytes: candidate.weightBytes, diskBytes: candidate.diskBytes, cached: candidate.cached,
+        rank: self.preferredModel(candidate.purpose.rawValue) == candidate.identity ? 0 : candidate.rank + 1)
+    }
+    let plan = try ProductCore.modelSetup(physical: ProcessInfo.processInfo.physicalMemory,
+      metal: device.recommendedMaxWorkingSetSize, resident: ModelResidency.footprint(), disk: disk,
+      writing: writing, candidates: candidates)
+    self.writingUsesConsultation = plan.reuseConsultation
+    for identity in [plan.consultation, plan.writing].compactMap({ $0 }) {
+      try flag.check()
+      guard let choice = choices.first(where: { $0.candidate.identity == identity }) else {
+        throw BoomError.invalid("The model setup decision is absent from its catalog.")
+      }
+      let directory: URL
+      if let cached = choice.directory {
+        directory = cached
+        self.status = "Opening \(choice.candidate.purpose.rawValue) model…"
+      } else if let checkpoint = choice.checkpoint {
+        self.status = "Downloading a local model…"
+        directory = try await ModelPacks.installPublished(checkpoint, flag: flag) { progress in
+          Task { @MainActor in
+            guard self.activeFlag === flag, !flag.isCancelled else { return }
+            self.status = progress
+          }
+        }
+      } else { throw BoomError.invalid("The selected model has no local files or download.") }
+      _ = try await self.openModel(directory, purpose: choice.candidate.purpose, flag: flag)
+    }
+    if plan.reuseConsultation, let runner = self.mlxRunner { self.useConsultationForWriting(runner) }
+    self.status = "Ready · models stay on this Mac"
   }
   func openModels() {
     showingModels = true
@@ -2396,7 +3542,6 @@ struct CompletionSegment {
     }
     residentModelWeights[purpose] = admission.weightBytes
     if purpose == .consultation && writingUsesConsultation { useConsultationForWriting(loaded) }
-    try await retainPairIfUseful(for: purpose)
     return loaded
   }
   func loadPack(_ url: URL, purpose: ModelPurpose) {
@@ -2421,36 +3566,111 @@ struct CompletionSegment {
       self.status = "\(purpose.title) ready · on this Mac"
     }
   }
+  var canBackupWorkspace: Bool {
+    !isBusy && !pagedTransition && !pagedShutdownRequested && recordingAttachmentTask == nil
+  }
   func backupWorkspace(restoring: Bool) {
-    guard !isBusy else { return }
+    guard canBackupWorkspace else { return }
     if restoring {
-      let panel = NSOpenPanel(); panel.allowedContentTypes = [.data]
-      guard panel.runModal() == .OK, let url = panel.url else { return }
-      backupRequest = BackupRequest(url: url, restoring: true)
+      let sourcePanel = NSOpenPanel()
+      sourcePanel.canChooseFiles = false; sourcePanel.canChooseDirectories = true
+      guard sourcePanel.runModal() == .OK, let source = sourcePanel.url else { return }
+      let destinationPanel = NSSavePanel()
+      destinationPanel.nameFieldStringValue = "Bloom-restored"
+      destinationPanel.canCreateDirectories = true
+      guard destinationPanel.runModal() == .OK, let target = destinationPanel.url else { return }
+      work("Restoring workspace…", after: { [weak self] in self?.openRestoredWorkspace?(target) }) { [weak self] flag in
+        guard let self else { return }
+        let scoped = source.startAccessingSecurityScopedResource()
+        defer { if scoped { source.stopAccessingSecurityScopedResource() } }
+        try flag.check()
+        try await detachedWork { try WorkspaceBackup.restore(from: source, into: target) }
+        self.status = "Workspace restored"
+      }
     } else {
-      let panel = NSSavePanel(); panel.nameFieldStringValue = "Bloom.bloombackup"
-      guard panel.runModal() == .OK, let url = panel.url else { return }
-      backupRequest = BackupRequest(url: url, restoring: false)
+      let panel = NSSavePanel(); panel.nameFieldStringValue = "Bloom-backup"
+      panel.canCreateDirectories = true
+      guard panel.runModal() == .OK, let target = panel.url else { return }
+      do { _ = try exportWorkspaceBackup(to: target) }
+      catch { status = error.localizedDescription }
     }
   }
-  func performBackup(_ request: BackupRequest, passphrase: String) {
-    backupRequest = nil
-    work(request.restoring ? "Restoring encrypted backup…" : "Encrypting complete backup…") { [weak self] _ in
-      guard let self else { return }
-      try await self.flush()
-      if request.restoring {
-        let restored = try await self.store.restoreBackup(passphrase: passphrase, from: request.url)
-        self.state = restored.0; self.documents = restored.1
-        self.dirty.removeAll(); self.undoManagers.removeAll()
-        self.selectedDocumentIDs = Set(self.state.selectedDocument.map { [$0] } ?? [])
-        self.selectedChatIDs = Set(self.state.selectedChat.map { [$0] } ?? [])
-        self.draft = ""; self.pendingAttachments = []; self.invalidateGhost()
-        self.status = "Backup restored"
-      } else {
-        try await self.store.exportBackup(passphrase: passphrase, to: request.url)
-        self.status = "Complete encrypted backup exported"
+  @discardableResult
+  func exportWorkspaceBackup(to url: URL, progress: WorkspaceBackup.CopyProgress? = nil, temporaryParent: URL? = nil) throws -> Task<URL, Error> {
+    try requirePagedOperation()
+    guard canBackupWorkspace, recordingAttachmentTask == nil else {
+      throw BoomError.unavailable("Another workspace capture or recording is still being saved.")
+    }
+    let target = url.standardizedFileURL, id = UUID(), flag = CancellationFlag()
+    guard pagedExportTaskCount < Self.maximumPagedExportTasks,
+      exportTasks[target] != nil || exportTasks.count < Self.maximumPagedExportTasks else {
+      throw BoomError.budget("The existing export registry has eight pending or retained destinations.")
+    }
+    let (engine, _) = try pagedOwners(), vault = store.vault
+    // Retain the pre-existing handles before installing this export's entry;
+    // joining the new entry itself would wait on its own producer.
+    let priorExports = Array(exportTasks.values), previousExport = exportTasks[target], previousGhost = ghostTask
+    cancelInputCompletions(); invalidateGhost()
+    isBusy = true; activeID = id; activeFlag = flag
+    status = "Backing up workspace…"
+    pagedExportTaskCount += 1
+    let producer = Task<URL, Error> { [weak self] in
+      try await withTaskCancellationHandler {
+        guard let self else { throw CancellationError() }
+        var captured = false
+        defer { if !captured { self.finishWorkspaceBackupCapture(id) } }
+        if let previousGhost { await previousGhost.value }
+        for input in self.inputCompletions { await input.value?.join() }
+        for operation in priorExports {
+          await operation.task.value
+          // Terminal export failures remain in their existing entries; they
+          // do not poison a new backup of the live workspace.
+          if let result = operation.pagedResult { _ = await result.result }
+          if let result = operation.clipboardResult { _ = await result.result }
+        }
+        try flag.check()
+        if let failure = await self.joinWorkspaceSaveTasks() { throw failure }
+        guard self.pagedEngine === engine, self.pagedImported == nil, self.pagedInitialized == nil else {
+          throw BoomError.stale("The backup capture lost its existing workspace source.")
+        }
+        // A marked composition stays live. Its last completed file checkpoint
+        // is backed up; no forced unmark or synthetic native receiving occurs.
+        if self.pagedSession?.isPinned == true { try await self.saveWorkspaceMetadata() }
+        else { try await self.flush() }
+        try flag.check()
+        let snapshot = try await engine.captureWorkspaceBackup(vault: vault, cancellation: flag, temporaryParent: temporaryParent)
+        captured = true
+        self.finishWorkspaceBackupCapture(id)
+        // This Task/registry owns the clone until export AND disposal join.
+        // No live writer lock, editor retirement or busy UI spans this copy.
+        try await detachedWork { try WorkspaceBackup.export(snapshot, to: target, cancellation: flag, progress: progress) }
+        return target
+      } onCancel: {
+        flag.cancel()
+        previousExport?.pagedResult?.cancel(); previousExport?.clipboardResult?.cancel()
       }
     }
+    let observer = Task { [weak self] in
+      defer { self?.pagedExportTaskCount -= 1 }
+      do {
+        _ = try await producer.value
+        if self?.exportTasks[target]?.id == id { self?.exportTasks[target] = nil }
+        if self?.isBusy == false { self?.status = "Backup exported" }
+      } catch {
+        // The result and any refused cleanup path remain in the existing
+        // registry. Backup failure never retires or poisons the live editor.
+        self?.status = error is CancellationError ? "Stopped" : error.localizedDescription
+        PerformanceTrace.event("Workspace.Flush")
+      }
+    }
+    exportTasks[target] = (id, observer, producer, nil)
+    return producer
+  }
+  private func finishWorkspaceBackupCapture(_ id: UUID) {
+    guard activeID == id else { return }
+    isBusy = false; activeID = nil; activeFlag = nil
+    startPendingConsultations()
+    scheduleSave(); refreshVisibleSearch(); scheduleCompletion()
   }
   func importModel() {
     guard !isBusy else { return }
@@ -2492,4 +3712,428 @@ struct CompletionSegment {
   alert.addButton(withTitle: "Delete")
   alert.addButton(withTitle: "Cancel")
   return alert.runModal() == .alertFirstButtonReturn
+}
+
+/// The existing Model is the ordinary receiving owner. A startup failure names
+/// that same reachable Model/Engine and its actual retained outputs; this Error
+/// is not a replacement root owner or a claim that resource close joined.
+struct WorkspacePagedStartupFailure: Error, LocalizedError {
+  let original: Error
+  let model: WorkspaceModel
+  var errorDescription: String? { original.localizedDescription }
+}
+
+extension WorkspaceModel {
+  func joinWorkspaceOperation() async throws {
+    if let foreground { await foreground.value }
+    if let pagedFirstFailure { throw pagedFirstFailure }
+  }
+  private func requirePagedOperation() throws {
+    guard !pagedTransition, !pagedShutdownRequested, pagedImported == nil, pagedInitialized == nil else {
+      throw BoomError.stale("The workspace is still joining a document operation.")
+    }
+    if let pagedFirstFailure { throw pagedFirstFailure }
+  }
+  private func pagedOwners() throws -> (PagedTextEngineAdapter, PagedWorkspacePublisher) {
+    guard let engine = pagedEngine, let publisher = pagedPublisher,
+      engine.ownerID == publisher.ownerID else {
+      throw BoomError.unavailable("The document store is not open.")
+    }
+    return (engine, publisher)
+  }
+  private func failPagedSource(_ error: Error) {
+    if pagedFirstFailure == nil { pagedFirstFailure = error }
+    // Background durability errors retain their source evidence and unsaved
+    // bytes. Reporting them cannot take focus away from continued typing.
+    status = error.localizedDescription
+    PerformanceTrace.event("Editor.ManagedHistoryReconcile")
+  }
+  private func openPagedWorkspace(reclaimCold: Bool = false) async throws {
+    let identity = try await store.storageIdentity()
+    let engine = try await PagedTextEngineAdapter.create(root: store.root,
+      ownerID: identity.ownerID, storeID: identity.storeID)
+    pagedEngine = engine
+    let publisher = try await engine.makeWorkspacePublisher()
+    pagedPublisher = publisher
+    if reclaimCold { _ = try await engine.reclaimColdWorkspace(state: state) }
+    if let id = state.selectedDocument {
+      guard documentIndices.contains(where: { $0.id == id }) else { throw BoomError.invalid("The selected document is absent from the catalog.") }
+      try await openPagedSelection(try await selectedPagedRecord(id))
+    }
+  }
+  private func openPagedSelection(_ record: PagedDocumentRootRecord) async throws {
+    let (engine, publisher) = try pagedOwners()
+    guard pagedBackend == nil, pagedSession == nil, pagedInput == nil,
+      pagedCommands == nil, pagedViewport == nil else {
+      throw BoomError.stale("The previous native graph has not actually retired/detached.")
+    }
+    let backend = try await engine.makeNativeStorage(publisher, expected: record)
+    pagedBackend = backend // keep partial opening failure on THIS Model
+    let opening = try await backend.opening(sessionID: UUID())
+    let session = try PagedNativeSession(opening: opening, storage: backend)
+    pagedSession = session; pagedSelectedRecord = record
+    let input = try PagedNativeInputOwner(frame: NSRect(x: 0, y: 0, width: 640, height: 480), session: session)
+    pagedInput = input
+    input.installCompletionClient(self)
+    input.activeView?.setMedia(model: self)
+    input.onNativeEdit = { [weak self] observation in self?.nativeInputChanged(observation, edited: true) }
+    input.onNativeSelection = { [weak self] observation in self?.nativeInputChanged(observation, edited: false) }
+    let commands = try PagedNativeUndoOwner(input: input)
+    pagedCommands = commands
+    let viewport = try PagedDocumentViewport(frame: NSRect(x: 0, y: 0, width: 640, height: 480), input: input)
+    pagedViewport = viewport
+    commands.mountView = { [weak viewport, weak self] old, new in
+      guard let viewport else { throw BoomError.stale("The ordinary selected viewport lost its real receiving host.") }
+      try viewport.mountManagedView(from: old, to: new)
+      new.setMedia(model: self)
+      self?.refreshVisibleSearch()
+    }
+    commands.didFail = { [weak self, weak commands] error in
+      if commands?.firstFailure != nil { self?.failPagedSource(error) }
+      else {
+        self?.nativeInputIssue = error.localizedDescription
+        self?.status = error.localizedDescription
+        PerformanceTrace.event("Editor.ManagedAdmission")
+      }
+    }
+    session.didFail = { [weak self] error in
+      // Durability failure belongs to the retained saver; live source and
+      // ordinary input remain usable. Explicit durable operations receive it.
+      self?.status = error.localizedDescription
+      PerformanceTrace.event("Storage.Save")
+    }
+    session.didSeal = { [weak self, weak session] _ in
+      guard let self, let session, self.pagedSession === session else { return }
+      let record = session.sealedRootRecord
+      guard record.document.id == self.pagedSelectedRecord?.document.id else { return }
+      // The actual worker projection is already received. No title-array
+      // rebuild, document hash, metadata encode, IO or whole source copy here.
+      self.pagedSelectedRecord = record
+      self.captureCache.removeValue(forKey: record.document.id)
+      if !self.librarySearch.isEmpty { self.refreshSearch() }
+    }
+    viewport.didRejectPresentation = { [weak self] error in
+      // A read-only display failure cannot take over the editable responder.
+      // The existing status remains inspectable without a modal input fence.
+      guard let self else { return }
+      self.status = error.localizedDescription
+      PerformanceTrace.event("Editor.SourceRead")
+    }
+    try viewport.enableDocumentNavigation(engine: engine, publisher: publisher)
+    refreshVisibleSearch()
+  }
+  private func nativeInputChanged(_ observation: PagedNativeStateObservation, edited: Bool) {
+    guard let session = pagedSession, observation.sessionID == session.sessionID,
+      observation.arenaID == session.arenaID, observation.generation == session.generation,
+      let caret = Int(exactly: observation.caretUTF16) else { return }
+    let changed = self.caret != caret
+    self.caret = caret; lastInputPane = .document
+    if edited {
+      nativeInputIssue = nil
+      captureCache.removeValue(forKey: selectedDocumentID ?? UUID())
+      if !librarySearch.isEmpty { refreshVisibleSearch() }
+    }
+    // A word accepted synchronously may already have resumed its remainder
+    // under this exact new generation before the outer input callback.
+    let resumed = ghostStamp?.revision == completionSourceIdentity && ghostStamp?.caretUTF16 == caret
+    if !resumed && (edited || changed || observation.hasMarkedText || observation.selectionLength != 0) { invalidateGhost() }
+    if !observation.hasMarkedText, observation.selectionLength == 0, ghostText.isEmpty { scheduleCompletion() }
+  }
+  private func closePagedSelection() async throws {
+    guard let backend = pagedBackend else {
+      guard pagedSession == nil, pagedInput == nil, pagedCommands == nil, pagedViewport == nil else {
+        throw BoomError.stale("The ordinary native graph lost its actual storage owner.")
+      }
+      return
+    }
+    guard let session = pagedSession, let input = pagedInput,
+      let commands = pagedCommands, let viewport = pagedViewport else {
+      throw BoomError.stale("A partially opened native graph remains retained; shutdown cannot invent its installation.")
+    }
+    visibleSearchTask?.cancel()
+    if let visibleSearchTask { await visibleSearchTask.value }
+    visibleSearchTask = nil
+    try await commands.joinPendingCommand()
+    let generation = session.generation
+    _ = try await session.flush(through: generation)
+    try await viewport.closePresentation()
+    try await commands.joinPendingCommand()
+    guard session.generation == generation, session.sealedGeneration == generation,
+      session.sealedRootRecord == pagedSelectedRecord else {
+      throw BoomError.stale("Later admitted input keeps its existing source; selection did not discard it.")
+    }
+    let record = session.sealedRootRecord
+    try session.requireJoinedNativeClose()
+    try commands.closeInput()
+    try commands.requireJoinedClose(); try input.requireJoinedClose()
+    try await backend.detachJoinedController(sessionID: session.sessionID,
+      sequence: generation, record: record)
+    // Clearing requires the actual Input/Foundation retirement AND the exact
+    // same Engine/head transfer. Retained old contexts contain inert proxies.
+    session.didSeal = nil; session.didFail = nil
+    pagedViewport = nil; pagedCommands = nil; pagedInput = nil
+    pagedSession = nil; pagedBackend = nil; pagedSelectedRecord = nil
+    nativeInputIssue = nil
+  }
+
+  @discardableResult func beginPagedWorkspaceSave() throws -> Task<Void, Error> {
+    try requirePagedOperation()
+    let request = UUID(); saveRequestID = request
+    if saveEntered, let current = saveTask { return current }
+    return startWorkspaceSave(request: request, expedited: true)
+  }
+  private func selectedPagedRecord(_ id: UUID) async throws -> PagedDocumentRootRecord {
+    if let session = pagedSession, pagedSelectedRecord?.document.id == id {
+      let generation = session.generation
+      if let commands = pagedCommands { try await commands.joinPendingCommand() }
+      _ = try await session.flush(through: generation)
+      guard pagedSession === session, session.generation == generation,
+        session.sealedGeneration == generation else { throw BoomError.stale("Later input changed the captured document.") }
+      let record = session.sealedRootRecord
+      pagedSelectedRecord = record
+      return record
+    }
+    let (engine, publisher) = try pagedOwners()
+    let read = try await engine.currentDocumentRecordRetaining(publisher, documentID: id)
+    let record = read.value
+    try await engine.abandonJoinedRootOutput(read.lease)
+    return record
+  }
+  func selectPagedDocument(_ id: UUID, preservingSelection: Bool = false,
+    flag: CancellationFlag = CancellationFlag()) async throws {
+    try requirePagedOperation(); try flag.check()
+    guard documentIndices.contains(where: { $0.id == id }) else { throw BoomError.stale("The document was removed.") }
+    if state.selectedDocument == id, pagedSession != nil { focusEditor(id); return }
+    pagedTransition = true
+    defer { pagedTransition = false }
+    retainComposerDraft(schedule: false)
+    try await flush()
+    let record = try await selectedPagedRecord(id)
+    try await closePagedSelection(); try flag.check()
+    try await openPagedSelection(record)
+    state.selectedDocument = id; state.showDocument = true
+    if layout.isAuthor, selectedChat?.attachedDocumentID != id {
+      state.selectedChat = state.chats.last(where: { $0.attachedDocumentID == id })?.id
+    }
+    restoreComposerDraft(); resetContinuationView()
+    if !preservingSelection { selectedDocumentIDs = [id] }
+    compactPane = "document"; composerFocusEpoch &+= 1
+    invalidateGhost(); try await flush(); focusEditor(id)
+  }
+  private func createPagedDocument(flag: CancellationFlag) async throws {
+    try await importAuthoredDocument(DocumentSnapshot(title: "Untitled", text: ""), selecting: true, flag: flag)
+  }
+  /// One platform-owned directory scopes transient authored/branch input.
+  /// Normal success, failure and cancellation join disposal off the UI thread;
+  /// an uncertain handle cleanup keeps its original file and error together.
+  func withTemporaryDocumentFile(_ body: @MainActor (URL) async throws -> Void) async throws {
+    let root = store.root
+    let directory = try await detachedWork {
+      try FileManager.default.url(for: .itemReplacementDirectory, in: .userDomainMask,
+        appropriateFor: root, create: true)
+    }
+    let result: Result<Void, Error>
+    do {
+      try await detachedWork {
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+      }
+      try await body(directory.appendingPathComponent("Document.md"))
+      result = .success(())
+    } catch { result = .failure(error) }
+    if case .failure(let failure as WorkspacePagedImportFailure) = result { throw failure }
+    do { try await detachedWork { try FileManager.default.removeItem(at: directory) } }
+    catch {
+      if case .failure(let original) = result {
+        throw WorkspacePagedImportFailure(original: original, cleanup: error, url: directory)
+      }
+      throw error
+    }
+    try result.get()
+  }
+  func importAuthoredDocument(_ document: DocumentSnapshot, selecting: Bool,
+    flag: CancellationFlag) async throws {
+    try flag.check()
+    guard document.text.utf8.count <= 2_097_152 else { throw BoomError.budget("Authored input exceeds the bounded import size.") }
+    try await withTemporaryDocumentFile { url in
+      try await detachedWork { try Data(document.text.utf8).write(to: url, options: .withoutOverwriting) }
+      try await importPagedDocument(url, title: document.title, documentID: document.id,
+        selecting: selecting, recordImportedSource: false, flag: flag)
+    }
+  }
+  private func importPagedDocument(_ url: URL, title: String, documentID: UUID = UUID(),
+    selecting: Bool = true, recordImportedSource: Bool = true, flag: CancellationFlag) async throws {
+    try requirePagedOperation(); try flag.check()
+    pagedTransition = true
+    defer { pagedTransition = false }
+    try await flush()
+    let (engine, publisher) = try pagedOwners()
+    let scoped = url.startAccessingSecurityScopedResource()
+    defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+    let file = try await detachedWork { try FileHandle(forReadingFrom: url) }
+    let cancellation = PagedTextCancellation()
+    var closeAttempted = false
+    do {
+      let imported = try await withTaskCancellationHandler {
+        try await engine.importUTF8Retaining(documentID: documentID, from: file, cancellation: cancellation)
+      } onCancel: { cancellation.cancel() }
+      pagedImported = imported
+      closeAttempted = true
+      do { try await detachedWork { try file.close() } }
+      catch { throw WorkspacePagedImportFailure(original: BoomError.unavailable("Import stream did not close."), cleanup: error, url: url) }
+      let descriptor = PagedDocumentDescriptor(id: documentID, title: title, revision: imported.value.revision)
+      let initialized = try await engine.initialNativeRecordRetaining(descriptor)
+      pagedInitialized = initialized
+      let record = try await engine.publishInitialDocumentRetaining(publisher, imported: imported, initialized: initialized)
+      pagedImported = nil; pagedInitialized = nil
+      documentIndices.append(DocumentIndex(id: documentID, title: title)); state.documents = documentIndices
+      if recordImportedSource {
+        if state.importedFiles == nil { state.importedFiles = [:] }
+        state.importedFiles?[documentID] = ImportedFile(folderID: nil, path: url.path,
+          originalDigest: imported.value.wholeTextSha256, originalRevision: imported.value.revision)
+      }
+      if selecting {
+        retainComposerDraft(schedule: false)
+        try await closePagedSelection(); try flag.check()
+        try await openPagedSelection(record)
+        state.selectedDocument = documentID; state.showDocument = true
+        selectedDocumentIDs = [documentID]; compactPane = "document"
+        restoreComposerDraft(); resetContinuationView(); composerFocusEpoch &+= 1
+      }
+      try await flush()
+      if selecting { focusEditor(documentID) }
+    } catch {
+      let original = error
+      if !closeAttempted {
+        do { try await detachedWork { try file.close() } }
+        catch { throw WorkspacePagedImportFailure(original: original, cleanup: error, url: url) }
+      }
+      throw original
+    }
+  }
+  private func renamePagedDocument(_ id: UUID, to title: String, flag: CancellationFlag) async throws {
+    try requirePagedOperation(); try flag.check()
+    guard title.utf8.count <= 1_024 else { throw BoomError.budget("A document title is limited to 1 KiB.") }
+    guard let index = documentIndices.firstIndex(where: { $0.id == id }) else { throw BoomError.stale("The document was removed.") }
+    // Display titles are metadata, not source edits or native Undo groups.
+    documentIndices[index].title = title; state.documents = documentIndices
+    captureCache.removeValue(forKey: id)
+    try await flush()
+  }
+  func trashPagedDocuments(_ ids: Set<UUID>, flag: CancellationFlag = CancellationFlag()) async throws {
+    try requirePagedOperation(); try flag.check()
+    pagedTransition = true
+    defer { pagedTransition = false }
+    retainComposerDraft(schedule: false); try await flush()
+    if selectedDocumentID.map(ids.contains) == true { try await closePagedSelection() }
+    try flag.check()
+    state.archivedDocuments = (state.archivedDocuments ?? []) + documentIndices.filter { ids.contains($0.id) }
+    documentIndices.removeAll { ids.contains($0.id) }; state.documents = documentIndices
+    for id in ids { captureCache.removeValue(forKey: id) }
+    writingExampleIDs.removeAll { ids.contains($0) }
+    selectedDocumentIDs.subtract(ids)
+    if state.selectedDocument.map(ids.contains) == true {
+      state.selectedDocument = documentIndices.first?.id
+      if let id = state.selectedDocument { try await openPagedSelection(try await selectedPagedRecord(id)) }
+    }
+    restoreComposerDraft(); invalidateGhost(); try await flush()
+  }
+  func previewDocument(_ id: UUID) async throws -> BoundedDocumentCapture {
+    try await captureDocument(id, maximumBytes: 16_384)
+  }
+  private func sourceReferences(for documents: [DocumentSnapshot]) throws -> [SourceReference] {
+    try documents.map { document in
+      guard let source = consultationCaptures[document.id]?.source ?? captureCache[document.id]?.source else {
+        throw BoomError.stale("The captured document source was replaced.")
+      }
+      return source
+    }
+  }
+  private func captureChatContext(request: String, attachedDocumentID: UUID?,
+    editingDocumentID: UUID?, flag: CancellationFlag) async throws -> BoundedConsultationContext {
+    var ordered: [BoundedDocumentCapture] = [], active = Set<UUID>(), followed = Set<UUID>()
+    var omitted = Set<UUID>(), charged = 0
+    func resolve(_ title: String, id: UUID?) throws -> UUID {
+      if let id {
+        guard documentIndices.contains(where: { $0.id == id })
+          || state.archivedDocuments?.contains(where: { $0.id == id }) == true else {
+          throw BoomError.stale("The referenced document was removed.")
+        }
+        return id
+      }
+      let matches = documentIndices.filter { $0.title.compare(title, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame }
+      guard matches.count == 1, let match = matches.first else {
+        throw BoomError.invalid("Missing or ambiguous document: \(title). Insert its stable reference from the library.")
+      }
+      return match.id
+    }
+    func capture(_ id: UUID, depth: Int) async throws -> BoundedDocumentCapture? {
+      try flag.check()
+      if let value = ordered.first(where: { $0.documentID == id }) { return value }
+      guard depth <= 8, ordered.count < 24, charged < 262_144 else {
+        omitted.insert(id); return nil
+      }
+      let start = id == editingDocumentID ? try pagedSession?.documentCoordinates().utf16Start : nil
+      let value = try await captureDocument(id, startingAtUTF16: start,
+        maximumBytes: min(PagedTextWindow.maximumBytes, 262_144 - charged))
+      charged += value.window.text.utf8.count
+      ordered.append(value); omitted.remove(id)
+      return value
+    }
+    func visit(_ id: UUID, depth: Int) async throws {
+      try flag.check()
+      guard !active.contains(id) else { throw BoomError.invalid("Document-follow cycle.") }
+      if followed.contains(id) { return }
+      guard let value = try await capture(id, depth: depth) else { return }
+      active.insert(id)
+      for link in try ReferenceParser.wiki(value.window.text) {
+        try await visit(resolve(link.title, id: link.documentID), depth: depth + 1)
+      }
+      active.remove(id); followed.insert(id)
+    }
+    // The editing target and attached document precede optional link traversal.
+    let primary = [editingDocumentID, attachedDocumentID].compactMap { $0 }
+    for id in primary { _ = try await capture(id, depth: 0) }
+    for id in primary { try await visit(id, depth: 0) }
+    for link in try ReferenceParser.wiki(request) { try await visit(resolve(link.title, id: link.documentID), depth: 0) }
+    return BoundedConsultationContext(captures: ordered, omittedSources: omitted.count)
+  }
+
+  func captureDocument(_ id: UUID, prefixAt caret: UInt64? = nil,
+    startingAtUTF16 start: UInt64? = nil,
+    maximumBytes: Int = PagedTextWindow.maximumBytes) async throws -> BoundedDocumentCapture {
+    guard documentIndices.contains(where: { $0.id == id }) || state.archivedDocuments?.contains(where: { $0.id == id }) == true else { throw BoomError.stale("The requested source was removed.") }
+    let record = try await selectedPagedRecord(id), generation = id == selectedDocumentID ? pagedSession?.generation : nil
+    let (engine, _) = try pagedOwners()
+    let read: PagedTextCustodiedValue<PagedTextWindow>
+    if let caret { read = try await engine.prefixWindowRetaining(record.document.revision, utf16Caret: caret, maximumBytes: maximumBytes) }
+    else {
+      var byte: UInt64 = 0
+      if let start { byte = try await engine.byteAtUTF16(record.document.revision, offset: start) }
+      read = try await engine.windowRetaining(record.document.revision, byteStart: byte, maximumBytes: maximumBytes)
+    }
+    let captured: BoundedDocumentCapture
+    let title = documentIndices.first(where: { $0.id == id })?.title ?? record.document.title
+    do {
+      captured = try await detachedWork {
+        try BoundedDocumentCapture(record: record, window: read.value, generation: generation, title: title)
+      }
+    } catch {
+      let original = error
+      do { try await engine.abandonJoinedRootOutput(read.lease) }
+      catch { throw PagedTextCustodyHandoffFailure(original: original, handoff: error, lease: read.lease) }
+      throw original
+    }
+    try await engine.abandonJoinedRootOutput(read.lease)
+    if let generation, pagedSession?.generation != generation { throw BoomError.stale("Later input changed the captured model range.") }
+    if captureCache.count >= 24, captureCache[id] == nil { captureCache.removeAll(keepingCapacity: true) }
+    captureCache[id] = captured
+    return captured
+  }
+}
+
+private struct WorkspacePagedImportFailure: Error, LocalizedError {
+  let original: Error
+  let cleanup: Error
+  let url: URL
+  var errorDescription: String? { "\(original.localizedDescription) Import cleanup: \(cleanup.localizedDescription). Original source retained at \(url.path)." }
 }

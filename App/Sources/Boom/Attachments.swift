@@ -34,6 +34,20 @@ extension NSPasteboard.PasteboardType {
 }
 private struct ClipboardMedia: Codable { let name: String; let data: Data }
 
+/// One ordered intent for asynchronous text AND media Copy/Cut. The previous
+/// real clipboard remains available until prepared content is published.
+struct ClipboardIntent: Sendable {
+  private let id: UUID
+  private let changeCount: Int
+  @MainActor private static var latest = UUID()
+  @MainActor static func begin() -> Self {
+    let id = UUID(); latest = id
+    return Self(id: id, changeCount: NSPasteboard.general.changeCount)
+  }
+  @MainActor var isLatest: Bool { Self.latest == id }
+  @MainActor var isCurrent: Bool { isLatest && NSPasteboard.general.changeCount == changeCount }
+}
+
 enum AttachmentInput {
   case file(URL)
   case bytes(name: String, data: Data)
@@ -69,12 +83,36 @@ enum AttachmentInput {
     return result.isEmpty ? nil : result
   }
 
-  static func write(_ input: AttachmentInput, to pasteboard: NSPasteboard) {
+  struct PreparedClipboard: Sendable {
+    let encoded: Data
+    let original: Data
+    let originalType: String?
+  }
+  /// Original reads/encoding/header inspection can finish on the existing
+  /// media worker. Only the final pasteboard publication belongs to Main.
+  static func prepareWrite(_ input: AttachmentInput) -> PreparedClipboard? {
     guard case .bytes(let name, let data) = input,
-      let encoded = try? PropertyListEncoder().encode(ClipboardMedia(name: name, data: data)) else { return }
-    pasteboard.clearContents(); pasteboard.setData(encoded, forType: .bloomMedia)
-    if let image = NSImage(data: data), let tiff = image.tiffRepresentation { pasteboard.setData(tiff, forType: .tiff) }
-    else if let type = UTType(filenameExtension: (name as NSString).pathExtension) { pasteboard.setData(data, forType: NSPasteboard.PasteboardType(type.identifier)) }
+      let encoded = try? PropertyListEncoder().encode(ClipboardMedia(name: name, data: data)) else { return nil }
+    let type: String?
+    if let source = CGImageSourceCreateWithData(data as CFData,
+      [kCGImageSourceShouldCache: false] as CFDictionary),
+      let identifier = CGImageSourceGetType(source) as String?,
+      let uniform = UTType(identifier), uniform.conforms(to: .image) {
+      type = uniform.identifier
+    } else { type = UTType(filenameExtension: (name as NSString).pathExtension)?.identifier }
+    return PreparedClipboard(encoded: encoded, original: data, originalType: type)
+  }
+  @discardableResult static func write(_ input: AttachmentInput, to pasteboard: NSPasteboard) -> Bool {
+    guard let prepared = prepareWrite(input) else { return false }
+    return write(prepared, to: pasteboard)
+  }
+  @discardableResult static func write(_ prepared: PreparedClipboard, to pasteboard: NSPasteboard) -> Bool {
+    pasteboard.clearContents()
+    guard pasteboard.setData(prepared.encoded, forType: .bloomMedia) else { return false }
+    if let type = prepared.originalType {
+      return pasteboard.setData(prepared.original, forType: NSPasteboard.PasteboardType(type))
+    }
+    return true
   }
   static func readImage(_ pasteboard: NSPasteboard) -> AttachmentInput? {
     // AppKit can synthesize TIFF when asked for it on a JPEG/HEIC board.
@@ -187,20 +225,7 @@ enum AttachmentProcessor {
       receipt: response, original: data)
   }
   static func readGranted(_ url: URL, limit: Int = 67_108_864, allowEmpty: Bool = false) throws -> Data {
-    let v = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
-    guard v.isRegularFile == true, v.isSymbolicLink != true, let size = v.fileSize, (allowEmpty || size > 0),
-      size <= limit
-    else {
-      throw BoomError.budget(
-        "Choose a regular file up to 64 MiB; symlinks and directories are not attachments.")
-    }
-    let handle = try FileHandle(forReadingFrom: url)
-    defer { try? handle.close() }
-    let data = try handle.read(upToCount: limit + 1) ?? Data()
-    guard data.count <= limit else {
-      throw BoomError.budget("File grew beyond its import limit while reading.")
-    }
-    return data
+    try RegularFile(url, limit: Int64(limit), allowEmpty: allowEmpty).data()
   }
 }
 
@@ -215,9 +240,15 @@ enum NativePreparedMedia: @unchecked Sendable {
 }
 enum NativeMedia {
   static func thumbnail(_ data: Data, maximum: Int = 1600) -> CGImage? {
-    guard
-      let source = CGImageSourceCreateWithData(
-        data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
+    thumbnail(source: CGImageSourceCreateWithData(data as CFData,
+      [kCGImageSourceShouldCache: false] as CFDictionary), maximum: maximum)
+  }
+  static func thumbnail(_ url: URL, maximum: Int = 1600) -> CGImage? {
+    thumbnail(source: CGImageSourceCreateWithURL(url as CFURL,
+      [kCGImageSourceShouldCache: false] as CFDictionary), maximum: maximum)
+  }
+  private static func thumbnail(source: CGImageSource?, maximum: Int) -> CGImage? {
+    guard let source,
       let type = CGImageSourceGetType(source) as String?,
       [
         "public.jpeg", "public.png", "public.heic", "public.heif", "public.tiff",

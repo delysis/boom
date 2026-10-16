@@ -1,0 +1,1253 @@
+import BoomCore
+import Foundation
+import Metal
+import MLX
+import MLXLMCommon
+
+/// Explicit public native-value diagnostic. It never runs ordinary UI or replay.
+enum NeuralPrefixParitySmoke {
+  enum Kind: String, Codable, Hashable, Sendable { case consultationInterior, writingLateDivergence }
+  struct Reference: Codable, Sendable { let path: String; let sha256: String }
+  enum SourceStage: String, Codable, Sendable { case sharedDecode, anchorPrefill }
+  struct SourceRun: Decodable, Sendable {
+    let status: String
+    let joined: Bool
+    let runtime_revision: String
+    let source_inventory_sha256: String
+    let writing_identity: String
+    let consultation_identity: String
+    let writing_model_manifest_sha256: String
+    let consultation_model_manifest_sha256: String
+  }
+  struct CapturedForward: Codable, Sendable {
+    let start: Int
+    let end: Int
+    let evaluatedEnd: Int
+    let origin: String
+    let width: Int
+    let row: Int?
+    let originalInput: ForwardOperandBinding?
+  }
+  struct CapturedHistory: Codable, Sendable {
+    let promptTokens: Int
+    let decodeRow: Int
+    let decodeWidth: Int
+    let blockers: [String]
+    let forwards: [CapturedForward]
+  }
+  struct Declaration: Codable, Sendable {
+    let kind: Kind
+    let namespace: UUID
+    let sharedSource: Reference
+    let anchorSource: Reference?
+    let currentQuery: Reference
+    let modelManifest: Reference?
+    let sourceStage: SourceStage?
+    let sharedSourceRow: Int?
+    let sharedProcessedDecodeTokens: Int
+    let sharedDeliveredLedgerTokens: Int
+    let sharedWidth: Int
+    let anchorCachedPrefix: Int?
+    let sourceNativeBoundary: Int
+    let cachedPrefix: Int
+    let coldNativeBoundary: Int
+    let warmSuffixPartitions: [Int]
+    let decodeControlTokens: Int
+    let seed: UInt64
+    var interveningSources: [Reference]? = nil
+  }
+  struct Fixture: Codable, Sendable {
+    let schema: Int
+    let scope: String
+    let runtimeRevision: String
+    let originatingSourceInventory: String
+    let sourceRun: Reference?
+    let declarations: [Declaration]
+  }
+  struct CapturedOutput: Codable, Sendable {
+    let token_ids: [Int]
+    let stop_reason: String
+    let stop_token_id: Int?
+    let prompt_digest: String
+    let prompt_tokens: Int
+  }
+  struct CapturedInput: Codable, Sendable {
+    struct Batch: Codable, Sendable {
+      let width: Int
+      let sharedPromptPrefills: Int
+      let decodeForwardPasses: Int
+    }
+    let name: String
+    let model: String
+    let prompt: String?
+    let plan: ConsultationPlan?
+    let prepared_token_ids: [Int]
+    let generation_policy: ModelGenerationPolicy
+    let settings: SamplingSettings
+    let outputs: [CapturedOutput]
+    let status: String
+    let expected_cached_tokens_at_snapshot: Int?
+    let seeds: [UInt64]?
+    let output_history_evidence: [CapturedHistory]?
+    var max_tokens_per_row: Int? = nil
+    var batch_metrics: Batch? = nil
+  }
+  struct Request: Sendable {
+    let declaration: Declaration
+    let schema: Int
+    let shared: CapturedInput
+    let anchor: CapturedInput?
+    let query: CapturedInput
+    let intervening: [CapturedInput]
+    var inputs: [CapturedInput] { [shared] + intervening + (anchor.map { [$0] } ?? []) + [query] }
+    var name: String { declaration.kind.rawValue }
+  }
+  struct Samples: Codable, Sendable {
+    let sampledTokenIDs: [Int]
+    let emittedTokenIDs: [Int]
+    let stopReason: String
+    let stopTokenID: Int?
+    let processedDecodeTokens: Int
+  }
+  /// Explicit diagnostic only. The update tap does no evaluation or copying;
+  /// actual native completion precedes every backing pin and comparison.
+  final class Layer0ValueBoundary {
+    static let target = 4095..<4112
+    static let byteLimit = 16 << 20
+    struct Input: Codable, Sendable {
+      let actualInput: NativePrefixParityProbe.TokenRange
+      let observed: NativePrefixParityProbe.TokenRange
+      let incomingShape: [Int]
+      let incomingAllocationBytes: Int
+      let nativeAllocationBytes: Int
+      let aliasesNativeAllocation: Bool
+    }
+    struct Proof: Codable, Sendable {
+      let target: NativePrefixParityProbe.TokenRange
+      let inputs: [Input]
+      let originalNative: NativePrefixParityProbe.SourceLayer
+      let originalRawSlots: [Int]
+      let incomingVsOriginalRaw: NativePrefixParityProbe.TensorComparison
+      let peakRetainedValueBackingByteUpperBound: Int
+      let frozenAllocationBytes: Int
+    }
+    struct Frozen {
+      let values: MLXArray
+      let proof: Proof
+      fileprivate let pin: MLXReadyBuffer
+    }
+    struct Comparison: Codable, Sendable {
+      let source: Proof
+      let cold: Proof
+      let incomingSourceVsCold: NativePrefixParityProbe.TensorComparison
+      let method: String
+    }
+    private struct Pending {
+      let input: Range<Int>
+      let observed: Range<Int>
+      let values: MLXArray
+    }
+    private struct Piece {
+      let input: Input
+      let values: MLXArray
+      let pin: MLXReadyBuffer
+    }
+    private var pending: Pending?
+    private var pieces: [Piece] = []
+    private var failure: Error?
+    private var next = Layer0ValueBoundary.target.lowerBound
+    private var retainedBytes = 0
+    private var finished = false
+
+    func observing(_ caches: [any KVCache]) throws -> [any KVCache] {
+      guard let first = caches.first else { throw BoomError.invalid("No layer0 cache for the V boundary diagnostic.") }
+      let observed = PrefixKVCache(layer: 0, base: first) { [weak self] _, offset, _, values in
+        self?.willUpdate(offset: offset, values: values)
+      }
+      var result = caches; result[0] = observed; return result
+    }
+    private func willUpdate(offset: Int, values: MLXArray) {
+      guard !finished, failure == nil else { return }
+      guard offset >= 0, values.ndim == 4, values.dim(0) == 1, values.dim(2) > 0 else {
+        failure = BoomError.invalid("Invalid layer0 incoming V extent."); return
+      }
+      let (end, overflow) = offset.addingReportingOverflow(values.dim(2))
+      guard !overflow else { failure = BoomError.invalid("Incoming V extent overflow."); return }
+      let lower = max(offset, Self.target.lowerBound), upper = min(end, Self.target.upperBound)
+      guard lower < upper else { return }
+      guard pending == nil, pieces.count < Self.target.count, lower == next,
+        values.dim(2) <= 512, values.nbytes > 0, values.nbytes <= Self.byteLimit,
+        [.float16, .bfloat16, .float32].contains(values.dtype) else {
+        failure = BoomError.invalid("Layer0 V boundary is noncontiguous or exceeds its diagnostic bound."); return
+      }
+      // Freeze the incoming projected descriptor, never an original cache view.
+      // Its full physical allocation is charged after actual native completion.
+      pending = Pending(input: offset..<end, observed: lower..<upper, values: values[.ellipsis])
+    }
+    func completedNativeForward(_ caches: [any KVCache], fence: () -> Void) throws {
+      guard pending != nil || failure != nil else { return }
+      eval(caches.flatMap { $0.innerState() }); fence()
+      if let failure { throw failure }
+      guard let pending else { return }
+      // A retained lazy view is not a completion or allocation-size witness.
+      // This deliberate evaluation happens only AFTER the native update joined.
+      eval(pending.values); fence()
+      let remaining = Self.byteLimit - retainedBytes
+      guard let pin = pending.values.readyBuffer(admitting: { bytes in
+        guard bytes > 0, bytes <= remaining else { return nil }; return {}
+      }), let native = PrefixKVStorage.unwrap(caches[0]).innerState().last,
+        let nativePin = native.readyBuffer(), nativePin.allocationBytes <= Self.byteLimit else {
+        throw BoomError.invalid("Completed layer0 V backing is unavailable or exceeds its exact physical bound.")
+      }
+      let aliases = pin.withUnsafeBytes { incoming in
+        nativePin.withUnsafeBytes { actual in incoming.baseAddress == actual.baseAddress }
+      }
+      guard !aliases else {
+        throw BoomError.invalid("Incoming V aliases native storage; an independent pre-update witness is unavailable.")
+      }
+      let relative = (pending.observed.lowerBound - pending.input.lowerBound)..<(pending.observed.upperBound - pending.input.lowerBound)
+      pieces.append(Piece(input: Input(actualInput: .init(pending.input), observed: .init(pending.observed),
+        incomingShape: pending.values.shape, incomingAllocationBytes: pin.allocationBytes,
+        nativeAllocationBytes: nativePin.allocationBytes, aliasesNativeAllocation: aliases),
+        values: pending.values[0..., 0..., relative, 0...], pin: pin))
+      retainedBytes += pin.allocationBytes
+      next = pending.observed.upperBound; self.pending = nil
+    }
+    func freeze(at snapshot: NativePrefixParityProbe.Snapshot, fence: () -> Void,
+      record: (Proof) throws -> Void = { _ in }) throws -> Frozen {
+      let heldPins = pieces.map(\.pin)
+      defer { withExtendedLifetime(heldPins) {} }
+      guard !finished, failure == nil, pending == nil, next == Self.target.upperBound,
+        !pieces.isEmpty, snapshot.selectedRow == 0, let layer = snapshot.layers.first,
+        layer.source.layer == 0, layer.source.sourceBatchWidth == 1,
+        layer.source.offset >= Self.target.upperBound, layer.values.dim(0) == 1,
+        case .rotating(let ring) = layer.kind else {
+        throw BoomError.invalid("The completed layer0 V boundary or original native coverage is unavailable.")
+      }
+      let capacity = layer.values.dim(2), held = ring.wrapped ? capacity : ring.index
+      let keep = min(ring.keep, held), tailCount = held - keep
+      let tailStart = ring.offset - tailCount
+      guard ring.offset == layer.source.offset, held > 0, held <= capacity,
+        ring.index <= capacity, tailStart >= keep else {
+        throw BoomError.invalid("Original native V metadata does not describe its raw backing.")
+      }
+      var slots: [Int] = []
+      for absolute in Self.target {
+        guard layer.source.presentRanges.contains(where: { $0.start <= absolute && absolute < $0.end }) else {
+          throw BoomError.invalid("Original native V has no authenticated requested absolute position.")
+        }
+        let slot: Int
+        if absolute < keep { slot = absolute }
+        else {
+          guard absolute >= tailStart, absolute < ring.offset, tailCount > 0 else {
+            throw BoomError.invalid("The original raw V tail does not cover the requested position.")
+          }
+          let relative = absolute - tailStart
+          if ring.wrapped {
+            let start = ring.index == capacity ? keep : ring.index
+            guard start >= keep, capacity > keep else { throw BoomError.invalid("Invalid wrapped V origin.") }
+            slot = keep + (start - keep + relative) % (capacity - keep)
+          } else { slot = keep + relative }
+        }
+        guard (0..<held).contains(slot) else { throw BoomError.invalid("Original raw V slot exceeds live backing.") }
+        slots.append(slot)
+      }
+      // Direct original raw slots: no oracle(), crop(), chronology helper or hydration.
+      let incoming = concatenated(pieces.map(\.values), axis: 2)
+      let original = concatenated(slots.map { layer.values[0..., 0..., $0..<($0 + 1), 0...] }, axis: 2)
+      eval(incoming, original); fence()
+      // `concatenated` can leave an evaluated descriptor whose storage is not
+      // eligible for an owned raw lease. Materialize one compact, byte-exact
+      // snapshot through MLX's copying Data bridge, then pin that allocation.
+      // This happens only after the native update joined; incoming piece leases
+      // still protect the pre-update operands while the snapshot is copied.
+      let frozenData = incoming.asData(access: .copy)
+      guard frozenData.data.count > 0,
+        frozenData.data.count <= Self.byteLimit - retainedBytes else {
+        throw BoomError.invalid("The frozen V diagnostic copy exceeds its physical backing bound.")
+      }
+      let frozenIncoming = MLXArray(data: frozenData)
+      eval(frozenIncoming); fence()
+      let remaining = Self.byteLimit - retainedBytes - frozenData.data.count
+      var rejectedBytes: Int?
+      guard let pin = frozenIncoming.readyBuffer(admitting: { bytes in
+        guard bytes > 0, bytes <= remaining else { rejectedBytes = bytes; return nil }; return {}
+      }) else {
+        throw BoomError.invalid("The frozen V diagnostic exceeds its physical backing bound (retained=\(retainedBytes), requested=\(rejectedBytes.map(String.init) ?? "unavailable"), limit=\(Self.byteLimit)).")
+      }
+      let comparison = try NativePrefixParityProbe.compareTensor(incoming, original)
+      let proof = Proof(target: .init(Self.target), inputs: pieces.map(\.input), originalNative: layer.source,
+        originalRawSlots: slots, incomingVsOriginalRaw: comparison,
+        peakRetainedValueBackingByteUpperBound: retainedBytes + frozenData.data.count + pin.allocationBytes,
+        frozenAllocationBytes: pin.allocationBytes)
+      try record(proof)
+      guard comparison.bitwiseEqual == true else {
+        throw BoomError.invalid("Incoming layer0 V does not equal its own original uncropped native values.")
+      }
+      finished = true; pieces.removeAll(); retainedBytes = 0
+      return Frozen(values: frozenIncoming, proof: proof, pin: pin)
+    }
+  }
+
+  struct PairSummary: Codable, Sendable {
+    let name: String
+    let initialState: NativePrefixParityProbe.StateComparison
+    let allLogitBitsEqual: Bool
+    let sampledReferenceTokenIDs: [Int]
+    let sampledCandidateTokenIDs: [Int]
+    let firstSampleDifferenceZeroBased: Int?
+    let eitherBranchStoppedByControl: Bool
+    let method: String
+    var allSamplesEqual: Bool { sampledReferenceTokenIDs == sampledCandidateTokenIDs }
+  }
+  struct CaseSummary: Codable, Sendable {
+    let name: String
+    let modelIdentity: String
+    let sourceBoundary: Int
+    let coldBoundary: Int
+    let prefix: Int
+    let actualWarmObservation: PromptPrefixCache.Observation
+    let restoration: PairSummary
+    let coldVsRetained: PairSummary
+    let naturalFullQueryColdSamples: Samples
+    let fullQueryColdPromptHistory: [NativePrefixParityProbe.TokenRange]
+    let releaseQualified: Bool
+    var preCacheLayer0Values: Layer0ValueBoundary.Comparison? = nil
+    var sameHistoryRestorationExact: Bool {
+      restoration.initialState.allKVBitsEqual && restoration.initialState.allMasksEqual
+        && restoration.allLogitBitsEqual && restoration.allSamplesEqual
+    }
+    var coldHistoryEquivalenceObserved: Bool {
+      coldVsRetained.initialState.allKVBitsEqual && coldVsRetained.initialState.allMasksEqual
+        && coldVsRetained.allLogitBitsEqual && coldVsRetained.allSamplesEqual
+    }
+  }
+
+  private static func validReference(_ value: Reference) -> Bool {
+    value.path.hasPrefix("/") && ForwardOperandBinding.isDigest(value.sha256)
+  }
+
+  static func validateDeclaration(_ d: Declaration, schema: Int) throws {
+    guard d.seed == 42, d.decodeControlTokens == 16,
+      validReference(d.sharedSource), validReference(d.currentQuery),
+      (0...255).contains(d.sharedProcessedDecodeTokens),
+      (1...256).contains(d.sharedDeliveredLedgerTokens), (1...3).contains(d.sharedWidth),
+      (1...4_609).contains(d.sourceNativeBoundary), (1...4_352).contains(d.cachedPrefix),
+      (1...4_352).contains(d.coldNativeBoundary), d.warmSuffixPartitions.count == 2,
+      d.warmSuffixPartitions.allSatisfy({ (1...512).contains($0) }) else {
+      throw BoomError.invalid("Require bounded seeded controls and source-bound public receipts.")
+    }
+    if schema == 1 {
+      // Preserve the original registered scope and refusal behavior.
+      guard d.modelManifest == nil, d.sourceStage == nil, d.sharedSourceRow == nil,
+        d.interveningSources == nil else {
+        throw BoomError.invalid("Version-one parity cannot declare a new source geometry.")
+      }
+      switch d.kind {
+      case .consultationInterior:
+        guard d.anchorSource == nil, d.anchorCachedPrefix == nil, d.sharedWidth == 1,
+          d.sharedProcessedDecodeTokens == 16, d.sharedDeliveredLedgerTokens == 16,
+          d.sourceNativeBoundary == 4095, d.cachedPrefix == 4092, d.coldNativeBoundary == 4096,
+          d.warmSuffixPartitions == [36, 1] else {
+          throw BoomError.invalid("Changed consultation parity scope.")
+        }
+      case .writingLateDivergence:
+        guard let anchor = d.anchorSource, validReference(anchor),
+          d.sharedWidth == 3, d.sharedProcessedDecodeTokens == 85, d.sharedDeliveredLedgerTokens == 86,
+          d.anchorCachedPrefix == 4181, d.sourceNativeBoundary == 4352,
+          d.cachedPrefix == 4349, d.coldNativeBoundary == 4352, d.warmSuffixPartitions == [3, 1] else {
+          throw BoomError.invalid("Changed mixed writing parity scope.")
+        }
+      }
+    } else {
+      guard schema == 2, let manifest = d.modelManifest, validReference(manifest),
+        let row = d.sharedSourceRow, (0..<d.sharedWidth).contains(row) else {
+        throw BoomError.invalid("Version-two parity requires an exact model and original native row.")
+      }
+      switch d.kind {
+      case .consultationInterior:
+        guard d.anchorSource == nil, d.anchorCachedPrefix == nil, d.interveningSources == nil,
+          d.sharedWidth == 1, row == 0,
+          d.sharedProcessedDecodeTokens == 16, d.sharedDeliveredLedgerTokens == 16,
+          d.sourceStage == .sharedDecode, d.sourceNativeBoundary == 4112,
+          d.cachedPrefix == 4112, d.coldNativeBoundary == 4128, d.warmSuffixPartitions == [16, 1] else {
+          throw BoomError.invalid("Changed completed-decode consultation parity scope.")
+        }
+      case .writingLateDivergence:
+        guard let anchor = d.anchorSource, validReference(anchor), let prefix = d.anchorCachedPrefix,
+          let intervening = d.interveningSources, intervening.count == 2,
+          intervening.allSatisfy(validReference),
+          (4_097...4_351).contains(prefix), d.sharedWidth == 3,
+          d.sharedProcessedDecodeTokens == prefix - 4096,
+          d.sharedDeliveredLedgerTokens == d.sharedProcessedDecodeTokens + 1,
+          d.cachedPrefix == 4349, d.coldNativeBoundary == 4352, d.warmSuffixPartitions == [3, 1],
+          (d.sourceStage == .anchorPrefill && d.sourceNativeBoundary == 4352)
+            || (d.sourceStage == .sharedDecode && d.sourceNativeBoundary == 4349
+              && d.sourceNativeBoundary <= prefix) else {
+          throw BoomError.invalid("Changed receipt-bound writing parity scope.")
+        }
+      }
+    }
+  }
+
+  static func decodeFixture(_ data: Data) throws -> Fixture {
+    guard data.count <= 1_048_576 else { throw BoomError.invalid("Oversized parity manifest.") }
+    let fixture = try JSONDecoder().decode(Fixture.self, from: data)
+    guard (fixture.schema == 1 && fixture.scope == "public_completed_trial_inputs_v1"
+        && fixture.sourceRun == nil)
+        || (fixture.schema == 2 && fixture.scope == "public_completed_trial_inputs_v2"
+          && fixture.sourceRun.map(validReference) == true) else {
+      throw BoomError.invalid("Unknown public parity fixture version.")
+    }
+    guard fixture.runtimeRevision == ModelPacks.runtimeRevision,
+      ForwardOperandBinding.isDigest(fixture.originatingSourceInventory), fixture.declarations.count == 2,
+      Set(fixture.declarations.map(\.kind)) == [.consultationInterior, .writingLateDivergence] else {
+      throw BoomError.invalid("Require the two registered public parity controls and exact runtime.")
+    }
+    for declaration in fixture.declarations { try validateDeclaration(declaration, schema: fixture.schema) }
+    return fixture
+  }
+
+  private static func referencedData(_ reference: Reference, limit: Int64) throws -> Data {
+    guard validReference(reference) else { throw BoomError.invalid("Invalid parity source reference.") }
+    let bytes = try RegularFile(URL(fileURLWithPath: reference.path), limit: limit).data()
+    guard Digest.sha256(bytes) == reference.sha256 else { throw BoomError.stale("A declared public receipt changed.") }
+    return bytes
+  }
+
+  static func validateSourceRun(_ fixture: Fixture, requests: [Request]) throws -> SourceRun? {
+    guard fixture.schema == 2, let reference = fixture.sourceRun else { return nil }
+    let run = try JSONDecoder().decode(SourceRun.self, from: referencedData(reference, limit: 1_048_576))
+    guard run.joined, ["qualification_open", "passed"].contains(run.status),
+      run.runtime_revision == fixture.runtimeRevision,
+      run.source_inventory_sha256 == fixture.originatingSourceInventory else {
+      throw BoomError.invalid("Parity inputs are not bound to the declared completed source run.")
+    }
+    struct Manifest: Decodable { let identity: String; let purpose: String; let runtimeRevision: String }
+    for item in requests {
+      let writing = item.declaration.kind == .writingLateDivergence
+      guard let manifest = item.declaration.modelManifest,
+        manifest.sha256 == (writing ? run.writing_model_manifest_sha256 : run.consultation_model_manifest_sha256),
+        item.query.model == (writing ? run.writing_identity : run.consultation_identity) else {
+        throw BoomError.invalid("Source run model identity or manifest differs from its parity inputs.")
+      }
+      let declared = try JSONDecoder().decode(Manifest.self, from: referencedData(manifest, limit: 1_048_576))
+      guard declared.identity == item.query.model, declared.purpose == (writing ? "writing" : "consultation"),
+        declared.runtimeRevision == fixture.runtimeRevision else {
+        throw BoomError.invalid("Changed public parity model manifest.")
+      }
+    }
+    return run
+  }
+
+  static func captured(_ reference: Reference, schema: Int = 1) throws -> CapturedInput {
+    // Current host-operand receipts contain up to 11 MiB of bounded history metadata.
+    // Legacy manifests retain their original 4 MiB input admission.
+    let bytes = try referencedData(reference, limit: schema == 2 ? 16_777_216 : 4_194_304)
+    let input = try JSONDecoder().decode(CapturedInput.self, from: bytes)
+    let promptDigest = Digest.sha256(try JSONEncoder().encode(input.prepared_token_ids))
+    guard input.status == "passed", !input.prepared_token_ids.isEmpty,
+      input.prepared_token_ids.count <= 4_353, (1...3).contains(input.outputs.count),
+      input.generation_policy.prefill == PrefillGeometry(chunking: "fixed_v1", tokenCeiling: 512),
+      input.outputs.allSatisfy({ $0.prompt_tokens == input.prepared_token_ids.count
+        && $0.prompt_digest == promptDigest }) else {
+      throw BoomError.invalid("Require complete public inputs with their exact prompt and fixed policy.")
+    }
+    return input
+  }
+
+  private static func validateCurrentInput(_ input: CapturedInput) throws {
+    guard (1...Int(Int32.max)).contains(input.generation_policy.vocabularySize),
+      input.prepared_token_ids.allSatisfy({ (0..<input.generation_policy.vocabularySize).contains($0) }),
+      input.outputs.allSatisfy({ (1...256).contains($0.token_ids.count)
+        && $0.token_ids.allSatisfy { (0..<input.generation_policy.vocabularySize).contains($0) } }),
+      let histories = input.output_history_evidence, histories.count == input.outputs.count,
+      let seeds = input.seeds, seeds == input.outputs.indices.map({ UInt64(42 + $0) }),
+      let cached = input.expected_cached_tokens_at_snapshot, (0..<input.prepared_token_ids.count).contains(cached)
+    else { throw BoomError.invalid("Malformed current public token, row or source history bounds.") }
+    for (row, history) in histories.enumerated() {
+      guard history.promptTokens == input.prepared_token_ids.count, history.decodeRow == row,
+        history.decodeWidth == input.outputs.count, history.blockers.isEmpty,
+        (1...1_024).contains(history.forwards.count), history.forwards.allSatisfy({ f in
+          (0...4_609).contains(f.start) && (1...4_609).contains(f.end)
+            && (1...4_609).contains(f.evaluatedEnd) && f.start < f.end && f.end <= f.evaluatedEnd
+            && (1...3).contains(f.width) && (f.width == 1 || f.row != nil)
+            && f.row.map({ (0..<f.width).contains($0) }) != false
+        }) else { throw BoomError.invalid("Unbounded or incomplete current source forward history.") }
+    }
+  }
+
+  private static func sameForward(_ f: CapturedForward, _ start: Int, _ end: Int,
+    origin: String, width: Int, row: Int? = nil) -> Bool {
+    f.start == start && f.end == end && f.evaluatedEnd == end
+      && f.origin == origin && f.width == width && f.row == row
+  }
+
+  private static func sourcePrefill(_ input: CapturedInput) throws -> [CapturedForward] {
+    guard let history = input.output_history_evidence?.first else { throw BoomError.invalid("Missing original source history.") }
+    let ranges = stride(from: 0, to: 3_584, by: 512).map { $0..<($0 + 512) } + [3_584..<4_095, 4_095..<4_096]
+    guard history.forwards.count >= ranges.count,
+      zip(history.forwards, ranges).allSatisfy({ sameForward($0.0, $0.1.lowerBound, $0.1.upperBound,
+        origin: "prefill", width: 1) }) else {
+      throw BoomError.invalid("The original fixed source prefill partitions changed.")
+    }
+    return history.forwards
+  }
+
+  private static func validateDecodeHistory(_ input: CapturedInput, shared: CapturedInput,
+    processed: Int, width: Int, row: Int) throws {
+    // processed/width/row are checked before forming ranges or indexing supplied rows.
+    guard (0...255).contains(processed), (1...3).contains(width), (0..<width).contains(row),
+      shared.outputs.count == width, shared.outputs.allSatisfy({ $0.token_ids.count >= processed }) else {
+      throw BoomError.invalid("Invalid captured decode-matrix bounds.")
+    }
+    let forwards = try sourcePrefill(input)
+    guard forwards.count >= 9 + processed else { throw BoomError.invalid("Truncated source decode history.") }
+    for position in 0..<processed {
+      let f = forwards[9 + position], start = 4096 + position
+      let matrix = shared.outputs.map { [$0.token_ids[position]] }
+      guard sameForward(f, start, start + 1, origin: width == 1 ? "singleDecode" : "batchDecode",
+          width: width, row: width == 1 ? nil : row),
+        let original = f.originalInput, original.phase == .decode,
+        original.covers(start: start, end: start + 1, evaluatedEnd: start + 1,
+          width: width, row: width == 1 ? nil : row),
+        original.tokenMatrixDigest == ForwardOperandBinding.tokenDigest(matrix),
+        original.generationActive.allSatisfy({ $0 }) else {
+        throw BoomError.invalid("The original selected row, completed decode operands or partitions changed.")
+      }
+    }
+  }
+
+  private static func validatePrefillTail(_ input: CapturedInput, after processed: Int,
+    start: Int, middle: Int, end: Int) throws {
+    guard let forwards = input.output_history_evidence?.first?.forwards,
+      forwards.count == 9 + processed + 2,
+      sameForward(forwards[9 + processed], start, middle, origin: "prefill", width: 1),
+      sameForward(forwards[10 + processed], middle, end, origin: "prefill", width: 1) else {
+      throw BoomError.invalid("The original source suffix prefill partitions changed.")
+    }
+  }
+
+  /// A bounded replay of the recorded ordinary width-three loop, not a new
+  /// sampling policy. Finished rows submit the real stop once, then the same
+  /// inert EOS operand as runBatch; those operands are never delivered output.
+  struct ReceiptBatchReplay: Sendable {
+    let processed: Int
+    let ledgers: [[Int]]
+    let terminalIterations: [Int]
+    let stopTokenIDs: [Int?]
+    let inertToken: Int
+
+    func column(at position: Int) throws -> [Int] {
+      guard (0..<processed).contains(position) else {
+        throw BoomError.invalid("Recorded batch replay position exceeds its actual forwards.")
+      }
+      return ledgers.indices.map { row in
+        if position < ledgers[row].count { return ledgers[row][position] }
+        if position == ledgers[row].count, let stop = stopTokenIDs[row] { return stop }
+        return inertToken
+      }
+    }
+  }
+
+  static func receiptBatchReplay(_ input: CapturedInput) throws -> ReceiptBatchReplay {
+    guard input.name == "writing-three-repeat", input.max_tokens_per_row == 256,
+      let batch = input.batch_metrics, batch.width == 3, batch.sharedPromptPrefills == 1,
+      batch.decodeForwardPasses == 255, input.outputs.count == 3,
+      (1...Int(Int32.max)).contains(input.generation_policy.vocabularySize),
+      let inert = input.generation_policy.eosTokenIDs.first,
+      (0..<input.generation_policy.vocabularySize).contains(inert) else {
+      throw BoomError.invalid("The original complete shared batch timeline is unavailable.")
+    }
+    var terminals: [Int] = []
+    for output in input.outputs {
+      guard (1...256).contains(output.token_ids.count), output.token_ids.allSatisfy({
+        (0..<input.generation_policy.vocabularySize).contains($0)
+          && !input.generation_policy.controlTokenIDs.contains($0)
+      }) else { throw BoomError.invalid("The recorded batch delivered ledger is invalid.") }
+      switch output.stop_reason {
+      case "output_limit":
+        guard output.token_ids.count == 256, output.stop_token_id == nil else {
+          throw BoomError.invalid("The recorded batch output limit has no actual terminal boundary.")
+        }
+        terminals.append(output.token_ids.count - 1)
+      case "eos", "model_control":
+        guard output.token_ids.count < 256, let stop = output.stop_token_id,
+          (0..<input.generation_policy.vocabularySize).contains(stop),
+          input.generation_policy.controlTokenIDs.contains(stop),
+          input.generation_policy.eosTokenIDs.contains(stop) == (output.stop_reason == "eos") else {
+          throw BoomError.invalid("The recorded batch control stop differs from its policy.")
+        }
+        terminals.append(output.token_ids.count)
+      default: throw BoomError.invalid("The original shared batch did not finish normally.")
+      }
+    }
+    guard terminals.max() == batch.decodeForwardPasses else {
+      throw BoomError.invalid("Recorded shared forwards and terminal row boundaries disagree.")
+    }
+    return ReceiptBatchReplay(processed: batch.decodeForwardPasses,
+      ledgers: input.outputs.map(\.token_ids), terminalIterations: terminals,
+      stopTokenIDs: input.outputs.map(\.stop_token_id), inertToken: inert)
+  }
+
+  private static func validateInterveningWriting(_ inputs: [CapturedInput], shared: CapturedInput) throws {
+    guard inputs.count == 2 else { throw BoomError.invalid("The two original intervening append requests are required.") }
+    for (index, input) in inputs.enumerated() {
+      let count = 4097 + index
+      guard input.name == "writing-append-\(count)", input.prepared_token_ids.count == count,
+        input.max_tokens_per_row == 16, input.expected_cached_tokens_at_snapshot == count - 1,
+        input.outputs.count == 1, input.outputs[0].token_ids.count == 16,
+        input.outputs[0].stop_reason == "output_limit", input.outputs[0].stop_token_id == nil,
+        input.prepared_token_ids.prefix(4096).elementsEqual(shared.prepared_token_ids),
+        index == 0 || input.prepared_token_ids.prefix(count - 1).elementsEqual(inputs[index - 1].prepared_token_ids)
+      else { throw BoomError.invalid("The original intervening append inputs or completion bounds changed.") }
+      let forwards = try sourcePrefill(input)
+      guard forwards.count == 10 + index,
+        (0...index).allSatisfy({ offset in
+          sameForward(forwards[9 + offset], 4096 + offset, 4097 + offset, origin: "prefill", width: 1)
+        }) else { throw BoomError.invalid("The actual intervening append prefill partitions changed.") }
+    }
+  }
+
+  static func validateRequest(_ declaration: Declaration, schema: Int, shared: CapturedInput,
+    anchor: CapturedInput?, query: CapturedInput, intervening: [CapturedInput] = []) throws -> Request {
+    try validateDeclaration(declaration, schema: schema)
+    let request = Request(declaration: declaration, schema: schema, shared: shared, anchor: anchor,
+      query: query, intervening: intervening)
+    guard intervening.count == (declaration.interveningSources?.count ?? 0) else {
+      throw BoomError.invalid("The source-bound intervening manager timeline is missing.")
+    }
+    guard shared.prepared_token_ids.count == 4096, shared.outputs.count == declaration.sharedWidth,
+      query.outputs.count == 1, query.outputs[0].token_ids.count == 16,
+      request.inputs.allSatisfy({ $0.model == shared.model && $0.settings == query.settings
+        && $0.generation_policy == query.generation_policy }),
+      shared.outputs.allSatisfy({ $0.token_ids.count >= declaration.sharedDeliveredLedgerTokens }) else {
+      throw BoomError.invalid("Public source, rows, policies or sampling settings changed.")
+    }
+    if schema == 2 { for input in request.inputs { try validateCurrentInput(input) } }
+    switch declaration.kind {
+    case .consultationInterior:
+      guard query.prepared_token_ids.count == 4129,
+        request.inputs.allSatisfy({ $0.prompt == nil && $0.plan != nil }),
+        query.prepared_token_ids.prefix(declaration.cachedPrefix).elementsEqual(
+          (shared.prepared_token_ids + shared.outputs[0].token_ids).prefix(declaration.cachedPrefix)) else {
+        throw BoomError.invalid("The public next-turn integer prefix is not the declared consultation.")
+      }
+      if schema == 2 {
+        guard shared.expected_cached_tokens_at_snapshot == 0,
+          query.expected_cached_tokens_at_snapshot == declaration.cachedPrefix else {
+          throw BoomError.invalid("Changed actual consultation cache selection.")
+        }
+        _ = try sourcePrefill(shared)
+        try validateDecodeHistory(query, shared: shared, processed: 16, width: 1, row: 0)
+        try validatePrefillTail(query, after: 16, start: 4112, middle: 4128, end: 4129)
+      }
+    case .writingLateDivergence:
+      guard let anchor, anchor.prepared_token_ids.count == 4353, anchor.outputs.count == 1,
+        anchor.outputs[0].token_ids.count == 16, query.prepared_token_ids.count == 4353,
+        request.inputs.allSatisfy({ $0.prompt != nil && $0.plan == nil }),
+        let prefix = declaration.anchorCachedPrefix else {
+        throw BoomError.invalid("Changed public width-three source geometry.")
+      }
+      guard let row = schema == 1 ? 2 : declaration.sharedSourceRow else {
+        throw BoomError.invalid("Missing original shared row.")
+      }
+      guard anchor.prepared_token_ids.prefix(prefix).elementsEqual(shared.prepared_token_ids
+          + Array(shared.outputs[row].token_ids.prefix(declaration.sharedProcessedDecodeTokens))),
+        query.prepared_token_ids.prefix(declaration.cachedPrefix).elementsEqual(
+          anchor.prepared_token_ids.prefix(declaration.cachedPrefix)) else {
+        throw BoomError.invalid("The public width-three row/late-anchor integer prefixes changed.")
+      }
+      if schema == 2 {
+        _ = try receiptBatchReplay(shared)
+        try validateInterveningWriting(intervening, shared: shared)
+        guard shared.expected_cached_tokens_at_snapshot == 4095,
+          anchor.expected_cached_tokens_at_snapshot == prefix,
+          query.expected_cached_tokens_at_snapshot == declaration.cachedPrefix else {
+          throw BoomError.invalid("Changed actual writing cache selection.")
+        }
+        _ = try sourcePrefill(shared)
+        try validateDecodeHistory(anchor, shared: shared,
+          processed: declaration.sharedProcessedDecodeTokens, width: 3, row: row)
+        try validatePrefillTail(anchor, after: declaration.sharedProcessedDecodeTokens,
+          start: prefix, middle: 4352, end: 4353)
+        if declaration.sourceStage == .sharedDecode {
+          try validateDecodeHistory(query, shared: shared,
+            processed: declaration.sourceNativeBoundary - 4096, width: 3, row: row)
+          try validatePrefillTail(query, after: declaration.sourceNativeBoundary - 4096,
+            start: declaration.sourceNativeBoundary, middle: 4352, end: 4353)
+          guard query.prepared_token_ids.prefix(declaration.cachedPrefix).elementsEqual(
+            (shared.prepared_token_ids + shared.outputs[row].token_ids).prefix(declaration.cachedPrefix)) else {
+            throw BoomError.invalid("Changed selected-row source at the actual query boundary.")
+          }
+        }
+      }
+    }
+    return request
+  }
+
+  static func request(_ declaration: Declaration, schema: Int = 1) throws -> Request {
+    try validateRequest(declaration, schema: schema, shared: captured(declaration.sharedSource, schema: schema),
+      anchor: declaration.anchorSource.map { try captured($0, schema: schema) },
+      query: captured(declaration.currentQuery, schema: schema),
+      intervening: (declaration.interveningSources ?? []).map { try captured($0, schema: schema) })
+  }
+
+  private static func write<T: Encodable>(_ value: T, _ name: String, _ evidence: URL) throws {
+    let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    try encoder.encode(value).write(to: evidence.appendingPathComponent(name), options: .atomic)
+  }
+  private static func object(_ value: [String: Any], _ name: String, _ evidence: URL) throws {
+    try JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys])
+      .write(to: evidence.appendingPathComponent(name), options: .atomic)
+  }
+  static func nativeBases(_ caches: [any KVCache]) -> [any KVCache] {
+    // Transparent adapter access only. The independent oracle does not use the
+    // storage helper's layout, resident ranges, spans or hydration implementation.
+    caches.map(PrefixKVStorage.unwrap)
+  }
+  private struct Prepared {
+    let session: PromptPrefixCache.Session
+    let logits: MLXArray
+    let snapshot: NativePrefixParityProbe.Snapshot?
+    let ranges: [NativePrefixParityProbe.TokenRange]
+    var valueBoundary: Layer0ValueBoundary.Frozen? = nil
+  }
+
+  // Mirrors pinned Gemma text-only prepare, in this explicit diagnostic only.
+  // Capture may occur before a later prefill chunk, not only at its final extent.
+  private static func prepare(model: any LanguageModel, session: PromptPrefixCache.Session,
+    captureAt: Int?, label: String, flag: CancellationFlag, evidence: URL,
+    forwardCache: [any KVCache]? = nil, valueBoundary: Layer0ValueBoundary? = nil,
+    fence: () -> Void = {}) async throws -> Prepared {
+    let executionCache = forwardCache ?? session.cache
+    let ids = session.input.text.tokens.asArray(Int.self)
+    let y = MLXArray(ids.map(Int32.init)).expandedDimensions(axis: 0)
+    var frozenValues: Layer0ValueBoundary.Frozen?
+    var snapshot: NativePrefixParityProbe.Snapshot?, ranges: [NativePrefixParityProbe.TokenRange] = []
+    var partition = session.prefill; partition.progress = nil
+    var chunks: [Range<Int>] = []
+    let done = try partition.forEachChunk(total: ids.count) { chunks.append($0) }
+    for range in chunks {
+      try flag.check(); try ModelResidency.check()
+      let result = model(LMInput.Text(tokens: y[0..., range]), cache: executionCache, state: nil)
+      guard result.state == nil else { throw BoomError.invalid("Unsupported public model state.") }
+      asyncEval([result.logits] + session.cache.flatMap { $0.innerState() })
+      eval(result.logits); session.markCacheSubmitted()
+      try valueBoundary?.completedNativeForward(executionCache, fence: fence)
+      session.prefill.progress?(range.upperBound, ids.count)
+      session.observeReadySpill(); await session.joinPendingSpill(cancelled: false)
+      let absolute = session.cachedTokenCount + range.upperBound
+      ranges.append(NativePrefixParityProbe.TokenRange(
+        session.cachedTokenCount + range.lowerBound ..< absolute))
+      if captureAt == absolute {
+        let captured = try NativePrefixParityProbe.captureNative(nativeBases(session.cache),
+          evaluatedPrefix: absolute, selectedRow: 0)
+        snapshot = captured
+        frozenValues = try valueBoundary?.freeze(at: captured, fence: fence,
+          record: { try write($0, label + "-incoming-v-boundary.json", evidence) })
+        try write(captured.source, label + "-native-source.json", evidence)
+      }
+      try write(ranges, label + "-prefill-ranges.json", evidence)
+    }
+    if done > 0 { eval(session.cache) }
+    try flag.check(); try ModelResidency.check()
+    let final = model(LMInput.Text(tokens: y[0..., done...]), cache: executionCache, state: nil)
+    guard final.state == nil, final.logits.ndim == 3, final.logits.dim(0) == 1 else {
+      throw BoomError.invalid("Unsupported final public model output.")
+    }
+    ranges.append(NativePrefixParityProbe.TokenRange(session.cachedTokenCount + done ..< session.fullPromptTokenCount))
+    session.prefill.progress?(ids.count, ids.count)
+    asyncEval([final.logits] + session.cache.flatMap { $0.innerState() })
+    eval(final.logits); session.markCacheSubmitted()
+    try valueBoundary?.completedNativeForward(executionCache, fence: fence)
+    session.observeReadySpill(); await session.joinPendingSpill(cancelled: false)
+    try flag.check(); try ModelResidency.check()
+    try write(ranges, label + "-prefill-ranges.json", evidence)
+    if captureAt != nil, snapshot == nil {
+      throw BoomError.invalid("The declared native boundary was not part of the actual source partitions.")
+    }
+    return Prepared(session: session, logits: final.logits[0..., -1, 0...], snapshot: snapshot, ranges: ranges, valueBoundary: frozenValues)
+  }
+
+  private static func produce(_ input: CapturedInput, model: any LanguageModel,
+    manager: PromptPrefixCache, owner: PromptCacheOwner, prefill: PrefillParameters,
+    policy: ModelGenerationPolicy, expectedCached: Int, width: Int, processed: Int, delivered: Int,
+    captureAt: Int?, captureRow: Int = 0, expectedSourceRow: Int? = nil, label: String, flag: CancellationFlag,
+    replayCompleteBatch: Bool = false, valueBoundary: Layer0ValueBoundary? = nil,
+    allowSnapshot: @escaping @Sendable (UInt64) -> Bool, fence: () -> Void, evidence: URL) async throws -> Prepared {
+    let replay = replayCompleteBatch ? try receiptBatchReplay(input) : nil
+    let processedCount = replay?.processed ?? processed
+    let parameters = GenerateParameters(maxTokens: replay == nil ? 16 : 256, temperature: input.settings.temperature,
+      topP: input.settings.topP, topK: input.settings.topK, minP: input.settings.minP,
+      repetitionPenalty: nil, prefill: prefill, seed: 42)
+    try write(manager.retainedLookupSnapshotObservations, label + "-lookup-candidates-before.json", evidence)
+    let session = try manager.makeSession(owner: owner,
+      input: LMInput(tokens: MLXArray(input.prepared_token_ids.map(Int32.init))),
+      promptTokenIDs: input.prepared_token_ids, prefill: prefill, allowSnapshot: allowSnapshot,
+      useActiveNative: true, outputTokens: replay == nil ? 16 : 256, batchWidth: width,
+      makeCache: { try model.newCache(parameters: parameters) })
+    try write(session.observation, label + "-lookup.json", evidence)
+    guard session.cachedTokenCount == expectedCached else {
+      throw BoomError.invalid("The declared source's actual manager selection changed.")
+    }
+    if let row = expectedSourceRow {
+      let originalBatch = session.observation.cachedForwardHistory.filter { $0.origin == .batchDecode }
+      guard !originalBatch.isEmpty, originalBatch.allSatisfy({ $0.row == row && $0.batchWidth == 3 }) else {
+        throw BoomError.invalid("The actual manager selected a different original batch row.")
+      }
+    }
+    let executionCache = try valueBoundary?.observing(session.cache) ?? session.cache
+    let decodeCapture = captureAt.map { $0 > input.prepared_token_ids.count } == true
+    let prepared = try await prepare(model: model, session: session,
+      captureAt: decodeCapture ? nil : captureAt, label: label, flag: flag, evidence: evidence,
+      forwardCache: executionCache, valueBoundary: valueBoundary, fence: fence)
+    var snapshot = prepared.snapshot, frozenValues = prepared.valueBoundary
+    guard (1...3).contains(width), (0...255).contains(processed), (1...256).contains(delivered),
+      (0..<width).contains(captureRow), input.outputs.count == width,
+      processed <= delivered, width == 1 || processed < delivered else {
+      throw BoomError.invalid("Invalid public teacher-forced ledger dimensions.")
+    }
+    let ledgers = replay?.ledgers ?? input.outputs.map { Array($0.token_ids.prefix(delivered)) }
+    guard ledgers.allSatisfy({ (replay != nil || $0.count == delivered) && $0.allSatisfy { !policy.controlTokenIDs.contains($0)
+        && $0 >= 0 && $0 < policy.vocabularySize } }) else {
+      throw BoomError.invalid("Invalid public teacher-forced ledger bounds.")
+    }
+    if width > 1 {
+      for var entry in session.cache {
+        let state = entry.state
+        guard state.count == 2, state.allSatisfy({ $0.ndim == 4 && $0.dim(0) == 1 }) else {
+          throw BoomError.invalid("Unsupported real batch cache expansion.")
+        }
+        entry.state = state.map { broadcast($0, to: [width] + Array($0.shape.dropFirst())) }
+      }
+      eval(session.cache)
+    }
+    var processedMatrices: [[Int]] = []
+    for position in 0 ..< processedCount {
+      try flag.check(); try ModelResidency.check()
+      let column = try replay?.column(at: position) ?? ledgers.map { $0[position] }
+      if width == 1 { session.didSample?(MLXArray(Int32(column[0]))) }
+      else {
+        for row in 0 ..< width {
+          if let replay, position > replay.terminalIterations[row] { continue }
+          let stop = replay.flatMap { position == $0.terminalIterations[row] ? $0.stopTokenIDs[row] : nil }
+          guard session.captureDecodeLane(row: row, width: width,
+            emittedTokenIDs: Array(ledgers[row].prefix(position + 1)), stopTokenID: stop,
+            finished: replay.map { position == $0.terminalIterations[row] } ?? false) else {
+            throw BoomError.invalid("The actual manager refused a declared batch ledger boundary.")
+          }
+        }
+      }
+      let output = model(LMInput.Text(tokens: MLXArray(column.map(Int32.init)).reshaped([width, 1])),
+        cache: executionCache, state: nil)
+      guard output.state == nil else { throw BoomError.invalid("Unexpected teacher-forced model state.") }
+      asyncEval([output.logits] + session.cache.flatMap { $0.innerState() })
+      eval(output.logits); session.markCacheSubmitted()
+      try valueBoundary?.completedNativeForward(executionCache, fence: fence)
+      session.observeReadySpill(); await session.joinPendingSpill(cancelled: false)
+      processedMatrices.append(column)
+      let absolute = input.prepared_token_ids.count + position + 1
+      if captureAt == absolute {
+        // This exact forward has submitted AND completed all owning cache layers.
+        // No iterator lookahead, delivered-only token or synthetic ring rewind.
+        let captured = try NativePrefixParityProbe.captureNative(nativeBases(session.cache),
+          evaluatedPrefix: absolute, selectedRow: captureRow)
+        snapshot = captured
+        frozenValues = try valueBoundary?.freeze(at: captured, fence: fence,
+          record: { try write($0, label + "-incoming-v-boundary.json", evidence) })
+        try write(captured.source, label + "-native-source.json", evidence)
+      }
+    }
+    guard captureAt == nil || snapshot != nil else {
+      throw BoomError.invalid("The declared native capture was not an actual completed producer boundary.")
+    }
+    if width > 1 {
+      for row in 0 ..< width {
+        if let replay, replay.terminalIterations[row] < processedCount { continue }
+        guard session.captureFinishedLane(row: row, width: width, emittedTokenIDs: ledgers[row],
+          stopTokenID: replay?.stopTokenIDs[row]) else {
+          throw BoomError.invalid("The actual manager refused the public finished-row checkpoint.")
+        }
+      }
+    }
+    fence(); try flag.check(); try ModelResidency.check()
+    await session.joinPendingSpill(cancelled: false)
+    let published = manager.publish(session, completions: ledgers.indices.map {
+      PromptPrefixCache.Completion(row: $0, emittedTokenIDs: ledgers[$0],
+        stopTokenID: replay?.stopTokenIDs[$0])
+    })
+    try object(["method": "teacher_force_exact_public_receipt_ledger",
+      "original_receipt_emitted_counts": input.outputs.map { $0.token_ids.count },
+      "original_receipt_stop_reasons": input.outputs.map(\.stop_reason),
+      "original_receipt_stop_token_ids": input.outputs.map { $0.stop_token_id.map { $0 as Any } ?? NSNull() },
+      "declared_supplied_ledger_counts": ledgers.map(\.count),
+      "processed_decode_positions": processedCount, "processed_row_matrix": processedMatrices,
+      "unprocessed_supplied_ledger_suffixes": ledgers.map { Array($0.dropFirst(processedCount)) },
+      "complete_original_batch_timeline": replayCompleteBatch,
+      "recorded_terminal_sample_iterations": replay?.terminalIterations ?? [],
+      "inert_positions": replay.map { value in
+        (0..<value.processed).filter { position in value.terminalIterations.contains { $0 < position } }
+      } ?? [], "actual_native_offsets": session.cache.map { $0.offset },
+      "actual_native_batch_dimensions": session.cache.flatMap { $0.state.map { $0.dim(0) } },
+      "published": published, "retained_byte_bound": manager.retainedBytesUpperBound,
+      "source_is_autonomous_generation": false], label + "-producer.json", evidence)
+    try write(manager.retainedSnapshotObservations, label + "-manager-snapshots.json", evidence)
+    try write(session.retentionObservation, label + "-retention-after-publication.json", evidence)
+    try write(manager.retainedLookupSnapshotObservations, label + "-lookup-candidates-after-publication.json", evidence)
+    guard published else { throw BoomError.invalid("The bounded normal manager did not retain the declared source.") }
+    return Prepared(session: session, logits: prepared.logits, snapshot: snapshot, ranges: prepared.ranges, valueBoundary: frozenValues)
+  }
+
+  private static func naturalSamples(model: any LanguageModel, cache: [any KVCache], logits initial: MLXArray,
+    settings: SamplingSettings, policy: ModelGenerationPolicy, flag: CancellationFlag) throws -> Samples {
+    let sampler = GenerateParameters(temperature: settings.temperature, topP: settings.topP,
+      topK: settings.topK, minP: settings.minP, repetitionPenalty: nil, seed: 42).sampler()
+    let mask = CheckpointTokenMask(policy.suppressedTokenIDs)
+    var logits = initial, sampled: [Int] = [], emitted: [Int] = [], processed = 0
+    var reason = "output_limit", stop: Int?
+    for step in 0 ..< 16 {
+      try flag.check(); try ModelResidency.check()
+      let next = sampler.sample(logits: mask.process(logits: logits)).reshaped([1])
+      eval(next)
+      let id = next.item(Int.self); sampled.append(id)
+      guard !policy.suppressedTokenIDs.contains(id), id >= 0, id < policy.vocabularySize else {
+        throw BoomError.invalid("The normal sampler returned a forbidden token.")
+      }
+      if policy.controlTokenIDs.contains(id) {
+        stop = id; reason = policy.eosTokenIDs.contains(id) ? "eos" : "model_control"; break
+      }
+      emitted.append(id)
+      if step == 15 { break }
+      let output = model(LMInput.Text(tokens: next.reshaped([1, 1])), cache: cache, state: nil)
+      guard output.state == nil else { throw BoomError.invalid("Unexpected natural-cold inference state.") }
+      logits = output.logits[0..., -1, 0...]; eval([logits] + cache.flatMap { $0.innerState() })
+      processed += 1
+    }
+    return Samples(sampledTokenIDs: sampled, emittedTokenIDs: emitted, stopReason: reason,
+      stopTokenID: stop, processedDecodeTokens: processed)
+  }
+
+  private static func pair(name: String, model: any LanguageModel, reference: [any KVCache],
+    candidate: [any KVCache], query: [Int], prefix: Int, partitions: [Int], windows: [Int?],
+    settings: SamplingSettings, policy: ModelGenerationPolicy, flag: CancellationFlag,
+    evidence: URL) throws -> PairSummary {
+    let initial = try NativePrefixParityProbe.compareState(oracle: reference, hydrated: candidate,
+      suffixLength: partitions[0], maskWindows: windows)
+    try write(initial, name + "-initial-state.json", evidence)
+    let makeSampler = { GenerateParameters(temperature: settings.temperature, topP: settings.topP,
+      topK: settings.topK, minP: settings.minP, repetitionPenalty: nil, seed: 42).sampler() }
+    let aSampler = makeSampler(), bSampler = makeSampler(), mask = CheckpointTokenMask(policy.suppressedTokenIDs)
+    var aIDs: [Int] = [], bIDs: [Int] = [], control = false, equalLogits = true
+    let sample: (MLXArray, MLXArray, Int) throws -> [NativePrefixParityProbe.SampleComparison] = { a, b, _ in
+      let at = aSampler.sample(logits: mask.process(logits: a)).reshaped([1])
+      let bt = bSampler.sample(logits: mask.process(logits: b)).reshaped([1])
+      eval([at, bt]); let ai = at.item(Int.self), bi = bt.item(Int.self)
+      guard [ai, bi].allSatisfy({ $0 >= 0 && $0 < policy.vocabularySize
+        && !policy.suppressedTokenIDs.contains($0) }) else {
+        throw BoomError.invalid("A paired normal sampler returned a forbidden token.")
+      }
+      aIDs.append(ai); bIDs.append(bi)
+      control = policy.controlTokenIDs.contains(ai) || policy.controlTokenIDs.contains(bi)
+      return [.init(seed: 42, referenceTokenID: ai, candidateTokenID: bi)]
+    }
+    var cursor = prefix
+    for (index, count) in partitions.enumerated() {
+      try flag.check(); try ModelResidency.check()
+      let ids = Array(query[cursor ..< cursor + count]); cursor += count
+      let result = try NativePrefixParityProbe.forwardSameInputs(model: model, oracle: reference,
+        hydrated: candidate, tokenBlocks: [ids], maskWindows: windows, vocabularySize: policy.vocabularySize,
+        sample: index == partitions.count - 1 ? sample : nil,
+        didRecordBlock: { try write($0, name + "-suffix-\(index).json", evidence) })
+      equalLogits = equalLogits && result.allSatisfy { $0.logits.bitwiseEqual == true }
+    }
+    // Continue both histories with the same reference token after every draw.
+    // Each sampler has its own RNG state. Stop at either actual control token.
+    for step in 1 ..< 16 {
+      if control { break }
+      try flag.check(); try ModelResidency.check()
+      guard let previous = aIDs.last else { throw BoomError.invalid("The paired sampler did not produce its declared checkpoint.") }
+      let result = try NativePrefixParityProbe.forwardSameInputs(model: model, oracle: reference,
+        hydrated: candidate, tokenBlocks: [[previous]], maskWindows: windows, vocabularySize: policy.vocabularySize,
+        sample: sample, didRecordBlock: { try write($0, name + "-decode-\(step).json", evidence) })
+      equalLogits = equalLogits && result.allSatisfy { $0.logits.bitwiseEqual == true }
+    }
+    let first = aIDs.indices.first { aIDs[$0] != bIDs[$0] }
+    let summary = PairSummary(name: name, initialState: initial, allLogitBitsEqual: equalLogits,
+      sampledReferenceTokenIDs: aIDs, sampledCandidateTokenIDs: bIDs,
+      firstSampleDifferenceZeroBased: first, eitherBranchStoppedByControl: control,
+      method: "identical_suffix_partitions_then_reference_teacher_forced_tokens; independent_normal_samplers; candidate_after_divergence_is_not_autonomous")
+    try write(summary, name + "-summary.json", evidence)
+    return summary
+  }
+
+  // Remains on the owned inference executor; only this deliberate diagnostic
+  // joins disposable spill work between its actual forwards. Default inference
+  // gains no snapshot, matrix, reduction or diagnostic callback.
+  static func execute(_ request: Request, model: any LanguageModel, manager: PromptPrefixCache,
+    prefill: PrefillParameters, policy: ModelGenerationPolicy, layerWindows: [Int?],
+    flag: CancellationFlag, allowSnapshot: @escaping @Sendable (UInt64) -> Bool, fence: () -> Void,
+    evidence: URL) async throws -> CaseSummary {
+    let d = request.declaration
+    try validateDeclaration(d, schema: request.schema)
+    let owner = PromptCacheOwner(namespace: d.namespace, entity: d.namespace,
+      route: d.kind == .consultationInterior ? .consultation : .writing)
+    let sharedCapture = request.schema == 1 ? d.kind == .consultationInterior : d.sourceStage == .sharedDecode
+    let inspectValues = request.schema == 2 && d.kind == .consultationInterior
+    let sourceValues = inspectValues ? Layer0ValueBoundary() : nil
+    let shared = try await produce(request.shared, model: model, manager: manager, owner: owner,
+      prefill: prefill, policy: policy, expectedCached: 0, width: d.sharedWidth,
+      processed: d.sharedProcessedDecodeTokens, delivered: d.sharedDeliveredLedgerTokens,
+      captureAt: sharedCapture ? d.sourceNativeBoundary : nil,
+      captureRow: request.schema == 2 && sharedCapture ? (d.sharedSourceRow ?? 0) : 0,
+      label: "shared-source", flag: flag,
+      replayCompleteBatch: request.schema == 2 && d.kind == .writingLateDivergence,
+      valueBoundary: sourceValues,
+      allowSnapshot: allowSnapshot, fence: fence, evidence: evidence)
+    // These two actual requests replaced the hot batch owner before the
+    // original anchor queried historical rows. Omitting them changes a valid
+    // normal tie from the original disk row to the freshly published hot row.
+    for input in request.intervening {
+      guard let cached = input.expected_cached_tokens_at_snapshot else {
+        throw BoomError.invalid("An original intervening request lost its cache boundary.")
+      }
+      _ = try await produce(input, model: model, manager: manager, owner: owner,
+        prefill: prefill, policy: policy, expectedCached: cached, width: 1, processed: 16, delivered: 16,
+        captureAt: nil, label: input.name, flag: flag,
+        allowSnapshot: allowSnapshot, fence: fence, evidence: evidence)
+    }
+    let anchor: Prepared?
+    if let input = request.anchor {
+      guard let cached = d.anchorCachedPrefix else { throw BoomError.invalid("Missing declared anchor admission.") }
+      anchor = try await produce(input, model: model, manager: manager, owner: owner, prefill: prefill,
+        policy: policy, expectedCached: cached, width: 1, processed: 16, delivered: 16,
+        captureAt: sharedCapture ? nil : d.sourceNativeBoundary,
+        expectedSourceRow: request.schema == 2 ? d.sharedSourceRow : nil,
+        label: "late-anchor", flag: flag,
+        allowSnapshot: allowSnapshot, fence: fence, evidence: evidence)
+    } else { anchor = nil }
+    let capturedSource: Prepared? = sharedCapture ? shared : anchor
+    guard let sourceSnapshot = capturedSource?.snapshot else { throw BoomError.invalid("Original native source was not captured.") }
+    // Hold both original producer sessions, source tensors and model lease until
+    // after all comparisons; snapshots are bounded to these declared cases.
+    defer { withExtendedLifetime((shared, anchor)) {} }
+
+    let parameters = GenerateParameters(maxTokens: 16, temperature: request.query.settings.temperature,
+      topP: request.query.settings.topP, topK: request.query.settings.topK, minP: request.query.settings.minP,
+      repetitionPenalty: nil, prefill: prefill, seed: 42)
+    let cold = try manager.makeSession(owner: nil,
+      input: LMInput(tokens: MLXArray(request.query.prepared_token_ids.map(Int32.init))),
+      promptTokenIDs: request.query.prepared_token_ids, prefill: prefill,
+      makeCache: { try model.newCache(parameters: parameters) })
+    let coldValues = inspectValues ? Layer0ValueBoundary() : nil
+    let coldForwardCache = try coldValues?.observing(cold.cache) ?? cold.cache
+    let coldPrepared = try await prepare(model: model, session: cold, captureAt: d.coldNativeBoundary,
+      label: "natural-full-query-cold", flag: flag, evidence: evidence,
+      forwardCache: coldForwardCache, valueBoundary: coldValues, fence: fence)
+    guard let coldSnapshot = coldPrepared.snapshot else { throw BoomError.invalid("Full-query cold native boundary was not captured.") }
+    let coldSamples = try naturalSamples(model: model, cache: cold.cache, logits: coldPrepared.logits,
+      settings: request.query.settings, policy: policy, flag: flag)
+    try write(coldSamples, "natural-full-query-cold-samples.json", evidence)
+    try object(["method": "natural_full_current_query_cold; no shortened_C_token_prefill",
+      "prepared_tokens": request.query.prepared_token_ids.count,
+      "native_capture_boundary": d.coldNativeBoundary,
+      "natural_samples_match_historical_public_query": coldSamples.emittedTokenIDs == request.query.outputs[0].token_ids,
+      "final_native_offsets": cold.cache.map(\.offset)], "natural-full-query-cold-scope.json", evidence)
+    fence(); try flag.check(); try ModelResidency.check()
+
+    try write(manager.retainedLookupSnapshotObservations, "actual-warm-lookup-candidates-before.json", evidence)
+    let warm = try manager.makeSession(owner: owner,
+      input: LMInput(tokens: MLXArray(request.query.prepared_token_ids.map(Int32.init))),
+      promptTokenIDs: request.query.prepared_token_ids, prefill: prefill, allowSnapshot: allowSnapshot,
+      useActiveNative: true, outputTokens: 16, batchWidth: 1, makeCache: { try model.newCache(parameters: parameters) })
+    defer { withExtendedLifetime((warm, coldPrepared)) {} }
+    try write(warm.observation, "actual-warm-lookup.json", evidence)
+    if request.schema == 2, d.kind == .writingLateDivergence, let row = d.sharedSourceRow {
+      let originalBatch = warm.observation.cachedForwardHistory.filter { $0.origin == .batchDecode }
+      guard !originalBatch.isEmpty, originalBatch.allSatisfy({ $0.row == row && $0.batchWidth == 3 }) else {
+        throw BoomError.invalid("The warm query selected a different original decoded row.")
+      }
+    }
+    guard warm.cachedTokenCount == d.cachedPrefix,
+      warm.fullPromptTokenCount - warm.cachedTokenCount == d.warmSuffixPartitions.reduce(0, +) else {
+      throw BoomError.invalid("The actual bounded manager did not select the declared parity prefix.")
+    }
+    let bases = nativeBases(warm.cache)
+    guard !bases.isEmpty, bases.count <= layerWindows.count else { throw BoomError.invalid("Actual owning cache layers exceed declared architecture.") }
+    let windows = Array(layerWindows.prefix(bases.count))
+    var ranges: [Int] = []
+    let tailCount = warm.input.text.tokens.size
+    _ = try warm.prefill.forEachChunk(total: tailCount) { ranges.append($0.count) }
+    ranges.append(tailCount - ranges.reduce(0, +))
+    guard ranges == d.warmSuffixPartitions else { throw BoomError.invalid("The actual warm suffix partitions changed.") }
+    // Equal prefix counters alone do not imply the same physical layout.
+    // Only an unchanged transfer of the retained producer's native objects
+    // uses its original boundary. Disk/row/interior restoration remains the
+    // independent canonical crop, never a format inferred from candidate data.
+    let sourceBases = capturedSource.map { nativeBases($0.session.cache) } ?? []
+    let sameOriginalBoundary = d.cachedPrefix == sourceSnapshot.evaluatedPrefix
+      && sourceBases.count == bases.count && bases.indices.allSatisfy {
+        ObjectIdentifier(bases[$0] as AnyObject) == ObjectIdentifier(sourceBases[$0] as AnyObject)
+      }
+    let restorationReference: [any KVCache]
+    if sameOriginalBoundary { restorationReference = try sourceSnapshot.originalBoundary() }
+    else { restorationReference = try sourceSnapshot.oracle(prefix: d.cachedPrefix) }
+    try object(["comparison_A": "same_original_evaluated_native_history_vs_actual_normal_manager_hydration",
+      "comparison_B": "retained_original_native_history_vs_independently_cold_full_current_query_native_history",
+      "warm_suffix_partitions": ranges, "source_native_boundary": d.sourceNativeBoundary,
+      "cold_native_boundary": d.coldNativeBoundary, "prefix": d.cachedPrefix,
+      "fixture_schema": request.schema, "source_stage": d.sourceStage?.rawValue ?? "legacy_prefill",
+      "original_shared_row": d.sharedSourceRow.map { $0 as Any } ?? NSNull(),
+      "same_integer_prefix_proved": true, "unavailable_oracle_fallback": false,
+      "same_original_native_boundary": sameOriginalBoundary,
+      "restoration_reference_layout": sameOriginalBoundary ? "original_native_boundary" : "canonical_prefix",
+      "full_query_cold_history_is_primary": true, "historical_native_tensors_recreated_from_receipts": false],
+      "comparison-scope.json", evidence)
+
+    let a = try pair(name: "A-same-history-restoration", model: model,
+      reference: restorationReference, candidate: bases,
+      query: request.query.prepared_token_ids, prefix: d.cachedPrefix, partitions: ranges, windows: windows,
+      settings: request.query.settings, policy: policy, flag: flag, evidence: evidence)
+    // A's working caches were advanced; B starts from fresh independent native
+    // snapshot crops, never from A's advanced hydration or oracle-derived spans.
+    let b = try pair(name: "B-full-query-cold-vs-retained-history", model: model,
+      reference: sourceSnapshot.oracle(prefix: d.cachedPrefix), candidate: coldSnapshot.oracle(prefix: d.cachedPrefix),
+      query: request.query.prepared_token_ids, prefix: d.cachedPrefix, partitions: ranges, windows: windows,
+      settings: request.query.settings, policy: policy, flag: flag, evidence: evidence)
+    fence(); try flag.check(); try ModelResidency.check()
+    var result = CaseSummary(name: request.name, modelIdentity: request.query.model,
+      sourceBoundary: d.sourceNativeBoundary, coldBoundary: d.coldNativeBoundary,
+      prefix: d.cachedPrefix, actualWarmObservation: warm.observation,
+      restoration: a, coldVsRetained: b, naturalFullQueryColdSamples: coldSamples,
+      fullQueryColdPromptHistory: coldPrepared.ranges, releaseQualified: false)
+    if inspectValues {
+      guard let source = shared.valueBoundary, let cold = coldPrepared.valueBoundary else {
+        throw BoomError.invalid("The completed pre-cache layer0 V boundary was not observed.")
+      }
+      result.preCacheLayer0Values = Layer0ValueBoundary.Comparison(source: source.proof, cold: cold.proof,
+        incomingSourceVsCold: try withExtendedLifetime((source.pin, cold.pin)) {
+          try NativePrefixParityProbe.compareTensor(source.values, cold.values)
+        },
+        method: "incoming_layer0_V4095..<4112_after_native_completion; exact_own_uncropped_raw_slots; cross_history_observation_only_no_kernel_attribution")
+      try write(result.preCacheLayer0Values, "pre-cache-layer0-values.json", evidence)
+    }
+    try write(result, "case-result.json", evidence)
+    try object(["status": "execution_complete", "source_bound": true,
+      "same_history_restoration_exact": result.sameHistoryRestorationExact,
+      "cold_history_equivalence_observed": result.coldHistoryEquivalenceObserved,
+      "natural_full_query_cold_samples": try ProductCore.object(coldSamples),
+      "no_hidden_retry": true, "release_qualified": false], "terminal.json", evidence)
+    return result
+  }
+
+  private final class MemoryObservation: @unchecked Sendable {
+    private let lock = NSLock()
+    private let timer: DispatchSourceTimer
+    private var samples = 0
+    private var peakFootprint: UInt64 = 0
+    private var peakAllocator: UInt64 = 0
+    init() {
+      timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+      timer.schedule(deadline: .now(), repeating: .milliseconds(20))
+      timer.setEventHandler { [weak self] in self?.sample() }; timer.resume()
+    }
+    func sample() {
+      let account = ModelResidency.memoryAccounting()
+      let allocated = UInt64(max(0, Memory.activeMemory + Memory.cacheMemory))
+      lock.lock(); defer { lock.unlock() }
+      samples += 1; peakFootprint = max(peakFootprint, max(account.current, account.peak))
+      peakAllocator = max(peakAllocator, allocated)
+    }
+    func snapshot() -> [String: Any] {
+      sample(); lock.lock(); defer { lock.unlock() }
+      return ["sample_interval_ms": 20, "sample_count": samples,
+        "peak_process_footprint_bytes": peakFootprint, "peak_allocator_active_plus_cache_bytes": peakAllocator,
+        "mlx_peak_memory_bytes": Memory.peakMemory]
+    }
+    func check(_ limit: UInt64) throws {
+      sample(); lock.lock(); let used = max(peakFootprint, peakAllocator); lock.unlock()
+      guard used > 0, used <= limit else { throw BoomError.budget("The parity diagnostic exceeded 24 GiB.") }
+    }
+    func stop() { timer.cancel() }
+    deinit { timer.cancel() }
+  }
+
+  static func run(writingPack: URL, consultationPack: URL, fixtureURL: URL, evidence: URL) async throws {
+    var receipt: [String: Any] = ["schema": 1, "status": "running",
+      "scope": "two declared public native-KV/logit comparisons; teacher_forcing_explicit",
+      "source_inventory_sha256": Bundle.main.object(forInfoDictionaryKey: "BoomSourceSHA256") ?? "unavailable",
+      "runtime_revision": ModelPacks.runtimeRevision, "automatic_retries": false,
+      "diagnostic_only_evaluations": true, "release_qualified": false,
+      "main_4k_256_gate_replaced": false, "full_context_16k": "not_run", "interactive_ui_qualified": false]
+    func persist() throws { try object(receipt, "receipt.json", evidence) }
+    try persist()
+    let observation = MemoryObservation(); defer { observation.stop() }
+    do {
+      let bytes = try RegularFile(fixtureURL, limit: 1_048_576).data()
+      let fixture = try decodeFixture(bytes)
+      let requests = try fixture.declarations.map { try request($0, schema: fixture.schema) }
+      let sourceRun = try validateSourceRun(fixture, requests: requests)
+      receipt["fixture_schema"] = fixture.schema
+      receipt["source_run_sha256"] = fixture.sourceRun?.sha256
+      receipt["source_run_status"] = sourceRun?.status
+      receipt["fixture_sha256"] = Digest.sha256(bytes)
+      receipt["originating_source_inventory"] = fixture.originatingSourceInventory
+      let budget = min(try ModelResidency.budget(), UInt64(24) << 30)
+      let wa = try ModelPacks.admission(writingPack, purpose: .writing)
+      let ca = try ModelPacks.admission(consultationPack, purpose: .consultation)
+      for (name, admission, purpose) in [("writing", wa, ModelPurpose.writing),
+        ("consultation", ca, ModelPurpose.consultation)] {
+        let manifest = try ModelPacks.evidenceManifest(admission, purpose: purpose)
+        if fixture.schema == 2 {
+          let kind: Kind = purpose == .writing ? .writingLateDivergence : .consultationInterior
+          guard let declared = requests.first(where: { $0.declaration.kind == kind })?.declaration.modelManifest,
+            Digest.sha256(manifest) == declared.sha256 else {
+            throw BoomError.stale("The actual admitted model differs from the source receipt's exact manifest.")
+          }
+        }
+        try manifest.write(to: evidence.appendingPathComponent(name + "-model-manifest.json"))
+        receipt[name + "_model_manifest_sha256"] = Digest.sha256(manifest)
+      }
+      let writing = try await MLXGemmaRunner.load(admission: wa)
+      try ModelResidency.admit(weightBytes: ca.weightBytes, residentWeights: wa.weightBytes)
+      let consultation = try await MLXGemmaRunner.load(admission: ca)
+      defer { withExtendedLifetime((writing, consultation)) {} }
+      receipt["both_models_retained"] = true; receipt["budget_bytes"] = budget
+      receipt["metal_device"] = MTLCreateSystemDefaultDevice()?.name ?? "unavailable"
+      receipt["cases"] = [String: Any](); try persist()
+      var statuses: [String: Any] = [:], results: [CaseSummary] = [], failed = false
+      for item in requests {
+        let directory = evidence.appendingPathComponent(item.name)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+          attributes: [.posixPermissions: 0o700])
+        try object(["status": "running", "declared_public_control": item.name,
+          "automatic_retries": false, "release_qualified": false], "terminal.json", directory)
+        do {
+          try observation.check(budget)
+          let runner = item.declaration.kind == .writingLateDivergence ? writing : consultation
+          let result = try await runner.diagnosticPrefixParity(item, evidence: directory)
+          results.append(result)
+          statuses[item.name] = ["status": "execution_complete",
+            "same_history_restoration_exact": result.sameHistoryRestorationExact,
+            "cold_history_equivalence_observed": result.coldHistoryEquivalenceObserved]
+          failed = failed || !result.sameHistoryRestorationExact || !result.coldHistoryEquivalenceObserved
+        } catch {
+          failed = true
+          let status: [String: Any] = ["status": "failed_or_unavailable", "error": String(describing: error),
+            "joined": true, "automatic_retries": false, "release_qualified": false]
+          statuses[item.name] = status; try object(status, "terminal.json", directory)
+        }
+        receipt["cases"] = statuses; receipt["memory"] = observation.snapshot(); try persist()
+      }
+      try observation.check(budget)
+      receipt["status"] = failed ? "differences_or_unavailable_controls" : "execution_complete"
+      receipt["joined"] = true; receipt["cases_completed"] = results.count
+      receipt["memory"] = observation.snapshot(); try persist()
+      if failed { throw BoomError.invalid("Native parity differences or unavailable controls were preserved in the receipts.") }
+    } catch {
+      if receipt["joined"] == nil { receipt["status"] = "failed" }
+      receipt["error"] = String(describing: error); receipt["joined"] = true
+      receipt["memory"] = observation.snapshot(); try persist(); throw error
+    }
+  }
+}

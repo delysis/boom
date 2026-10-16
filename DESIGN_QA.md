@@ -65,11 +65,11 @@ The Markdown editor stores plain UTF-8. A font trait changed only temporary
 display attributes, so it could never be an authoring command. All formatting
 controls must edit the Markdown source through the text view's normal undo path.
 For each keyboard shortcut and context menu action, select text, apply the
-action, inspect both the editor and decrypted document bytes, apply it again to remove
+action, inspect both the editor and exported document bytes, apply it again to remove
 the syntax, then undo. The native font palette and Writing Tools must not offer
 formatting that cannot be represented in the saved document.
 
-Test deletion inside Bloom separately from removing an indexed encrypted record
+Test deletion inside Bloom separately from removing an indexed source root
 while Bloom is closed. An absent, corrupt, or incompatible indexed record must
 stop loading with a clear error and leave the surviving records intact. Never
 replace that workspace with empty state or silently remove the indexed document.
@@ -92,7 +92,7 @@ Pointer entry or keyboard focus reveals timestamps, copy, edit and branch;
 replies also offer one feedback menu. Reserve the rail's height so entering it
 cannot reflow the transcript. Keep context-menu access as well. Check actual
 button hit regions at narrow widths and edit both roles through the pencil,
-save and discard through native icons, and verify originals remain encrypted.
+save and discard through native icons, and verify originals remain on disk.
 New messages retain their creation time across generation retries, completion,
 edits and branches; unknown historical times remain unknown. Test feedback
 selection and removal, branch boundaries, and hidden-action keyboard focus.
@@ -150,7 +150,7 @@ Repeat with playable audio and video; preparation for assistant consumption is
 automatic on explicit Send. Image description/OCR is not a paste prerequisite.
 Ordinary context menus provide intentional copy, cut and export. Delete an
 embedded object as a unit, undo, type on either side, and reopen. Verify source
-bytes, encrypted original and insertion target separately.
+bytes, original file and insertion target separately.
 
 `NativeInlineMedia` projects Rust-parsed local references through the shared
 TextKit delegate used by display, isolated measurement and ghost layouts.
@@ -165,7 +165,7 @@ media object, native Undo and complete-object deletion.
 
 Writing must pass original images and audio waveforms to the base checkpoint,
 without a chat template or a substituted description/transcript. Capture original
-identities and ordered occurrences in encrypted recipes. Supply only references
+identities and ordered occurrences in captured recipes. Supply only references
 before the caret and in selected examples; count expanded model tokens before
 admission. Context lower bounds use compiled media markers, never discarded
 filename/UUID text, and suffixes cannot bisect an embedded object. Exercise a
@@ -178,7 +178,7 @@ pages, and four sampled video frames. Preserve page/frame hashes in recipes;
 sampling a video does not establish coverage of its sound or every frame.
 
 `AttachmentQualificationSmoke` owns the checked-in public format matrix. Each
-new format adds a corpus fixture and runs the same receiving-surface, encrypted
+new format adds a corpus fixture and runs the same receiving-surface, file
 reopen, native rendering and actual model-input gates. A filename is a hint,
 never a rendering authority: retain the Rust host's detected presentation kind.
 Readable text-bearing files display their canonical content through NativeText
@@ -188,17 +188,24 @@ hover explanation; they cannot silently enter a model as empty context.
 
 Test both file URLs and external image/audio/video/PDF pasteboard bytes. macOS
 can add synthesized TIFF types to the aggregate pasteboard type list. Read the
-item's original declarations so the encrypted original and receipt refer to the
+item's original declarations so the original file and receipt refer to the
 actual supplied bytes. Preserve plain-text pasting as native editing. Repeat
 layout after data loads and require both document media and direct chat media to
 fit the receiving width; media never owns an independent fixed-width card.
 
 Text attachments use the shared TextKit reader in a bounded native viewport.
 Short content must consume its measured height; only long content scrolls.
+Offscreen document geometry must not construct or fully lay out an extracted-text
+reader. Visible inline cards use finite-rectangle measurement on their actual
+reader, without the isolated full-height snapshot. Their first complete Markdown
+styling pass remains a separately measured cost; a finite layout request alone
+does not prove a Main-thread latency bound. Preserve all extracted text and its
+Markdown presentation when scrolling to the end.
 Inspect PDF text as well as scanned pages in the actual embedded preview.
 PDFKit's layer-backed viewer once showed a blank page in an unshown host while
-extraction and inference passed. The preview now draws locally rendered pages;
-a successful extraction or thumbnail alone cannot qualify that embedded view.
+extraction and inference passed. The file-backed native viewer must show its
+actual embedded page in the qualified bundle; successful extraction or a
+thumbnail alone cannot qualify that view.
 
 Media preparation replaces a placeholder with a player. Attach preparation and
 teardown to a stable container, not that changing conditional branch. The player
@@ -207,15 +214,20 @@ frame and a timeline with nonzero width, alongside playback and decoder checks.
 An unboxed player that shows only controls does not pass visual acceptance.
 Codec decoding is not playback readiness: AVAudioPlayer once accepted Ogg/Opus
 metadata while returning false from prepareToPlay. Both controls now use the
-same memory-backed AVPlayer readiness gate. Every audio/video fixture must
-reach readyToPlay and advance its muted timeline in the exact-bundle journey.
+same AVPlayer readiness requirement. Inline previews use verified immutable
+file-backed assets; model media preparation retains its existing input route.
+Every audio/video fixture must reach readyToPlay and advance its muted timeline
+in the exact-bundle journey; descriptor admission alone is insufficient.
 
-Switch documents and verify playback stops and memory-backed media is released.
-Inspect app-owned storage for plaintext media. Copy or export Markdown and confirm
-its source references remain intact. An explicit copy of one embedded object
-retains its original bytes for pasting into another workspace, with no plaintext
-app-owned temporary file. Re-run the receiving-surface routing matrix after each
-new media type.
+Switch documents and verify playback stops and retired native media is released.
+Workspace records are ordinary local files. Native previews may own verified
+plaintext clones in system replacement directories; require exact digest,
+last-native-owner lifetime and joined cleanup diagnostics. Do not claim that
+escaped platform references or process-crash temporary files disappear at surface
+close. Copy or export Markdown and confirm its source references remain intact.
+An explicit copy of one embedded object retains its exact original bytes for
+pasting into another workspace. Re-run the receiving-surface routing matrix after
+each new media type.
 
 For chunked transcription, test two consecutive segments of a real compressed
 recording, then one final short segment. Each segment must contain converted
@@ -268,7 +280,7 @@ not separate key handlers or suggestion overlays. Exercise the composer and inli
 editing of both speakers with real weights, context after the caret excluded,
 speaker attribution retained, repeated word acceptance/reversal, typing, Undo,
 marked text, focus loss and stale callbacks. Save is always explicit. Retain input
-recipes, seeds, token journals and cancelled attempts in encrypted storage.
+recipes, seeds, token journals and cancelled attempts in file storage.
 Branching from a user message rerolls in a new conversation. Branching from an
 assistant reply preserves that reply without generation. Keep the parent intact.
 
@@ -316,7 +328,8 @@ do not qualify actual focused mouse/keyboard behavior or typing latency.
 AppKit/TextKit owns prose rendering, selection and editing. SwiftUI owns pane,
 row and command layout. `NativeText.swift` is the only read-only prose bridge;
 `NativeTextMeasurement.swift` supplies isolated proposed-size measurement to
-both reading rows and the manuscript editor. `NativeTextStyle.swift` projects Rust Markdown spans onto native text storage for
+reading rows. The manuscript uses a native scrolling viewport and does not
+measure the whole document to determine its pane height. `NativeTextStyle.swift` projects Rust Markdown spans onto native text storage for
 both reading and editing. Keep labels and buttons in SwiftUI. Do not add another
 prose renderer or a per-surface Markdown parser.
 
@@ -326,8 +339,8 @@ an isolated TextKit container with the same attributed source and geometry as
 the display container. Speculative measurement cannot mutate the live renderer.
 Invalidate size when source or styling changes, including the first empty-to-text
 update; synchronize the display container only with the actual assigned width.
-The direct manuscript view also takes its frame from SwiftUI and uses that same
-isolated measurement helper. The chat input owns a native scrolling document;
+SwiftUI assigns the manuscript viewport's frame; AppKit owns its inner scrolling
+document and caret scrolling. The chat input owns a native scrolling document;
 AppKit controls that inner document's frame and reports content height through
 its live native layout. Preserve Undo and IME composition in both. These are
 explicit layout contracts over the same engine, not interchangeable controls.

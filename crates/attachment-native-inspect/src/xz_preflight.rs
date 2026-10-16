@@ -307,12 +307,14 @@ fn inspect_block_header(
                 "XZ filter properties overflow the block header.",
             )
         })?;
-        let properties = header.get(cursor..properties_end).ok_or_else(|| {
-            malformed(
-                "xz_filter_properties_truncated",
-                "XZ filter properties are truncated.",
-            )
-        })?;
+        let properties = header[..data_end]
+            .get(cursor..properties_end)
+            .ok_or_else(|| {
+                malformed(
+                    "xz_filter_properties_truncated",
+                    "XZ filter properties are truncated.",
+                )
+            })?;
         cursor = properties_end;
         if filter_id == LZMA2_FILTER_ID {
             if filter_index + 1 != filter_count || properties.len() != 1 {

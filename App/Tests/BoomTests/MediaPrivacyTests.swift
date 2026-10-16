@@ -1,7 +1,6 @@
 import AppKit
 import AVFoundation
 import BoomCore
-import CryptoKit
 import XCTest
 @testable import Boom
 
@@ -45,11 +44,11 @@ final class MediaPrivacyTests: XCTestCase {
       XCTFail("Cancelled audio reached speech.")
     } catch { XCTAssertTrue(error is CancellationError, "\(error)") }
   }
-  @MainActor func testRejectedImportedMediaRetainsEncryptedOriginalAndFailureCoverage() async throws {
+  @MainActor func testRejectedImportedMediaRetainsFileOriginalAndFailureCoverage() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("Bloom-media-test-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
     addTeardownBlock { try? FileManager.default.removeItem(at: root) }
-    let store = try WorkspaceStore(rootOverride: root, testKey: SymmetricKey(size: .bits256))
+    let store = try WorkspaceStore(rootOverride: root)
     let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     let bytes = referenceMovie()
     model.attachToCurrentChat([.bytes(name: "Reference.m4a", data: bytes)])
@@ -60,8 +59,8 @@ final class MediaPrivacyTests: XCTestCase {
     XCTAssertTrue(record.coverage.contains("forbidden"), record.coverage)
     XCTAssertEqual(record.rootDigest, Digest.sha256(bytes))
     XCTAssertEqual(try store.vault.get(.attachment, id: record.id), bytes)
-    let encrypted = try Data(contentsOf: store.vault.recordURL(.attachment, record.id))
-    XCTAssertNil(encrypted.range(of: Data("https://example.invalid".utf8)))
+    let stored = try Data(contentsOf: store.vault.recordURL(.attachment, record.id))
+    XCTAssertEqual(stored, bytes)
     XCTAssertTrue(model.pendingAttachments.contains(record.id))
     try await model.shutdown()
   }

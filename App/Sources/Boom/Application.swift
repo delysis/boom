@@ -15,6 +15,52 @@ import SwiftUI
 
 @main @MainActor enum BoomMain {
   static func main() {
+    #if BLOOM_DEVELOPER_STACK_DIAGNOSTICS
+    // This branch precedes every ordinary workspace, Keychain and model path.
+    // Malformed diagnostic arguments must never fall through to a normal launch.
+    if CommandLine.arguments.contains("--developer-stack-public-fixture")
+      || CommandLine.arguments.contains("--developer-stack-recipe") {
+      guard CommandLine.arguments.count == 4,
+        CommandLine.arguments[1] == "--developer-stack-public-fixture",
+        CommandLine.arguments[2] == "--developer-stack-recipe",
+        CommandLine.arguments[3].hasPrefix("/") else {
+        fputs("Public editor diagnostic arguments refused.\n", stderr); exit(1)
+      }
+      do { try DeveloperStackDiagnostics.startOwnedEntryLifetime() }
+      catch { fputs("Public editor lifetime admission refused.\n", stderr); exit(1) }
+      let recipe = URL(fileURLWithPath: CommandLine.arguments[3])
+      let app = NSApplication.shared
+      if app.activationPolicy() != .regular { _ = app.setActivationPolicy(.regular) }
+      guard app.activationPolicy() == .regular else {
+        fputs("Public editor activation policy refused: \(app.activationPolicy().rawValue).\n", stderr); exit(1)
+      }
+      Task {
+        do { try await DeveloperEditorFixture.run(recipe: recipe); exit(0) }
+        catch { fputs("Public editor diagnostic failed: \(error.localizedDescription)\n", stderr); exit(1) }
+      }
+      app.run(); return
+    }
+    #endif
+    if CommandLine.arguments.contains("--editor-memory-smoke") {
+      let app = NSApplication.shared
+      if app.activationPolicy() != .regular { _ = app.setActivationPolicy(.regular) }
+      guard app.activationPolicy() == .regular else { fputs("Public editor activation refused.\n", stderr); exit(1) }
+      Task {
+        do { try await DeveloperEditorFixture.runMemory(arguments: CommandLine.arguments); exit(0) }
+        catch { fputs("Public normal editor observation failed: \(error.localizedDescription)\n", stderr); exit(1) }
+      }
+      app.run(); return
+    }
+    if CommandLine.arguments.contains("--graphics-idle-smoke") {
+      let app = NSApplication.shared
+      if app.activationPolicy() != .regular { _ = app.setActivationPolicy(.regular) }
+      guard app.activationPolicy() == .regular else { fputs("Graphics diagnostic activation refused.\n", stderr); exit(1) }
+      Task {
+        do { try await DeveloperEditorFixture.runGraphicsIdle(arguments: CommandLine.arguments); exit(0) }
+        catch { fputs("Graphics idle diagnostic failed: \(error.localizedDescription)\n", stderr); exit(1) }
+      }
+      app.run(); return
+    }
     if CommandLine.arguments.contains("--video-storyboard-smoke") {
       let app = NSApplication.shared; app.setActivationPolicy(.prohibited)
       Task {
@@ -53,15 +99,6 @@ import SwiftUI
       Task {
         do { try await SpeechRecognitionSmoke.run(arguments: CommandLine.arguments); exit(0) }
         catch { fputs("Public speech lifecycle check failed: \(error.localizedDescription)\n", stderr); exit(1) }
-      }
-      app.run(); return
-    }
-    if CommandLine.arguments.contains("--keychain-smoke") {
-      let app = NSApplication.shared
-      app.setActivationPolicy(.prohibited)
-      Task {
-        do { try await KeychainSmoke.run(arguments: CommandLine.arguments); exit(0) }
-        catch { fputs("Isolated Keychain diagnostic failed: \(error.localizedDescription)\n", stderr); exit(1) }
       }
       app.run(); return
     }
@@ -193,7 +230,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
   static func workspaceWindow(frame: NSRect) -> NSWindow {
     let window = NSWindow(contentRect: frame, styleMask: [.titled, .closable, .miniaturizable, .resizable],
       backing: .buffered, defer: false)
-    // Workspace restoration belongs to the encrypted store, not AppKit Resume.
+    // Workspace restoration belongs to the file store, not AppKit Resume.
     window.isRestorable = false
     window.disableSnapshotRestoration()
     return window
@@ -202,6 +239,16 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
   func configureWorkspaceWindow(_ window: NSWindow, model: WorkspaceModel) {
     self.model = model
     self.window = window
+    model.openRestoredWorkspace = { [weak self, weak model] root in
+      Task { @MainActor in
+        guard let self, let model, self.model === model else { return }
+        do {
+          try await model.shutdown()
+          self.model = nil
+          await self.openWorkspace(restoredRoot: root)
+        } catch { model.report(error) }
+      }
+    }
     window.title = "Bloom"
     window.backgroundColor = BoomChrome.sidebarBackground
     window.titlebarAppearsTransparent = true
@@ -221,36 +268,44 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
   func applicationDidFinishLaunching(_ notification: Notification) {
     Task { await openWorkspace() }
   }
-  private func openWorkspace() async {
+  private func openWorkspace(restoredRoot: URL? = nil) async {
+    var retainedDirectory: URL?
     do {
       let arguments = try QualificationLaunch.current()
       let override: WorkspaceStore?
-      if let index = arguments.firstIndex(of: "--native-check-workspace") {
+      if let root = restoredRoot {
+        retainedDirectory = root
+        override = try await detachedWork { try WorkspaceStore(rootOverride: root) }
+      } else if let index = arguments.firstIndex(of: "--native-check-workspace") {
         guard arguments.filter({ $0 == "--native-check-workspace" }).count == 1,
           index + 1 < arguments.count, arguments[index + 1].hasPrefix("/") else {
-          throw BoomError.invalid("Native checks require an explicit absolute encrypted workspace path.")
+          throw BoomError.invalid("Native checks require an explicit absolute workspace path.")
         }
         let root = URL(fileURLWithPath: arguments[index + 1]).standardizedFileURL
-        let session: VaultSession
-        if let scopeIndex = arguments.firstIndex(of: "--native-check-qualification-id") {
-          guard arguments.filter({ $0 == "--native-check-qualification-id" }).count == 1,
-            scopeIndex + 1 < arguments.count, let id = UUID(uuidString: arguments[scopeIndex + 1]) else {
-            throw BoomError.invalid("Native qualification requires one UUID scope.")
-          }
-          session = VaultSession(qualificationID: id)
-        } else { session = .shared }
-        override = try await detachedWork { try WorkspaceStore(rootOverride: root, session: session) }
+        retainedDirectory = root
+        override = try await detachedWork { try WorkspaceStore(rootOverride: root) }
         if arguments.contains("--native-check-evidence") {
-          guard arguments.contains("--native-check-qualification-id"),
+          guard let qualificationIndex = arguments.firstIndex(of: "--native-check-qualification-id"),
+            qualificationIndex + 1 < arguments.count,
+            UUID(uuidString: arguments[qualificationIndex + 1]) != nil,
             arguments.filter({ $0 == "--native-check-evidence" }).count == 1,
             let evidenceIndex = arguments.firstIndex(of: "--native-check-evidence"),
             evidenceIndex + 1 < arguments.count, arguments[evidenceIndex + 1].hasPrefix("/") else {
             throw BoomError.invalid("Visible qualification evidence requires an explicit UUID and fresh absolute directory.")
           }
-          nativeEvidence = try await NativeCheckEvidence(directory: URL(fileURLWithPath: arguments[evidenceIndex + 1]), session: session)
+          nativeEvidence = try await NativeCheckEvidence(directory: URL(fileURLWithPath: arguments[evidenceIndex + 1]))
         }
         isNativeCheck = true
-      } else { override = nil }
+      } else if let path = UserDefaults.standard.string(forKey: "workspaceRoot"), path.hasPrefix("/") {
+        let root = URL(fileURLWithPath: path, isDirectory: true)
+        retainedDirectory = root
+        override = try await detachedWork { try WorkspaceStore(rootOverride: root) }
+      } else {
+        override = nil
+        retainedDirectory = try FileManager.default.url(for: .applicationSupportDirectory,
+          in: .userDomainMask, appropriateFor: nil, create: false)
+          .appendingPathComponent("Bloom", isDirectory: true)
+      }
       let backgroundCheck = isNativeCheck && arguments.contains("--native-check-background")
       let noModels = isNativeCheck && arguments.contains("--native-check-no-models")
       let model = try await WorkspaceModel(storeOverride: override, loadModels: !noModels)
@@ -258,14 +313,14 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
       if isNativeCheck, let index = arguments.firstIndex(of: "--native-check-theme"), index + 1 < arguments.count {
         guard ["light", "dark"].contains(arguments[index + 1]) else { throw BoomError.invalid("Native appearance check requires light or dark.") }
         model.setTheme(arguments[index + 1])
-      } else { model.setTheme(model.state.theme) }
+      } else { model.setTheme(model.themeName) }
       #if BOOM_UI_TEST
       let initialWidth: CGFloat = 340
       #else
       let initialWidth: CGFloat = model.layout.isAuthor ? 1190 : 1000
       #endif
       let frame = NSRect(x: 0, y: 0, width: initialWidth, height: 780)
-      let window = Self.workspaceWindow(frame: frame)
+      let window = self.window ?? Self.workspaceWindow(frame: frame)
       #if BOOM_UI_TEST
       window.contentMinSize = NSSize(width: 300, height: 440)
       #else
@@ -285,13 +340,31 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
         window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
       }
       refreshToolbar()
+      if let restoredRoot { UserDefaults.standard.set(restoredRoot.path, forKey: "workspaceRoot") }
+      if model.usesPagedStorage, model.showsDocument, let id = model.selectedDocumentID { model.focusEditor(id) }
       nativeEvidence?.observe(window: window, model: model)
     } catch {
+      if let failure = error as? WorkspacePagedStartupFailure {
+        // Preserve the actual existing Model and all entered storage/source
+        // owners. Merely dropping a thrown startup error is not a resource join.
+        self.model = failure.model
+      }
       let alert = NSAlert()
       alert.messageText = "Bloom could not open its local workspace"
       alert.informativeText = error.localizedDescription
       alert.alertStyle = .critical
-      alert.runModal()
+      alert.addButton(withTitle: "Quit")
+      let canReveal = retainedDirectory.flatMap {
+        try? $0.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+      }.map { $0.isDirectory == true && $0.isSymbolicLink != true } ?? false
+      if canReveal {
+        let button = alert.addButton(withTitle: "Reveal")
+        button.toolTip = "Reveal the retained workspace in Finder."
+        button.setAccessibilityLabel("Reveal retained workspace")
+      }
+      if alert.runModal() == .alertSecondButtonReturn, let directory = retainedDirectory {
+        NSWorkspace.shared.activateFileViewerSelecting([directory])
+      }
       NSApp.terminate(nil)
     }
   }
@@ -378,7 +451,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
     buttons["library"]?.state = model.showsLibrary ? .on : .off
     buttons["document"]?.state = model.showsDocument ? .on : .off
     buttons["chat"]?.state = model.showsChat ? .on : .off
-    let title = model.layout.isAuthor ? model.selectedDocument?.title ?? "Bloom" : model.selectedChat?.title ?? "Bloom"
+    let title = model.layout.isAuthor ? model.selectedDocumentIndex?.title ?? "Bloom" : model.selectedChat?.title ?? "Bloom"
     window?.title = isNativeCheck ? "Native check · " + title : title
   }
   private func makeMenu() -> NSMenu {
@@ -406,6 +479,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
     app.addItem(
       item("Quit Bloom", #selector(NSApplication.terminate(_:)), "q", target: NSApp))
     let file = submenu("File")
+    file.addItem(item("Save", #selector(saveWorkspace), "s", target: self))
     if model?.layout.isAuthor == true {
     file.addItem(item("New Document", #selector(newDocument), "n", target: self))
     file.addItem(item("New Chat", #selector(newChat), "n", [.command, .shift], target: self))
@@ -422,8 +496,8 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
     }
     file.addItem(item("Attach Files to Chat…", #selector(attachChat), target: self))
     file.addItem(.separator())
-    file.addItem(item("Export Encrypted Backup…", #selector(exportBackup), target: self))
-    file.addItem(item("Restore Encrypted Backup…", #selector(restoreBackup), target: self))
+    file.addItem(item("Export Backup…", #selector(exportBackup), target: self))
+    file.addItem(item("Restore Backup…", #selector(restoreBackup), target: self))
     let edit = submenu("Edit")
     if #available(macOS 15.2, *) { edit.automaticallyInsertsWritingToolsItems = false }
     edit.delegate = self
@@ -511,19 +585,19 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
       menuItem.title = model.selectedChat.flatMap { model.chatVoice($0.id) } == nil ? "Pin as voice" : "Unpin voice"
       return model.showsChat && model.selectedChat != nil && !model.isBusy
     case #selector(importVoice): return !model.isBusy
-    case #selector(exportBackup), #selector(restoreBackup): return !model.isBusy
-    case #selector(exportDocument): return model.selectedDocument != nil
+    case #selector(exportBackup), #selector(restoreBackup): return model.canBackupWorkspace
+    case #selector(exportDocument): return model.hasSelectedDocument
     case #selector(toggleLibrary): menuItem.state = model.showsLibrary ? .on : .off
     case #selector(toggleDocument): menuItem.state = model.showsDocument ? .on : .off
     case #selector(toggleChat): menuItem.state = model.showsChat ? .on : .off
     case #selector(exploreWriting): return model.showsDocument && model.canExploreWriting
     case #selector(showContinuations): menuItem.title = model.showingCandidates ? "Hide continuations" : "Show continuations"; return model.showsDocument && model.canShowContinuations
-    case #selector(writingExamples): return model.showsDocument && model.selectedDocument != nil && !model.isBusy
+    case #selector(writingExamples): return model.showsDocument && model.hasSelectedDocument && !model.isBusy
     case #selector(changeVariation): menuItem.state = (menuItem.representedObject as? String) == model.samplingProfile.rawValue ? .on : .off
-    case #selector(toggleCompletion): menuItem.state = model.state.autocomplete ? .on : .off
+    case #selector(toggleCompletion): menuItem.state = model.autocompleteEnabled ? .on : .off
     case #selector(changeTheme(_:)):
-      menuItem.state = (menuItem.representedObject as? String) == model.state.theme ? .on : .off
-    case #selector(attachDocument): return !model.isBusy && model.selectedDocument != nil
+      menuItem.state = (menuItem.representedObject as? String) == model.themeName ? .on : .off
+    case #selector(attachDocument): return !model.isBusy && model.hasSelectedDocument
     case #selector(attachChat): return !model.isBusy
     default: break
     }
@@ -544,13 +618,14 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
   }
   @objc private func toggleDocument() { model?.toggle("document") }
   @objc private func toggleChat() { model?.toggle("chat") }
+  @objc private func saveWorkspace() { model?.save() }
   @objc private func newDocument() {
     do { try model?.newDocument() } catch { model?.report(error) }
   }
-  @objc private func newChat() { do { try model?.newChat(about: model?.layout.isAuthor == true ? model?.state.selectedDocument : nil) } catch { model?.report(error) } }
-  @objc private func chatInstructions() { if let id = model?.state.selectedChat { model?.openChatInstructions(id) } }
+  @objc private func newChat() { do { try model?.newChat(about: model?.layout.isAuthor == true ? model?.selectedDocumentID : nil) } catch { model?.report(error) } }
+  @objc private func chatInstructions() { if let id = model?.selectedChatID { model?.openChatInstructions(id) } }
   @objc private func pinChat() {
-    guard let model, let id = model.state.selectedChat else { return }
+    guard let model, let id = model.selectedChatID else { return }
     if model.chatVoice(id) == nil { model.pinChat(id) } else { model.unpinChat(id) }
   }
   @objc private func writeQuestion() { model?.authorChatMessage(.user) }
@@ -607,7 +682,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSToolbarDeleg
   }
   @objc private func toggleCompletion() {
     guard let model else { return }
-    model.setAutocomplete(!model.state.autocomplete)
+    model.setAutocomplete(!model.autocompleteEnabled)
   }
   @objc private func changeTheme(_ sender: NSMenuItem) {
     if let value = sender.representedObject as? String { model?.setTheme(value) }

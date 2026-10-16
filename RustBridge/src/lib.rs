@@ -1,6 +1,6 @@
-//! In-process C boundary for the existing, authority-free attachment host.
-//! Unsafe code is confined to borrowed C slices and returning/freeing one Box<[u8]>.
-//! No filesystem paths, network handles, model handles or subprocess APIs exist here.
+//! In-process C boundaries for product policy, attachments and paged text.
+//! Paged I/O uses host-owned authenticated callbacks, separate from model policy.
+//! Unsafe code is confined to C buffers and those callbacks; no keys or paths cross.
 use attachment_native_host::{AttachmentHost, AttachmentHostConfig, ProvidedAttachment};
 use attachment_native_types::{DetectedFormat, MediaFamily, PreparedPart, TargetCapabilities};
 use serde_json::{json, Value};
@@ -9,6 +9,10 @@ use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     ptr, slice, str,
 };
+
+mod encoding;
+mod paged_text;
+pub use paged_text::*;
 
 const MAX_INPUT: usize = 64 * 1024 * 1024;
 const MAX_OUTPUT: usize = 8 * 1024 * 1024;
@@ -95,11 +99,11 @@ fn process(name: &str, bytes: &[u8]) -> Value {
     }
 }
 fn owned(value: Value) -> BoomAttachmentBuffer {
-    let mut bytes =
-        serde_json::to_vec(&value).unwrap_or_else(|_| b"{\"schema\":1,\"ok\":false}".to_vec());
-    if bytes.len() > MAX_OUTPUT {
-        bytes = b"{\"schema\":1,\"ok\":false,\"error\":{\"code\":\"output_limit\",\"message\":\"Attachment receipt exceeds 8 MiB; no context admitted.\"}}".to_vec();
-    }
+    let bytes = match encoding::encode(&value, MAX_OUTPUT) {
+        Ok(bytes) => bytes,
+        Err(encoding::EncodingError::Limit) => b"{\"schema\":1,\"ok\":false,\"error\":{\"code\":\"output_limit\",\"message\":\"Attachment receipt exceeds 8 MiB; no context admitted.\"}}".to_vec(),
+        Err(encoding::EncodingError::Failed) => b"{\"schema\":1,\"ok\":false,\"error\":{\"code\":\"serialization_failed\",\"message\":\"Product reply could not be encoded.\"}}".to_vec(),
+    };
     let boxed = bytes.into_boxed_slice();
     let length = boxed.len();
     BoomAttachmentBuffer {
@@ -117,21 +121,95 @@ pub unsafe extern "C" fn bloom_core_request(
     data: *const u8,
     length: usize,
 ) -> BoomAttachmentBuffer {
-    if data.is_null() || length == 0 || length > 16 * 1024 * 1024 {
-        return owned(error("input_limit", "Product request exceeds 16 MiB."));
+    if data.is_null() || length == 0 || length > MAX_INPUT {
+        return owned(error("input_limit", "Product request exceeds 64 MiB."));
     }
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: caller provides a live immutable buffer for this call only.
         let bytes = unsafe { slice::from_raw_parts(data, length) };
         match serde_json::from_slice::<bloom_core::Request>(bytes) {
-            Ok(request) => match bloom_core::execute(request) {
-                Ok(value) => json!({"schema":1,"ok":true,"value":value}),
-                Err(e) => error("invalid", &e.to_string()),
-            },
+            Ok(request) => {
+                let windowed = matches!(
+                    &request,
+                    bloom_core::Request::CompileConsultation {
+                        working_text_bytes: Some(_),
+                        ..
+                    } | bloom_core::Request::CompileConsultationCompact {
+                        working_text_bytes: Some(_),
+                        ..
+                    } | bloom_core::Request::CompileConsultation {
+                        working_request_bytes: Some(_),
+                        ..
+                    } | bloom_core::Request::CompileConsultationCompact {
+                        working_request_bytes: Some(_),
+                        ..
+                    }
+                );
+                if length > 16 * 1024 * 1024 && !windowed {
+                    return error("input_limit", "Product request exceeds 16 MiB.");
+                }
+                match bloom_core::execute_for_transport(request) {
+                    Ok(value) => json!({"schema":1,"ok":true,"value":value}),
+                    Err(e) => error(e.code(), &e.to_string()),
+                }
+            }
             Err(_) => error("request_invalid", "Malformed product request."),
         }
     }));
     owned(outcome.unwrap_or_else(|_| error("core_panic", "Product request failed.")))
+}
+
+/// The caller owns readable immutable input for this call. Empty text needs no
+/// pointer; every result retains the existing bounded JSON/free-once contract.
+unsafe fn markdown_request(
+    data: *const u8,
+    length: usize,
+    parse: fn(&str) -> Result<Value, bloom_core::Error>,
+) -> BoomAttachmentBuffer {
+    if length > 16 * 1024 * 1024 || (length != 0 && data.is_null()) {
+        return owned(error("input_limit", "Product request exceeds 16 MiB."));
+    }
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        let bytes = if length == 0 {
+            &[]
+        } else {
+            // SAFETY: the caller owns this immutable buffer until this call returns.
+            unsafe { slice::from_raw_parts(data, length) }
+        };
+        let text = match str::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => return error("request_invalid", "Markdown text is not UTF-8."),
+        };
+        match parse(text) {
+            Ok(value) => json!({"schema":1,"ok":true,"value":value}),
+            Err(e) => error("invalid", &e.to_string()),
+        }
+    }));
+    owned(outcome.unwrap_or_else(|_| error("core_panic", "Product request failed.")))
+}
+
+/// # Safety
+/// Nonempty input must address readable immutable bytes for this call. Empty
+/// input may use a null pointer. Malformed UTF-8 is refused. Free the result once.
+#[no_mangle]
+pub unsafe extern "C" fn bloom_markdown_spans(
+    data: *const u8,
+    length: usize,
+) -> BoomAttachmentBuffer {
+    // SAFETY: the caller supplies the borrowed buffer required by markdown_request.
+    unsafe { markdown_request(data, length, bloom_core::markdown_spans) }
+}
+
+/// # Safety
+/// Nonempty input must address readable immutable bytes for this call. Empty
+/// input may use a null pointer. Malformed UTF-8 is refused. Free the result once.
+#[no_mangle]
+pub unsafe extern "C" fn bloom_markdown_media_spans(
+    data: *const u8,
+    length: usize,
+) -> BoomAttachmentBuffer {
+    // SAFETY: the caller supplies the borrowed buffer required by markdown_request.
+    unsafe { markdown_request(data, length, bloom_core::markdown_media_spans) }
 }
 
 /// # Safety

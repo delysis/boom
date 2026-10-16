@@ -1,6 +1,5 @@
 import AppKit
 import BoomCore
-import CryptoKit
 import Foundation
 import SwiftUI
 
@@ -8,8 +7,6 @@ import SwiftUI
 @MainActor enum WorkspaceImportSmoke {
   private struct Original: Codable { let id: UUID; let bytes: Data }
   private struct Fixture: Codable { let documents: [DocumentSnapshot]; let originals: [Original]; let attachments: [Original] }
-  private static let key = SymmetricKey(data: Data(repeating: 0x5a, count: 32))
-  private static let passphrase = "public import restore fixture passphrase"
   static func run(arguments: [String]) async throws {
     func argument(_ name: String) throws -> String {
       guard arguments.filter({ $0 == name }).count == 1,
@@ -28,7 +25,7 @@ import SwiftUI
     } else { try await verify(evidence) }
   }
   private static func store(_ evidence: URL) throws -> WorkspaceStore {
-    try WorkspaceStore(rootOverride: evidence.appendingPathComponent("encrypted-workspace"), testKey: key)
+    try WorkspaceStore(rootOverride: evidence.appendingPathComponent("public-workspace"))
   }
   private static func capture(_ evidence: URL) async throws {
     let source = evidence.appendingPathComponent("chosen-public-files")
@@ -38,9 +35,15 @@ import SwiftUI
     for (url, data) in zip(urls, bytes) { try data.write(to: url) }
     let store = try store(evidence), model = try await WorkspaceModel(storeOverride: store, loadModels: false)
     try await model.importDocuments(urls, flag: CancellationFlag())
-    let imported = model.documents.filter { model.state.importedFiles?[$0.id] != nil }
+    let inputPaths = Set(urls.map(\.path))
+    var imported: [DocumentSnapshot] = []
+    for index in model.documentIndices where model.state.importedFiles?[index.id].map({ inputPaths.contains($0.path) }) == true {
+      let capture = try await model.captureDocument(index.id)
+      guard let document = capture.completeSnapshot else { throw BoomError.invalid("Small imported fixture was not captured completely.") }
+      imported.append(document)
+    }
     guard imported.count == 2, let first = imported.first else { throw BoomError.invalid("Native import did not retain both selected files.") }
-    model.updateDocument("# After import\n\nThe manuscript can change while its exact original stays private. Café 👩‍💻\n", id: first.id, caret: 0)
+    try await NativeCheckEvidence.replacePublicDocument(model, text: "# After import\n\nThe manuscript can change while its exact original stays private. Café 👩‍💻\n", id: first.id, caret: 0)
     if model.selectedChat == nil { try model.newChat() }
     let attachedBytes = Data("Public standalone attachment canary. Café 👩‍💻".utf8)
     model.attachToCurrentChat([.bytes(name: "Public notes.txt", data: attachedBytes)])
@@ -50,7 +53,7 @@ import SwiftUI
       try store.vault.get(.attachment, id: attachment.id) == attachedBytes,
       store.vault.exists(.receipt, attachment.id) else { throw BoomError.invalid("Standalone attachment capture failed.") }
     try await model.flush()
-    let fixture = Fixture(documents: model.documents, originals: zip(imported, bytes).map { Original(id: $0.0.id, bytes: $0.1) },
+    let fixture = Fixture(documents: try await NativeCheckEvidence.readPublicDocuments(model: model), originals: zip(imported, bytes).map { Original(id: $0.0.id, bytes: $0.1) },
       attachments: [Original(id: attachment.id, bytes: attachedBytes)])
     try write(fixture, to: evidence.appendingPathComponent("fixture.json"))
     if model.layout.isAuthor {
@@ -59,56 +62,50 @@ import SwiftUI
       }
     }
     try await model.shutdown()
-    try await store.exportBackup(passphrase: passphrase, to: evidence.appendingPathComponent("complete.bloombackup"))
+    try await store.exportBackup(to: evidence.appendingPathComponent("complete.bloombackup"))
     for (url, original) in zip(urls, bytes) {
       guard try Data(contentsOf: url) == original else { throw BoomError.invalid("Import wrote back to a chosen source file.") }
     }
-    // Relaunch must rely on encrypted originals, independently of these source files.
+    // Relaunch must rely on retained original file revisions, independently of these source files.
     try FileManager.default.removeItem(at: source)
     try outcome("captured", evidence: evidence, extra: ["source_files_unchanged_before_removal": true])
     print("Native selected-file import captured; source files remained unchanged.")
   }
   private static func verify(_ evidence: URL) async throws {
     let fixture = try JSONDecoder().decode(Fixture.self, from: Data(contentsOf: evidence.appendingPathComponent("fixture.json")))
-    let store = try store(evidence)
-    let (state, documents) = try await store.load().get()
-    guard documents == fixture.documents else { throw BoomError.invalid("Imported manuscript bytes changed across process relaunch.") }
-    for original in fixture.originals {
-      guard state.importedFiles?[original.id]?.originalDigest == Digest.sha256(original.bytes),
-        state.importedFiles?[original.id]?.folderID == nil,
-        try store.vault.get(.attachment, id: original.id) == original.bytes else {
-        throw BoomError.invalid("Imported originals or their captured identities changed.")
-      }
+    func check(_ store: WorkspaceStore) async throws {
+      let model = try await WorkspaceModel(storeOverride: store, loadModels: false)
+      do {
+        let documents = try await NativeCheckEvidence.readPublicDocuments(model: model)
+        guard documents == fixture.documents else { throw BoomError.invalid("Imported manuscript bytes changed across process relaunch.") }
+        for original in fixture.originals {
+          let actual = try await NativeCheckEvidence.readPublicOriginal(model: model, documentID: original.id)
+          guard actual == original.bytes, model.state.importedFiles?[original.id]?.folderID == nil else {
+            throw BoomError.invalid("Imported originals or their captured identities changed.")
+          }
+        }
+        for original in fixture.attachments {
+          guard model.state.attachments.first(where: { $0.id == original.id })?.rootDigest == Digest.sha256(original.bytes),
+            try store.vault.get(.attachment, id: original.id) == original.bytes,
+            store.vault.exists(.receipt, original.id) else { throw BoomError.invalid("Standalone original or inspection receipt changed.") }
+        }
+        try await model.shutdown()
+      } catch { throw WorkspacePagedStartupFailure(original: error, model: model) }
     }
-    for original in fixture.attachments {
-      guard state.attachments.first(where: { $0.id == original.id })?.rootDigest == Digest.sha256(original.bytes),
-        try store.vault.get(.attachment, id: original.id) == original.bytes,
-        store.vault.exists(.receipt, original.id) else { throw BoomError.invalid("Standalone original or inspection receipt changed.") }
-    }
-    let restored = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("restored-workspace"),
-      testKey: SymmetricKey(data: Data(repeating: 0x5b, count: 32)))
-    let (_, restoredDocuments) = try await restored.restoreBackup(passphrase: passphrase,
-      from: evidence.appendingPathComponent("complete.bloombackup"))
-    guard restoredDocuments == fixture.documents else { throw BoomError.invalid("Complete backup lost manuscript bytes.") }
-    for original in fixture.originals {
-      guard try restored.vault.get(.attachment, id: original.id) == original.bytes else {
-        throw BoomError.invalid("Complete backup lost an imported original.")
-      }
-    }
-    for original in fixture.attachments {
-      guard try restored.vault.get(.attachment, id: original.id) == original.bytes,
-        restored.vault.exists(.receipt, original.id) else { throw BoomError.invalid("Backup lost a standalone original or its receipt.") }
-    }
-    let occupied = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("occupied-workspace"), testKey: key)
-    try await occupied.save(WorkspaceState(), documents: [])
+    try await check(try store(evidence))
+    let restored = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("restored-workspace"))
+    try await restored.restoreBackup(from: evidence.appendingPathComponent("complete.bloombackup"))
+    try await check(restored)
+    let occupied = try WorkspaceStore(rootOverride: evidence.appendingPathComponent("occupied-workspace"))
+    try await occupied.saveState(WorkspaceState())
     try occupied.vault.put(Data("Public unindexed original.".utf8), kind: .attachment, id: UUID())
     let before = try privateHashes(occupied.vault)
     var rejected = false
-    do { _ = try await occupied.restoreBackup(passphrase: passphrase, from: evidence.appendingPathComponent("complete.bloombackup")) }
+    do { _ = try await occupied.restoreBackup(from: evidence.appendingPathComponent("complete.bloombackup")) }
     catch { rejected = true }
     guard rejected, try privateHashes(occupied.vault) == before else { throw BoomError.invalid("Restore discarded an unindexed private record.") }
     try outcome("passed", evidence: evidence, extra: ["originals_and_manuscripts_exact_after_process_relaunch": true,
-      "passphrase_backup_restore_exact": true, "unindexed_record_rejected_without_changes": true])
+      "file_backup_restore_exact": true, "unindexed_record_rejected_without_changes": true])
     print("Native import, process relaunch, complete restore, and occupied-target rejection passed.")
   }
   private static func render(_ model: WorkspaceModel, width: Int, dark: Bool, evidence: URL) async throws {

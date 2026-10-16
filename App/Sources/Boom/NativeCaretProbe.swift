@@ -12,7 +12,7 @@ import BoomCore
     let acquiredEditorFocus: Bool
     let windowStayedUnshown: Bool
   }
-  static func point(at caret: Int, in editor: MarkdownTextView) throws -> NSPoint {
+  static func point(at caret: Int, in editor: NSTextView) throws -> NSPoint {
     guard caret >= 0, caret <= editor.string.utf16.count, let window = editor.window,
       let layout = editor.layoutManager, let container = editor.textContainer else {
       throw BoomError.invalid("The public caret fixture has no native layout.")
@@ -26,7 +26,7 @@ import BoomCore
     }
     return NSPoint(x: local.minX + 0.1, y: local.midY)
   }
-  static func click(_ point: NSPoint, in editor: MarkdownTextView) throws -> Observation {
+  static func click(_ point: NSPoint, in editor: PagedNativeTextView) throws -> Observation {
     guard NSApp.activationPolicy() == .prohibited, let window = editor.window,
       !window.isVisible, let content = window.contentView else {
       throw BoomError.invalid("Native caret checks require an unshown public-fixture window and prohibited activation.")
@@ -51,7 +51,7 @@ import BoomCore
     NSApp.postEvent(up, atStart: true)
     receiver.mouseDown(with: down)
     let after = editor.selectedRange()
-    let observation = Observation(documentID: editor.documentID,
+    let observation = Observation(documentID: editor.session.sourceBaseRevision.documentID,
       beforeLocation: before.location, beforeLength: before.length,
       afterLocation: after.location, afterLength: after.length,
       acquiredEditorFocus: window.firstResponder === editor, windowStayedUnshown: !window.isVisible)

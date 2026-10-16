@@ -10,7 +10,7 @@ publish = false
 chat-layout = []
 
 [dependencies]
-argon2.workspace = true
+bloom-text = { path = "../bloom-text" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
