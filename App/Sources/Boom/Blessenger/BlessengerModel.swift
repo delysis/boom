@@ -23,11 +23,20 @@ import Foundation
   @Published var composerFocus = 0
   @Published var recipientFocus = 0
   let audio = BlessengerAudioOutput()
+  lazy var inputCompletion = BlessengerCompletion(model: self)
   @Published private(set) var isCalling = false
   @Published private(set) var callStarting = false
   private var call: BlessengerCall?
   private var callID: UUID?
   private var callOperation: CancellationFlag?
+  enum NoteState { case idle, preparing, recording, stopping }
+  @Published private(set) var noteState = NoteState.idle
+  private let voiceNote = VoiceInput()
+  private var unstoredVoiceNote: (draftID: UUID, bytes: Data)?
+  @Published private(set) var hasUnstoredVoiceNote = false
+  @Published private(set) var callIssue: String?
+  private var speechActionFlag: CancellationFlag?
+  @Published var exampleRole = Role.user
   private var runner: MLXGemmaRunner?
   private var runnerPath: String?
   private var draftTask: Task<Void, Never>?
@@ -39,6 +48,11 @@ import Foundation
   private var closed = false
   private var closing = false
   private var actionCount = 0
+  private var actions: [UUID: Task<Void, Never>] = [:]
+  private var setupFlags: [UUID: CancellationFlag] = [:]
+  @Published private(set) var setupProgress: String?
+  @Published private(set) var callMuted = false
+  @Published private(set) var callReady = false
   private var actionWaiters: [CheckedContinuation<Void, Never>] = []
   @Published private(set) var searchIDs: Set<UUID>?
   private var searchTask: Task<Void, Never>?
@@ -56,7 +70,11 @@ import Foundation
   }
   func launch(_ action: @escaping @MainActor () async throws -> Void) {
     do { try beginAction() } catch { return }
-    Task { defer { endAction() }; do { try await action() } catch { report(error) } }
+    let id = UUID()
+    actions[id] = Task {
+      defer { actions.removeValue(forKey: id); endAction() }
+      do { try Task.checkCancellation(); try await action() } catch { report(error) }
+    }
   }
   func change(restoreDraft: Bool = false,
     _ mutation: @escaping @Sendable (inout WorkspaceState, inout BlessengerState) throws -> Void) async {
@@ -102,7 +120,7 @@ import Foundation
   var templateSelected: Bool { product.selectedTemplate == state.selectedChat && state.selectedChat != nil }
   var recipients: [BlessengerContact] { product.addresses[draft.id]?.recipients ?? draft.recipients }
   var canSend: Bool {
-    !closed && !closing && !navigating && !preparing && !loading && !isCalling && !callStarting && !templateSelected
+    !closed && !closing && !navigating && !preparing && !loading && !isCalling && !callStarting && noteState == .idle && !hasUnstoredVoiceNote && !templateSelected
       && !(selected.map { active.contains($0.id) } ?? false)
       && ((try? BlessengerPolicy.validate(draft).sendable) == true)
   }
@@ -114,8 +132,8 @@ import Foundation
 
   init(store: WorkspaceStore, catalog: BlessengerCatalog, state: WorkspaceState, namespace: UUID) {
     self.store = store; self.catalog = catalog; self.state = state; self.namespace = namespace
-    draft = state.blessenger!.draft(for: state.selectedChat)
-    storedDraftVersion = draft.version
+    let initialDraft = state.blessenger!.draft(for: state.selectedChat)
+    draft = initialDraft; storedDraftVersion = initialDraft.version
   }
   static func open(root: URL? = nil, keySession: BlessengerKeySession = .shared) async throws -> BlessengerModel {
     let directory = try root ?? FileManager.default.url(for: .applicationSupportDirectory,
@@ -130,13 +148,14 @@ import Foundation
     if error is CancellationError { return }
     failure = error.localizedDescription
   }
-  func dismissFailure() { failure = nil }
+  func dismissFailure() { failure = nil; audio.dismissError() }
   private func accept(_ next: WorkspaceState) {
     guard !closed, (next.blessenger?.generation ?? 0) >= product.generation else { return }
     state = next
+    if let view = inputCompletion.view { inputCompletion.observe(view) }
   }
   func editText(_ text: String) {
-    guard !closed, !navigating, !templateSelected, text.utf8.count <= 2_097_152,
+    guard !closed, !navigating, text.utf8.count <= 2_097_152,
       !draft.text.utf8.elementsEqual(text.utf8) else { return }
     draft.text = text; draft.version = UUID(); scheduleDraftSave()
   }
@@ -175,7 +194,7 @@ import Foundation
     try await saveDraftLoop()
   }
   func select(_ id: UUID?, template: Bool = false) async {
-    guard !navigating, !closed else { return }
+    guard !navigating, !closed, noteState == .idle else { return }
     do { try beginAction() } catch { return }
     navigating = true; defer { navigating = false; endAction() }
     do {
@@ -188,7 +207,9 @@ import Foundation
   }
   func addContact(_ contact: BlessengerContact) async {
     guard !navigating, !closed else { return }
+    let origin = draft.id
     if state.selectedChat != nil { await select(nil) }
+    guard origin == BlessengerDraft.unsentID || state.selectedChat == nil else { return }
     guard state.selectedChat == nil, !navigating else { return }
     do {
       var next = draft
@@ -205,14 +226,15 @@ import Foundation
     guard !navigating, !templateSelected else { return }
     draft.attachments.removeAll { $0 == id }; draft.version = UUID(); scheduleDraftSave()
   }
-  func importInputs(_ inputs: [AttachmentInput]) async {
-    guard !navigating, !closed, !templateSelected else { return }
-    do { try beginAction() } catch { return }
+  @discardableResult func importInputs(_ inputs: [AttachmentInput]) async -> Bool {
+    guard !navigating, !closed, !templateSelected else { return false }
+    do { try beginAction() } catch { return false }
     navigating = true; defer { navigating = false; endAction() }
     do {
       try await flushDraft()
       guard inputs.count + draft.attachments.count <= 8 else { throw BoomError.budget("At most eight attachments may be sent together.") }
       for input in inputs {
+        try Task.checkCancellation()
         let imported = try await detachedWork { () throws -> AttachmentImport in
           switch input {
           case .file(let url):
@@ -221,13 +243,15 @@ import Foundation
           case .bytes(let name, let data): return try AttachmentProcessor.inspect(name: name, data: data)
           }
         }
+        try Task.checkCancellation()
         let next = try await store.blessengerImport(imported, draftID: draft.id, expectedVersion: storedDraftVersion)
         accept(next); draft = next.blessenger!.draft(for: state.selectedChat); storedDraftVersion = draft.version
       }
-    } catch { report(error) }
+      return true
+    } catch { report(error); return false }
   }
   func chooseModel(_ path: URL) async {
-    guard !loading, !preparing, active.isEmpty, !closed else { return }
+    guard !loading, !preparing, active.isEmpty, !closed, !isCalling, !callStarting else { return }
     do { try beginAction() } catch { return }
     loading = true; defer { loading = false; endAction() }
     do {
@@ -260,6 +284,7 @@ import Foundation
   }
   func send() {
     guard canSend else { return }
+    inputCompletion.invalidateGhost()
     let flag = CancellationFlag(); admitting = flag.operationID; flags[flag.operationID] = flag
     preparing = true
     operations[flag.operationID] = Task { [weak self] in
@@ -271,14 +296,55 @@ import Foundation
       do { try await self.performSend(flag: flag) } catch { self.report(error) }
     }
   }
-  private func performSend(flag: CancellationFlag, caller: BlessengerCallerTurn? = nil) async throws {
+  func answerAgain(_ questionID: UUID) {
+    guard !preparing, !navigating, !isCalling, !callStarting, let captured = selected,
+      !active.contains(captured.id), let question = captured.messages.first(where: { $0.id == questionID && $0.role == .user && $0.state == .complete }) else { return }
+    launch {
+      await self.branch(at: question.id, in: captured)
+      guard let branch = self.selected, self.product.branches[branch.id] == captured.id,
+        branch.messages.last?.id == question.id else { throw BoomError.stale("The alternate-answer branch was not created.") }
+      self.startReplay(BlessengerReplay(chat: branch, question: question))
+    }
+  }
+  func regenerate(_ responseID: UUID) {
+    guard let chat = selected, let i = chat.messages.firstIndex(where: { $0.id == responseID && $0.role == .assistant }),
+      let question = chat.messages[..<i].last(where: { $0.role == .user }) else { return }
+    answerAgain(question.id)
+  }
+  private func startReplay(_ replay: BlessengerReplay) {
+    guard !preparing, !closing, !active.contains(replay.chat.id) else { return }
+    inputCompletion.invalidateGhost()
+    let flag = CancellationFlag(); admitting = flag.operationID; flags[flag.operationID] = flag; preparing = true
+    operations[flag.operationID] = Task {
+      defer {
+        flags.removeValue(forKey: flag.operationID); operations.removeValue(forKey: flag.operationID)
+        if admitting == flag.operationID { admitting = nil; preparing = false }
+      }
+      do { try await performSend(flag: flag, replay: replay) } catch { report(error) }
+    }
+  }
+  private func performSend(flag: CancellationFlag, caller: BlessengerCallerTurn? = nil, replay: BlessengerReplay? = nil) async throws {
+    await inputCompletion.join()
     if caller == nil { try await flushDraft() }
     try flag.check()
-    let captured = caller?.draft ?? draft
-    let capturedSelection = caller.map { $0.conversationID } ?? state.selectedChat
+    var captured = caller?.draft ?? draft
+    if let replay {
+      captured = BlessengerDraft(id: replay.chat.id); captured.text = replay.question.text
+      captured.attachments = replay.question.directAttachments ?? []
+    }
+    let capturedSelection = caller.map { $0.conversationID } ?? replay?.chat.id ?? state.selectedChat
     let snapshot: WorkspaceState
     if let caller { snapshot = caller.snapshot } else { snapshot = try await store.blessengerSnapshot() }
     let history = snapshot.chats.first { $0.id == capturedSelection }
+    if let replay {
+      guard let history, try BlessengerPolicy.exactDigest(history) == BlessengerPolicy.exactDigest(replay.chat) else { throw BoomError.stale("The alternate-answer branch changed.") }
+    }
+    let previousQuestionID = caller?.inputMessageID ?? replay?.question.id
+    let contextHistory: [ChatMessage]
+    if let previousQuestionID {
+      guard let last = history?.messages.last, last.id == previousQuestionID, last.role == .user else { throw BoomError.stale("The committed question is no longer last in the branch.") }
+      contextHistory = Array(history!.messages.dropLast())
+    } else { contextHistory = history?.messages ?? [] }
     let profile = caller?.profile ?? snapshot.blessenger!.addresses[captured.id]?.profile ?? snapshot.blessenger!.defaultProfile
     var routed = captured
     if let address = snapshot.blessenger!.addresses[captured.id] { routed.recipients = address.recipients }
@@ -291,11 +357,11 @@ import Foundation
     var speechVoice: BlessengerSpeechVoice?
     if shouldSpeak {
       audio.stop(); try await audio.join()
-      let selectedVoice = contacts.first.flatMap { snapshot.blessenger!.speechVoices[$0.id] } ?? snapshot.blessenger!.defaultSpeech
+      let selectedVoice = caller?.speech ?? contacts.first.flatMap { snapshot.blessenger!.speechVoices[$0.id] } ?? snapshot.blessenger!.defaultSpeech
       speechVoice = try await audio.prepare(selectedVoice); try flag.check()
     }
     let media = try await BlessengerMedia.prepare(captured.attachments, state: snapshot, store: store, runner: runner, flag: flag)
-    let projectedHistory = BlessengerMedia.deliveredHistory(history?.messages ?? [], product: snapshot.blessenger!)
+    let projectedHistory = BlessengerMedia.deliveredHistory(contextHistory, product: snapshot.blessenger!)
     let historical = try await BlessengerMedia.history(projectedHistory, state: snapshot, store: store, runner: runner, flag: flag)
     let payloads = (historical.prepared.payloads + media.payloads).reduce(into: [WritingMediaData]()) { values, item in
       if !values.contains(where: { $0.reference.id == item.reference.id }) { values.append(item) }
@@ -325,10 +391,11 @@ import Foundation
     }
     let turn = BlessengerPreparedTurn(chatID: chatID, draft: captured, history: history, contacts: contacts,
       profile: profile, sourceDigests: admittedSources, context: media.context, responseIDs: ids,
-      receipts: receipts, voices: voices, outputLimit: profile.maximumTokens, caller: caller, speech: speechVoice)
-    try flag.check()
-    let next = try await store.blessengerAdmit(turn); accept(next)
-    if caller == nil, state.selectedChat == chatID, capturedSelection == history?.id,
+      receipts: receipts, voices: voices, outputLimit: profile.maximumTokens, caller: caller, speech: speechVoice, previousQuestionID: previousQuestionID)
+    try flag.check(); caller?.trace?.once("turn.admissionStarted")
+    let next = try await store.blessengerAdmit(turn, flag: flag); accept(next)
+    caller?.trace?.once("turn.admitted")
+    if caller == nil, replay == nil, state.selectedChat == chatID, capturedSelection == history?.id,
       draft.id == captured.id, draft.version == captured.version {
       draft = next.blessenger!.draft(for: chatID); storedDraftVersion = draft.version; composerFocus += 1
     }
@@ -347,7 +414,7 @@ import Foundation
         let registration = flag.onCancel { child.cancel() }
         group.addTask { [weak self] in
           await self?.runResponse(receipts[index], id: ids[index], chatID: chatID, media: admittedPayloads,
-            runner: runner, profile: profile, flag: child, voice: speechVoice, useMTP: useMTP)
+            runner: runner, profile: profile, flag: child, voice: speechVoice, useMTP: useMTP, callerTrace: caller?.trace)
           flag.removeCancellationHandler(registration)
         }
       }
@@ -355,7 +422,7 @@ import Foundation
     }
   }
   private func runResponse(_ input: ConsultationReceipt, id: UUID, chatID: UUID, media: [WritingMediaData],
-    runner: MLXGemmaRunner, profile: BlessengerProfile, flag: CancellationFlag, voice: BlessengerSpeechVoice?, useMTP: Bool) async {
+    runner: MLXGemmaRunner, profile: BlessengerProfile, flag: CancellationFlag, voice: BlessengerSpeechVoice?, useMTP: Bool, callerTrace: BlessengerTrace? = nil) async {
     var receipt = input
     let identity = GenerationIdentity(kind: .consultation, operationID: input.operationID, recordID: id,
       attemptID: input.attemptID!, model: input.model, seed: input.seed,
@@ -363,6 +430,8 @@ import Foundation
     let (updates, continuation) = AsyncStream<String>.makeStream(bufferingPolicy: .bufferingNewest(1))
     var audioFailure: String?
     let trace = BlessengerTrace(operation: input.attemptID!)
+    if let callerTrace { for event in callerTrace.snapshot().events { trace.record(event.name, at: event.uptime) } }
+    trace.once("generation.admission")
     if let voice {
       do { try audio.begin(id, voice: voice, attempt: input.attemptID!, seed: input.seed, cancellation: flag, trace: trace) }
       catch { audioFailure = error.localizedDescription; flag.cancel() }
@@ -370,6 +439,7 @@ import Foundation
     let output = Task { [weak self] in
       for await text in updates {
         guard let self, !flag.isCancelled else { continue }
+        if !text.isEmpty { trace.once("text.firstVisible") }
         self.liveText[id] = text
         if let voice {
           do { try self.audio.append(text, responseID: id, voice: voice) }
@@ -394,6 +464,7 @@ import Foundation
           cacheOwner: PromptCacheOwner(namespace: namespace, entity: chatID, route: .consultation),
           onCheckpoint: checkpoint, onText: { continuation.yield($0) })
       }
+      trace.once("generation.completed")
       receipt.mtp = result.mtp
       text = result.text; receipt.promptDigest = result.promptDigest; receipt.tokenIDs = result.tokenIDs
       receipt.stopReason = result.stopReason; receipt.stopTokenID = result.stopTokenID
@@ -434,6 +505,7 @@ import Foundation
     liveText.removeValue(forKey: id); childFlags.removeValue(forKey: id)
   }
   func stop(_ messageID: UUID? = nil) {
+    if messageID == nil { speechActionFlag?.cancel(); audio.stop(); for flag in setupFlags.values { flag.cancel() } }
     if let messageID { childFlags[messageID]?.cancel(); audio.stop(responseID: messageID); return }
     if let admitting { flags[admitting]?.cancel(); operations[admitting]?.cancel() }
     if let chatID = state.selectedChat {
@@ -441,30 +513,35 @@ import Foundation
     }
   }
   func readAloud(_ message: ChatMessage) {
-    guard message.state != .pending, !message.text.isEmpty, !isCalling, !callStarting else { return }
+    guard message.state != .pending, !message.text.isEmpty, !isCalling, !callStarting, !preparing, active.isEmpty else { return }
+    let flag = CancellationFlag(); speechActionFlag?.cancel(); speechActionFlag = flag
     let sourceDigest = Digest.sha256(message.text), id = message.id
     let voice = message.speaker?.voiceID.flatMap { product.speechVoices[$0] } ?? product.defaultSpeech
     launch {
-      self.audio.stop(); try await self.audio.join()
+      defer { if self.speechActionFlag === flag { self.speechActionFlag = nil } }
+      self.audio.stop(); try await self.audio.join(); try flag.check()
       let selected = try await self.audio.prepare(voice)
-      guard self.state.chats.contains(where: { $0.messages.contains(where: { $0.id == id && Digest.sha256($0.text) == sourceDigest }) }) else {
+      try Task.checkCancellation(); try flag.check()
+      guard !self.closing, self.state.chats.contains(where: { $0.messages.contains(where: { $0.id == id && Digest.sha256($0.text) == sourceDigest }) }) else {
         throw BoomError.stale("The selected message changed before playback.")
       }
-      let flag = CancellationFlag(), attempt = UUID()
+      let attempt = UUID()
       try self.audio.begin(id, voice: selected, attempt: attempt, seed: UInt64.random(in: .min ... .max), cancellation: flag)
       do { try self.audio.append(message.text, responseID: id, voice: selected, finished: true) }
       catch { self.audio.stop(responseID: id); try await self.audio.join(); _ = try? await self.audio.result(for: id, attempt: attempt); throw error }
-      let result = try await self.audio.result(for: id, attempt: attempt)
+      let result = try await withTaskCancellationHandler {
+        try await self.audio.result(for: id, attempt: attempt)
+      } onCancel: { flag.cancel() }
       if let failure = result.failure { throw BoomError.unavailable(failure) }
     }
   }
   var canCall: Bool {
     !closed && !closing && !navigating && !preparing && !loading && !callStarting && !isCalling
-      && active.isEmpty && !templateSelected && recipients.count <= 1
+      && active.isEmpty && !templateSelected && recipients.count <= 1 && draft.recipientQuery.isEmpty && noteState == .idle && !hasUnstoredVoiceNote
   }
   func toggleCall() {
     if isCalling || callStarting {
-      call?.stop(); callOperation?.cancel(); isCalling = false
+      call?.stop(); callOperation?.cancel(); isCalling = false; callReady = false; callMuted = false
       let old = call, id = callID
       launch {
         if let id { await self.store.blessengerEndCall(id) }
@@ -474,10 +551,10 @@ import Foundation
       return
     }
     guard canCall else { return }
-    callStarting = true
+    inputCompletion.invalidateGhost(); callStarting = true
     launch {
       defer { self.callStarting = false }
-      try await self.flushDraft()
+      await self.inputCompletion.join(); try await self.flushDraft()
       if let previous = self.call {
         previous.stop(); await previous.join()
         if let id = self.callID { await self.store.blessengerEndCall(id) }
@@ -487,10 +564,12 @@ import Foundation
         expectedDraftVersion: self.storedDraftVersion)
       self.callID = route.id
       let call = BlessengerCall(output: self.audio)
+      call.onReady = { [weak self] in if self?.callID == route.id { self?.callReady = true } }
+      call.onIssue = { [weak self] issue in if self?.callID == route.id { self?.callIssue = issue } }
       self.call = call
       call.onEnded = { [weak self] failure in
         guard let self, self.callID == route.id else { return }
-        self.isCalling = false
+        self.isCalling = false; self.callReady = false; self.callMuted = false
         if let failure { self.failure = failure }
         Task { await self.store.blessengerEndCall(route.id) }
       }
@@ -498,17 +577,30 @@ import Foundation
         guard let self, self.callID == route.id else { throw CancellationError() }
         let runner = try await self.model(for: route.profile.modelPath)
         guard runner.supportsRawAudio else { throw BoomError.unavailable("This model cannot receive caller audio.") }
+        if route.profile.useMTP != false { _ = try await runner.prepareMTP() }
+        try Task.checkCancellation()
+        _ = try await self.audio.prepare(route.speech)
+        try Task.checkCancellation()
       }
       call.onInterrupt = { [weak self] in self?.callOperation?.cancel() }
       call.onUtterance = { [weak self] clip, _, epoch in
         guard let self, self.callID == route.id else { throw CancellationError() }
+        let trace = BlessengerTrace()
+        trace.record(clip.nativeInputClock ? "caller.voicedPacketEnd.native" : "caller.voicedPacketEnd.deliveryEstimate", at: clip.speechEndedUptime)
+        if let time = clip.deliveredUptime { trace.record("capture.finalVoicedPacketDelivered", at: time) }
+        trace.record("caller.turnAdmitted." + clip.decision, at: clip.admittedUptime)
         let flag = CancellationFlag(); self.callOperation = flag
         defer { if self.callOperation === flag { self.callOperation = nil } }
         let imported = try await detachedWork {
           try AttachmentProcessor.inspect(name: "Caller audio.wav", data: clip.wav())
         }
         try flag.check()
-        let turn = try await self.store.blessengerCallerTurn(imported, callID: route.id, epoch: epoch, flag: flag)
+        var turn = try await self.store.blessengerCallerTurn(imported, callID: route.id, epoch: epoch, flag: flag)
+        turn.trace = trace
+        self.accept(turn.snapshot)
+        if self.state.selectedChat == turn.conversationID, self.draft.id != turn.conversationID {
+          self.draft = turn.snapshot.blessenger!.draft(for: turn.conversationID); self.storedDraftVersion = self.draft.version
+        }
         try flag.check(); try await self.performSend(flag: flag, caller: turn)
       }
       do {
@@ -521,14 +613,186 @@ import Foundation
       }
     }
   }
+  var completionContext: BlessengerCompletion.Context {
+    BlessengerCompletion.Context(draftID: draft.id, chatVersion: selected?.contentVersion,
+      profile: product.addresses[draft.id]?.profile ?? product.defaultProfile, recipients: recipients,
+      attachments: draft.attachments.compactMap { id in state.attachments.first { $0.id == id }?.reference })
+  }
+  var completionAvailable: Bool {
+    state.autocomplete && !closed && !closing && !navigating && !loading && !preparing && active.isEmpty
+      && !isCalling && !callStarting && noteState == .idle && !hasUnstoredVoiceNote && !templateSelected && runner != nil
+      && runnerPath == ((product.addresses[draft.id]?.profile ?? product.defaultProfile).modelPath ?? ModelPacks.cached(.consultation)?.path)
+  }
+  func inputSuggestions(document: DocumentSnapshot, caret: Int, context: BlessengerCompletion.Context,
+    count: Int, flag: CancellationFlag, publish: @escaping @Sendable (String) -> Void) async throws -> [String] {
+    guard completionAvailable, completionContext == context, let runner, (1...3).contains(count) else { throw CancellationError() }
+    let snapshot = state, chat = selected, profile = context.profile
+    let current = try await BlessengerMedia.prepare(draft.attachments, state: snapshot, store: store, runner: runner, flag: flag)
+    let history = BlessengerMedia.deliveredHistory(chat?.messages ?? [], product: snapshot.blessenger!)
+    let prior = try await BlessengerMedia.history(history, state: snapshot, store: store, runner: runner, flag: flag)
+    let payloads = (prior.prepared.payloads + current.payloads).reduce(into: [WritingMediaData]()) { values, item in
+      if !values.contains(where: { $0.reference.id == item.reference.id }) { values.append(item) }
+    }
+    let compiled = try await detachedWork {
+      func links(_ ids: [UUID]) -> String { ids.map { "[Attachment: media](boom-attachment:\($0.uuidString))" }.joined(separator: "\n") }
+      let turns = history.map { message in
+        PromptTurn(role: message.role.rawValue,
+          text: [message.context, links(prior.occurrences[message.id] ?? []), message.text].filter { !$0.isEmpty }.joined(separator: "\n"),
+          speaker: message.speaker ?? Speaker(name: message.role == .user ? "You" : "Blessenger"))
+      }
+      let raw = try ProductCore.inputContext(instructions: [chat?.instructions ?? "", current.context, links(current.payloads.map { $0.reference.id })].joined(separator: "\n"),
+        history: turns, speaker: "You", text: document.text, caret: caret)
+      return try RawWritingInput.compiled(raw, media: payloads.map(\.reference))
+    }
+    let ordered = try compiled.media.map { reference in
+      guard let item = payloads.first(where: { $0.reference == reference }) else { throw BoomError.stale("Completion media changed.") }
+      return item
+    }
+    try flag.check()
+    var values: [String] = []
+    for _ in 0..<count {
+      guard completionAvailable, completionContext == context else { throw CancellationError() }
+      let result = try await runner.run(rawPrompt: compiled.prompt, media: ordered, maxTokens: 64,
+        settings: ProductCore.sampling(profile.sampling), seed: UInt64.random(in: .min ... .max), flag: flag, background: true,
+        cacheOwner: PromptCacheOwner(namespace: namespace, entity: context.draftID, route: .inputCompletion), onText: publish)
+      try flag.check(); values.append(result.text)
+    }
+    return values
+  }
+  func toggleVoiceNote() {
+    guard !navigating, !isCalling, !callStarting, !closing, !hasUnstoredVoiceNote else { return }
+    switch noteState {
+    case .idle:
+      guard !preparing, active.isEmpty, !templateSelected else { return }
+      noteState = .preparing
+      launch {
+        do { try await self.voiceNote.start(.recording); try Task.checkCancellation(); self.noteState = .recording }
+        catch { self.voiceNote.cancel(); self.noteState = .idle; throw error }
+      }
+    case .recording:
+      let destination = draft.id
+      noteState = .stopping
+      launch {
+        defer { self.noteState = .idle }
+        let capture = try await self.voiceNote.stop(); try Task.checkCancellation()
+        guard self.draft.id == destination else { throw BoomError.stale("The voice note's destination changed.") }
+        guard case .audio(let data) = capture else { throw BoomError.invalid("Recording returned a transcript instead of original audio.") }
+        // Retention is an attachment operation, not a Send. The ordinary draft
+        // provides review, removal, persistence, and failed-send recovery.
+        self.unstoredVoiceNote = (destination, data); self.hasUnstoredVoiceNote = true
+        if await self.importInputs([.bytes(name: "Voice note.wav", data: data)]) {
+          self.unstoredVoiceNote = nil; self.hasUnstoredVoiceNote = false
+        }
+      }
+    case .preparing, .stopping: break
+    }
+  }
+  func cancelVoiceNote() { voiceNote.cancel(); noteState = .idle }
+  func retryVoiceNote() {
+    guard let note = unstoredVoiceNote else { return }
+    launch {
+      guard self.draft.id == note.draftID else { throw BoomError.stale("Return to the recording's original draft before saving it.") }
+      if await self.importInputs([.bytes(name: "Voice note.wav", data: note.bytes)]) {
+        self.unstoredVoiceNote = nil; self.hasUnstoredVoiceNote = false
+      }
+    }
+  }
+  func discardUnstoredVoiceNote() { unstoredVoiceNote = nil; hasUnstoredVoiceNote = false }
+  func replayAudio(_ id: UUID) {
+    guard !isCalling, !callStarting, active.isEmpty, let record = product.audio[id],
+      let original = state.attachments.first(where: { $0.id == record.attachmentID }) else { return }
+    launch {
+      let bytes = try await detachedWork { try self.store.vault.get(.attachment, id: record.attachmentID, limit: 67_108_864) }
+      guard Digest.sha256(bytes) == original.rootDigest, self.product.audio[id] == record else { throw BoomError.stale("The retained audio changed.") }
+      let pcm = try await detachedWork { try BlessengerWave.decode(bytes) }
+      guard pcm.rate == record.sampleRate, pcm.samples.count == record.frames else { throw BoomError.invalid("The retained audio geometry changed.") }
+      let flag = CancellationFlag()
+      try await withTaskCancellationHandler {
+        try await self.audio.replay(pcm.samples, rate: pcm.rate, messageID: id, voice: record.voice, flag: flag)
+      } onCancel: { flag.cancel() }
+    }
+  }
+  func clearModel() async {
+    guard active.isEmpty, !preparing, !isCalling, !callStarting, !loading else { return }
+    let id = state.selectedChat
+    await change { _, product in
+      if let id, var address = product.addresses[id] { address.profile.modelPath = nil; address.profile.id = UUID(); product.addresses[id] = address }
+      else { product.defaultProfile.modelPath = nil; product.defaultProfile.id = UUID() }
+    }
+  }
+  func setProfile(sampling: SamplingProfile? = nil, mtp: Bool?? = nil) async {
+    guard !isCalling, !callStarting else { return }
+    let id = state.selectedChat
+    await change { _, product in
+      var profile = id.flatMap { product.addresses[$0]?.profile } ?? product.defaultProfile
+      if let sampling { profile.sampling = sampling }
+      if let mtp { profile.useMTP = mtp }
+      profile.id = UUID(); try BlessengerState.validate(profile)
+      if let id, var address = product.addresses[id] { address.profile = profile; product.addresses[id] = address }
+      else { product.defaultProfile = profile }
+    }
+  }
+  var effectiveProfile: BlessengerProfile { product.addresses[draft.id]?.profile ?? product.defaultProfile }
+  var hasDraftFailure: Bool { draftFailure != nil }
+  func setTheme(_ value: String) {
+    guard ["system", "light", "dark"].contains(value) else { return }
+    launch { await self.change { state, _ in state.theme = value }
+      NSApp.appearance = self.state.theme == "system" ? nil : NSAppearance(named: self.state.theme == "dark" ? .darkAqua : .aqua)
+    }
+  }
+  func setAutocomplete(_ value: Bool) {
+    if !value { inputCompletion.invalidateGhost() }
+    launch { await self.change { state, _ in state.autocomplete = value } }
+  }
+  func recoverDraft() {
+    guard !navigating, active.isEmpty, !preparing, !isCalling, !callStarting else { return }
+    let authored = draft, previous = storedDraftVersion
+    launch {
+      self.navigating = true; defer { self.navigating = false }
+      // A failed physical replacement can already be on disk. Reload the actual
+      // current record, then compare identities before writing any authored bytes.
+      var recovered = try await self.store.openBlessenger(catalog: self.catalog)
+      let current = recovered.blessenger!.draft(for: authored.id == BlessengerDraft.unsentID ? nil : authored.id)
+      if current != authored {
+        guard current.version == previous else { throw BoomError.stale("The stored draft changed. Your unsaved text remains in the composer; it was not overwritten.") }
+        recovered = try await self.store.blessengerSaveDraft(authored, expectedVersion: current.version)
+      }
+      self.storedDraftVersion = authored.version; self.draftFailure = nil
+      self.accept(recovered); self.failure = nil
+    }
+  }
+  func setCallMuted(_ value: Bool) { call?.setMuted(value); callMuted = value }
+  func submitCallTurn() { call?.submitPausedTurn() }
+  func runSetup(_ work: @escaping @Sendable (CancellationFlag, @escaping @Sendable (String) -> Void) async throws -> Void) {
+    guard !loading, active.isEmpty, !isCalling, !callStarting, !closing else { return }
+    loading = true
+    launch {
+      let flag = CancellationFlag(); self.setupFlags[flag.operationID] = flag
+      defer { self.setupFlags.removeValue(forKey: flag.operationID); self.loading = false; self.setupProgress = nil }
+      try await withTaskCancellationHandler {
+        try await work(flag) { [weak self] message in
+          Task { @MainActor in if self?.setupFlags[flag.operationID] != nil { self?.setupProgress = message } }
+        }
+      } onCancel: { flag.cancel() }
+    }
+  }
   func shutdown() async throws {
     guard !closed else { return }
+    guard !hasUnstoredVoiceNote else { throw BoomError.unavailable("Save or explicitly discard the retained recording before quitting.") }
     closing = true; navigating = true
-    call?.stop(); callOperation?.cancel()
+    defer { if !closed { closing = false; navigating = false } }
+    // Revoke publication and unblock audio consumers BEFORE waiting for UI actions.
+    // In particular Read Aloud itself is an owned action waiting for its producer.
+    for action in actions.values { action.cancel() }
+    for flag in setupFlags.values { flag.cancel() }
+    for flag in flags.values { flag.cancel() }
+    for operation in operations.values { operation.cancel() }
+    for flag in childFlags.values { flag.cancel() }
+    speechActionFlag?.cancel(); audio.stop(); voiceNote.cancel(); noteState = .idle; call?.stop(); callOperation?.cancel()
     if let callID { await store.blessengerEndCall(callID) }
     if let call { await call.join() }
     isCalling = false
-    searchTask?.cancel()
+    searchTask?.cancel(); await inputCompletion.join()
     if actionCount > 0 { await withCheckedContinuation { actionWaiters.append($0) } }
     if let searchTask { await searchTask.value }
     for flag in flags.values { flag.cancel() }

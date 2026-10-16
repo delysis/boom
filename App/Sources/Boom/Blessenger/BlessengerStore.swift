@@ -45,6 +45,7 @@ struct BlessengerPreparedTurn: Sendable {
   let outputLimit: Int
   var caller: BlessengerCallerTurn? = nil
   var speech: BlessengerSpeechVoice? = nil
+  var previousQuestionID: UUID? = nil
 }
 
 extension WorkspaceStore {
@@ -53,7 +54,7 @@ extension WorkspaceStore {
     let fresh = !vault.exists(.workspace, Vault.workspaceID)
     try BlessengerInventory.validate(self, fresh: fresh)
     var state = try loadState()
-    if fresh { state.blessenger = BlessengerState() }
+    if fresh { state.blessenger = BlessengerState(); state.autocomplete = false }
     guard var product = state.blessenger else {
       throw BoomError.invalid("This is not a Blessenger workspace. No conversion was attempted.")
     }
@@ -131,7 +132,8 @@ extension WorkspaceStore {
       product.drafts[index] = draft
     }.0
   }
-  func blessengerAdmit(_ turn: BlessengerPreparedTurn) throws -> WorkspaceState {
+  func blessengerAdmit(_ turn: BlessengerPreparedTurn, flag: CancellationFlag? = nil) throws -> WorkspaceState {
+    try flag?.check()
     guard turn.responseIDs.count == turn.receipts.count, turn.voices.count == turn.receipts.count,
       (1...4).contains(turn.responseIDs.count), Set(turn.responseIDs).count == turn.responseIDs.count else {
       throw BoomError.invalid("The response plan is inconsistent.")
@@ -154,14 +156,20 @@ extension WorkspaceStore {
       }
     }
     let next = try blessengerTransaction { state, product in
-      if turn.caller == nil {
+      try flag?.check()
+      if turn.caller == nil && turn.previousQuestionID == nil {
       guard let retainedDraft = product.drafts.first(where: { $0.id == turn.draft.id }),
         try BlessengerPolicy.validate(retainedDraft).digest == BlessengerPolicy.validate(turn.draft).digest,
         try BlessengerPolicy.validate(turn.draft).sendable else { throw BoomError.stale("The submitted draft changed.") }
       let currentProfile = product.addresses[turn.chatID]?.profile ?? product.defaultProfile
       guard currentProfile == turn.profile else { throw BoomError.stale("The conversation model profile changed during preparation.") }
       } else {
-        guard try BlessengerPolicy.validate(turn.draft).sendable else { throw BoomError.invalid("The caller supplied no audio.") }
+        guard try BlessengerPolicy.validate(turn.draft).sendable else { throw BoomError.invalid("The captured turn has no input.") }
+      }
+      if turn.caller == nil {
+        guard (product.addresses[turn.chatID]?.profile ?? product.defaultProfile) == turn.profile else {
+          throw BoomError.stale("The captured execution profile changed.")
+        }
       }
       var forResolution = state; forResolution.blessenger = product
       var routed = turn.draft
@@ -193,9 +201,18 @@ extension WorkspaceStore {
           product.groups.append(BlessengerGroup(id: UUID(), handle: handle, name: name, members: contacts))
         }
       }
-      state.chats[index].messages.append(ChatMessage(role: .user, text: turn.draft.text,
-        context: turn.context, sources: turn.sourceDigests, directAttachments: turn.draft.attachments,
-        consultationRouting: contacts.map(\.handle), consultationPromptContract: .referenceHistoryV2))
+      if let questionID = turn.previousQuestionID {
+        guard let question = state.chats[index].messages.last, question.id == questionID,
+          question.role == .user, question.state == .complete,
+          question.text.utf8.elementsEqual(turn.draft.text.utf8),
+          question.directAttachments ?? [] == turn.draft.attachments else {
+          throw BoomError.stale("The committed question changed. No second question was created.")
+        }
+      } else {
+        state.chats[index].messages.append(ChatMessage(role: .user, text: turn.draft.text,
+          context: turn.context, sources: turn.sourceDigests, directAttachments: turn.draft.attachments,
+          consultationRouting: contacts.map(\.handle), consultationPromptContract: .referenceHistoryV2))
+      }
       for i in turn.responseIDs.indices {
         let id = turn.responseIDs[i], receipt = turn.receipts[i]
         let identity = GenerationIdentity(kind: .consultation, operationID: receipt.operationID,
@@ -211,7 +228,7 @@ extension WorkspaceStore {
         product.attempts[id] = BlessengerAttempt(conversationID: turn.chatID, messageID: id,
           identity: identity, sourceDigests: turn.sourceDigests)
       }
-      if turn.caller == nil {
+      if turn.caller == nil && turn.previousQuestionID == nil {
         product.drafts.removeAll { $0.id == turn.draft.id }
         product.drafts.append(BlessengerDraft(id: turn.draft.id))
       }
@@ -310,13 +327,15 @@ extension WorkspaceStore {
       !product.attempts.values.contains(where: { $0.conversationID == selection }) else {
       throw BoomError.stale("The conversation is not ready for a call.")
     }
+    guard draft.recipientQuery.isEmpty else { throw BoomError.invalid("Resolve the To field before calling.") }
     // Unsent text remains authored text, not an implicit call question or routing command.
     draft.text = ""; draft.attachments = []
     if let selection, let address = product.addresses[selection] { draft.recipients = address.recipients }
     let recipients = try BlessengerPolicy.resolve(host: selection, draft: draft, state: state, frozen: selection != nil)
     guard recipients.count <= 1 else { throw BoomError.unavailable("Calls currently support one Contact at a time.") }
     let call = BlessengerCallContext(id: UUID(), conversationID: selection, recipients: recipients,
-      profile: selection.flatMap { product.addresses[$0]?.profile } ?? product.defaultProfile)
+      profile: selection.flatMap { product.addresses[$0]?.profile } ?? product.defaultProfile,
+      speech: recipients.first.flatMap { product.speechVoices[$0.id] } ?? product.defaultSpeech)
     blessengerCall = call
     return call
   }
@@ -332,15 +351,37 @@ extension WorkspaceStore {
     }
     try vault.put(imported.original, kind: .attachment, id: imported.record.id)
     try vault.put(imported.receipt, kind: .receipt, id: imported.record.id)
-    var draft = BlessengerDraft(id: call.conversationID ?? UUID())
+    guard imported.record.kind == .audio else { throw BoomError.invalid("The caller input is not admitted audio.") }
+    let chatID = call.conversationID ?? UUID(), inputID = UUID()
+    var draft = BlessengerDraft(id: chatID)
     draft.recipients = call.recipients; draft.attachments = [imported.record.id]
     let digest = try BlessengerPolicy.validate(draft).digest
+    let captured = call
     try flag.check()
-    let snapshot = try blessengerTransaction { state, _ in
+    let snapshot = try blessengerTransaction { state, product in
+      try flag.check()
+      let index: Int
+      if let id = captured.conversationID {
+        guard let i = state.chats.firstIndex(where: { $0.id == id }),
+          !product.attempts.values.contains(where: { $0.conversationID == id }) else { throw BoomError.stale("The preceding caller response has not settled.") }
+        index = i
+      } else {
+        guard !state.chats.contains(where: { $0.id == chatID }) else { throw BoomError.stale("The call conversation identity is already in use.") }
+        state.chats.append(ChatRecord(id: chatID, title: captured.recipients.first?.name ?? "Voice conversation"))
+        index = state.chats.count - 1
+        product.addresses[chatID] = BlessengerAddress(recipients: captured.recipients, profile: captured.profile)
+        product.drafts.append(BlessengerDraft(id: chatID))
+        if state.selectedChat == nil { state.selectedChat = chatID }
+      }
       state.attachments.append(imported.record)
+      // Audio is an authored question as soon as the semantic turn is admitted.
+      // Model/TTS preparation failure cannot orphan it or consume a typed draft.
+      state.chats[index].messages.append(ChatMessage(id: inputID, role: .user, text: "",
+        sources: [imported.record.reference], speaker: Speaker(name: "You"), directAttachments: [imported.record.id],
+        consultationRouting: captured.recipients.map(\.handle), consultationPromptContract: .referenceHistoryV2))
     }.0
-    call.lastEpoch = epoch; call.pendingDraftDigest = digest; blessengerCall = call
+    call.conversationID = chatID; call.lastEpoch = epoch; call.pendingDraftDigest = digest; blessengerCall = call
     return BlessengerCallerTurn(callID: callID, epoch: epoch, draft: draft, snapshot: snapshot,
-      conversationID: call.conversationID, profile: call.profile)
+      conversationID: chatID, profile: call.profile, inputMessageID: inputID, speech: call.speech)
   }
 }

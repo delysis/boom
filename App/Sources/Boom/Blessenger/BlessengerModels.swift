@@ -98,7 +98,7 @@ actor BlessengerQwenSpeech {
     observe: @escaping @Sendable (String, Double) -> Void,
     receive: @escaping @Sendable (BlessengerPCM) async throws -> Void) async throws {
     guard !occupied, let pipeline, modelIdentity != nil else { throw BoomError.unavailable("Prepare the local Qwen voice before speaking.") }
-    guard voice.provider == .qwen else { throw BoomError.invalid("Wrong speech provider.") }
+    guard voice.provider == .qwen, voice.identifier == modelIdentity else { throw BoomError.stale("The captured speech model is no longer the prepared provider.") }
     occupied = true; defer { occupied = false }
     // Loading is serialized with model admission. Independent LM/TTS generation
     // overlaps, but both obey the process resource policy and retain their joins.

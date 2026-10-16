@@ -215,6 +215,8 @@ struct ChatComposer: NSViewRepresentable {
   var onContentHeight: ((CGFloat) -> Void)? = nil
   var showsEditingActions = false
   var onIssue: ((String) -> Void)? = nil
+  var onNativeInput: ((ChatTextView) -> Void)? = nil
+  var onNativeDetach: (() -> Void)? = nil
   var sendsOnReturn = false
   var maximumUTF8Bytes: Int? = nil
   var completionModel: WorkspaceModel? = nil
@@ -269,6 +271,8 @@ struct ChatComposer: NSViewRepresentable {
     view.maximumUTF8Bytes = maximumUTF8Bytes
     view.issue = onIssue
     context.coordinator.onContentHeight = onContentHeight
+    context.coordinator.onNativeInput = isEnabled ? onNativeInput : nil
+    context.coordinator.onNativeDetach = onNativeDetach
     view.onContentHeight = { [weak coordinator = context.coordinator] height in coordinator?.measure(height) }
     view.registerForDraggedTypes(AttachmentInput.draggingTypes)
     view.setAccessibilityLabel(accessibilityLabel)
@@ -305,6 +309,8 @@ struct ChatComposer: NSViewRepresentable {
     let styleChanged = context.coordinator.lineSpacing != lineSpacing
     context.coordinator.lineSpacing = lineSpacing
     context.coordinator.onContentHeight = onContentHeight
+    context.coordinator.onNativeInput = isEnabled ? onNativeInput : nil
+    context.coordinator.onNativeDetach = onNativeDetach
     view.onSend = isEnabled ? onSend : nil
     view.onCancel = isEnabled ? onCancel : nil
     view.onAttachments = isEnabled ? onAttachments : nil
@@ -357,10 +363,11 @@ struct ChatComposer: NSViewRepresentable {
     } else {
       coordinator.completion?.invalidateGhost(); coordinator.completion = nil
       view.completionClient = nil
+      if isEnabled { onNativeInput?(view) }
     }
   }
   static func dismantleNSView(_ input: ChatInputView, coordinator: Coordinator) {
-    coordinator.completion?.invalidateGhost()
+    coordinator.completion?.invalidateGhost(); coordinator.onNativeDetach?()
   }
 
   @MainActor final class Coordinator: NSObject, NSTextViewDelegate {
@@ -369,6 +376,8 @@ struct ChatComposer: NSViewRepresentable {
     var appliedFocusRequest = 0
     var lineSpacing: CGFloat = 0
     var onContentHeight: ((CGFloat) -> Void)?
+    var onNativeInput: ((ChatTextView) -> Void)?
+    var onNativeDetach: (() -> Void)?
     var completion: TextInputCompletion?
     var completionTarget: TextInputTarget?
     var currentTextVersion: (() -> UUID)?
@@ -408,7 +417,9 @@ struct ChatComposer: NSViewRepresentable {
       updateCompletion()
     }
     func updateCompletion() {
-      guard let view, let completionTarget else { return }
+      guard let view else { return }
+      onNativeInput?(view)
+      guard let completionTarget else { return }
       completion?.update(selection: view.selectedRange(),
         marked: view.hasMarkedText(), target: completionTarget)
     }

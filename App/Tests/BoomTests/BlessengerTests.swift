@@ -1,3 +1,4 @@
+import AVFoundation
 import BoomCore
 import Darwin
 import Foundation
@@ -70,13 +71,13 @@ final class BlessengerTests: XCTestCase {
     draft.version = UUID(); draft.text = "Unsent typed note must remain"
     let state = try await store.blessengerSaveDraft(draft, expectedVersion: prior)
     let route = try await store.blessengerBeginCall(selection: nil, expectedDraftVersion: draft.version)
-    let original = Data("owned component attachment, not real caller audio".utf8)
-    let record = AttachmentRecord(id: UUID(), name: "Owned call fixture", rootDigest: Digest.sha256(original),
-      text: "Public fixture", coverage: "component fixture", transform: nil, presentation: .text)
-    let imported = AttachmentImport(record: record, receipt: Data("fixture receipt".utf8), original: original)
+    let original = try BlessengerWave.encode([Float](repeating: 0.1, count: 1600), rate: 16000)
+    let imported = try AttachmentProcessor.inspect(name: "Caller fixture.wav", data: original), record = imported.record
     let caller = try await store.blessengerCallerTurn(imported, callID: route.id, epoch: 1, flag: CancellationFlag())
-    var prepared = try turn(caller.draft, profile: route.profile)
-    prepared.caller = caller
+    XCTAssertEqual(caller.snapshot.chats.count, state.chats.count + 1, "The authored caller input must already be durable before prefill.")
+    XCTAssertEqual(caller.snapshot.chats.last?.messages.last?.id, caller.inputMessageID)
+    var prepared = try turn(caller.draft, profile: route.profile, history: caller.snapshot.chats.first { $0.id == caller.conversationID })
+    prepared.caller = caller; prepared.previousQuestionID = caller.inputMessageID
     let admitted = try await store.blessengerAdmit(prepared)
     XCTAssertEqual(admitted.blessenger!.draft(for: nil), draft)
     XCTAssertEqual(admitted.chats.count, state.chats.count + 1)
@@ -127,6 +128,108 @@ final class BlessengerTests: XCTestCase {
     XCTAssertThrowsError(try SealedBlockWriter.read(fd, start: 0, count: 1,
       total: UInt64(source.count), binding: "owned-file", cipher: cipher))
   }
+  func testCallerInputSurvivesPreparationFailureAndReopen() async throws {
+    let directory = try root(), first = try store(directory)
+    let initial = try await first.openBlessenger(catalog: fixtureCatalog)
+    XCTAssertFalse(initial.autocomplete, "Input completion is opt-in.")
+    let call = try await first.blessengerBeginCall(selection: nil, expectedDraftVersion: initial.blessenger!.draft(for: nil).version)
+    let bytes = try BlessengerWave.encode([Float](repeating: 0.1, count: 3200), rate: 16000)
+    let imported = try AttachmentProcessor.inspect(name: "Caller.wav", data: bytes)
+    let turn = try await first.blessengerCallerTurn(imported, callID: call.id, epoch: 1, flag: CancellationFlag())
+    // Deliberately do not admit a model response: this is the failed-prefill boundary.
+    await first.blessengerEndCall(call.id); try await first.releaseExclusiveWorkspace()
+    let second = try store(directory)
+    let restored = try await second.openBlessenger(catalog: fixtureCatalog)
+    let message = try XCTUnwrap(restored.chats.first?.messages.first)
+    XCTAssertEqual(message.id, turn.inputMessageID)
+    XCTAssertEqual(message.directAttachments, [imported.record.id])
+    XCTAssertEqual(try second.vault.get(.attachment, id: imported.record.id, limit: 67_108_864), bytes)
+    XCTAssertEqual(restored.chats.first?.messages.count, 1)
+    XCTAssertTrue(restored.blessenger!.attempts.isEmpty)
+    try await second.releaseExclusiveWorkspace()
+  }
+  func testCallKeepsCapturedSpeechWhenGlobalSettingsChange() async throws {
+    let store = try store(root()), initial = try await store.openBlessenger(catalog: fixtureCatalog)
+    let call = try await store.blessengerBeginCall(selection: nil, expectedDraftVersion: initial.blessenger!.draft(for: nil).version)
+    _ = try await store.blessengerTransaction { _, product in product.defaultSpeech.provider = .apple }
+    let imported = try AttachmentProcessor.inspect(name: "Caller.wav",
+      data: BlessengerWave.encode([Float](repeating: 0.1, count: 3200), rate: 16000))
+    let turn = try await store.blessengerCallerTurn(imported, callID: call.id, epoch: 1, flag: CancellationFlag())
+    XCTAssertEqual(turn.speech, call.speech)
+    XCTAssertNotEqual(turn.speech?.provider, turn.snapshot.blessenger!.defaultSpeech.provider)
+    await store.blessengerEndCall(call.id); try await store.releaseExclusiveWorkspace()
+  }
+  func testReplayAddsOneResponseWithoutDuplicatingQuestionOrTakingDraft() async throws {
+    let store = try store(root()), initial = try await store.openBlessenger(catalog: fixtureCatalog)
+    var draft = initial.blessenger!.draft(for: nil), prior = draft.version
+    draft.text = "Exact question"; draft.version = UUID()
+    let saved = try await store.blessengerSaveDraft(draft, expectedVersion: prior)
+    let first = try turn(draft, profile: saved.blessenger!.defaultProfile)
+    _ = try await store.blessengerAdmit(first)
+    var receipt = first.receipts[0]; receipt.state = .failed; receipt.stopReason = "owned-fixture"
+    _ = try await store.blessengerFinish(receipt, messageID: first.responseIDs[0], text: "")
+    let fork = try await store.blessengerTransaction { state, product in
+      let source = state.chats[0]
+      let branch = try source.branch(at: source.messages[0].id, includeMessage: true)
+      state.chats.append(branch); state.selectedChat = branch.id
+      product.addresses[branch.id] = product.addresses[source.id]
+      var unsent = BlessengerDraft(id: branch.id); unsent.text = "Do not consume this draft"
+      product.drafts.append(unsent)
+    }.0
+    let branch = try XCTUnwrap(fork.chats.last), question = try XCTUnwrap(branch.messages.last)
+    var submitted = BlessengerDraft(id: branch.id); submitted.text = question.text
+    var repeatTurn = try turn(submitted, profile: fork.blessenger!.addresses[branch.id]!.profile, history: branch)
+    repeatTurn.previousQuestionID = question.id
+    let admitted = try await store.blessengerAdmit(repeatTurn)
+    let current = try XCTUnwrap(admitted.chats.last)
+    XCTAssertEqual(current.messages.filter { $0.role == .user }.count, 1)
+    XCTAssertEqual(current.messages.first?.id, question.id)
+    XCTAssertEqual(admitted.blessenger!.draft(for: branch.id), fork.blessenger!.draft(for: branch.id))
+    try await store.releaseExclusiveWorkspace()
+  }
+  func testSpeechFlushesShortAnswersAndRejectsRewrittenPrefix() throws {
+    let short = try BlessengerPolicy.speech("Yes.", cursor: BlessengerSpeechCursor(), finished: true)
+    XCTAssertEqual(short.fragments.map(\.text), ["Yes."])
+    let partial = try BlessengerPolicy.speech("One two three fou", cursor: BlessengerSpeechCursor(), finished: false)
+    XCTAssertTrue(partial.fragments.isEmpty)
+    let first = try BlessengerPolicy.speech("One two three four ", cursor: partial.cursor, finished: false)
+    XCTAssertEqual(first.fragments.map(\.text), ["One two three four"])
+    XCTAssertThrowsError(try BlessengerPolicy.speech("Changed two three four ", cursor: first.cursor, finished: true))
+    let rest = try BlessengerPolicy.speech("One two three four and five.", cursor: first.cursor, finished: true)
+    XCTAssertEqual(rest.fragments.map(\.text), ["and five."])
+  }
+  func testWaveRoundTripAndHonestTraceOverflow() throws {
+    let samples: [Float] = [0, -0.75, 0.3, 1]
+    let wave = try BlessengerWave.encode(samples, rate: 24000), decoded = try BlessengerWave.decode(wave)
+    XCTAssertEqual(decoded.samples.map(\.bitPattern), samples.map(\.bitPattern)); XCTAssertEqual(decoded.rate, 24000)
+    var bad = wave; bad[32] = 2
+    XCTAssertThrowsError(try BlessengerWave.decode(bad))
+    XCTAssertThrowsError(try BlessengerWave.encode([.nan], rate: 24000))
+    let trace = BlessengerTrace()
+    for i in 0..<513 { trace.record("stage.\(i)", at: Double(i)) }
+    XCTAssertEqual(trace.snapshot().events.count, 512); XCTAssertTrue(trace.snapshot().incomplete)
+  }
+  func testCaptureRejectsAClassificationAfterNewVoicedInput() throws {
+    let format = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false))
+    let capture = try BlessengerCaptureBuffer(source: format)
+    func packet(_ amplitude: Float) throws {
+      let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 480))
+      buffer.frameLength = 480
+      for i in 0..<480 { buffer.floatChannelData![0][i] = amplitude }
+      capture.append(buffer, at: AVAudioTime(sampleTime: 0, atRate: 16000))
+    }
+    for _ in 0..<8 { try packet(0.1) }
+    for _ in 0..<8 { try packet(0) }
+    let pause = capture.drain().compactMap { event -> UInt64? in if case .pause(let frame, _) = event { return frame }; return nil }.last
+    let frame = try XCTUnwrap(pause)
+    XCTAssertTrue(capture.isPaused(through: frame))
+    XCTAssertFalse(try capture.semanticWindow(through: frame).isEmpty)
+    try packet(0.1)
+    XCTAssertFalse(capture.isPaused(through: frame))
+    XCTAssertThrowsError(try capture.clip(through: frame, ended: 1, decision: "semantic"))
+    capture.stop()
+  }
+
 }
 private final class ReadCounter: @unchecked Sendable {
   private let lock = NSLock(); private var count = 0

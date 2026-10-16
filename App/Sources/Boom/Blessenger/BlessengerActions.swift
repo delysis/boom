@@ -82,8 +82,8 @@ extension BlessengerModel {
       }
     }
   }
-  func branch(at messageID: UUID, replacement: String? = nil) async {
-    guard let original = selected else { return }
+  func branch(at messageID: UUID, replacement: String? = nil, in capturedChat: ChatRecord? = nil) async {
+    guard let original = capturedChat ?? selected else { return }
     await change(restoreDraft: true) { state, product in
       guard let source = state.chats.first(where: { $0.id == original.id }),
         try BlessengerPolicy.exactDigest(source) == BlessengerPolicy.exactDigest(original),
@@ -107,18 +107,22 @@ extension BlessengerModel {
     }
   }
   func editMessage(_ message: ChatMessage) {
-    guard message.state != .pending else { return }
+    guard message.state != .pending, let chat = selected, chat.messages.contains(where: { $0.id == message.id }) else { return }
     let alert = NSAlert(); alert.messageText = "Edit on a new branch"
     alert.informativeText = "The original message and later replies remain unchanged."
     let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 480, height: 260)), editor = NSTextView(frame: scroll.bounds)
     editor.isRichText = false; editor.string = message.text; editor.font = .systemFont(ofSize: 14); editor.allowsUndo = true
     scroll.documentView = editor; scroll.hasVerticalScroller = true; alert.accessoryView = scroll
     alert.addButton(withTitle: "Save Branch"); alert.addButton(withTitle: "Cancel")
-    if alert.runModal() == .alertFirstButtonReturn { let text = editor.string; launch { await self.branch(at: message.id, replacement: text) } }
+    if alert.runModal() == .alertFirstButtonReturn { let text = editor.string; launch { await self.branch(at: message.id, replacement: text, in: chat) } }
   }
   func pickAttachments() {
+    let destination = draft.id, version = draft.version
     let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = true
-    if panel.runModal() == .OK { let inputs = panel.urls.map(AttachmentInput.file); launch { await self.importInputs(inputs) } }
+    if panel.runModal() == .OK { let inputs = panel.urls.map(AttachmentInput.file); launch {
+      guard self.draft.id == destination, self.draft.version == version else { throw BoomError.stale("The attachment picker destination changed. Nothing was attached.") }
+      await self.importInputs(inputs)
+    } }
   }
   func pickModel() {
     let panel = NSOpenPanel(); panel.canChooseDirectories = true; panel.canChooseFiles = false
@@ -129,16 +133,42 @@ extension BlessengerModel {
     alert.informativeText = "This explicitly downloads the pinned public model into the shared Hugging Face cache. Your conversations and microphone audio are not uploaded."
     alert.addButton(withTitle: "Install"); alert.addButton(withTitle: "Cancel")
     guard alert.runModal() == .alertFirstButtonReturn else { return }
-    launch {
-      let flag = CancellationFlag()
-      let installed = try await ModelPacks.installPublished(.consultation, flag: flag) { _ in }
-      await self.chooseModel(installed)
-    }
+    runSetup { flag, progress in _ = try await ModelPacks.installPublished(.consultation, flag: flag, progress: progress) }
+  }
+  func installVoicePackage(_ kind: BlessengerModelPackage.Kind) {
+    let alert = NSAlert(); alert.messageText = "Install the local \(kind.rawValue) model?"
+    alert.informativeText = "This downloads only the pinned public model into the shared cache. No case text or audio is uploaded."
+    alert.addButton(withTitle: "Install"); alert.addButton(withTitle: "Cancel")
+    guard alert.runModal() == .alertFirstButtonReturn else { return }
+    runSetup { flag, progress in _ = try await BlessengerModelPackage.package(kind).install(flag: flag, progress: progress) }
   }
   func setReadReplies(_ value: Bool) { launch { await self.change { _, product in product.readReplies = value } } }
+  func setSpeechProvider(_ provider: BlessengerSpeechVoice.Provider) {
+    launch { await self.change { _, product in product.defaultSpeech.provider = provider; product.defaultSpeech.identifier = nil } }
+  }
   func setSpeechVoice(_ id: String) {
     guard id.isEmpty || BlessengerAppleSpeech.voices().contains(where: { $0.identifier == id }) else { return }
-    launch { await self.change { _, product in product.defaultSpeech.identifier = id.isEmpty ? nil : id } }
+    launch { await self.change { _, product in
+      product.defaultSpeech.provider = .apple; product.defaultSpeech.identifier = id.isEmpty ? nil : id
+    } }
+  }
+  func appendExample() {
+    guard templateSelected, let captured = selected, !draft.text.isEmpty else { return }
+    let submitted = draft, role = exampleRole
+    launch {
+      await self.change(restoreDraft: true) { state, product in
+        guard let c = state.chats.firstIndex(where: { $0.id == captured.id }),
+          let d = product.drafts.firstIndex(where: { $0.id == submitted.id }), product.drafts[d] == submitted,
+          let previous = state.voices.first(where: { $0.id == captured.id }) else { throw BoomError.stale("The Contact source changed.") }
+        let text = try ProductCore.chatText(submitted.text)
+        state.chats[c].messages.append(ChatMessage(role: role, text: text,
+          speaker: role == .assistant ? previous.speaker : Speaker(name: "You"), authoredByUser: true))
+        let voice = try ProductCore.pinnedVoice(state.chats[c], slug: previous.slug, occupied: state.voices.filter { $0.id != previous.id }.map(\.slug))
+        if voice.revision != previous.revision { state.voiceVersions.append(previous) }
+        state.voices.removeAll { $0.id == previous.id }; state.voices.append(voice)
+        product.drafts[d] = BlessengerDraft(id: submitted.id)
+      }
+    }
   }
   func exportConversation() {
     guard let chat = selected else { return }
@@ -146,8 +176,8 @@ extension BlessengerModel {
     guard panel.runModal() == .OK, let destination = panel.url else { return }
     launch {
       try await ExplicitFileExport.write(to: destination) {
-        let content = chat.messages.map { "## " + ($0.speaker?.name ?? ($0.role == .user ? "You" : "Blessenger")) + "\n\n" + $0.text }.joined(separator: "\n\n")
-        return Data(("# " + chat.title + "\n\n" + content).utf8)
+        let content = chat.messages.map { "## " + ($0.speaker?.name ?? ($0.role == .user ? "You" : "Blessenger")) + "\n\n" + $0.text + ($0.state == .complete ? "" : "\n\n[" + $0.state.rawValue + "]") }.joined(separator: "\n\n")
+        return Data(("# " + chat.title + "\n\nReadable transcript only. This is not a restorable backup.\n\n" + content).utf8)
       }
     }
   }

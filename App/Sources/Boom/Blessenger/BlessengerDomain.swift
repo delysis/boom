@@ -202,6 +202,7 @@ struct BlessengerCallContext: Sendable {
   var conversationID: UUID?
   let recipients: [BlessengerContact]
   let profile: BlessengerProfile
+  let speech: BlessengerSpeechVoice
   var lastEpoch: UInt64 = 0
   var pendingDraftDigest: String?
 }
@@ -212,4 +213,14 @@ struct BlessengerCallerTurn: Sendable {
   let snapshot: WorkspaceState
   let conversationID: UUID?
   let profile: BlessengerProfile
+  let inputMessageID: UUID
+  var speech: BlessengerSpeechVoice? = nil
+  var trace: BlessengerTrace? = nil
+}
+
+/// An explicit alternate answer to an already committed question. Its authored
+/// input is not resubmitted and the unrelated unsent draft is never consumed.
+struct BlessengerReplay: Sendable {
+  let chat: ChatRecord
+  let question: ChatMessage
 }

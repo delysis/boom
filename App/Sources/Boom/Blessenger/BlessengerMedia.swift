@@ -26,11 +26,13 @@ enum BlessengerMedia {
     runner: MLXGemmaRunner, flag: CancellationFlag) async throws -> History {
     var ids: [UUID] = [], occurrences: [UUID: [UUID]] = [:]
     for message in messages where message.role == .user {
-      let attachments = (message.directAttachments ?? []).filter { id in
-        state.attachments.first(where: { $0.id == id }).map { [.audio, .image, .video].contains($0.kind) } ?? false
+      let references = (message.directAttachments ?? []) + message.sources.filter { $0.kind == "attachment" }.map(\.id)
+      for id in references where !ids.contains(id) { ids.append(id) }
+      occurrences[message.id] = (message.directAttachments ?? []).filter { id in
+        state.attachments.first(where: { $0.id == id }).map {
+          [.audio, .image, .video].contains($0.kind) || ($0.kind == .pdf && $0.text.isEmpty)
+        } ?? false
       }
-      for id in attachments where !ids.contains(id) { ids.append(id) }
-      occurrences[message.id] = attachments
     }
     guard ids.count <= 32 else { throw BoomError.budget("The selected history has more than 32 retained media sources; choose a shorter branch.") }
     return History(prepared: try await prepare(ids, state: state, store: store, runner: runner, flag: flag), occurrences: occurrences)
@@ -62,22 +64,32 @@ enum BlessengerMedia {
         guard runner.supportsRawAudio else {
           throw BoomError.unavailable("This checkpoint cannot receive the selected audio. Transcribe it explicitly or choose an audio-capable model; the original is retained.")
         }
-        let media = try MemoryMedia(bytes: bytes), reader = try await media.audioReader()
-        guard reader.duration > 0, reader.duration < 30 else {
-          throw BoomError.budget("This audio route requires a clip shorter than 30 seconds. The complete original is retained.")
-        }
         let samples = try await detachedWork { () throws -> [Float] in
-          guard let buffer = try reader.next(flag: flag, seconds: 30), let values = buffer.floatChannelData?[0] else {
-            throw BoomError.invalid("The audio contains no decodable samples.")
+          let reader = try await MemoryMedia(bytes: bytes).audioReader()
+          var samples: [Float] = []
+          while let buffer = try reader.next(flag: flag) {
+            guard let values = buffer.floatChannelData?[0] else { throw BoomError.invalid("The audio contains no waveform samples.") }
+            let count = Int(buffer.frameLength)
+            guard count <= 16_384 * 640 - samples.count else { throw BoomError.budget("Audio exceeds the model's admitted context capacity. Its complete original is retained.") }
+            samples.append(contentsOf: UnsafeBufferPointer(start: values, count: count))
           }
-          let samples = Array(UnsafeBufferPointer(start: values, count: Int(buffer.frameLength)))
-          guard samples.allSatisfy(\.isFinite) else { throw BoomError.invalid("Audio contains invalid samples.") }
+          guard !samples.isEmpty, samples.allSatisfy(\.isFinite) else { throw BoomError.invalid("Audio contains no valid samples.") }
           return samples
         }
         payloads.append(WritingMediaData(reference: WritingMediaReference(id: id, name: item.name,
           rootDigest: item.rootDigest, kind: "audio", sourceDigest: item.digest), bytes: bytes, samples: samples))
       case .video:
-        throw BoomError.unavailable("Video consultation is not yet connected in this Blessenger view. Its original was retained; no visual or audio coverage was claimed.")
+        let storyboard = try await VideoPreparationCache.shared.prepare(bytes, digest: item.rootDigest, flag: flag)
+        guard runner.supportsRawAudio || storyboard.sound.isEmpty else { throw BoomError.unavailable("This model cannot receive the video soundtrack. Choose an audio-capable model; no soundtrack was silently omitted.") }
+        payloads.append(WritingMediaData(reference: WritingMediaReference(id: id, name: item.name,
+          rootDigest: item.rootDigest, kind: "video", sourceDigest: item.digest,
+          frameDigests: storyboard.images.map(Digest.sha256), video: storyboard.timeline),
+          bytes: bytes, images: storyboard.images, audioSegments: storyboard.sound))
+      case .pdf where item.text.isEmpty:
+        let pages = try await detachedWork { try NativePDF.pages(bytes, flag: flag) }
+        payloads.append(WritingMediaData(reference: WritingMediaReference(id: id, name: item.name,
+          rootDigest: item.rootDigest, kind: "pdf", sourceDigest: item.digest,
+          frameDigests: pages.map(Digest.sha256)), bytes: bytes, images: pages))
       default:
         guard !item.text.isEmpty else { throw BoomError.unavailable("This attachment has no admitted model representation. Its original was retained.") }
       }

@@ -28,7 +28,7 @@ import SwiftUI
       let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1040, height: 760),
         styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
       window.title = "Blessenger"; window.titleVisibility = .hidden
-      window.titlebarAppearsTransparent = true; window.minSize = NSSize(width: 640, height: 480)
+      window.titlebarAppearsTransparent = true; window.contentMinSize = NSSize(width: 640, height: 480)
       window.isRestorable = false; window.disableSnapshotRestoration(); window.delegate = self
       window.isReleasedWhenClosed = false; window.center()
       window.contentView = NSHostingView(rootView: ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity))

@@ -168,6 +168,11 @@ struct BlessengerSpeechResult: Sendable {
   var onEnd: ((UUID, Int, Bool) -> Void)?
   init() { engine.attach(player) }
 
+  func hasPlayableAudio(_ id: UUID) -> Bool {
+    (responseID == id && !samples.isEmpty) || completed.values.contains { $0.responseID == id && !$0.samples.isEmpty }
+      || (terminal?.responseID == id && terminal?.samples.isEmpty == false)
+  }
+  func dismissError() { if responseID == nil { error = nil } }
   func prepare(_ voice: BlessengerSpeechVoice) async throws -> BlessengerSpeechVoice {
     guard responseID == nil, worker == nil else { throw BoomError.unavailable("Stop and join current speech before changing its voice.") }
     var resolved = voice
@@ -345,13 +350,14 @@ struct BlessengerSpeechResult: Sendable {
   }
   func replay(_ samples: [Float], rate: Int, messageID: UUID, voice: BlessengerSpeechVoice, flag: CancellationFlag) async throws {
     stop(); try await join()
-    try begin(messageID, voice: voice, attempt: UUID(), seed: 0, cancellation: flag)
+    let replayAttempt = UUID()
+    try begin(messageID, voice: voice, attempt: replayAttempt, seed: 0, cancellation: flag)
     let captured = epoch
     do {
       for start in stride(from: 0, to: samples.count, by: rate) {
         try await enqueue(BlessengerPCM(samples: Array(samples[start..<min(start + rate, samples.count)]), rate: rate), epoch: captured, flag: self.flag)
       }
       sourceFinished = true; settleIfDrained(); _ = try await result(for: messageID)
-    } catch { stop(responseID: messageID); try await join(); throw error }
+    } catch { stop(responseID: messageID); try await join(); _ = try? await result(for: messageID, attempt: replayAttempt); throw error }
   }
 }

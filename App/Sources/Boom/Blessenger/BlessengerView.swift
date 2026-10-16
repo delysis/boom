@@ -11,6 +11,7 @@ struct BlessengerView: View {
   @State private var removeID: UUID?
   @State private var details = false
   @State private var composerHeight: CGFloat = 28
+  @State private var instructionsOpen = false
   init(model: BlessengerModel) { self.model = model; audio = model.audio }
   var body: some View {
     HSplitView {
@@ -18,6 +19,7 @@ struct BlessengerView: View {
       VStack(spacing: 0) {
         header
         Divider()
+        if model.isCalling || model.callStarting { callBar }
         if model.settingsOpen { settings }
         else {
           if model.state.selectedChat == nil { addressing }
@@ -30,7 +32,7 @@ struct BlessengerView: View {
     .frame(minWidth: 640, minHeight: 480)
     .background(Color(nsColor: .textBackgroundColor))
     .overlay(alignment: .bottom) {
-      if model.failure != nil || audio.error != nil {
+      if model.failure != nil || audio.error != nil || model.callIssue != nil {
         HStack(spacing: 10) {
           Button { details.toggle() } label: { Image(systemName: "exclamationmark.triangle") }
             .help("Open error details").accessibilityLabel("Open error details")
@@ -44,7 +46,7 @@ struct BlessengerView: View {
     .sheet(isPresented: $details) {
       VStack(alignment: .leading, spacing: 16) {
         Text("Details").font(.headline)
-        NativeScrollableText(text: model.failure ?? audio.error ?? "", maximumHeight: 300).frame(minWidth: 360)
+        NativeScrollableText(text: model.failure ?? audio.error ?? model.callIssue ?? "", maximumHeight: 300).frame(minWidth: 360)
         Button("Close") { details = false }.keyboardShortcut(.cancelAction)
       }.padding(24)
     }
@@ -169,15 +171,29 @@ struct BlessengerView: View {
   private func messageRow(_ message: ChatMessage) -> some View {
     let outgoing = message.role == .user
     let text = model.liveText[message.id] ?? message.text
+    let isSpoken = model.product.spokenResponses?[message.id] != nil
+    let storedAudio = model.product.audio[message.id]
+    let playable = storedAudio != nil || audio.hasPlayableAudio(message.id)
     return HStack(alignment: .bottom, spacing: 8) {
       if outgoing { Spacer(minLength: 40) }
-      else if message.state != .pending || !text.isEmpty {
+      else if !isSpoken || playable {
         BlessengerPortrait(id: message.speaker?.voiceID, catalog: model.catalog).frame(width: 32, height: 32)
       }
       VStack(alignment: .leading, spacing: 6) {
-        if !outgoing, let name = message.speaker?.name { Text(name).font(.caption).foregroundStyle(.secondary) }
-        if message.state == .pending && text.isEmpty {
+        if !outgoing, (!isSpoken || playable), let name = message.speaker?.name { Text(name).font(.caption).foregroundStyle(.secondary) }
+        if message.state == .pending && (text.isEmpty || (isSpoken && !playable)) {
           ProgressView().controlSize(.small).padding(5).accessibilityLabel("Preparing response")
+        } else if isSpoken {
+          if let storedAudio {
+            HStack {
+              Button { model.replayAudio(message.id) } label: { Image(systemName: "play.fill") }
+                .buttonStyle(.plain).disabled(model.isCalling || model.preparing || !model.active.isEmpty)
+                .accessibilityLabel("Replay recorded response")
+              Text(Duration.seconds(Double(storedAudio.frames) / Double(storedAudio.sampleRate)), format: .time(pattern: .minuteSecond))
+                .monospacedDigit().font(.callout)
+            }
+          }
+          if !text.isEmpty { DisclosureGroup("Transcript") { NativeText(text: text) } }
         } else if !text.isEmpty { NativeText(text: text) }
         ForEach(message.directAttachments ?? [], id: \.self) { id in
           if let attachment = model.state.attachments.first(where: { $0.id == id }) {
@@ -186,7 +202,10 @@ struct BlessengerView: View {
           }
         }
         if message.state == .cancelled { Text("Interrupted").font(.caption).foregroundStyle(.secondary) }
-        if message.state == .failed { Label("Incomplete", systemImage: "exclamationmark.circle").font(.caption) }
+        if message.state == .failed {
+          Label("Incomplete", systemImage: "exclamationmark.circle").font(.caption)
+          if let reason = message.failure { Text(reason).font(.caption).foregroundStyle(.secondary) }
+        }
         if audio.responseID == message.id, audio.ready {
           Button { audio.stop(responseID: message.id) } label: { Image(systemName: "stop.fill") }
             .buttonStyle(.plain).accessibilityLabel("Stop playback")
@@ -199,62 +218,158 @@ struct BlessengerView: View {
           if !outgoing, message.state == .pending { Button("Stop") { model.stop(message.id) } }
           if !outgoing, message.state != .pending { Button("Read Aloud") { model.readAloud(message) } }
           Button("Branch Here") { Task { await model.branch(at: message.id) } }
+          if !outgoing { Button("Regenerate on a Branch") { model.regenerate(message.id) } }
+          if outgoing { Button("Answer on a Branch") { model.answerAgain(message.id) } }
           Button("Edit") { model.editMessage(message) }
         }
       if !outgoing { Spacer(minLength: 40) }
     }
   }
   private var composer: some View {
-    HStack(alignment: .bottom, spacing: 10) {
-      Button { model.pickAttachments() } label: { Image(systemName: "plus") }
-        .buttonStyle(GlassControl()).accessibilityLabel("Add attachment")
-      ChatComposer(text: Binding(get: { model.draft.text }, set: model.editText), focusRequest: model.composerFocus,
-        onSend: { if model.draft.recipientQuery.isEmpty { model.send() } }, onCancel: { model.stop() },
-        onAttachments: { inputs in Task { await model.importInputs(inputs) } },
-        accessibilityLabel: "Message; Return sends, Shift Return inserts a line break",
-        onContentHeight: { composerHeight = min(180, max(28, $0)) },
-        onIssue: { model.report(BoomError.invalid($0)) }, sendsOnReturn: true, maximumUTF8Bytes: 2_097_152)
-        .disabled(model.navigating).frame(height: composerHeight)
-        .padding(.horizontal, 8).padding(.vertical, 5)
-        .background(Color(nsColor: .controlBackgroundColor)).clipShape(RoundedRectangle(cornerRadius: 18))
-      Button {
-        if model.preparing || model.state.selectedChat.map({ model.active.contains($0) }) == true { model.stop() }
-        else if model.draft.recipientQuery.isEmpty { model.send() }
-      } label: { Image(systemName: model.preparing || model.state.selectedChat.map({ model.active.contains($0) }) == true ? "stop.fill" : "arrow.up") }
-        .buttonStyle(GlassControl())
-        .disabled(!model.canSend && !model.preparing && model.state.selectedChat.map({ model.active.contains($0) }) != true)
-        .accessibilityLabel(model.preparing ? "Stop" : "Send")
+    VStack(alignment: .leading, spacing: 7) {
+      if !model.draft.attachments.isEmpty {
+        ScrollView(.horizontal) {
+          HStack {
+            ForEach(model.draft.attachments, id: \.self) { id in
+              if let item = model.state.attachments.first(where: { $0.id == id }) {
+                HStack(spacing: 6) {
+                  Button { model.preview(id) } label: { Label(item.name, systemImage: item.kind == .audio ? "waveform" : "paperclip") }
+                    .buttonStyle(.plain)
+                  Button { model.removeAttachment(id) } label: { Image(systemName: "xmark.circle.fill") }
+                    .buttonStyle(.plain).accessibilityLabel("Remove " + item.name)
+                }.padding(7).background(.quaternary).clipShape(RoundedRectangle(cornerRadius: 8))
+              }
+            }
+          }
+        }
+      }
+      if model.hasUnstoredVoiceNote {
+        HStack {
+          Text("The recording has not been saved.").font(.callout)
+          Button("Retry") { model.retryVoiceNote() }
+          Button("Discard", role: .destructive) { model.discardUnstoredVoiceNote() }
+        }
+      }
+      if model.templateSelected {
+        Picker("Example speaker", selection: $model.exampleRole) {
+          Text("You").tag(Role.user); Text("Contact").tag(Role.assistant)
+        }.pickerStyle(.segmented).frame(maxWidth: 230)
+      }
+      HStack(alignment: .bottom, spacing: 10) {
+        if !model.templateSelected {
+          Button { model.pickAttachments() } label: { Image(systemName: "plus") }
+            .buttonStyle(GlassControl()).accessibilityLabel("Add attachment")
+            .disabled(model.navigating || model.noteState != .idle)
+        }
+        ChatComposer(text: Binding(get: { model.draft.text }, set: model.editText), focusRequest: model.composerFocus,
+          onSend: { if model.templateSelected { model.appendExample() } else { model.send() } }, onCancel: { model.stop() },
+          onAttachments: model.templateSelected ? nil : { inputs in Task { _ = await model.importInputs(inputs) } },
+          accessibilityLabel: "Message; Return sends, Shift Return inserts a line break",
+          onContentHeight: { composerHeight = min(180, max(28, $0)) },
+          onIssue: { model.report(BoomError.invalid($0)) },
+          onNativeInput: { model.inputCompletion.observe($0) },
+          onNativeDetach: { model.inputCompletion.invalidateGhost() }, sendsOnReturn: true, maximumUTF8Bytes: 2_097_152)
+          .disabled(model.navigating).frame(height: composerHeight)
+          .padding(.horizontal, 8).padding(.vertical, 5)
+          .background(Color(nsColor: .controlBackgroundColor)).clipShape(RoundedRectangle(cornerRadius: 18))
+        if !model.templateSelected && !model.isCalling {
+          Button { model.toggleVoiceNote() } label: { Image(systemName: model.noteState == .recording ? "stop.circle" : "mic") }
+            .buttonStyle(GlassControl())
+            .disabled(model.noteState == .preparing || model.noteState == .stopping || model.navigating || model.callStarting)
+            .accessibilityLabel(model.noteState == .recording ? "Stop recording for review" : "Record voice note")
+          if model.noteState != .idle {
+            Button { model.cancelVoiceNote() } label: { Image(systemName: "xmark") }
+              .buttonStyle(GlassControl()).accessibilityLabel("Cancel recording")
+          }
+        }
+        Button {
+          if model.templateSelected { model.appendExample() }
+          else if selectedBusy { model.stop() }
+          else { model.send() }
+        } label: { Image(systemName: selectedBusy ? "stop.fill" : "arrow.up") }
+          .buttonStyle(GlassControl())
+          .disabled(model.templateSelected ? model.draft.text.isEmpty || model.navigating : !model.canSend && !selectedBusy)
+          .accessibilityLabel(selectedBusy ? "Stop response" : model.templateSelected ? "Append example" : "Send")
+      }
     }.padding(.horizontal, 18).padding(.bottom, 14).padding(.top, 8)
   }
+  private var selectedBusy: Bool { model.preparing || model.state.selectedChat.map { model.active.contains($0) } == true }
+  private var callBar: some View {
+    HStack(spacing: 12) {
+      if !model.callReady { ProgressView().controlSize(.small) }
+      Text(model.callReady ? (model.callMuted ? "Muted" : "Listening") : "Preparing call").font(.callout)
+      Spacer()
+      Button { model.setCallMuted(!model.callMuted) } label: { Image(systemName: model.callMuted ? "mic.slash.fill" : "mic.fill") }
+        .accessibilityLabel(model.callMuted ? "Unmute microphone" : "Mute microphone")
+        .disabled(!model.callReady)
+      Button("Send Turn") { model.submitCallTurn() }.disabled(!model.callReady || model.callMuted)
+      Button { model.toggleCall() } label: { Image(systemName: "phone.down.fill") }.accessibilityLabel("End call")
+    }.padding(.horizontal, 18).padding(.vertical, 8).background(.quaternary)
+  }
   private var template: some View {
-    VStack(alignment: .leading, spacing: 12) {
-      Text("Instructions").font(.headline)
-      TextEditor(text: $instructions).font(.system(size: 14))
-      HStack {
-        Button("Save") { Task { await model.updateInstructions(instructions) } }
-        Button("Message") { if let id = model.state.selectedChat, let voice = model.state.voices.first(where: { $0.id == id }) { Task { await model.addContact(BlessengerContact(voice)) } } }
-        Spacer()
-      }
-    }.padding(18).onAppear { instructions = model.selected?.instructions ?? "" }
+    VStack(alignment: .leading, spacing: 0) {
+      DisclosureGroup("Instructions", isExpanded: $instructionsOpen) {
+        ChatComposer(text: $instructions, focusRequest: 0,
+          onSend: { Task { await model.updateInstructions(instructions) } }, onCancel: { instructions = model.selected?.instructions ?? "" },
+          accessibilityLabel: "Contact instructions; Command Return saves", showsEditingActions: true)
+          .frame(minHeight: 90, maxHeight: 230)
+      }.padding(14)
+      transcript
+      composer
+    }.onAppear { instructions = model.selected?.instructions ?? "" }
+      .onChange(of: model.state.selectedChat) { _, _ in instructions = model.selected?.instructions ?? "" }
   }
   private var settings: some View {
     Form {
       Section("Local model") {
-        Text(model.product.addresses[model.draft.id]?.profile.modelPath ?? model.product.defaultProfile.modelPath ?? "Use the verified local model cache")
+        Text(model.effectiveProfile.modelPath ?? "Verified local model cache")
           .font(.caption).textSelection(.enabled)
-        Button("Choose Model…") { model.pickModel() }
-        Button("Install Model…") { model.installModel() }
-      }
-      Section("Speech") {
-        Toggle("Read replies aloud", isOn: Binding(get: { model.product.readReplies }, set: { model.setReadReplies($0) }))
-        Picker("Voice", selection: Binding(get: { model.product.defaultSpeech.identifier ?? "" }, set: { model.setSpeechVoice($0) })) {
-          Text("Local English voice").tag("")
-          ForEach(BlessengerAppleSpeech.voices(), id: \.identifier) { Text($0.name).tag($0.identifier) }
+        HStack {
+          Button("Choose…") { model.pickModel() }
+          Button("Use Cache") { Task { await model.clearModel() } }
+          Button("Install…") { model.installModel() }
         }
+        Picker("Sampling", selection: Binding(get: { model.effectiveProfile.sampling }, set: { value in Task { await model.setProfile(sampling: value) } })) {
+          ForEach(SamplingProfile.allCases, id: \.self) { Text($0.title).tag($0) }
+        }
+        Picker("MTP assistant", selection: Binding(get: { model.effectiveProfile.useMTP.map { $0 ? "on" : "off" } ?? "calls" }, set: { value in
+          Task { await model.setProfile(mtp: .some(value == "calls" ? nil : value == "on")) }
+        })) {
+          Text("Calls only").tag("calls"); Text("On").tag("on"); Text("Off · comparison").tag("off")
+        }
+        Button("Install MTP Assistant…") { model.installVoicePackage(.mtp) }
+      }.disabled(model.loading || model.isCalling || model.callStarting || !model.active.isEmpty)
+      Section("Speech") {
+        Toggle("Read text replies aloud", isOn: Binding(get: { model.product.readReplies }, set: model.setReadReplies))
+        Picker("Provider", selection: Binding(get: { model.product.defaultSpeech.provider }, set: model.setSpeechProvider)) {
+          Text("Qwen · local designed voice").tag(BlessengerSpeechVoice.Provider.qwen)
+          Text("Apple · local system voice").tag(BlessengerSpeechVoice.Provider.apple)
+        }
+        if model.product.defaultSpeech.provider == .apple {
+          Picker("Voice", selection: Binding(get: { model.product.defaultSpeech.identifier ?? "" }, set: model.setSpeechVoice)) {
+            Text("Local English voice").tag("")
+            ForEach(BlessengerAppleSpeech.voices(), id: \.identifier) { Text($0.name).tag($0.identifier) }
+          }
+        }
+        HStack {
+          Button("Install Qwen…") { model.installVoicePackage(.qwen) }
+          Button("Install Turn Detector…") { model.installVoicePackage(.turn) }
+        }
+        if model.loading {
+          HStack { ProgressView().controlSize(.small); Text(model.setupProgress ?? "Preparing").font(.caption); Button("Cancel") { model.stop() } }
+        }
+      }
+      Section("Appearance and input") {
+        Picker("Appearance", selection: Binding(get: { model.state.theme }, set: model.setTheme)) {
+          Text("System").tag("system"); Text("Light").tag("light"); Text("Dark").tag("dark")
+        }
+        Toggle("Inline suggestions", isOn: Binding(get: { model.state.autocomplete }, set: model.setAutocomplete))
+        Text("Suggestions use the already loaded local model. Right Arrow accepts a word; Escape dismisses. Nothing is sent automatically.").font(.caption).foregroundStyle(.secondary)
       }
       Section("Library") {
         Button("New Contact") { Task { await model.newContact() } }
-        Button("Export Conversation…") { model.exportConversation() }
+        Button("Export Readable Transcript…") { model.exportConversation() }.disabled(model.selected == nil)
+        Button("Recover Unstored Draft") { model.recoverDraft() }.disabled(!model.hasDraftFailure)
       }
       HStack { Spacer(); Button("Done") { model.settingsOpen = false } }
     }.formStyle(.grouped).frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -264,11 +379,14 @@ struct BlessengerView: View {
 }
 
 private struct GlassControl: ButtonStyle {
+  @Environment(\.isEnabled) private var enabled
+  @Environment(\.accessibilityReduceTransparency) private var opaque
   func makeBody(configuration: Configuration) -> some View {
     configuration.label.font(.system(size: 16, weight: .regular))
-      .frame(width: 34, height: 34).background(.thinMaterial, in: Circle())
+      .frame(width: 34, height: 34)
+      .background { if opaque { Circle().fill(Color(nsColor: .controlBackgroundColor)) } else { Circle().fill(.thinMaterial) } }
       .overlay(Circle().stroke(.primary.opacity(0.12), lineWidth: 0.5))
-      .opacity(configuration.isPressed ? 0.65 : 1)
+      .opacity(!enabled ? 0.4 : configuration.isPressed ? 0.65 : 1)
   }
 }
 struct BlessengerPortrait: View {
