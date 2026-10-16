@@ -25,7 +25,7 @@ jobs:
             python3 .blessenger-repair/apply.py
             git config user.name 'Blessenger source import'
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git commit -m 'Implement owned Qwen streaming, actual MTP, exact media history and speech delivery'
+            git commit -m 'Apply exact source-bound Blessenger repair'
             git push origin HEAD:refs/heads/blessenger/port-20261016
           fi
           git config --local --unset-all http.https://github.com/.extraheader || true
@@ -81,7 +81,12 @@ jobs:
           (root/'.build-support/RustProductBuild.json').write_text(json.dumps(data,sort_keys=True)+'\n')
           PY
           swift scripts/record-native-libs.swift evidence/rust-native-link.log .build-support/RustNativeLink.json
-          swift test --package-path App --jobs 3 --manifest-cache none --disable-automatic-resolution --disable-experimental-prebuilts --filter BlessengerTests 2>&1 | tee evidence/native-tests.log
+          swift build --package-path App --build-tests --jobs 3 --manifest-cache none --disable-automatic-resolution --disable-experimental-prebuilts 2>&1 | tee evidence/native-build.log
+          BIN="$(swift build --package-path App --show-bin-path --manifest-cache none --disable-automatic-resolution --disable-experimental-prebuilts)"
+          scripts/build-mlx-metallib.sh "$BIN/mlx.metallib" 2>&1 | tee evidence/metallib.log
+          test -d "$BIN/BoomPackageTests.xctest/Contents/MacOS"
+          cp "$BIN/mlx.metallib" "$BIN/BoomPackageTests.xctest/Contents/MacOS/mlx.metallib"
+          swift test --package-path App --skip-build --manifest-cache none --disable-automatic-resolution --disable-experimental-prebuilts --filter BlessengerTests 2>&1 | tee evidence/native-tests.log
           git diff --exit-code -- App/Package.resolved Cargo.lock > evidence/lock-diff.txt
       - name: Require every component lane
         if: always()
