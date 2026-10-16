@@ -44,6 +44,7 @@ struct BlessengerPreparedTurn: Sendable {
   let voices: [Voice?]
   let outputLimit: Int
   var caller: BlessengerCallerTurn? = nil
+  var speech: BlessengerSpeechVoice? = nil
 }
 
 extension WorkspaceStore {
@@ -202,6 +203,11 @@ extension WorkspaceStore {
           requestDigest: Digest.sha256(receipt.plan.rawPrompt), maxTokens: turn.outputLimit, generationPolicy: receipt.generationPolicy)
         state.chats[index].messages.append(ChatMessage(id: id, role: .assistant, text: "", state: .pending,
           provider: receipt.model, speaker: turn.voices[i]?.speaker ?? Speaker(name: "Blessenger")))
+        if let speech = turn.speech {
+          if product.spokenResponses == nil { product.spokenResponses = [:] }
+          product.spokenResponses?[id] = speech
+          if turn.caller != nil { if product.callResponses == nil { product.callResponses = [] }; product.callResponses?.insert(id) }
+        }
         product.attempts[id] = BlessengerAttempt(conversationID: turn.chatID, messageID: id,
           identity: identity, sourceDigests: turn.sourceDigests)
       }
@@ -219,7 +225,8 @@ extension WorkspaceStore {
     }
     return next
   }
-  func blessengerFinish(_ receipt: ConsultationReceipt, messageID: UUID, text: String) throws -> WorkspaceState {
+  func blessengerFinish(_ receipt: ConsultationReceipt, messageID: UUID, text: String,
+    speech: BlessengerSpeechResult? = nil) throws -> WorkspaceState {
     guard receipt.state != .pending, let attemptID = receipt.attemptID,
       let product = blessengerRuntime?.blessenger, let attempt = product.attempts[messageID],
       attempt.identity.attemptID == attemptID, attempt.identity.operationID == receipt.operationID,
@@ -229,6 +236,22 @@ extension WorkspaceStore {
       receipt.generationPolicy == attempt.identity.generationPolicy else {
       throw BoomError.stale("This response no longer owns its message.")
     }
+    let audioRecord: AttachmentImport?
+    let retainedAudio: BlessengerAudio?
+    if let speech, !speech.samples.isEmpty {
+      guard speech.responseID == messageID, speech.attempt == attemptID,
+        product.spokenResponses?[messageID] == speech.voice else { throw BoomError.stale("Speech lost its captured response or route.") }
+      let original = try speech.wav()
+      let imported = try AttachmentProcessor.inspect(name: "Reply audio.wav", data: original)
+      guard imported.record.kind == .audio else { throw BoomError.invalid("Generated speech failed audio inspection.") }
+      try vault.put(imported.original, kind: .attachment, id: imported.record.id)
+      try vault.put(imported.receipt, kind: .receipt, id: imported.record.id)
+      audioRecord = imported
+      retainedAudio = BlessengerAudio(attachmentID: imported.record.id, textDigest: Digest.sha256(text),
+        frames: speech.samples.count, sampleRate: speech.sampleRate, voice: speech.voice,
+        interrupted: speech.interrupted, heardFrames: speech.heardFrames, deliveredText: speech.deliveredText,
+        attemptID: attemptID, failure: speech.failure)
+    } else { audioRecord = nil; retainedAudio = nil }
     // Capture output before the terminal workspace commit; replay never sends.
     try vault.encode(receipt, kind: .receipt, id: attemptID)
     try vault.encode(receipt, kind: .receipt, id: messageID)
@@ -237,10 +260,21 @@ extension WorkspaceStore {
         let c = state.chats.firstIndex(where: { $0.id == attempt.conversationID }),
         let m = state.chats[c].messages.firstIndex(where: { $0.id == messageID }),
         state.chats[c].messages[m].state == .pending else { throw BoomError.stale("The response was already settled.") }
-      for source in attempt.sourceDigests {
-        guard state.attachments.first(where: { $0.id == source.id })?.reference == source else {
-          throw BoomError.stale("A response source changed before publication.")
+      // Revocation forbids a successful publication, not cancellation/failure
+      // settlement. A failed attempt must never strand a conversation as busy.
+      if receipt.state == .complete {
+        for source in attempt.sourceDigests {
+          guard state.attachments.first(where: { $0.id == source.id })?.reference == source else {
+            throw BoomError.stale("A response source changed before publication.")
+          }
         }
+      }
+      if let audioRecord, let retainedAudio {
+        state.attachments.append(audioRecord.record); product.audio[messageID] = retainedAudio
+      }
+      if let speech {
+        if product.traces == nil { product.traces = [:] }
+        product.traces?[messageID] = speech.trace.snapshot()
       }
       state.chats[c].messages[m].text = text
       state.chats[c].messages[m].state = receipt.state

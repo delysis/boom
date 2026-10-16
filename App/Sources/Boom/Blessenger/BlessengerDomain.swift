@@ -29,7 +29,9 @@ struct BlessengerDraft: Codable, Equatable, Identifiable, Sendable {
   var attachments: [UUID] = []
   var recipients: [BlessengerContact] = []
   var groupName: String?
-  enum CodingKeys: String, CodingKey { case id, version, text, attachments, recipients, groupName = "group_name" }
+  private var recipientQueryValue: String?
+  var recipientQuery: String { get { recipientQueryValue ?? "" } set { recipientQueryValue = newValue } }
+  enum CodingKeys: String, CodingKey { case id, version, text, attachments, recipients, groupName = "group_name", recipientQueryValue = "recipient_query" }
   init(id: UUID) { self.id = id }
 }
 struct BlessengerProfile: Codable, Equatable, Sendable {
@@ -37,6 +39,9 @@ struct BlessengerProfile: Codable, Equatable, Sendable {
   var modelPath: String?
   var sampling = SamplingProfile.standard
   var maximumTokens = 1024
+  /// Nil preserves the ordinary text route; calls explicitly require MTP unless
+  /// the user selects the disclosed non-MTP comparison in Settings.
+  var useMTP: Bool? = nil
 }
 struct BlessengerAddress: Codable, Equatable, Sendable {
   let recipients: [BlessengerContact]
@@ -44,7 +49,7 @@ struct BlessengerAddress: Codable, Equatable, Sendable {
 }
 struct BlessengerSpeechVoice: Codable, Equatable, Sendable {
   enum Provider: String, Codable, Sendable { case apple, qwen }
-  var provider = Provider.apple
+  var provider = Provider.qwen
   var identifier: String?
   var description = "A warm, articulate, reassuring mature American colleague with a natural conversational rhythm."
   var locale = "en-US"
@@ -57,6 +62,9 @@ struct BlessengerAudio: Codable, Equatable, Sendable {
   let voice: BlessengerSpeechVoice
   let interrupted: Bool
   var heardFrames: Int
+  var deliveredText: String? = nil
+  var attemptID: UUID? = nil
+  var failure: String? = nil
 }
 struct BlessengerAttempt: Codable, Equatable, Sendable {
   let conversationID: UUID
@@ -76,6 +84,9 @@ struct BlessengerState: Codable, Sendable {
   var defaultSpeech = BlessengerSpeechVoice()
   var speechVoices: [UUID: BlessengerSpeechVoice] = [:]
   var audio: [UUID: BlessengerAudio] = [:]
+  var spokenResponses: [UUID: BlessengerSpeechVoice]? = nil
+  var callResponses: Set<UUID>? = nil
+  var traces: [UUID: BlessengerTrace.Record]? = nil
   var attempts: [UUID: BlessengerAttempt] = [:]
   var branches: [UUID: UUID] = [:]
   var readReplies = false

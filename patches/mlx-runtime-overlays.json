@@ -3,7 +3,7 @@
     "directory": ".deps/MLXSwiftLM",
     "revision": "9afc3b55f75a0d41a3d0c11330b9df6a036d24e4",
     "patch": "patches/mlx-swift-lm-cohorts.patch",
-    "patchSHA256": "b181cf5e3ee38b191ceb4b3edc3e3b7806d81047261485eaf7f6e4e199e1d05b",
+    "patchSHA256": "91237c1231f930f9738262e4644fa6222bdbab6729d66fff2f891bf477e2c604",
     "files": [
       {
         "path": "Libraries/MLXLMCommon/BatchKVCache.swift",
@@ -11,11 +11,11 @@
       },
       {
         "path": "Libraries/MLXLMCommon/Evaluate.swift",
-        "sha256": "3640bb59259ef45572239affdd6a8d436f4783e9981adf34a38136eb64f11020"
+        "sha256": "992b430bf1f6a9defd3c5d59734b8c35bba0056801951cb144b34447ff6e04e8"
       },
       {
         "path": "Libraries/MLXVLM/Models/Gemma4.swift",
-        "sha256": "7e19f05a13532a1b022e870fad5a840837ffda33e263818f9c7e90225d211a1f"
+        "sha256": "a11dbcd777beb03764da7dc2b847d5355768923b92bab2865be945f513a7898c"
       },
       {
         "path": "Libraries/MLXVLM/Models/Gemma4Assistant.swift",
@@ -72,6 +72,22 @@
       {
         "path": "mlx/c/array.h",
         "sha256": "ca107802d1061ebeffeab9316555208a612e9e5d7e5486c0a010e25f9abbdb6e"
+      }
+    ]
+  },
+  {
+    "directory": ".deps/Qwen3TTS",
+    "revision": "2118167c06dd93233128ccef3011188e32bebd14",
+    "patch": "patches/qwen-owned-stream.patch",
+    "patchSHA256": "4ea02dc04d4bc4600c4ebe39cfde2cc407826fdd6115786b803e7b169f7f7b1d",
+    "files": [
+      {
+        "path": "Sources/Qwen3TTS/Model/Qwen3Talker.swift",
+        "sha256": "4a31e2d1c56986dcef4f47de1e2b3b81f7c79e695fad1193183cb0a85bfff1f4"
+      },
+      {
+        "path": "Sources/Qwen3TTS/Qwen3TTSPipeline.swift",
+        "sha256": "7b66221485570b10e2e03e25821e452408189a9f96e24dd8bceaa3b60d7bdaa4"
       }
     ]
   }

@@ -40,6 +40,8 @@ pub struct Draft {
     pub attachments: Vec<Uuid>,
     pub recipients: Vec<Contact>,
     pub group_name: Option<String>,
+    #[serde(default)]
+    pub recipient_query: String,
 }
 
 #[derive(Serialize)]
@@ -84,6 +86,11 @@ fn contacts(values: &[Contact]) -> Result<(), Error> {
 
 pub fn validate_draft(draft: &Draft) -> Result<DraftValidation, Error> {
     require(
+        draft.recipient_query.chars().count() <= 256
+            && !draft.recipient_query.chars().any(char::is_control),
+        "The recipient query exceeds its supported bound.",
+    )?;
+    require(
         !draft.id.is_nil() && !draft.version.is_nil(),
         "The draft has no stable identity.",
     )?;
@@ -113,7 +120,8 @@ pub fn validate_draft(draft: &Draft) -> Result<DraftValidation, Error> {
     let encoded = serde_json::to_vec(draft).map_err(|error| Error(error.to_string()))?;
     Ok(DraftValidation {
         digest: digest(&encoded),
-        sendable: !draft.text.trim().is_empty() || !draft.attachments.is_empty(),
+        sendable: draft.recipient_query.trim().is_empty()
+            && (!draft.text.trim().is_empty() || !draft.attachments.is_empty()),
     })
 }
 
@@ -252,6 +260,7 @@ mod tests {
             attachments: vec![],
             recipients: vec![entry(1)],
             group_name: None,
+            recipient_query: String::new(),
         }
     }
     #[test]
@@ -303,7 +312,7 @@ mod tests {
             &["team".into(), "contact1".into()],
             &lib,
             &[],
-            &[group.clone()],
+            std::slice::from_ref(&group),
             false,
         )
         .expect("union");
@@ -329,10 +338,10 @@ mod tests {
         assert!(
             resolve(
                 None,
-                &[old.clone()],
+                std::slice::from_ref(&old),
                 &[],
                 &[current.clone()],
-                &[old.clone()],
+                std::slice::from_ref(&old),
                 &[],
                 false
             )
@@ -341,10 +350,10 @@ mod tests {
         assert_eq!(
             resolve(
                 None,
-                &[old.clone()],
+                std::slice::from_ref(&old),
                 &[],
                 &[current],
-                &[old.clone()],
+                std::slice::from_ref(&old),
                 &[],
                 true
             )
@@ -403,5 +412,19 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn unresolved_address_is_retained_but_never_sendable() {
+        let mut value = draft();
+        value.text = "The exact case question".into();
+        value.recipient_query = "unresolved name".into();
+        assert!(!validate_draft(&value).expect("valid unsent query").sendable);
+        let old_digest = validate_draft(&value).expect("digest").digest;
+        value.recipient_query.clear();
+        let ready = validate_draft(&value).expect("resolved");
+        assert!(ready.sendable);
+        assert_ne!(ready.digest, old_digest);
+        value.recipient_query = "x".repeat(257);
+        assert!(validate_draft(&value).is_err());
     }
 }

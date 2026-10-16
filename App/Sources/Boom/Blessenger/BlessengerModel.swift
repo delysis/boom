@@ -142,7 +142,15 @@ import Foundation
   }
   func editGroupName(_ name: String) {
     guard !navigating, state.selectedChat == nil else { return }
-    draft.groupName = name.isEmpty ? nil : name; draft.version = UUID(); scheduleDraftSave()
+    var next = draft; next.groupName = name.isEmpty ? nil : name; next.version = UUID()
+    do { _ = try BlessengerPolicy.validate(next); draft = next; scheduleDraftSave() }
+    catch { report(error) }
+  }
+  func editRecipientQuery(_ query: String) {
+    guard !closed, !navigating, state.selectedChat == nil, query != draft.recipientQuery else { return }
+    var next = draft; next.recipientQuery = query; next.version = UUID()
+    do { _ = try BlessengerPolicy.validate(next); draft = next; scheduleDraftSave() }
+    catch { report(error) }
   }
   private func scheduleDraftSave() {
     // One debouncer and one coalesced current value, not a task per keystroke.
@@ -185,7 +193,7 @@ import Foundation
     do {
       var next = draft
       if !next.recipients.contains(where: { $0.id == contact.id }) { next.recipients.append(contact) }
-      next.version = UUID(); _ = try BlessengerPolicy.validate(next)
+      next.recipientQuery = ""; next.version = UUID(); _ = try BlessengerPolicy.validate(next)
       draft = next; scheduleDraftSave()
     } catch { report(error) }
   }
@@ -224,9 +232,14 @@ import Foundation
     loading = true; defer { loading = false; endAction() }
     do {
       try await flushDraft()
-      _ = try await model(for: path.path)
       let chatID = state.selectedChat
-      let next = try await store.blessengerTransaction { _, product in
+      let priorProfile = chatID.flatMap { product.addresses[$0]?.profile } ?? product.defaultProfile
+      _ = try await model(for: path.path)
+      let next = try await store.blessengerTransaction { state, product in
+        guard state.selectedChat == chatID,
+          (chatID.flatMap { product.addresses[$0]?.profile } ?? product.defaultProfile) == priorProfile else {
+          throw BoomError.stale("The model destination changed during preparation.")
+        }
         if let chatID, var address = product.addresses[chatID] {
           address.profile.modelPath = path.path; address.profile.id = UUID(); product.addresses[chatID] = address
         } else { product.defaultProfile.modelPath = path.path; product.defaultProfile.id = UUID() }
@@ -272,25 +285,48 @@ import Foundation
     let contacts = try BlessengerPolicy.resolve(host: history?.id, draft: routed, state: snapshot, frozen: history != nil)
     let voices: [Voice?] = contacts.isEmpty ? [nil] : try contacts.map { try BlessengerPolicy.capturedVoice($0, state: snapshot) }
     let runner = try await model(for: profile.modelPath); try flag.check()
+    let useMTP = profile.useMTP ?? (caller != nil)
+    if useMTP { _ = try await runner.prepareMTP(); try flag.check() }
+    let shouldSpeak = (caller != nil || snapshot.blessenger!.readReplies) && voices.count == 1
+    var speechVoice: BlessengerSpeechVoice?
+    if shouldSpeak {
+      audio.stop(); try await audio.join()
+      let selectedVoice = contacts.first.flatMap { snapshot.blessenger!.speechVoices[$0.id] } ?? snapshot.blessenger!.defaultSpeech
+      speechVoice = try await audio.prepare(selectedVoice); try flag.check()
+    }
     let media = try await BlessengerMedia.prepare(captured.attachments, state: snapshot, store: store, runner: runner, flag: flag)
+    let projectedHistory = BlessengerMedia.deliveredHistory(history?.messages ?? [], product: snapshot.blessenger!)
+    let historical = try await BlessengerMedia.history(projectedHistory, state: snapshot, store: store, runner: runner, flag: flag)
+    let payloads = (historical.prepared.payloads + media.payloads).reduce(into: [WritingMediaData]()) { values, item in
+      if !values.contains(where: { $0.reference.id == item.reference.id }) { values.append(item) }
+    }
+    let sourceRefs = (historical.prepared.sources + media.sources).reduce(into: [SourceReference]()) { values, item in
+      if !values.contains(item) { values.append(item) }
+    }
     let chatID = history?.id ?? UUID()
-    let fitted = try await runner.fittedRound(voices: voices, history: history?.messages ?? [],
+    let fitted = try await runner.fittedRound(voices: voices, history: projectedHistory,
       instructions: history?.instructions ?? "", context: media.context, request: captured.text,
-      routing: contacts.map(\.handle), images: [], media: media.payloads,
+      routing: contacts.map(\.handle), images: [], media: payloads,
       reserves: voices.map { _ in profile.maximumTokens }, flag: flag,
       cacheOwner: PromptCacheOwner(namespace: namespace, entity: chatID, route: .consultation),
-      promptContract: .referenceHistoryV2, capturedSources: media.sources)
+      promptContract: .referenceHistoryV2, capturedSources: sourceRefs,
+      historyMedia: historical.occurrences, currentMedia: media.payloads.map { $0.reference.id })
     try flag.check()
+    let admittedIDs = Set(fitted.plans.flatMap { $0.placedMediaIDs })
+    let admittedPayloads = payloads.filter { admittedIDs.contains($0.reference.id) }
+    let retainedHistoryIDs = Set(fitted.history.flatMap { ($0.directAttachments ?? []) + $0.sources.filter { $0.kind == "attachment" }.map(\.id) })
+    let admittedSources = sourceRefs.filter { captured.attachments.contains($0.id) || retainedHistoryIDs.contains($0.id) }
     let ids = voices.map { _ in UUID() }
     let receipts = fitted.plans.enumerated().map { index, plan in
       ConsultationReceipt(operationID: flag.operationID, seed: UInt64.random(in: .min ... .max), state: .pending,
-        model: runner.identity, voice: voices[index], plan: plan, sources: media.sources,
+        model: runner.identity, voice: voices[index], plan: plan, sources: admittedSources,
         promptDigest: Digest.sha256(plan.rawPrompt), tokenIDs: [], stopReason: "pending", elapsedSeconds: 0,
-        generationPolicy: runner.generationPolicy, attemptID: UUID(), responseID: ids[index], media: media.payloads.map(\.reference))
+        generationPolicy: runner.generationPolicy, attemptID: UUID(), responseID: ids[index], media: admittedPayloads.map(\.reference))
     }
     let turn = BlessengerPreparedTurn(chatID: chatID, draft: captured, history: history, contacts: contacts,
-      profile: profile, sourceDigests: media.sources, context: media.context, responseIDs: ids,
-      receipts: receipts, voices: voices, outputLimit: profile.maximumTokens, caller: caller)
+      profile: profile, sourceDigests: admittedSources, context: media.context, responseIDs: ids,
+      receipts: receipts, voices: voices, outputLimit: profile.maximumTokens, caller: caller, speech: speechVoice)
+    try flag.check()
     let next = try await store.blessengerAdmit(turn); accept(next)
     if caller == nil, state.selectedChat == chatID, capturedSelection == history?.id,
       draft.id == captured.id, draft.version == captured.version {
@@ -303,8 +339,6 @@ import Foundation
     }
     active.insert(chatID); preparing = false; admitting = nil
     defer { active.remove(chatID) }
-    let shouldSpeak = (caller != nil || product.readReplies) && voices.count == 1
-    if shouldSpeak { audio.stop(); try await audio.join() }
     // Separate answers have the same captured history, not earlier peers' output.
     // Native admission may cohort compatible text rows; each keeps its own flag.
     await withTaskGroup(of: Void.self) { group in
@@ -312,8 +346,8 @@ import Foundation
         let child = CancellationFlag(); childFlags[ids[index]] = child
         let registration = flag.onCancel { child.cancel() }
         group.addTask { [weak self] in
-          await self?.runResponse(receipts[index], id: ids[index], chatID: chatID, media: media.payloads,
-            runner: runner, profile: profile, flag: child, speak: shouldSpeak)
+          await self?.runResponse(receipts[index], id: ids[index], chatID: chatID, media: admittedPayloads,
+            runner: runner, profile: profile, flag: child, voice: speechVoice, useMTP: useMTP)
           flag.removeCancellationHandler(registration)
         }
       }
@@ -321,29 +355,46 @@ import Foundation
     }
   }
   private func runResponse(_ input: ConsultationReceipt, id: UUID, chatID: UUID, media: [WritingMediaData],
-    runner: MLXGemmaRunner, profile: BlessengerProfile, flag: CancellationFlag, speak: Bool) async {
+    runner: MLXGemmaRunner, profile: BlessengerProfile, flag: CancellationFlag, voice: BlessengerSpeechVoice?, useMTP: Bool) async {
     var receipt = input
     let identity = GenerationIdentity(kind: .consultation, operationID: input.operationID, recordID: id,
       attemptID: input.attemptID!, model: input.model, seed: input.seed,
       requestDigest: Digest.sha256(input.plan.rawPrompt), maxTokens: profile.maximumTokens, generationPolicy: input.generationPolicy)
     let (updates, continuation) = AsyncStream<String>.makeStream(bufferingPolicy: .bufferingNewest(1))
-    let voice = input.voice.flatMap { product.speechVoices[$0.id] } ?? product.defaultSpeech
+    var audioFailure: String?
+    let trace = BlessengerTrace(operation: input.attemptID!)
+    if let voice {
+      do { try audio.begin(id, voice: voice, attempt: input.attemptID!, seed: input.seed, cancellation: flag, trace: trace) }
+      catch { audioFailure = error.localizedDescription; flag.cancel() }
+    }
     let output = Task { [weak self] in
       for await text in updates {
         guard let self, !flag.isCancelled else { continue }
         self.liveText[id] = text
-        if speak { do { try self.audio.append(text, responseID: id, voice: voice) } catch { self.report(error) } }
+        if let voice {
+          do { try self.audio.append(text, responseID: id, voice: voice) }
+          catch { audioFailure = error.localizedDescription; flag.cancel(); self.report(error) }
+        }
       }
     }
     var text = ""
     do {
       let store = store
-      let result = try await runner.run(plan: input.plan, images: [], media: media,
-        maxTokens: profile.maximumTokens, seed: input.seed, settings: ProductCore.sampling(profile.sampling), flag: flag,
-        cacheOwner: PromptCacheOwner(namespace: namespace, entity: chatID, route: .consultation),
-        onCheckpoint: { progress, stop, token in
-          try await store.checkpoint(progress, identity: identity, stopReason: stop, stopTokenID: token)
-        }, onText: { continuation.yield($0) })
+      let checkpoint: @Sendable (GenerationProgress, String?, Int?) async throws -> Void = { progress, stop, token in
+        try await store.checkpoint(progress, identity: identity, stopReason: stop, stopTokenID: token)
+      }
+      let result: MLXGemmaRunner.Output
+      if useMTP {
+        result = try await runner.runMTP(plan: input.plan, media: media, maxTokens: profile.maximumTokens,
+          seed: input.seed, settings: ProductCore.sampling(profile.sampling), flag: flag,
+          onCheckpoint: checkpoint, onText: { continuation.yield($0) })
+      } else {
+        result = try await runner.run(plan: input.plan, images: [], media: media,
+          maxTokens: profile.maximumTokens, seed: input.seed, settings: ProductCore.sampling(profile.sampling), flag: flag,
+          cacheOwner: PromptCacheOwner(namespace: namespace, entity: chatID, route: .consultation),
+          onCheckpoint: checkpoint, onText: { continuation.yield($0) })
+      }
+      receipt.mtp = result.mtp
       text = result.text; receipt.promptDigest = result.promptDigest; receipt.tokenIDs = result.tokenIDs
       receipt.stopReason = result.stopReason; receipt.stopTokenID = result.stopTokenID
       receipt.firstTokenSeconds = result.firstTokenSeconds; receipt.elapsedSeconds = result.elapsedSeconds
@@ -356,10 +407,30 @@ import Foundation
       receipt.stopReason = receipt.state == .cancelled ? "cancelled" : "failed"; receipt.failure = error.localizedDescription
     }
     continuation.finish(); await output.value
-    if receipt.state == .complete, speak {
-      do { try audio.append(text, responseID: id, voice: voice, finished: true) } catch { report(error) }
-    } else if speak { audio.stop(responseID: id) }
-    do { accept(try await store.blessengerFinish(receipt, messageID: id, text: text)) } catch { report(error) }
+    var delivery: BlessengerSpeechResult?
+    if let voice {
+      if receipt.state == .complete {
+        do { try audio.append(text, responseID: id, voice: voice, finished: true) }
+        catch { audioFailure = error.localizedDescription; audio.stop(responseID: id) }
+      } else { audio.stop(responseID: id) }
+      do { delivery = try await audio.result(for: id, attempt: input.attemptID!) }
+      catch { if audioFailure == nil { audioFailure = error.localizedDescription } }
+      if let failure = delivery?.failure ?? audioFailure {
+        receipt.state = .failed; receipt.failure = failure; receipt.stopReason = "speech_failed"
+      } else if delivery?.interrupted == true || flag.isCancelled {
+        receipt.state = .cancelled; receipt.failure = "Speech was interrupted."; receipt.stopReason = "interrupted"
+      } else if delivery?.samples.isEmpty != false {
+        receipt.state = .failed; receipt.failure = "No playable speech was produced."; receipt.stopReason = "speech_empty"
+      }
+    }
+    do { accept(try await store.blessengerFinish(receipt, messageID: id, text: text, speech: delivery)) }
+    catch {
+      // A source revocation prohibits success; it must not leave a pending row.
+      // Persistence uncertainty still fails closed in the store transaction.
+      receipt.state = .failed; receipt.failure = error.localizedDescription; receipt.stopReason = "publication_failed"
+      do { accept(try await store.blessengerFinish(receipt, messageID: id, text: text)) }
+      catch { report(error) }
+    }
     liveText.removeValue(forKey: id); childFlags.removeValue(forKey: id)
   }
   func stop(_ messageID: UUID? = nil) {
@@ -370,12 +441,22 @@ import Foundation
     }
   }
   func readAloud(_ message: ChatMessage) {
-    guard message.state != .pending, !message.text.isEmpty else { return }
-    do {
-      audio.stop()
-      let voice = message.speaker?.voiceID.flatMap { product.speechVoices[$0] } ?? product.defaultSpeech
-      try audio.append(message.text, responseID: message.id, voice: voice, finished: true)
-    } catch { report(error) }
+    guard message.state != .pending, !message.text.isEmpty, !isCalling, !callStarting else { return }
+    let sourceDigest = Digest.sha256(message.text), id = message.id
+    let voice = message.speaker?.voiceID.flatMap { product.speechVoices[$0] } ?? product.defaultSpeech
+    launch {
+      self.audio.stop(); try await self.audio.join()
+      let selected = try await self.audio.prepare(voice)
+      guard self.state.chats.contains(where: { $0.messages.contains(where: { $0.id == id && Digest.sha256($0.text) == sourceDigest }) }) else {
+        throw BoomError.stale("The selected message changed before playback.")
+      }
+      let flag = CancellationFlag(), attempt = UUID()
+      try self.audio.begin(id, voice: selected, attempt: attempt, seed: UInt64.random(in: .min ... .max), cancellation: flag)
+      do { try self.audio.append(message.text, responseID: id, voice: selected, finished: true) }
+      catch { self.audio.stop(responseID: id); try await self.audio.join(); _ = try? await self.audio.result(for: id, attempt: attempt); throw error }
+      let result = try await self.audio.result(for: id, attempt: attempt)
+      if let failure = result.failure { throw BoomError.unavailable(failure) }
+    }
   }
   var canCall: Bool {
     !closed && !closing && !navigating && !preparing && !loading && !callStarting && !isCalling

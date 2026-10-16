@@ -10,6 +10,31 @@ enum BlessengerMedia {
     let sources: [SourceReference]
     let payloads: [WritingMediaData]
   }
+  static func deliveredHistory(_ messages: [ChatMessage], product: BlessengerState) -> [ChatMessage] {
+    messages.compactMap { message in
+      if let audio = product.audio[message.id], product.callResponses?.contains(message.id) == true,
+        audio.interrupted || message.state != .complete {
+        var projected = message
+        projected.text = (audio.deliveredText ?? "") + "\n[This spoken response was interrupted. The remaining generated text was not delivered.]"
+        projected.state = .complete; return projected
+      }
+      return message.state == .complete ? message : nil
+    }
+  }
+  struct History: Sendable { let prepared: Prepared; let occurrences: [UUID: [UUID]] }
+  static func history(_ messages: [ChatMessage], state: WorkspaceState, store: WorkspaceStore,
+    runner: MLXGemmaRunner, flag: CancellationFlag) async throws -> History {
+    var ids: [UUID] = [], occurrences: [UUID: [UUID]] = [:]
+    for message in messages where message.role == .user {
+      let attachments = (message.directAttachments ?? []).filter { id in
+        state.attachments.first(where: { $0.id == id }).map { [.audio, .image, .video].contains($0.kind) } ?? false
+      }
+      for id in attachments where !ids.contains(id) { ids.append(id) }
+      occurrences[message.id] = attachments
+    }
+    guard ids.count <= 32 else { throw BoomError.budget("The selected history has more than 32 retained media sources; choose a shorter branch.") }
+    return History(prepared: try await prepare(ids, state: state, store: store, runner: runner, flag: flag), occurrences: occurrences)
+  }
   static func prepare(_ ids: [UUID], state: WorkspaceState, store: WorkspaceStore,
     runner: MLXGemmaRunner, flag: CancellationFlag) async throws -> Prepared {
     var context: [String] = [], sources: [SourceReference] = [], payloads: [WritingMediaData] = []

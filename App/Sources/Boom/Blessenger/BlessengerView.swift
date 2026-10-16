@@ -5,7 +5,6 @@ import SwiftUI
 struct BlessengerView: View {
   @ObservedObject var model: BlessengerModel
   @ObservedObject private var audio: BlessengerAudioOutput
-  @State private var toQuery = ""
   @State private var instructions = ""
   @State private var renameID: UUID?
   @State private var renameText = ""
@@ -141,9 +140,9 @@ struct BlessengerView: View {
               .buttonStyle(.plain).accessibilityLabel("Remove \(contact.name)")
           }.padding(.horizontal, 7).padding(.vertical, 4).background(.quaternary).clipShape(Capsule())
         }
-        BlessengerToField(query: $toQuery, contacts: model.state.voices.map { BlessengerContact($0) },
+        BlessengerToField(query: Binding(get: { model.draft.recipientQuery }, set: model.editRecipientQuery), contacts: model.state.voices.map { BlessengerContact($0) },
           focus: model.recipientFocus) { contact in
-          toQuery = ""; Task { await model.addContact(contact) }
+          Task { await model.addContact(contact) }
         }.frame(minWidth: 70, height: 26)
       }
       if model.draft.recipients.count > 1 {
@@ -210,13 +209,13 @@ struct BlessengerView: View {
         .buttonStyle(GlassControl()).accessibilityLabel("Add attachment")
       ChatComposer(text: Binding(get: { model.draft.text }, set: model.editText), enabled: !model.navigating,
         placeholder: "Message", focusID: model.composerFocus, minHeight: 28, maxHeight: 180,
-        onSubmit: { if toQuery.isEmpty { model.send() } }, onAttachments: { inputs in Task { await model.importInputs(inputs) } },
+        onSubmit: { if model.draft.recipientQuery.isEmpty { model.send() } }, onAttachments: { inputs in Task { await model.importInputs(inputs) } },
         onIssue: { model.report(BoomError.invalid($0)) }, sendsOnReturn: true, maximumUTF8Bytes: 2_097_152)
         .padding(.horizontal, 8).padding(.vertical, 5)
         .background(Color(nsColor: .controlBackgroundColor)).clipShape(RoundedRectangle(cornerRadius: 18))
       Button {
         if model.preparing || model.state.selectedChat.map({ model.active.contains($0) }) == true { model.stop() }
-        else if toQuery.isEmpty { model.send() }
+        else if model.draft.recipientQuery.isEmpty { model.send() }
       } label: { Image(systemName: model.preparing || model.state.selectedChat.map({ model.active.contains($0) }) == true ? "stop.fill" : "arrow.up") }
         .buttonStyle(GlassControl())
         .disabled(!model.canSend && !model.preparing && model.state.selectedChat.map({ model.active.contains($0) }) != true)

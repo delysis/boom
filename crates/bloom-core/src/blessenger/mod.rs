@@ -1,6 +1,7 @@
 //! Blessenger's authority-free product rules. Native code owns storage, models,
 //! clocks and devices; these values never acquire file or microphone authority.
 mod addressing;
+mod assets;
 mod speech;
 mod turn;
 
@@ -15,6 +16,9 @@ pub use turn::{CallEvent, CallGate, CallTransition, TurnDecision, advance_call};
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    AssetRequirements {
+        package: assets::AssetPackage,
+    },
     ValidateDraft {
         draft: Draft,
     },
@@ -44,6 +48,7 @@ fn value<T: Serialize>(value: T) -> Result<Value, Error> {
 
 pub fn execute(request: Request) -> Result<Value, Error> {
     match request {
+        Request::AssetRequirements { package } => value(assets::requirements(&package)?),
         Request::ValidateDraft { draft } => value(validate_draft(&draft)?),
         Request::Resolve {
             host,

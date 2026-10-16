@@ -6,8 +6,8 @@ use unicode_segmentation::UnicodeSegmentation;
 const MAX_TEXT: usize = 65_536;
 const MAX_FRAGMENT: usize = 2048;
 
-/// Only the committed projection prefix is remembered. The native message owns
-/// the text. A different token-delta partition cannot change spoken words.
+/// A cursor into the stable spoken projection, never the mutable transport
+/// delta. Only a verified prefix may be scheduled. Finalization is idempotent.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SpeechCursor {
@@ -30,9 +30,102 @@ pub struct SpeechEmission {
     pub fragments: Vec<Fragment>,
 }
 
-/// Reading is a projection of visible Markdown, never a network fetch or a
-/// second generated answer. Raw HTML is inert; markup and destination URLs are
-/// not pronounced. Explicit code text remains text, not executable authority.
+/// Markdown is not prefix-monotone: closing `**`, a link destination or an
+/// entity can change earlier rendered text. Hold the unfinished construct,
+/// rather than pronouncing punctuation then retracting it. This is deliberately
+/// conservative for unusual Markdown; ordinary prose streams without delay.
+/// Reference-style links remain provisional until finalization because a later
+/// definition may resolve them. No resource is fetched by this projection.
+fn stable_source_end(text: &str, finished: bool) -> usize {
+    if finished {
+        return text.len();
+    }
+    let mut open: Vec<(char, usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        let ch = text[i..].chars().next().expect("UTF-8 boundary");
+        if ch == '\\' {
+            let after = i + ch.len_utf8();
+            let Some(escaped) = text[after..].chars().next() else {
+                return open.first().map_or(i, |v| v.2);
+            };
+            i = after + escaped.len_utf8();
+            continue;
+        }
+        if ch == '`' {
+            let width = text[i..].bytes().take_while(|c| *c == b'`').count();
+            if open.last().is_some_and(|v| v.0 == '`' && v.1 == width) {
+                open.pop();
+            } else if open.last().is_none_or(|v| v.0 != '`') {
+                open.push((ch, width, i));
+            }
+            i += width;
+            continue;
+        }
+        if open.last().is_some_and(|v| v.0 == '`') {
+            i += ch.len_utf8();
+            continue;
+        }
+        if ch == '[' || (ch == '!' && text[i..].starts_with("![")) {
+            let begin = i;
+            let label = i + if ch == '!' { 2 } else { 1 };
+            // An incomplete or reference link can reinterpret its entire label.
+            let Some(close) = text[label..].find("](").map(|v| v + label) else {
+                return open.first().map_or(begin, |v| v.2);
+            };
+            let mut depth = 1;
+            let mut end = close + 2;
+            while end < text.len() && depth > 0 {
+                let c = text[end..].chars().next().expect("UTF-8 boundary");
+                if c == '(' {
+                    depth += 1;
+                } else if c == ')' {
+                    depth -= 1;
+                }
+                end += c.len_utf8();
+            }
+            if depth != 0 {
+                return open.first().map_or(begin, |v| v.2);
+            }
+            i = end;
+            continue;
+        }
+        if ch == '<' || ch == '&' {
+            let terminal = if ch == '<' { '>' } else { ';' };
+            if let Some(end) = text[i..].find(terminal) {
+                i += end + 1;
+                continue;
+            }
+            // A literal comparison/ampersand followed by whitespace is already
+            // unambiguous; a possibly incomplete tag/entity is not.
+            if !text[i..].chars().any(char::is_whitespace) {
+                return open.first().map_or(i, |v| v.2);
+            }
+        }
+        if ch == '*' || ch == '_' || ch == '~' {
+            let width = text[i..].chars().take_while(|c| *c == ch).count();
+            let before = text[..i].chars().next_back();
+            let after = text[i + width..].chars().next();
+            let intraword = ch == '_'
+                && before.is_some_and(char::is_alphanumeric)
+                && after.is_some_and(char::is_alphanumeric);
+            if !intraword {
+                if before.is_some_and(|c| !c.is_whitespace())
+                    && open.last().is_some_and(|v| v.0 == ch && v.1 == width)
+                {
+                    open.pop();
+                } else if after.is_none_or(|c| !c.is_whitespace()) {
+                    open.push((ch, width, i));
+                }
+            }
+            i += width;
+            continue;
+        }
+        i += ch.len_utf8();
+    }
+    open.first().map_or(text.len(), |v| v.2)
+}
+
 fn projection(text: &str) -> String {
     let mut result = String::new();
     let mut image_depth = 0_u32;
@@ -41,30 +134,18 @@ fn projection(text: &str) -> String {
             Event::Start(Tag::Image { .. }) => image_depth += 1,
             Event::End(TagEnd::Image) => image_depth = image_depth.saturating_sub(1),
             Event::Text(value) | Event::Code(value) if image_depth == 0 => result.push_str(&value),
-            Event::SoftBreak | Event::HardBreak | Event::Rule => result.push('\n'),
+            Event::SoftBreak | Event::HardBreak | Event::Rule => result.push(' '),
             Event::End(
                 TagEnd::Paragraph
                 | TagEnd::Heading(_)
                 | TagEnd::Item
                 | TagEnd::CodeBlock
                 | TagEnd::TableRow,
-            ) => {
-                if !result.ends_with('\n') {
-                    result.push('\n');
-                }
-            }
+            ) => result.push(' '),
             _ => {}
         }
     }
-    // Paragraph-ending whitespace supplied by the parser is provisional. Use
-    // one stable separator, and expose a trailing separator only when actual
-    // source whitespace completes the last word. "four " and "four five"
-    // consequently share exactly the same already committed prefix.
-    let mut stable = result.split_whitespace().collect::<Vec<_>>().join(" ");
-    if !stable.is_empty() && text.chars().last().is_some_and(char::is_whitespace) {
-        stable.push(' ');
-    }
-    stable
+    result.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 pub fn speech_fragments(
@@ -76,7 +157,9 @@ pub fn speech_fragments(
         source.len() <= MAX_TEXT && cursor.bytes <= MAX_TEXT && cursor.next <= 512,
         "The speech text exceeds its bounded response.",
     )?;
-    let text = projection(source);
+    let stable_end = stable_source_end(source, finished);
+    let stable_source = &source[..stable_end];
+    let text = projection(stable_source);
     require(
         cursor.bytes <= text.len() && text.is_char_boundary(cursor.bytes),
         "The speech prefix changed.",
@@ -96,67 +179,65 @@ pub fn speech_fragments(
             fragments: vec![],
         });
     }
+    let ended_word = finished
+        || stable_source
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace);
     let mut fragments = Vec::new();
     loop {
         let tail = &text[cursor.bytes..];
-        if tail.is_empty() {
+        if tail.trim().is_empty() {
             break;
         }
         let target = if cursor.next == 0 { 4 } else { 16 };
         let mut words = 0;
         let mut cut = None;
-        for (start, word) in tail.unicode_word_indices() {
-            let end = start + word.len();
-            let next = tail[end..].chars().next();
-            // Apostrophes and hyphens can continue an unfinished word. A plain
-            // boundary at the current end is not complete until finalization.
-            let complete =
-                finished || next.is_some_and(|c| c.is_whitespace() || ",.!?;:)]}\"”»".contains(c));
+        let mut last_boundary = 0;
+        // Whitespace-delimited lexical groups retain decimals, contractions,
+        // abbreviations and punctuation with the word that owns them. A comma
+        // arriving alone cannot prematurely split a future numeric token.
+        let mut start = 0;
+        for group in tail.split_inclusive(char::is_whitespace) {
+            let content = group.trim();
+            let end = start + group.trim_end().len();
+            let complete = group.chars().next_back().is_some_and(char::is_whitespace) || ended_word;
             if !complete {
                 break;
             }
-            words += 1;
-            let mut boundary = end;
-            for (offset, c) in tail[end..].char_indices() {
-                if c.is_whitespace() || ",.!?;:)]}\"”»".contains(c) {
-                    boundary = end + offset + c.len_utf8();
-                } else {
+            if !content.is_empty() {
+                words += content.unicode_words().count();
+                if end > MAX_FRAGMENT {
+                    break;
+                }
+                last_boundary = end;
+                let sentence = content.ends_with(['.', '!', '?', ';', '。', '！', '？']);
+                if words >= target || (cursor.next > 0 && words >= 4 && sentence) {
+                    cut = Some(end);
                     break;
                 }
             }
-            let sentence = tail[end..boundary].chars().any(|c| ".!?;\n".contains(c));
-            if (words >= target || (cursor.next > 0 && sentence)) && boundary <= MAX_FRAGMENT {
-                cut = Some(boundary);
-                break;
-            }
-            if boundary > MAX_FRAGMENT {
-                break;
-            }
+            start += group.len();
         }
         if cut.is_none() && finished && tail.len() <= MAX_FRAGMENT {
             cut = Some(tail.len());
         }
         if cut.is_none() && tail.len() > MAX_FRAGMENT {
-            // A pathological unbroken word has no safe early speech boundary.
-            // Refuse it rather than drop bytes or build an unbounded TTS input.
-            let boundary = tail[..tail.floor_char_boundary(MAX_FRAGMENT)]
-                .char_indices()
-                .filter(|(_, c)| c.is_whitespace())
-                .map(|(i, c)| i + c.len_utf8())
-                .next_back();
-            cut = boundary.filter(|end| *end > 0);
             require(
-                cut.is_some(),
+                last_boundary > 0,
                 "One speech fragment exceeds 2048 bytes without a word boundary.",
             )?;
+            cut = Some(last_boundary);
         }
-        let Some(count) = cut else { break };
+        let Some(count) = cut else {
+            break;
+        };
         require(
-            cursor.next < 512,
-            "The response exceeds 512 speech fragments.",
+            count > 0 && cursor.next < 512,
+            "The response exceeds its speech fragment bound.",
         )?;
         let end = cursor.bytes + count;
-        let fragment = text[cursor.bytes..end].trim().to_string();
+        let fragment = text[cursor.bytes..end].trim().to_owned();
         if !fragment.is_empty() {
             fragments.push(Fragment {
                 ordinal: cursor.next,
@@ -166,6 +247,8 @@ pub fn speech_fragments(
             });
             cursor.next += 1;
         }
+        // Do not own a provisional trailing separator: closing Markdown can
+        // remove it. The following fragment consumes its own leading spacing.
         cursor.bytes = end;
     }
     if cursor.bytes > 0 {
@@ -252,5 +335,64 @@ mod tests {
         };
         assert!(speech_fragments(cursor, "é", true).is_err());
         assert!(speech_fragments(SpeechCursor::default(), &"x".repeat(2049), true).is_err());
+    }
+    #[test]
+    fn streamed_markdown_is_stable_at_every_unicode_boundary() {
+        for text in [
+            "**One two three four** five six seven eight.",
+            "One two three four **five six** seven eight nine.",
+            "One two three four [five six](https://example.invalid/a_(b)) seven eight.",
+            "One two three four &amp; five six seven eight.",
+            "One two three four `five six` seven eight.",
+            "One two three four café 🪷 naïve résumé.",
+            "One two three 4.25 milligrams, never 4. 25.",
+            "One two three four ![not speech](https://example.invalid/a) five six.",
+            "One two three four **five six seven eight ** nine**.",
+        ] {
+            let expected = projection(text);
+            for stride in 1..=8 {
+                let mut cursor = SpeechCursor::default();
+                let mut spoken = Vec::new();
+                let boundaries: Vec<_> =
+                    text.char_indices().map(|(i, c)| i + c.len_utf8()).collect();
+                for (i, end) in boundaries.iter().enumerate() {
+                    if (i + 1) % stride != 0 && *end != text.len() {
+                        continue;
+                    }
+                    let value =
+                        speech_fragments(cursor, &text[..*end], *end == text.len()).expect(text);
+                    spoken.extend(value.fragments.into_iter().map(|f| f.text));
+                    cursor = value.cursor;
+                }
+                assert_eq!(spoken.join(" "), expected, "partition {stride}: {text}");
+                assert!(cursor.finished);
+            }
+        }
+    }
+    #[test]
+    fn punctuation_does_not_complete_a_provisional_numeric_word() {
+        let first =
+            speech_fragments(SpeechCursor::default(), "One two three 4.", false).expect("partial");
+        assert!(first.fragments.is_empty());
+        let next =
+            speech_fragments(first.cursor, "One two three 4.25 ", false).expect("complete number");
+        assert_eq!(next.fragments[0].text, "One two three 4.25");
+    }
+    #[test]
+    fn a_later_reference_definition_cannot_rewrite_spoken_text() {
+        let first = speech_fragments(
+            SpeechCursor::default(),
+            "One two three four [five six][ref] ",
+            false,
+        )
+        .expect("provisional");
+        assert_eq!(first.fragments.len(), 1);
+        let next = speech_fragments(
+            first.cursor,
+            "One two three four [five six][ref]\n\n[ref]: https://example.invalid",
+            true,
+        )
+        .expect("resolved");
+        assert_eq!(next.fragments[0].text, "five six");
     }
 }

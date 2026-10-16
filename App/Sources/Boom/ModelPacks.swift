@@ -54,6 +54,23 @@ private struct ModelCatalog: Codable {
   let publishedCheckpoints: [PublishedCheckpoint]
 }
 
+/// A reservation belongs to loaded weights, not a screen or a requested model.
+/// Releases never credit process/RSS memory; actual footprint is still measured
+/// by every load and generation. The lock also covers overlapping preparations.
+final class ModelWeightLease: @unchecked Sendable {
+  private static let lock = NSLock()
+  private static var reserved: UInt64 = 0
+  let bytes: UInt64
+  init(bytes: UInt64) throws {
+    Self.lock.lock(); defer { Self.lock.unlock() }
+    try ModelResidency.admit(weightBytes: bytes, residentWeights: Self.reserved)
+    let total = Self.reserved.addingReportingOverflow(bytes)
+    guard !total.overflow else { throw BoomError.budget("Model weight reservation overflow.") }
+    self.bytes = bytes; Self.reserved = total.partialValue
+  }
+  deinit { Self.lock.lock(); Self.reserved -= bytes; Self.lock.unlock() }
+}
+
 enum ModelResidency {
   static func memoryAccounting() -> (current: UInt64, peak: UInt64) {
     var info = task_vm_info_data_t()
@@ -184,7 +201,7 @@ enum ModelPacks {
       }
     }
   }
-  private static func publicFileTarget(_ directory: URL, path: String) throws -> URL {
+  static func publicFileTarget(_ directory: URL, path: String) throws -> URL {
     let info = try directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
     guard info.isDirectory == true, info.isSymbolicLink != true else { throw BoomError.invalid("The model snapshot is not a real directory.") }
     let root = directory.resolvingSymlinksInPath()
@@ -199,7 +216,7 @@ enum ModelPacks {
   private static func publicConfiguration(_ directory: URL) throws -> (sha256: String, bytes: Int64) {
     try ModelInstaller.hashFile(publicFileTarget(directory, path: "config.json"), maxBytes: 4_194_304)
   }
-  private static func verifyPublicFiles(_ directory: URL, files: [ModelFile]) throws {
+  static func verifyPublicFiles(_ directory: URL, files: [ModelFile]) throws {
     for file in files {
       let target = try publicFileTarget(directory, path: file.path)
       let value = try ModelInstaller.hashFile(target, maxBytes: file.bytes)
@@ -399,27 +416,35 @@ enum ModelPacks {
   static func installPublished(_ specification: PublishedCheckpoint, flag: CancellationFlag,
     progress: @escaping @Sendable (String) -> Void,
     onStoredRange: @escaping @Sendable (String, UInt64) throws -> Void = { _, _ in }) async throws -> URL {
-    let purpose = specification.purpose
     if let cached = cachedSnapshot(specification, hubs: HuggingFaceCache.hubs) {
       _ = try await detachedWork { try verifyPublished(cached, checkpoint: specification) }
       return cached
     }
-    let requirements = try ProductCore.checkpointRequirements(specification)
-    let target = snapshot(repository: specification.repository, revision: specification.revision, hub: HuggingFaceCache.hub)
+    return try await installFiles(repository: specification.repository, revision: specification.revision,
+      files: specification.files, requirements: ProductCore.checkpointRequirements(specification),
+      label: specification.purpose.title, flag: flag, progress: progress, onStoredRange: onStoredRange)
+  }
+  /// Shared physical installer for reviewed immutable manifests. Admission is
+  /// performed by the caller's typed Rust package contract, never by presence.
+  static func installFiles(repository: String, revision: String, files: [ModelFile],
+    requirements: CheckpointRequirements, label: String, flag: CancellationFlag,
+    progress: @escaping @Sendable (String) -> Void,
+    onStoredRange: @escaping @Sendable (String, UInt64) throws -> Void = { _, _ in }) async throws -> URL {
+    let target = snapshot(repository: repository, revision: revision, hub: HuggingFaceCache.hub)
     let root = target.deletingLastPathComponent()
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-    let lease = try ModelInstallLease(root: root, identity: specification.revision)
+    let lease = try ModelInstallLease(root: root, identity: revision)
     defer { lease.release() }
     if FileManager.default.fileExists(atPath: target.path) {
-      _ = try await detachedWork { try verifyPublished(target, checkpoint: specification) }
+      _ = try await detachedWork { try verifyPublicFiles(target, files: files) }
       return target
     }
-    let stage = root.appendingPathComponent(".bloom-download-" + specification.revision)
+    let stage = root.appendingPathComponent(".bloom-download-" + revision)
     try FileManager.default.createDirectory(at: stage, withIntermediateDirectories: true)
     let resources = try stage.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey, .volumeAvailableCapacityForImportantUsageKey])
     guard resources.isDirectory == true, resources.isSymbolicLink != true else { throw BoomError.invalid("Unsafe model download directory.") }
     var stagedBytes: UInt64 = 0
-    for file in specification.files {
+    for file in files {
       guard !(FileManager.default.fileExists(atPath: stage.appendingPathComponent(file.path).path)
         && FileManager.default.fileExists(atPath: stage.appendingPathComponent(file.path + ".partial").path)) else {
         throw BoomError.invalid("The model has conflicting staged files. They were retained.")
@@ -436,9 +461,10 @@ enum ModelPacks {
     if let available = resources.volumeAvailableCapacityForImportantUsage, UInt64(max(0, available)) < needed {
       throw BoomError.budget("The model needs " + ByteCountFormatter.string(fromByteCount: Int64(needed), countStyle: .file) + " of free disk space.")
     }
-    for file in specification.files {
+    for file in files {
       try flag.check()
       let destination = stage.appendingPathComponent(file.path)
+      try createModelParents(stage, path: file.path)
       if FileManager.default.fileExists(atPath: destination.path) {
         let hash = try ModelInstaller.hashFile(destination, maxBytes: file.bytes)
         guard hash.bytes == file.bytes, hash.sha256 == file.sha256 else {
@@ -446,7 +472,7 @@ enum ModelPacks {
         }
         continue
       }
-      guard let url = URL(string: "https://huggingface.co/\(specification.repository)/resolve/\(specification.revision)/\(file.path)") else { throw BoomError.invalid("Invalid catalog URL.") }
+      guard let url = URL(string: "https://huggingface.co/\(repository)/resolve/\(revision)/\(file.path)") else { throw BoomError.invalid("Invalid catalog URL.") }
       let partial = stage.appendingPathComponent(file.path + ".partial")
       if !FileManager.default.fileExists(atPath: partial.path) { FileManager.default.createFile(atPath: partial.path, contents: nil) }
       let partialInfo = try partial.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
@@ -457,7 +483,7 @@ enum ModelPacks {
         var offset = Int64(try handle.seekToEnd())
         while offset < file.bytes {
           try flag.check()
-          progress("\(purpose.title) · \(ByteCountFormatter.string(fromByteCount: Int64(downloadedBytes), countStyle: .file)) of \(ByteCountFormatter.string(fromByteCount: Int64(requirements.downloadBytes), countStyle: .file))")
+          progress("\(label) · \(ByteCountFormatter.string(fromByteCount: Int64(downloadedBytes), countStyle: .file)) of \(ByteCountFormatter.string(fromByteCount: Int64(requirements.downloadBytes), countStyle: .file))")
           try flag.check()
           let bytes = try await ModelTransfer.fetch(url, fileBytes: UInt64(file.bytes), offset: UInt64(offset))
           try flag.check()
@@ -472,8 +498,20 @@ enum ModelPacks {
       guard result.sha256 == file.sha256, result.bytes == file.bytes else { throw BoomError.invalid("Downloaded file failed verification; partial retained.") }
       try FileManager.default.moveItem(at: partial, to: destination)
     }
-    _ = try await detachedWork { try verifyPublished(stage, checkpoint: specification) }
+    _ = try await detachedWork { try verifyPublicFiles(stage, files: files) }
     try flag.check(); try FileManager.default.moveItem(at: stage, to: target)
     return target
+  }
+  private static func createModelParents(_ root: URL, path: String) throws {
+    try DownloadPolicy.validateRelativePath(path)
+    var directory = root
+    for component in path.split(separator: "/").dropLast() {
+      directory.appendPathComponent(String(component), isDirectory: true)
+      if !FileManager.default.fileExists(atPath: directory.path) {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+      }
+      let info = try directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+      guard info.isDirectory == true, info.isSymbolicLink != true else { throw BoomError.invalid("Unsafe model subdirectory.") }
+    }
   }
 }

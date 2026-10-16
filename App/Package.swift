@@ -44,6 +44,7 @@ let package = Package(
   dependencies: [
     .package(path: "../Core"),
     .package(path: "../.deps/MLXSwiftLM", traits: []),
+    .package(path: "../.deps/Qwen3TTS"),
     .package(url: "https://github.com/ml-explore/mlx-swift", exact: "0.32.3"),
     .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.4"),
     .package(url: "https://github.com/huggingface/swift-huggingface.git", exact: "0.11.0"),
@@ -65,6 +66,7 @@ let package = Package(
         .product(name: "MLXVLM", package: "MLXSwiftLM"),
         .product(name: "MLXHuggingFace", package: "MLXSwiftLM"),
         .product(name: "MLX", package: "mlx-swift"),
+        .product(name: "Qwen3TTS", package: "Qwen3TTS"),
         .product(name: "HuggingFace", package: "swift-huggingface"),
         .product(name: "Tokenizers", package: "swift-transformers"),
         .product(name: "Hub", package: "swift-transformers"),
@@ -80,7 +82,7 @@ let package = Package(
         .linkedLibrary("bsm", .when(platforms: [.macOS])),
         .linkedFramework("AppKit"), .linkedFramework("Security"),
         .linkedFramework("SystemConfiguration"),
-        .linkedFramework("AVFoundation"), .linkedFramework("Speech"),
+        .linkedFramework("AVFoundation"), .linkedFramework("Speech"), .linkedFramework("CoreML"),
       ]),
     .testTarget(name: "BoomTests", dependencies: ["Boom"], resources: [.copy("Fixtures")]),
   ], swiftLanguageModes: [.v5]
