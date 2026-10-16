@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply the exact captured implementation; reject base or transport changes."""
+"""Apply the exact captured product source; keep workflow configuration unchanged."""
 import gzip, hashlib, os, pathlib, subprocess
 BASE = '82cb6474be593d1c9b49583a6f0213f2d88d96b9'
 def git(*args): return subprocess.check_output(['git', *args])
@@ -22,7 +22,12 @@ assert len(compressed) == 28568 and hashlib.sha256(compressed).hexdigest() == 'd
 patch = gzip.decompress(compressed)
 assert len(patch) == 114453 and hashlib.sha256(patch).hexdigest() == 'f78c11682f22d882d321148a400a302f645a1499620b66a1ea7cb21faba2edea'
 pathlib.Path('evidence/repair.patch').write_bytes(patch)
-for args in [('apply', '--check', '--index', '--binary', '-'), ('apply', '--index', '--binary', '-')]:
-    subprocess.run(['git', *args], input=patch, check=True)
+# The packet also changes the import commit's descriptive message. That is not
+# product source and must not be applied by the restricted Actions identity.
+workflow = '.github/workflows/blessenger-native-candidate.yml'
+original_workflow = pathlib.Path(workflow).read_bytes()
+for args in [('apply', '--check', '--index', '--binary'), ('apply', '--index', '--binary')]:
+    subprocess.run(['git', *args, '--exclude=' + workflow, '-'], input=patch, check=True)
+assert pathlib.Path(workflow).read_bytes() == original_workflow
 git('rm', '-r', '--', '.blessenger-repair')
-print('Verified exact implementation admitted; compilation and regression checks follow.')
+print('Verified exact product implementation admitted; workflow configuration was not changed.')
