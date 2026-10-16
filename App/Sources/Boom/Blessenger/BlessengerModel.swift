@@ -136,7 +136,7 @@ import Foundation
     if let selected { return selected.title }
     return draft.groupName ?? (draft.recipients.count == 1 ? draft.recipients[0].name : "New Message")
   }
-  var hasReadyModel: Bool { runner != nil }
+  var hasReadyModel: Bool { runner.map { effectiveProfile.modelIdentity == $0.identity } ?? false }
 
   init(store: WorkspaceStore, catalog: BlessengerCatalog, state: WorkspaceState, namespace: UUID,
     requestMicrophone: @escaping @MainActor () async -> Bool = { await AVCaptureDevice.requestAccess(for: .audio) }) {
@@ -268,26 +268,32 @@ import Foundation
       try await flushDraft()
       let chatID = state.selectedChat
       let priorProfile = chatID.flatMap { product.addresses[$0]?.profile } ?? product.defaultProfile
-      _ = try await model(for: path.path)
+      var chosen = priorProfile; chosen.modelPath = path.path; chosen.modelIdentity = nil
+      let loaded = try await model(for: chosen)
+      let bound = try chosen.resolvingModel(path: loaded.source.path, identity: loaded.identity)
       let next = try await store.blessengerTransaction { state, product in
         guard state.selectedChat == chatID,
           (chatID.flatMap { product.addresses[$0]?.profile } ?? product.defaultProfile) == priorProfile else {
           throw BoomError.stale("The model destination changed during preparation.")
         }
         if let chatID, var address = product.addresses[chatID] {
-          address.profile.modelPath = path.path; address.profile.id = UUID(); product.addresses[chatID] = address
-        } else { product.defaultProfile.modelPath = path.path; product.defaultProfile.id = UUID() }
+          address.profile = bound; address.profile.id = UUID(); product.addresses[chatID] = address
+        } else { product.defaultProfile = bound; product.defaultProfile.id = UUID() }
       }.0
       accept(next)
     } catch { report(error) }
   }
-  private func model(for path: String?) async throws -> MLXGemmaRunner {
-    let directory = path.map { URL(fileURLWithPath: $0) } ?? ModelPacks.cached(.consultation)
+  private func model(for profile: BlessengerProfile) async throws -> MLXGemmaRunner {
+    try BlessengerState.validate(profile)
+    let directory = profile.modelPath.map { URL(fileURLWithPath: $0).standardizedFileURL } ?? ModelPacks.cached(.consultation)
     guard let directory else { throw BoomError.unavailable("Choose or install a local consultation model in Settings.") }
-    if let runner, runnerPath == directory.path { return runner }
+    if let runner, runnerPath == directory.path {
+      _ = try profile.resolvingModel(path: directory.path, identity: runner.identity); return runner
+    }
     guard active.isEmpty else { throw BoomError.unavailable("Finish the current response before changing models.") }
     if let old = runner { await old.cancelAndJoin(); runner = nil; runnerPath = nil }
     let admission = try await detachedWork { try ModelPacks.admission(directory, purpose: .consultation) }
+    _ = try profile.resolvingModel(path: directory.path, identity: admission.identity)
     let loaded = try await MLXGemmaRunner.load(admission: admission, cacheProtection: .ephemeral())
     runner = loaded; runnerPath = directory.path
     return loaded
@@ -360,7 +366,9 @@ import Foundation
     if let address = snapshot.blessenger!.addresses[captured.id] { routed.recipients = address.recipients }
     let contacts = try BlessengerPolicy.resolve(host: history?.id, draft: routed, state: snapshot, frozen: history != nil)
     let voices: [Voice?] = contacts.isEmpty ? [nil] : try contacts.map { try BlessengerPolicy.capturedVoice($0, state: snapshot) }
-    let runner = try await model(for: profile.modelPath); try flag.check()
+    try profile.requireBinding(for: history, caller: caller != nil)
+    let runner = try await model(for: profile); try flag.check()
+    let resolvedProfile = try profile.resolvingModel(path: runner.source.path, identity: runner.identity)
     let useMTP = profile.useMTP ?? (caller != nil)
     if useMTP { _ = try await runner.prepareMTP(); try flag.check() }
     let shouldSpeak = (caller != nil || snapshot.blessenger!.readReplies) && voices.count == 1
@@ -401,7 +409,7 @@ import Foundation
     }
     let turn = BlessengerPreparedTurn(chatID: chatID, draft: captured, history: history, contacts: contacts,
       profile: profile, sourceDigests: admittedSources, context: media.context, responseIDs: ids,
-      receipts: receipts, voices: voices, outputLimit: profile.maximumTokens, caller: caller, speech: speechVoice, previousQuestionID: previousQuestionID)
+      receipts: receipts, voices: voices, outputLimit: profile.maximumTokens, caller: caller, speech: speechVoice, previousQuestionID: previousQuestionID, resolvedProfile: resolvedProfile)
     try flag.check(); caller?.trace?.once("turn.admissionStarted")
     let next = try await store.blessengerAdmit(turn, flag: flag); accept(next)
     caller?.trace?.once("turn.admitted")
@@ -606,7 +614,10 @@ import Foundation
       }
       call.onStart = { [weak self] in
         guard let self, self.callID == route.id, !lifetime.isCancelled else { throw CancellationError() }
-        let runner = try await self.model(for: route.profile.modelPath)
+        try route.profile.requireBinding(for: self.state.chats.first { $0.id == route.conversationID })
+        let runner = try await self.model(for: route.profile)
+        let bound = try route.profile.resolvingModel(path: runner.source.path, identity: runner.identity)
+        try lifetime.check(); try await self.store.blessengerBindCall(route.id, resolved: bound)
         try lifetime.check()
         guard runner.supportsRawAudio else { throw BoomError.unavailable("This model cannot receive caller audio.") }
         if route.profile.useMTP != false { _ = try await runner.prepareMTP() }
@@ -660,6 +671,7 @@ import Foundation
     state.autocomplete && !closed && !closing && !navigating && !loading && !preparing && active.isEmpty
       && !callInProgress && noteState == .idle && !hasUnstoredVoiceNote && !templateSelected && runner != nil
       && runnerPath == ((product.addresses[draft.id]?.profile ?? product.defaultProfile).modelPath ?? ModelPacks.cached(.consultation)?.path)
+      && runner?.identity == (product.addresses[draft.id]?.profile ?? product.defaultProfile).modelIdentity
   }
   func inputSuggestions(document: DocumentSnapshot, caret: Int, context: BlessengerCompletion.Context,
     count: Int, flag: CancellationFlag, publish: @escaping @Sendable (String) -> Void) async throws -> [String] {
@@ -752,11 +764,12 @@ import Foundation
   }
   func clearModel() async {
     guard active.isEmpty, !preparing, !callInProgress, !loading else { return }
-    let id = state.selectedChat
-    await change { _, product in
-      if let id, var address = product.addresses[id] { address.profile.modelPath = nil; address.profile.id = UUID(); product.addresses[id] = address }
-      else { product.defaultProfile.modelPath = nil; product.defaultProfile.id = UUID() }
+    guard let cached = ModelPacks.cached(.consultation) else {
+      report(BoomError.unavailable("No local cached model is available. The current binding was retained.")); return
     }
+    // This Settings command deliberately rebinds; nil is not a request to keep
+    // consulting through whichever model happened to be loaded previously.
+    await chooseModel(cached)
   }
   func setProfile(sampling: SamplingProfile? = nil, mtp: Bool?? = nil) async {
     guard !callInProgress else { return }

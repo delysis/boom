@@ -46,7 +46,7 @@ enum BlessengerArchive {
       }
     }
     let kinds: [Vault.Kind] = [.attachment, .receipt, .candidate, .editJournal, .generationJournal]
-    var retained = Set<UUID>()
+    var retained = Set<UUID>(), receipts = Set<UUID>()
     // One bounded plaintext record at a time; orphans are authenticated and
     // copied too. A backup never deletes evidence to manufacture consistency.
     for name in try FileManager.default.contentsOfDirectory(atPath: objects.path) {
@@ -58,6 +58,7 @@ enum BlessengerArchive {
           throw BoomError.invalid("The backup contains an unknown private record.")
         }
         let bytes = try vault.readProtectedArchiveRecord(directory, kind: kind, id: id, limit: 67_108_864)
+        if kind == .receipt { receipts.insert(id) }
         if kind == .attachment {
           retained.insert(id)
           if let record = state.attachments.first(where: { $0.id == id }) {
@@ -66,15 +67,48 @@ enum BlessengerArchive {
         }
       }
     }
-    guard state.attachments.allSatisfy({ retained.contains($0.id) }) else {
+    guard state.attachments.allSatisfy({ retained.contains($0.id) && receipts.contains($0.id) }) else {
       throw BoomError.invalid("The backup is missing an indexed original. Nothing was restored.")
     }
-    for (messageID, attempt) in product.attempts {
-      let bytes = try vault.readProtectedArchiveRecord(directory, kind: .receipt, id: messageID, limit: 16_777_216)
+    var inspected = Set<UUID>()
+    for message in state.chats.flatMap({ $0.messages + ($0.messageVersions ?? []) })
+      where message.role == .assistant && message.provider != nil && message.authoredByUser != true {
+      guard inspected.insert(message.id).inserted else { continue }
+      try flag.check()
+      let bytes = try vault.readProtectedArchiveRecord(directory, kind: .receipt, id: message.id, limit: 16_777_216)
       let receipt = try PropertyListDecoder().decode(ConsultationReceipt.self, from: bytes)
-      guard receipt.responseID == messageID, receipt.attemptID == attempt.identity.attemptID,
-        receipt.operationID == attempt.identity.operationID else {
-        throw BoomError.invalid("The backup lost an in-flight response's provenance.")
+      guard receipt.responseID == message.id, receipt.model == message.provider, let attemptID = receipt.attemptID,
+        receipt.voice.map({ $0.speaker == message.speaker }) ?? (message.speaker?.voiceID == nil) else {
+        throw BoomError.invalid("A retained reply lost its captured model, Contact, or attempt provenance.")
+      }
+      let attemptBytes = try vault.readProtectedArchiveRecord(directory, kind: .receipt, id: attemptID, limit: 16_777_216)
+      let original = try PropertyListDecoder().decode(ConsultationReceipt.self, from: attemptBytes)
+      // A backup may intersect checkpoint/final publication. The two records
+      // can have different progress, but never different captured authority.
+      guard original.attemptID == attemptID, original.responseID == message.id,
+        original.operationID == receipt.operationID, original.seed == receipt.seed,
+        original.model == receipt.model, original.voice == receipt.voice,
+        try BlessengerPolicy.exactDigest(original.plan) == BlessengerPolicy.exactDigest(receipt.plan),
+        original.generationPolicy == receipt.generationPolicy else {
+        throw BoomError.invalid("The retained response and attempt disagree about captured authority.")
+      }
+      if let attempt = product.attempts[message.id] {
+        guard receipt.attemptID == attempt.identity.attemptID, receipt.operationID == attempt.identity.operationID,
+          receipt.model == attempt.identity.model, receipt.seed == attempt.identity.seed,
+          Digest.sha256(receipt.plan.rawPrompt) == attempt.identity.requestDigest else {
+          throw BoomError.invalid("The backup lost an in-flight response's provenance.")
+        }
+      }
+      if let audio = product.audio[message.id] {
+        guard audio.textDigest == Digest.sha256(message.text), audio.attemptID == attemptID,
+          product.spokenResponses?[message.id] == audio.voice else {
+          throw BoomError.invalid("Recorded speech does not belong to its retained response.")
+        }
+        let pcm = try BlessengerWave.decode(vault.readProtectedArchiveRecord(directory, kind: .attachment,
+          id: audio.attachmentID, limit: 67_108_864))
+        guard pcm.samples.count == audio.frames, pcm.rate == audio.sampleRate else {
+          throw BoomError.invalid("The retained audio and its replay geometry disagree.")
+        }
       }
     }
   }

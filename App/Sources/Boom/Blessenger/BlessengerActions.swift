@@ -63,7 +63,7 @@ extension BlessengerModel {
     }
   }
   func remove(_ id: UUID) async {
-    guard !active.contains(id) else { report(BoomError.unavailable("Stop the active response before removing its conversation.")); return }
+    guard !callInProgress, !active.contains(id) else { report(BoomError.unavailable("Stop the active response before removing its conversation.")); return }
     await change(restoreDraft: true) { state, product in
       guard !product.attempts.values.contains(where: { $0.conversationID == id }) else { throw BoomError.unavailable("The conversation is still settling a response.") }
       if let contact = state.voices.first(where: { $0.id == id }) {
@@ -75,10 +75,7 @@ extension BlessengerModel {
         // Unpinning preserves the source conversation and historic membership.
         if product.selectedTemplate == id { product.selectedTemplate = nil }
       } else {
-        state.chats.removeAll { $0.id == id }; product.drafts.removeAll { $0.id == id }
-        product.addresses.removeValue(forKey: id)
-        product.branches.removeValue(forKey: id)
-        if state.selectedChat == id { state.selectedChat = nil; product.selectedTemplate = nil }
+        product.removeConversation(id, from: &state)
       }
     }
   }

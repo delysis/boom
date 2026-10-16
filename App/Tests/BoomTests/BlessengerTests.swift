@@ -26,7 +26,8 @@ final class BlessengerTests: XCTestCase {
       voice: nil, plan: plan, sources: [], promptDigest: Digest.sha256(plan.rawPrompt), tokenIDs: [],
       stopReason: "pending", elapsedSeconds: 0, generationPolicy: nil, attemptID: UUID(), responseID: id)
     return BlessengerPreparedTurn(chatID: history?.id ?? UUID(), draft: draft, history: history, contacts: [],
-      profile: profile, sourceDigests: [], context: "", responseIDs: [id], receipts: [receipt], voices: [nil], outputLimit: profile.maximumTokens)
+      profile: profile, sourceDigests: [], context: "", responseIDs: [id], receipts: [receipt], voices: [nil], outputLimit: profile.maximumTokens,
+      resolvedProfile: try profile.resolvingModel(path: profile.modelPath ?? "/component-fixture/model", identity: receipt.model))
   }
   func testNativeDraftTransferIsAtomicAndCannotRepeat() async throws {
     let root = try root(), store = try store(root)
@@ -361,6 +362,92 @@ final class BlessengerTests: XCTestCase {
     catch is CancellationError {} catch { XCTFail("Unexpected failure: \(error)") }
     await call.join()
     XCTAssertFalse(call.active); XCTAssertFalse(audio.engine.isRunning)
+  }
+
+  func testResolvedConversationModelIsPinnedIndependentlyOfTheGlobalDefault() async throws {
+    let store = try store(root()), initial = try await store.openBlessenger(catalog: fixtureCatalog)
+    var draft = initial.blessenger!.draft(for: nil)
+    let old = draft.version; draft.version = UUID(); draft.text = "Keep this route."
+    let saved = try await store.blessengerSaveDraft(draft, expectedVersion: old)
+    let prepared = try turn(draft, profile: saved.blessenger!.defaultProfile)
+    let first = try await store.blessengerAdmit(prepared)
+    let bound = try XCTUnwrap(first.blessenger?.addresses[prepared.chatID]?.profile)
+    XCTAssertEqual(bound.modelPath, "/component-fixture/model")
+    XCTAssertEqual(bound.modelIdentity, prepared.receipts[0].model)
+    var receipt = prepared.receipts[0]; receipt.state = .complete; receipt.stopReason = "eos"
+    _ = try await store.blessengerFinish(receipt, messageID: prepared.responseIDs[0], text: "Retained answer")
+    let changed = try await store.blessengerTransaction { _, product in
+      product.defaultProfile.modelPath = "/another/model"; product.defaultProfile.modelIdentity = "another-model"; product.defaultProfile.id = UUID()
+    }.0
+    XCTAssertEqual(changed.blessenger!.addresses[prepared.chatID]?.profile, bound)
+    XCTAssertThrowsError(try bound.resolvingModel(path: bound.modelPath!, identity: "replacement-at-same-path"))
+    XCTAssertThrowsError(try bound.resolvingModel(path: "/different/path", identity: bound.modelIdentity!))
+    var nextDraft = changed.blessenger!.draft(for: prepared.chatID)
+    let prior = nextDraft.version; nextDraft.version = UUID(); nextDraft.text = "Continue the same case."
+    let before = try await store.blessengerSaveDraft(nextDraft, expectedVersion: prior)
+    let history = try XCTUnwrap(before.chats.first { $0.id == prepared.chatID })
+    var tampered = try turn(nextDraft, profile: bound, history: history)
+    tampered.resolvedProfile?.modelIdentity = "not-the-admitted-weights"
+    do { _ = try await store.blessengerAdmit(tampered); XCTFail("A mismatched executed model was accepted.") }
+    catch let error as BoomError { if case .stale = error {} else { XCTFail("Unexpected error: \(error)") } }
+    let after = try await store.blessengerSnapshot()
+    XCTAssertEqual(after.chats, before.chats)
+    XCTAssertEqual(after.blessenger!.draft(for: prepared.chatID), nextDraft)
+    try await store.releaseExclusiveWorkspace()
+  }
+
+  func testModelBindingDoesNotSilentlyMigrateExistingUnboundConversations() throws {
+    let profile = BlessengerProfile()
+    let existing = ChatRecord(messages: [ChatMessage(role: .user, text: "Retain this case")])
+    XCTAssertThrowsError(try profile.requireBinding(for: existing))
+    XCTAssertNoThrow(try profile.requireBinding(for: nil))
+    let resolved = try profile.resolvingModel(path: "/models/current", identity: "verified-fixture")
+    XCTAssertNoThrow(try resolved.requireBinding(for: existing))
+    var differentSettings = resolved; differentSettings.maximumTokens += 1
+    XCTAssertThrowsError(try profile.admitResolution(differentSettings))
+    var identityWithoutPath = resolved; identityWithoutPath.modelPath = nil
+    XCTAssertThrowsError(try BlessengerState.validate(identityWithoutPath))
+  }
+
+  func testBranchRelationshipsRejectCyclesAndPreserveExplicitlyRemovedAncestors() throws {
+    var state = WorkspaceState(), product = BlessengerState()
+    let a = ChatRecord(title: "Root"), b = ChatRecord(title: "Branch"), c = ChatRecord(title: "Descendant")
+    state.chats = [a, b, c]; product.branches = [b.id: a.id, c.id: b.id]
+    XCTAssertNoThrow(try product.validate(in: state))
+    product.branches[a.id] = c.id
+    XCTAssertThrowsError(try product.validate(in: state))
+    product.branches.removeValue(forKey: a.id)
+    product.branches[b.id] = UUID()
+    XCTAssertThrowsError(try product.validate(in: state))
+    product.branches[b.id] = a.id
+    product.removeConversation(b.id, from: &state)
+    XCTAssertEqual(product.branches[c.id], b.id)
+    XCTAssertEqual(product.branches[b.id], a.id)
+    XCTAssertNoThrow(try product.validate(in: state))
+    product.removedConversations = []
+    XCTAssertThrowsError(try product.validate(in: state), "Missing ancestors require an explicit removal record, never a guessed truncated branch.")
+  }
+
+  func testPrivateBackupRequiresCompletedResponseAndAttemptReceipts() async throws {
+    let parent = try root(), source = try store(parent.appendingPathComponent("source"))
+    let initial = try await source.openBlessenger(catalog: fixtureCatalog)
+    var draft = initial.blessenger!.draft(for: nil)
+    let old = draft.version; draft.version = UUID(); draft.text = "A case question"
+    let saved = try await source.blessengerSaveDraft(draft, expectedVersion: old)
+    let prepared = try turn(draft, profile: saved.blessenger!.defaultProfile)
+    _ = try await source.blessengerAdmit(prepared)
+    var receipt = prepared.receipts[0]; receipt.state = .complete; receipt.stopReason = "eos"
+    _ = try await source.blessengerFinish(receipt, messageID: prepared.responseIDs[0], text: "A response")
+    for (label, id) in [("message", prepared.responseIDs[0]), ("attempt", receipt.attemptID!)] {
+      let backup = parent.appendingPathComponent("backup-" + label)
+      try await source.exportBlessengerBackup(to: backup, flag: CancellationFlag())
+      let file = backup.appendingPathComponent("Objects/receipt-" + id.uuidString + ".record")
+      try FileManager.default.removeItem(at: file)
+      let refused = parent.appendingPathComponent("refused-" + label)
+      do { try await source.restoreBlessengerBackup(from: backup, to: refused, flag: CancellationFlag()); XCTFail("Missing completed provenance was accepted.") } catch {}
+      XCTAssertFalse(FileManager.default.fileExists(atPath: refused.path))
+    }
+    try await source.releaseExclusiveWorkspace()
   }
 
 }

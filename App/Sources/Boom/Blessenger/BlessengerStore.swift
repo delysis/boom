@@ -46,6 +46,7 @@ struct BlessengerPreparedTurn: Sendable {
   var caller: BlessengerCallerTurn? = nil
   var speech: BlessengerSpeechVoice? = nil
   var previousQuestionID: UUID? = nil
+  var resolvedProfile: BlessengerProfile? = nil
 }
 
 extension WorkspaceStore {
@@ -138,6 +139,12 @@ extension WorkspaceStore {
       (1...4).contains(turn.responseIDs.count), Set(turn.responseIDs).count == turn.responseIDs.count else {
       throw BoomError.invalid("The response plan is inconsistent.")
     }
+    let resolved = turn.resolvedProfile ?? turn.profile
+    try turn.profile.admitResolution(resolved)
+    guard turn.receipts.allSatisfy({ $0.model == resolved.modelIdentity }),
+      turn.outputLimit == resolved.maximumTokens else {
+      throw BoomError.stale("The prepared model is not the captured conversation route.")
+    }
     // Receipts are immutable attempt inputs. Orphans from a failed later index
     // publication remain private and are included in complete backups.
     for (index, receipt) in turn.receipts.enumerated() {
@@ -195,11 +202,15 @@ extension WorkspaceStore {
         let title = turn.draft.groupName ?? String(turn.draft.text.split(whereSeparator: \.isNewline).first?.prefix(72) ?? "Message")
         state.chats.append(ChatRecord(id: turn.chatID, title: title.isEmpty ? "Voice message" : title))
         index = state.chats.count - 1
-        product.addresses[turn.chatID] = BlessengerAddress(recipients: contacts, profile: turn.profile)
+        product.addresses[turn.chatID] = BlessengerAddress(recipients: contacts, profile: resolved)
         if contacts.count > 1, let name = turn.draft.groupName {
           let handle = try ProductCore.suggestedSlug(name, occupied: state.voices.map(\.slug) + product.groups.map(\.handle))
           product.groups.append(BlessengerGroup(id: UUID(), handle: handle, name: name, members: contacts))
         }
+      }
+      if var address = product.addresses[turn.chatID] {
+        try address.profile.admitResolution(resolved)
+        address.profile = resolved; product.addresses[turn.chatID] = address
       }
       if let questionID = turn.previousQuestionID {
         guard let question = state.chats[index].messages.last, question.id == questionID,
@@ -238,7 +249,7 @@ extension WorkspaceStore {
       if state.selectedChat == turn.history?.id && product.selectedTemplate == nil { state.selectedChat = turn.chatID }
     }.0
     if let caller = turn.caller, blessengerCall?.id == caller.callID {
-      blessengerCall?.conversationID = turn.chatID; blessengerCall?.pendingDraftDigest = nil
+      blessengerCall?.conversationID = turn.chatID; blessengerCall?.profile = resolved; blessengerCall?.pendingDraftDigest = nil
     }
     return next
   }
@@ -338,6 +349,13 @@ extension WorkspaceStore {
       speech: recipients.first.flatMap { product.speechVoices[$0.id] } ?? product.defaultSpeech)
     blessengerCall = call
     return call
+  }
+  func blessengerBindCall(_ id: UUID, resolved: BlessengerProfile) throws {
+    guard var call = blessengerCall, call.id == id, call.lastEpoch == 0 else {
+      throw BoomError.stale("The call changed while its model was prepared.")
+    }
+    try call.profile.admitResolution(resolved)
+    call.profile = resolved; blessengerCall = call
   }
   func blessengerEndCall(_ id: UUID) {
     if blessengerCall?.id == id { blessengerCall = nil }

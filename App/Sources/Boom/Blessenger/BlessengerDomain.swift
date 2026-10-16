@@ -37,6 +37,8 @@ struct BlessengerDraft: Codable, Equatable, Identifiable, Sendable {
 struct BlessengerProfile: Codable, Equatable, Sendable {
   var id = UUID()
   var modelPath: String?
+  /// Identity of the verified weights/processor actually admitted, not a path alias.
+  var modelIdentity: String? = nil
   var sampling = SamplingProfile.standard
   var maximumTokens = 1024
   /// Nil preserves the ordinary text route; calls explicitly require MTP unless
@@ -89,6 +91,8 @@ struct BlessengerState: Codable, Sendable {
   var traces: [UUID: BlessengerTrace.Record]? = nil
   var attempts: [UUID: BlessengerAttempt] = [:]
   var branches: [UUID: UUID] = [:]
+  /// Explicitly removed ancestry may remain referenced by surviving branches.
+  var removedConversations: Set<UUID>? = nil
   var readReplies = false
   var selectedTemplate: UUID?
 
@@ -97,6 +101,7 @@ struct BlessengerState: Codable, Sendable {
     return drafts.first(where: { $0.id == key }) ?? BlessengerDraft(id: key)
   }
   func validate(in state: WorkspaceState) throws {
+    try validateRelationships(in: state)
     guard schema == 1, state.composerDrafts?.isEmpty ?? true,
       drafts.count <= state.chats.count + 1, Set(drafts.map(\.id)).count == drafts.count,
       drafts.contains(where: { $0.id == BlessengerDraft.unsentID }),
@@ -132,7 +137,8 @@ struct BlessengerState: Codable, Sendable {
   }
   static func validate(_ profile: BlessengerProfile) throws {
     guard (1...4096).contains(profile.maximumTokens),
-      profile.modelPath.map({ $0.hasPrefix("/") && $0.utf8.count <= 4096 && !$0.contains("\0") }) ?? true else {
+      profile.modelPath.map({ $0.hasPrefix("/") && $0.utf8.count <= 4096 && !$0.contains("\0") }) ?? true,
+      profile.modelIdentity.map({ !$0.isEmpty && $0.utf8.count <= 256 && !$0.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) && profile.modelPath != nil }) ?? true else {
       throw BoomError.invalid("The conversation model profile is invalid.")
     }
     _ = try ProductCore.sampling(profile.sampling)
@@ -201,7 +207,7 @@ struct BlessengerCallContext: Sendable {
   let id: UUID
   var conversationID: UUID?
   let recipients: [BlessengerContact]
-  let profile: BlessengerProfile
+  var profile: BlessengerProfile
   let speech: BlessengerSpeechVoice
   var lastEpoch: UInt64 = 0
   var pendingDraftDigest: String?
