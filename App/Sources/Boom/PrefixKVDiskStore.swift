@@ -50,6 +50,7 @@ final class PrefixKVDiskStore: @unchecked Sendable {
   }
   private let queue = DispatchQueue(label: "Bloom.prefix-kv-spill", qos: .utility)
   private let lock = NSLock()
+  fileprivate let protection: RecordCipher?
   private let temporaryParent: URL?
   private var directory: URL?
   private let byteLimit: UInt64
@@ -86,10 +87,11 @@ final class PrefixKVDiskStore: @unchecked Sendable {
   }
 
   init(byteLimit: UInt64 = 4_294_967_296, maximumFiles: Int = 4096,
-    temporaryParent: URL? = nil) {
+    temporaryParent: URL? = nil, protection: RecordCipher? = nil) {
     precondition(byteLimit <= UInt64(Int64.max) && maximumFiles > 0)
     self.byteLimit = byteLimit; self.maximumFiles = maximumFiles
     self.temporaryParent = temporaryParent // explicit isolated parent for fixtures
+    self.protection = protection
   }
   deinit {
     let path = directory?.path, fd = directoryFD, identity = directoryIdentity
@@ -116,7 +118,23 @@ final class PrefixKVDiskStore: @unchecked Sendable {
       let (sum, overflow) = amount.addingReportingOverflow(span.byteCount)
       guard !overflow else { return false }; amount = sum
     }
-    return amount <= byteLimit && Set(spans.map(\.layer)).count <= maximumFiles
+    guard let physical = try? chargedBytes(spans) else { return false }
+    return physical <= byteLimit && Set(spans.map(\.layer)).count <= maximumFiles
+  }
+
+  private func chargedBytes(_ spans: [ReadySpan]) throws -> UInt64 {
+    var total: UInt64 = 0
+    for group in Dictionary(grouping: spans, by: \.layer).values {
+      var raw: UInt64 = 0
+      for span in group {
+        let (sum, overflow) = raw.addingReportingOverflow(span.byteCount)
+        guard !overflow else { throw BoomError.budget("KV byte extent overflowed.") }; raw = sum
+      }
+      let charge = try protection == nil ? raw : SealedBlockWriter.cost(raw)
+      let (sum, overflow) = total.addingReportingOverflow(charge)
+      guard !overflow else { throw BoomError.budget("KV quota overflowed.") }; total = sum
+    }
+    return total
   }
 
   /// Admission never touches a file or waits for a worker. Refusal is a real
@@ -135,6 +153,8 @@ final class PrefixKVDiskStore: @unchecked Sendable {
       let (sum, overflow) = amount.addingReportingOverflow(span.byteCount)
       guard !overflow else { return false }; amount = sum
     }
+    guard let physical = try? chargedBytes(spans) else { return false }
+    amount = physical
     let fileCount = Set(spans.map(\.layer)).count
     lock.lock()
     guard !inFlight else { misses &+= 1; lock.unlock(); return false }
@@ -223,7 +243,7 @@ final class PrefixKVDiskStore: @unchecked Sendable {
     var result: [PrefixKVSpan] = []
     for layer in groups.keys.sorted() {
       let group = groups[layer]!
-      let layerBytes = group.reduce(UInt64(0)) { $0 + $1.byteCount }
+      let layerBytes = try chargedBytes(group)
       remainingBytes -= layerBytes; remainingFiles -= 1
       do { result.append(contentsOf: try writeLayer(group, amount: layerBytes, isLive: isLive)) }
       catch {
@@ -259,21 +279,25 @@ final class PrefixKVDiskStore: @unchecked Sendable {
       }
     }
     var offset: UInt64 = 0
+    let logicalAmount = spans.reduce(UInt64(0)) { $0 + $1.byteCount }
+    let sealed = protection.map { SealedBlockWriter(fd: fd, total: logicalAmount,
+      binding: url.lastPathComponent, cipher: $0, wrote: wrote) }
     var records: [(ReadySpan, UInt64, UInt64)] = []
     for span in spans {
       let keysOffset = offset
-      try Self.writeArray(span.keys, positions: span.positions, rows: span.rows, fd: fd, offset: &offset, isLive: isLive, wrote: wrote)
+      try Self.writeArray(span.keys, positions: span.positions, rows: span.rows, fd: fd, offset: &offset, isLive: isLive, wrote: wrote, sealed: sealed)
       let valuesOffset = offset
-      try Self.writeArray(span.values, positions: span.positions, rows: span.rows, fd: fd, offset: &offset, isLive: isLive, wrote: wrote)
+      try Self.writeArray(span.values, positions: span.positions, rows: span.rows, fd: fd, offset: &offset, isLive: isLive, wrote: wrote, sealed: sealed)
       records.append((span, keysOffset, valuesOffset))
     }
     guard isLive() else { throw CancellationError() }
-    guard offset == amount, fchmod(fd, 0o400) == 0 else { throw Self.ioError() }
+    try sealed?.finish()
+    guard offset == logicalAmount, fchmod(fd, 0o400) == 0 else { throw Self.ioError() }
     var identity = stat()
     guard fstat(fd, &identity) == 0, identity.st_size == Int64(amount) else { throw Self.ioError() }
     let closed = Darwin.close(fd); fd = -1
     guard closed == 0 else { throw Self.ioError() }
-    let file = PrefixKVDiskFile(store: self, url: url, bytes: amount, identity: identity)
+    let file = PrefixKVDiskFile(store: self, url: url, bytes: amount, identity: identity, logicalBytes: logicalAmount)
     published = true // file now owns quota/unlink, including construction failure
     let values = try records.map { span, keys, values in
       try PrefixKVSpan(disk: file, offset: span.start, layer: span.layer,
@@ -285,7 +309,7 @@ final class PrefixKVDiskStore: @unchecked Sendable {
     return values
   }
   private static func writeArray(_ source: MLXReadyBuffer, positions: Range<Int>, rows: Range<Int>,
-    fd: Int32, offset: inout UInt64, isLive: @Sendable () -> Bool, wrote: (Int) -> Void) throws {
+    fd: Int32, offset: inout UInt64, isLive: @Sendable () -> Bool, wrote: (Int) -> Void, sealed: SealedBlockWriter?) throws {
     try source.withUnsafeBytes { bytes in
       let item = source.dtype.size, shape = source.shape, strides = source.strides
       if strides[3] == 1, strides[2] == shape[3] {
@@ -297,7 +321,7 @@ final class PrefixKVDiskStore: @unchecked Sendable {
           while done < length {
             guard isLive() else { throw CancellationError() }
             let count = min(65_536, length - done)
-            try writeAll(fd, bytes.baseAddress!.advanced(by: start + done), count, offset: &offset, wrote: wrote)
+            try writeAll(fd, bytes.baseAddress!.advanced(by: start + done), count, offset: &offset, wrote: wrote, sealed: sealed)
             done += count
           }
         } }
@@ -313,14 +337,14 @@ final class PrefixKVDiskStore: @unchecked Sendable {
           let start = source.byteOffset + (row * strides[0] + head * strides[1]
             + position * strides[2] + feature * strides[3]) * item
           if strides[3] == 1 {
-            try writeAll(fd, bytes.baseAddress!.advanced(by: start), length, offset: &offset, wrote: wrote)
+            try writeAll(fd, bytes.baseAddress!.advanced(by: start), length, offset: &offset, wrote: wrote, sealed: sealed)
           } else {
             try scratch.withUnsafeMutableBytes { destination in
               for index in 0..<count {
                 destination.baseAddress!.advanced(by: index * item).copyMemory(
                   from: bytes.baseAddress!.advanced(by: start + index * strides[3] * item), byteCount: item)
               }
-              try writeAll(fd, destination.baseAddress!, length, offset: &offset, wrote: wrote)
+              try writeAll(fd, destination.baseAddress!, length, offset: &offset, wrote: wrote, sealed: sealed)
             }
           }
           feature += count
@@ -329,7 +353,8 @@ final class PrefixKVDiskStore: @unchecked Sendable {
     }
   }
   private static func writeAll(_ fd: Int32, _ bytes: UnsafeRawPointer, _ count: Int,
-    offset: inout UInt64, wrote: (Int) -> Void) throws {
+    offset: inout UInt64, wrote: (Int) -> Void, sealed: SealedBlockWriter?) throws {
+    if let sealed { try sealed.append(bytes, count: count); offset += UInt64(count); return }
     var done = 0
     while done < count {
       let n = pwrite(fd, bytes.advanced(by: done), count - done, off_t(offset))
@@ -353,9 +378,11 @@ final class PrefixKVDiskFile: @unchecked Sendable {
   private let store: PrefixKVDiskStore
   let url: URL
   private let bytes: UInt64
+  private let logicalBytes: UInt64
   private let identity: stat
-  init(store: PrefixKVDiskStore, url: URL, bytes: UInt64, identity: stat) {
+  init(store: PrefixKVDiskStore, url: URL, bytes: UInt64, identity: stat, logicalBytes: UInt64? = nil) {
     self.store = store; self.url = url; self.bytes = bytes; self.identity = identity
+    self.logicalBytes = logicalBytes ?? bytes
   }
   deinit { store.remove(url, bytes: bytes) }
   func read(offset: UInt64, shape: [Int], dtype: DType, row: Int,
@@ -379,7 +406,7 @@ final class PrefixKVDiskFile: @unchecked Sendable {
     let rowBytes = try PrefixKVDiskStore.arrayBytes([1] + Array(shape.dropFirst()),
       positions: positions.count, type: dtype)
     let fullBytes = try PrefixKVDiskStore.arrayBytes(shape, positions: shape[2], type: dtype)
-    guard offset <= bytes, UInt64(fullBytes) <= bytes - offset else {
+    guard offset <= logicalBytes, UInt64(fullBytes) <= logicalBytes - offset else {
       throw BoomError.invalid("Disposable KV array exceeds its file.")
     }
     var data = Data(count: rowBytes)
@@ -388,8 +415,16 @@ final class PrefixKVDiskFile: @unchecked Sendable {
       for head in 0..<shape[1] {
         let start = offset + UInt64(((row * shape[1] + head) * shape[2]
           + positions.lowerBound) * shape[3] * dtype.size)
-        guard start <= bytes, UInt64(length) <= bytes - start else {
+        guard start <= logicalBytes, UInt64(length) <= logicalBytes - start else {
           throw BoomError.invalid("Disposable KV range exceeds its file.")
+        }
+        if let cipher = store.protection {
+          let plaintext = try SealedBlockWriter.read(fd, start: start, count: length,
+            total: logicalBytes, binding: url.lastPathComponent, cipher: cipher)
+          plaintext.withUnsafeBytes { input in
+            output.baseAddress!.advanced(by: head * length).copyMemory(from: input.baseAddress!, byteCount: length)
+          }
+          continue
         }
         var done = 0
         while done < length {

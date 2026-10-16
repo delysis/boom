@@ -243,7 +243,7 @@ actor MLXGemmaRunner {
   private let container: ModelContainer
   // Stored anchors are immutable; the manager synchronizes eviction and epochs.
   // Working caches remain confined to the exclusive inference executor.
-  private nonisolated let promptCache = PromptPrefixCache()
+  private nonisolated let promptCache: PromptPrefixCache
   private let cacheConfiguration: Data
   private nonisolated let verifiedContextCeiling: Int
   private let tokenizerDescription: Data
@@ -263,7 +263,7 @@ actor MLXGemmaRunner {
     let added_tokens: [Added]
     struct Added: Decodable { let id: Int; let special: Bool }
   }
-  static func load(admission: ModelPacks.Admission, prefillTokens: UInt32? = nil) async throws -> MLXGemmaRunner {
+  static func load(admission: ModelPacks.Admission, prefillTokens: UInt32? = nil, cacheProtection: RecordCipher? = nil) async throws -> MLXGemmaRunner {
     let trace = PerformanceTrace.begin("Model.Load")
     defer { PerformanceTrace.end("Model.Load", trace) }
     let directory = admission.directory
@@ -332,7 +332,7 @@ actor MLXGemmaRunner {
         generationPolicy: policy, tokenizerDescription: tokenizerDescription,
         processorIdentity: Digest.sha256(try encoder.encode(processorBinding)),
         verifiedStatelessTextKV: loadedTypes.3, verifiedContextCeiling: min(16_384, text.max_position_embeddings),
-        supportsRawAudio: config.model_type == "gemma4_unified" && object["audio_config"] != nil)
+        supportsRawAudio: config.model_type == "gemma4_unified" && object["audio_config"] != nil, cacheProtection: cacheProtection)
       try ModelResidency.check()
       guard try runner.availableContext() >= 1024 else {
         throw BoomError.budget("The model leaves too little memory for a useful context.")
@@ -343,8 +343,9 @@ actor MLXGemmaRunner {
   }
   private init(source: URL, container: ModelContainer, identity: String,
     cacheConfiguration: Data, generationPolicy: ModelGenerationPolicy, tokenizerDescription: Data,
-    processorIdentity: String, verifiedStatelessTextKV: Bool, verifiedContextCeiling: Int, supportsRawAudio: Bool) {
+    processorIdentity: String, verifiedStatelessTextKV: Bool, verifiedContextCeiling: Int, supportsRawAudio: Bool, cacheProtection: RecordCipher?) {
     self.source = source; self.identity = identity
+    promptCache = PromptPrefixCache(protection: cacheProtection)
     self.container = container; self.cacheConfiguration = cacheConfiguration
     self.verifiedContextCeiling = verifiedContextCeiling
     self.generationPolicy = generationPolicy
@@ -943,7 +944,7 @@ actor MLXGemmaRunner {
       generationPolicy: generationPolicy, sourcePrompt: compiled.media.isEmpty ? nil : selected.prompt,
       media: compiled.media.isEmpty ? nil : compiled.media)
   }
-  func run(plan: ConsultationPlan, images: [Data], media: [WritingMediaData] = [], maxTokens: Int, seed: UInt64? = nil,
+  func run(plan: ConsultationPlan, images: [Data], media: [WritingMediaData] = [], maxTokens: Int, seed: UInt64? = nil, settings: SamplingSettings? = nil,
     flag: CancellationFlag, independentIdentity: GenerationIdentity? = nil,
     cacheOwner: PromptCacheOwner? = nil, executionPolicy: ModelGenerationPolicy? = nil,
     joinedRetention: JoinedKVRetentionRequest? = nil,
@@ -961,13 +962,13 @@ actor MLXGemmaRunner {
         throw BoomError.stale("The independent consultation lost its captured seed or prompt.")
       }
       return try await submitIndependentText(.init(identity: independentIdentity, owner: cacheOwner,
-        input: .consultation(plan), settings: try ProductCore.sampling(.standard), flag: flag, policy: policy,
+        input: .consultation(plan), settings: try settings ?? ProductCore.sampling(.standard), flag: flag, policy: policy,
         joinedRetention: joinedRetention, pairedAdmission: pairedAdmission,
         beforeCachePublication: beforeCachePublication,
         onPrefill: onPrefill, onCheckpoint: onCheckpoint, onText: onText))
     }
     return try await generate(plan: plan, raw: nil, images: images, media: media, maxTokens: maxTokens,
-      settings: ProductCore.sampling(.standard), seed: seed, flag: flag,
+      settings: settings ?? ProductCore.sampling(.standard), seed: seed, flag: flag,
       cacheOwner: cacheOwner, executionPolicy: executionPolicy, joinedRetention: joinedRetention,
       beforeCachePublication: beforeCachePublication, pairedAdmission: pairedAdmission, diagnostic: diagnostic, onPrefill: onPrefill,
       onCheckpoint: onCheckpoint, onText: onText)

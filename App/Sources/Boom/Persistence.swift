@@ -56,6 +56,7 @@ struct ComposerDraft: Codable, Sendable {
 }
 struct WorkspaceState: Codable, Sendable {
   var schema = 1
+  var blessenger: BlessengerState? = nil
   var documents: [DocumentIndex] = []
   var archivedDocuments: [DocumentIndex]? = nil
   var chats: [ChatRecord] = []
@@ -119,6 +120,8 @@ final class Vault: @unchecked Sendable {
   static let workspaceLimit = 134_217_728
   static let workspaceID = UUID(uuidString: "726B3A82-2EB1-493B-9D8E-F17C7A6E4B8A")!
   let root: URL
+  private let protection: RecordCipher?
+  var isProtected: Bool { protection != nil }
   private let lock = NSLock()
   /// Called only inside the existing Engine writer job. All category and
   /// workspace JSON writers use this same lock; no await occurs while held.
@@ -127,7 +130,8 @@ final class Vault: @unchecked Sendable {
     lock.lock(); defer { lock.unlock() }
     return try WorkspaceBackup.captureForExport(root: root.deletingLastPathComponent(), cancellation: cancellation, temporaryParent: temporaryParent)
   }
-  init(root: URL) throws {
+  init(root: URL, protection: RecordCipher? = nil) throws {
+    self.protection = protection
     guard root.isFileURL else { throw BoomError.invalid("Workspace storage must be a local directory.") }
     let selected = root.standardizedFileURL
     var existing = stat()
@@ -172,6 +176,7 @@ final class Vault: @unchecked Sendable {
     let lockTrace = PerformanceTrace.begin("Storage.LockWait")
     lock.lock(); PerformanceTrace.end("Storage.LockWait", lockTrace)
     defer { lock.unlock() }
+    let payload = try protection.map { try $0.seal(data, binding: kind.rawValue + ":" + id.uuidString) } ?? data
     let target = recordURL(kind, id)
     var existing = stat()
     if lstat(target.path, &existing) == 0 {
@@ -187,7 +192,7 @@ final class Vault: @unchecked Sendable {
     let writeTrace = PerformanceTrace.begin("Storage.AtomicWrite")
     defer { PerformanceTrace.end("Storage.AtomicWrite", writeTrace) }
     do {
-      try handle.write(contentsOf: data)
+      try handle.write(contentsOf: payload)
       try handle.synchronize()
       closeAttempted = true
       try handle.close()
@@ -221,7 +226,10 @@ final class Vault: @unchecked Sendable {
     try admit(kind, id)
     guard limit >= 0 else { throw BoomError.invalid("Invalid workspace read bound.") }
     lock.lock(); defer { lock.unlock() }
-    return try RegularFile(recordURL(kind, id), limit: Int64(limit)).data()
+    let extra = protection == nil ? 0 : RecordCipher.overhead
+    guard limit <= Int.max - extra else { throw BoomError.invalid("Invalid private read bound.") }
+    let bytes = try RegularFile(recordURL(kind, id), limit: Int64(limit + extra)).data()
+    return try protection.map { try $0.open(bytes, binding: kind.rawValue + ":" + id.uuidString, limit: limit) } ?? bytes
   }
   func encode<T: Encodable>(_ value: T, kind: Kind, id: UUID) throws {
     let trace = PerformanceTrace.begin("Storage.Encode")
@@ -253,7 +261,11 @@ actor WorkspaceStore {
   nonisolated let root: URL
   nonisolated let vault: Vault
   private var workspaceLock: Int32?
-  init(rootOverride: URL? = nil) throws {
+  // Used only by the Blessenger product. All its metadata mutations share this
+  // actor and the existing atomic workspace record; no renderer is a writer.
+  var blessengerRuntime: WorkspaceState?
+  var blessengerCall: BlessengerCallContext?
+  init(rootOverride: URL? = nil, privateSession: BlessengerKeySession? = nil) throws {
     #if BOOM_UI_TEST
     let path = ProcessInfo.processInfo.environment["BOOM_UI_TEST_ROOT"] ?? "/tmp/boom-ui-test-root"
     guard path.hasPrefix("/") else { throw BoomError.invalid("UI test root must be absolute.") }
@@ -272,11 +284,26 @@ actor WorkspaceStore {
       attributes: [.posixPermissions: 0o700])
     root = try WorkspaceBackup.physicalDirectory(normalized)
     try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
-    vault = try Vault(root: root.appendingPathComponent("Objects", isDirectory: true))
+    var lease: Int32?
+    do {
+      if privateSession != nil {
+        guard rootOverride != nil else { throw BoomError.invalid("Private storage needs its explicit product root.") }
+        lease = try Self.claimWorkspace(root)
+      }
+      let cipher = try privateSession?.cipher(existingRecords: BlessengerInventory.hasRecords(root))
+      vault = try Vault(root: root.appendingPathComponent("Objects", isDirectory: true), protection: cipher)
+      workspaceLock = lease
+    } catch {
+      if let lease { _ = Darwin.close(lease) }
+      throw error
+    }
   }
   deinit { if let descriptor = workspaceLock { _ = Darwin.close(descriptor) } }
   func acquireExclusiveWorkspace() throws {
     guard workspaceLock == nil else { return }
+    workspaceLock = try Self.claimWorkspace(root)
+  }
+  private nonisolated static func claimWorkspace(_ root: URL) throws -> Int32 {
     let path = root.appendingPathComponent(".workspace-lock")
     let descriptor = Darwin.open(path.path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
     guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
@@ -286,7 +313,7 @@ actor WorkspaceStore {
       let failure = errno; _ = Darwin.close(descriptor)
       throw BoomError.unavailable("The workspace is already open or its lock is unavailable (\(failure)).")
     }
-    workspaceLock = descriptor
+    return descriptor
   }
   /// The caller releases only after its actual source engine has closed.
   func releaseExclusiveWorkspace() throws {
@@ -335,6 +362,7 @@ actor WorkspaceStore {
       throw BoomError.invalid("Workspace metadata contains inconsistent identities; files retained.")
     }
     try state.validateRetainedInput()
+    if let value = state.blessenger { try value.validate(in: state) }
   }
   private func recoverGenerations(_ state: inout WorkspaceState) throws {
     var bundles: [CandidateBundle] = [], receipts: [(UUID, ConsultationReceipt)] = []

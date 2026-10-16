@@ -7,9 +7,11 @@ let productRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
 let buildURL = productRoot.appendingPathComponent(".build-support/RustProductBuild.json")
 let libraryDirectory: String
 let rustArchiveSettings: [CSetting]
+let productSwiftSettings: [SwiftSetting]
 if FileManager.default.fileExists(atPath: buildURL.path) {
   let config = try JSONDecoder().decode([String: String].self, from: Data(contentsOf: buildURL))
   libraryDirectory = config["libraryDirectory"]!
+  productSwiftSettings = config["edition"] == "blessenger" ? [.define("BLESSENGER")] : []
   guard let hash = config["librarySHA256"], hash.utf8.count == 64,
     hash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
     fatalError("Rebuild with scripts/build-macos.sh to record the Rust archive hash.")
@@ -21,6 +23,7 @@ if FileManager.default.fileExists(atPath: buildURL.path) {
 } else {
   libraryDirectory = productRoot.appendingPathComponent("target/release").path
   rustArchiveSettings = []
+  productSwiftSettings = []
 }
 let nativeLinkURL = productRoot.appendingPathComponent(".build-support/RustNativeLink.json")
 let nativeLinkFlags: [String]
@@ -67,6 +70,7 @@ let package = Package(
         .product(name: "Hub", package: "swift-transformers"),
       ],
       resources: [.process("Resources")],
+      swiftSettings: productSwiftSettings,
       linkerSettings: [
         .unsafeFlags(
           [

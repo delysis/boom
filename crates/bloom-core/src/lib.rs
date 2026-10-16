@@ -8,6 +8,7 @@ use uuid::Uuid;
 const TEXT_LIMIT: usize = 2 * 1024 * 1024;
 
 mod batch;
+pub mod blessenger;
 mod checkpoint;
 mod consultation;
 mod context;
@@ -607,6 +608,9 @@ fn sampling(profile: &str) -> Result<Sampling, Error> {
     deny_unknown_fields
 )]
 pub enum Request {
+    Blessenger {
+        request: blessenger::Request,
+    },
     CheckpointRequirements {
         checkpoint: checkpoint::Checkpoint,
     },
@@ -1058,6 +1062,7 @@ pub fn markdown_media_spans(text: &str) -> Result<Value, Error> {
 
 pub fn execute(request: Request) -> Result<Value, Error> {
     match request {
+        Request::Blessenger { request } => return blessenger::execute(request),
         Request::CheckpointRequirements { checkpoint } => {
             serde_json::to_value(checkpoint::requirements(&checkpoint)?)
         }

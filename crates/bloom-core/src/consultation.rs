@@ -244,9 +244,9 @@ pub(super) fn compile_with_window(
     let prompt_contract =
         prompt_contract.filter(|contract| *contract != ConsultationPromptContract::TextHistoryV1);
     require(
-        (1..=3).contains(&voices.len())
+        (1..=4).contains(&voices.len())
             && (voices.len() == 1 || voices.iter().all(Option::is_some)),
-        "A consultation round requires one assistant or up to three voices.",
+        "A consultation round requires one assistant or up to four voices.",
     )?;
     let identities: BTreeSet<_> = voices.iter().flatten().map(|voice| voice.id).collect();
     require(
@@ -258,8 +258,8 @@ pub(super) fn compile_with_window(
         "Consultation input exceeds the supported bound.",
     )?;
     require(
-        routing.len() <= 3 && routing.iter().all(|slug| valid_slug(slug)),
-        "Consult at most three valid @names per turn.",
+        routing.len() <= 4 && routing.iter().all(|slug| valid_slug(slug)),
+        "Consult at most four valid @names per turn.",
     )?;
     // Validate the whole captured round before compiling any capacity-limited
     // plan. An invalid later turn or voice must not become a trimming signal.
@@ -284,7 +284,7 @@ pub(super) fn compile_with_window(
         require(
             turn.routing
                 .as_ref()
-                .is_none_or(|value| value.len() <= 3 && value.iter().all(|slug| valid_slug(slug))),
+                .is_none_or(|value| value.len() <= 4 && value.iter().all(|slug| valid_slug(slug))),
             "Invalid captured routing.",
         )?;
         if matches!(

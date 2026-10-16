@@ -8,3 +8,7 @@ out/
 .build-support/
 target/
 .build/
+
+# Exact pinned Blessenger assets, prepared explicitly before native builds.
+/App/Sources/Boom/Resources/BlessengerContacts.json
+/App/Sources/Boom/Resources/BlessengerPortraits.png

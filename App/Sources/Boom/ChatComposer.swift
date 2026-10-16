@@ -54,6 +54,19 @@ func nativeEditEvent(_ event: String) {
     super.mouseDown(with: event)
     if window?.firstResponder !== self { window?.makeFirstResponder(self) }
   }
+  override func shouldChangeText(in affectedCharRange: NSRange, replacementString: String?) -> Bool {
+    if let maximumUTF8Bytes, let replacementString {
+      let source = string as NSString
+      guard affectedCharRange.location >= 0, affectedCharRange.length >= 0,
+        affectedCharRange.location <= source.length,
+        affectedCharRange.length <= source.length - affectedCharRange.location else { return false }
+      let removed = source.substring(with: affectedCharRange).utf8.count
+      guard string.utf8.count - removed <= maximumUTF8Bytes - min(maximumUTF8Bytes + 1, replacementString.utf8.count) else {
+        issue?("The message exceeds its input limit. Nothing was pasted or truncated."); return false
+      }
+    }
+    return super.shouldChangeText(in: affectedCharRange, replacementString: replacementString)
+  }
   override func becomeFirstResponder() -> Bool {
     let accepted = super.becomeFirstResponder()
     if accepted { onFocus?() }
@@ -193,6 +206,8 @@ struct ChatComposer: NSViewRepresentable {
   var lineSpacing: CGFloat = 0
   var onContentHeight: ((CGFloat) -> Void)? = nil
   var showsEditingActions = false
+  var sendsOnReturn = false
+  var maximumUTF8Bytes: Int? = nil
   var completionModel: WorkspaceModel? = nil
   var completionTarget: TextInputTarget? = nil
   var textVersion: UUID? = nil
