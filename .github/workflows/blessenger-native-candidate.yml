@@ -60,6 +60,9 @@ jobs:
           set -euo pipefail
           scripts/bootstrap.sh 2>&1 | tee evidence/bootstrap.log
           scripts/prepare-blessenger-assets.sh 2>&1 | tee evidence/catalog.log
+          uname -a > evidence/hardware.txt
+          sysctl hw.memsize hw.ncpu >> evidence/hardware.txt
+          tar -czf evidence/runtime-sources.tar.gz --exclude=.git --exclude=.build -C .deps MLXSwiftLM Qwen3TTS
       - name: Native bridge and Blessenger regressions
         id: native
         if: steps.dependencies.outcome == 'success'

@@ -187,12 +187,16 @@ struct BlessengerCallTransition: Decodable, Sendable {
   private var pausedUptime: Double?
   private var modelReady = false
   private var lifecycle = UUID()
+  private var endingWaiters: [CheckedContinuation<Void, Never>] = []
+  private let requestMicrophone: @MainActor () async -> Bool
   var onEnded: (@MainActor (String?) -> Void)?
   var onIssue: (@MainActor (String?) -> Void)?
   init(output: BlessengerAudioOutput, onStart: @escaping @MainActor () async throws -> Void = {},
     onUtterance: @escaping @MainActor (BlessengerCallerClip, UUID, UInt64) async throws -> Void = { _, _, _ in },
     onInterrupt: @escaping @MainActor () -> Void = {},
-    onClassify: (@Sendable ([Float]) async throws -> Float)? = nil) {
+    onClassify: (@Sendable ([Float]) async throws -> Float)? = nil,
+    requestMicrophone: @escaping @MainActor () async -> Bool = { await AVCaptureDevice.requestAccess(for: .audio) }) {
+    self.requestMicrophone = requestMicrophone
     self.output = output; self.onStart = onStart; self.onUtterance = onUtterance; self.onInterrupt = onInterrupt
     let classifier = BlessengerTurnClassifier(); self.classifier = classifier
     self.onClassify = onClassify ?? { samples in
@@ -200,12 +204,17 @@ struct BlessengerCallTransition: Decodable, Sendable {
       try Task.checkCancellation(); return result
     }
   }
-  func start() async throws {
+  func start(cancellation: CancellationFlag = CancellationFlag()) async throws {
     guard !active, preparation == nil, response == nil else { throw BoomError.unavailable("The preceding call is still closing.") }
     let attempt = UUID(); lifecycle = attempt
+    try cancellation.check()
     output.stop(); try await output.join()
-    guard await AVCaptureDevice.requestAccess(for: .audio) else { throw BoomError.denied("Microphone access was not granted.") }
+    try cancellation.check()
     guard lifecycle == attempt, !Task.isCancelled else { throw CancellationError() }
+    let permitted = await requestMicrophone()
+    try cancellation.check()
+    guard lifecycle == attempt, !Task.isCancelled else { throw CancellationError() }
+    guard permitted else { throw BoomError.denied("Microphone access was not granted.") }
     let engine = output.engine
     engine.stop()
     try engine.inputNode.setVoiceProcessingEnabled(true)
@@ -339,6 +348,11 @@ struct BlessengerCallTransition: Decodable, Sendable {
     output.engine.inputNode.removeTap(onBus: 0)
     onInterrupt(); output.stop(); response?.cancel(); preparation?.cancel(); poll?.cancel()
     gate.ended = true; onEnded?(error)
+    let waiters = endingWaiters; endingWaiters.removeAll()
+    for waiter in waiters { waiter.resume() }
+  }
+  func waitUntilEnded() async {
+    if active { await withCheckedContinuation { endingWaiters.append($0) } }
   }
   func join() async {
     if let poll { await poll.value }; if let preparation { await preparation.value }; if let response { await response.value }

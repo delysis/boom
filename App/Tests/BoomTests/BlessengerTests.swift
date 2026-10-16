@@ -300,6 +300,69 @@ final class BlessengerTests: XCTestCase {
     capture.stop()
   }
 
+  @MainActor func testHangUpBeforeStartupRegistersNothingAndNeverAsksForMicrophone() async throws {
+    let store = try store(root()), initial = try await store.openBlessenger(catalog: fixtureCatalog)
+    let model = BlessengerModel(store: store, catalog: fixtureCatalog, state: initial, namespace: UUID(),
+      requestMicrophone: { XCTFail("A cancelled startup must not ask for microphone access."); return false })
+    XCTAssertTrue(model.canCall)
+    model.toggleCall()
+    XCTAssertTrue(model.callStarting)
+    model.toggleCall()
+    XCTAssertTrue(model.callEnding)
+    XCTAssertFalse(model.canCall, "Cancellation is not producer release.")
+    await model.endCall()
+    XCTAssertFalse(model.callInProgress)
+    XCTAssertFalse(model.isCalling)
+    XCTAssertTrue(model.canCall)
+    let after = try await store.blessengerSnapshot()
+    XCTAssertEqual(after.chats, initial.chats)
+    XCTAssertEqual(after.blessenger!.draft(for: nil), initial.blessenger!.draft(for: nil))
+    try await model.shutdown()
+  }
+
+  @MainActor func testHangUpDuringPermissionRejectsLateGrantAndReleasesCallRoute() async throws {
+    let store = try store(root()), initial = try await store.openBlessenger(catalog: fixtureCatalog)
+    let requested = expectation(description: "Permission requested by the real call startup")
+    var reply: CheckedContinuation<Bool, Never>?
+    let model = BlessengerModel(store: store, catalog: fixtureCatalog, state: initial, namespace: UUID(),
+      requestMicrophone: {
+        await withCheckedContinuation { reply = $0; requested.fulfill() }
+      })
+    model.toggleCall()
+    await fulfillment(of: [requested], timeout: 5)
+    model.toggleCall()
+    XCTAssertTrue(model.callEnding)
+    XCTAssertFalse(model.canCall)
+    // A real native request cannot necessarily be interrupted. Its late answer
+    // is denied publication instead of being misreported as a successful call.
+    reply?.resume(returning: true); reply = nil
+    await model.endCall()
+    XCTAssertFalse(model.callInProgress)
+    XCTAssertFalse(model.audio.engine.isRunning)
+    XCTAssertTrue(model.canCall)
+    let route = try await store.blessengerBeginCall(selection: nil,
+      expectedDraftVersion: initial.blessenger!.draft(for: nil).version)
+    await store.blessengerEndCall(route.id)
+    try await model.shutdown()
+  }
+
+  @MainActor func testCallObjectStoppedDuringPermissionNeverStartsItsAudioGraph() async throws {
+    let requested = expectation(description: "Permission boundary reached")
+    var reply: CheckedContinuation<Bool, Never>?
+    let audio = BlessengerAudioOutput()
+    let call = BlessengerCall(output: audio,
+      onStart: { XCTFail("A stopped call may not prepare a model.") },
+      requestMicrophone: { await withCheckedContinuation { reply = $0; requested.fulfill() } })
+    let task = Task { try await call.start() }
+    await fulfillment(of: [requested], timeout: 5)
+    call.stop()
+    reply?.resume(returning: true); reply = nil
+    do { try await task.value; XCTFail("A late permission grant reopened the call.") }
+    catch is CancellationError {} catch { XCTFail("Unexpected failure: \(error)") }
+    await call.join()
+    XCTAssertFalse(call.active); XCTAssertFalse(audio.engine.isRunning)
+  }
+
 }
 private final class ReadCounter: @unchecked Sendable {
   private let lock = NSLock(); private var count = 0

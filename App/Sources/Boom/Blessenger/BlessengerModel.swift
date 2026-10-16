@@ -24,8 +24,15 @@ import Foundation
   @Published var recipientFocus = 0
   let audio = BlessengerAudioOutput()
   lazy var inputCompletion = BlessengerCompletion(model: self)
-  @Published private(set) var isCalling = false
-  @Published private(set) var callStarting = false
+  enum CallPhase { case idle, preparing, active, ending }
+  @Published private(set) var callPhase = CallPhase.idle
+  var isCalling: Bool { callPhase == .active }
+  var callStarting: Bool { callPhase == .preparing }
+  var callEnding: Bool { callPhase == .ending }
+  var callInProgress: Bool { callPhase != .idle }
+  private var callLifetime: CancellationFlag?
+  private var callTask: Task<Void, Never>?
+  private let requestMicrophone: @MainActor () async -> Bool
   private var call: BlessengerCall?
   private var callID: UUID?
   private var callOperation: CancellationFlag?
@@ -68,13 +75,14 @@ import Foundation
       for waiter in waiters { waiter.resume() }
     }
   }
-  func launch(_ action: @escaping @MainActor () async throws -> Void) {
-    do { try beginAction() } catch { return }
+  @discardableResult func launch(_ action: @escaping @MainActor () async throws -> Void) -> Task<Void, Never>? {
+    do { try beginAction() } catch { return nil }
     let id = UUID()
     actions[id] = Task {
       defer { actions.removeValue(forKey: id); endAction() }
       do { try Task.checkCancellation(); try await action() } catch { report(error) }
     }
+    return actions[id]
   }
   func change(restoreDraft: Bool = false,
     _ mutation: @escaping @Sendable (inout WorkspaceState, inout BlessengerState) throws -> Void) async {
@@ -120,7 +128,7 @@ import Foundation
   var templateSelected: Bool { product.selectedTemplate == state.selectedChat && state.selectedChat != nil }
   var recipients: [BlessengerContact] { product.addresses[draft.id]?.recipients ?? draft.recipients }
   var canSend: Bool {
-    !closed && !closing && !navigating && !preparing && !loading && !isCalling && !callStarting && noteState == .idle && !hasUnstoredVoiceNote && !templateSelected
+    !closed && !closing && !navigating && !preparing && !loading && !callInProgress && noteState == .idle && !hasUnstoredVoiceNote && !templateSelected
       && !(selected.map { active.contains($0.id) } ?? false)
       && ((try? BlessengerPolicy.validate(draft).sendable) == true)
   }
@@ -130,7 +138,9 @@ import Foundation
   }
   var hasReadyModel: Bool { runner != nil }
 
-  init(store: WorkspaceStore, catalog: BlessengerCatalog, state: WorkspaceState, namespace: UUID) {
+  init(store: WorkspaceStore, catalog: BlessengerCatalog, state: WorkspaceState, namespace: UUID,
+    requestMicrophone: @escaping @MainActor () async -> Bool = { await AVCaptureDevice.requestAccess(for: .audio) }) {
+    self.requestMicrophone = requestMicrophone
     self.store = store; self.catalog = catalog; self.state = state; self.namespace = namespace
     let initialDraft = state.blessenger!.draft(for: state.selectedChat)
     draft = initialDraft; storedDraftVersion = initialDraft.version
@@ -251,7 +261,7 @@ import Foundation
     } catch { report(error); return false }
   }
   func chooseModel(_ path: URL) async {
-    guard !loading, !preparing, active.isEmpty, !closed, !isCalling, !callStarting else { return }
+    guard !loading, !preparing, active.isEmpty, !closed, !callInProgress else { return }
     do { try beginAction() } catch { return }
     loading = true; defer { loading = false; endAction() }
     do {
@@ -297,7 +307,7 @@ import Foundation
     }
   }
   func answerAgain(_ questionID: UUID) {
-    guard !preparing, !navigating, !isCalling, !callStarting, let captured = selected,
+    guard !preparing, !navigating, !callInProgress, let captured = selected,
       !active.contains(captured.id), let question = captured.messages.first(where: { $0.id == questionID && $0.role == .user && $0.state == .complete }) else { return }
     launch {
       await self.branch(at: question.id, in: captured)
@@ -513,7 +523,7 @@ import Foundation
     }
   }
   func readAloud(_ message: ChatMessage) {
-    guard message.state != .pending, !message.text.isEmpty, !isCalling, !callStarting, !preparing, active.isEmpty else { return }
+    guard message.state != .pending, !message.text.isEmpty, !callInProgress, !preparing, active.isEmpty else { return }
     let flag = CancellationFlag(); speechActionFlag?.cancel(); speechActionFlag = flag
     let sourceDigest = Digest.sha256(message.text), id = message.id
     let voice = message.speaker?.voiceID.flatMap { product.speechVoices[$0] } ?? product.defaultSpeech
@@ -536,55 +546,77 @@ import Foundation
     }
   }
   var canCall: Bool {
-    !closed && !closing && !navigating && !preparing && !loading && !callStarting && !isCalling
+    !closed && !closing && !navigating && !preparing && !loading && !callInProgress
       && active.isEmpty && !templateSelected && recipients.count <= 1 && draft.recipientQuery.isEmpty && noteState == .idle && !hasUnstoredVoiceNote
   }
-  func toggleCall() {
-    if isCalling || callStarting {
-      call?.stop(); callOperation?.cancel(); isCalling = false; callReady = false; callMuted = false
-      let old = call, id = callID
-      launch {
-        if let id { await self.store.blessengerEndCall(id) }
-        if let old { await old.join() }
-        if self.call === old { self.call = nil; self.callID = nil; self.callStarting = false }
-      }
-      return
+  /// Hang-up invalidates the lifetime synchronously. The same action owns
+  /// startup, capture, response workers and teardown until all have joined.
+  /// In particular there is no gap before a call object or store route exists.
+  func stopCall() {
+    guard callInProgress else { return }
+    callPhase = .ending; callReady = false; callMuted = false
+    callLifetime?.cancel(); callOperation?.cancel(); call?.stop()
+  }
+  func endCall() async {
+    let lifetime = callLifetime, task = callTask
+    stopCall()
+    if let task { await task.value }
+    // A parent may cancel the tracked action before its body ever begins.
+    // The generic action owner still joins; there is no call route to release.
+    if callLifetime === lifetime {
+      call = nil; callID = nil; callLifetime = nil; callTask = nil
+      callPhase = .idle; callReady = false; callMuted = false
     }
+  }
+  func toggleCall() {
+    if callInProgress { stopCall(); return }
     guard canCall else { return }
-    inputCompletion.invalidateGhost(); callStarting = true
-    launch {
-      defer { self.callStarting = false }
-      await self.inputCompletion.join(); try await self.flushDraft()
-      if let previous = self.call {
-        previous.stop(); await previous.join()
-        if let id = self.callID { await self.store.blessengerEndCall(id) }
-        self.call = nil; self.callID = nil
+    let selection = state.selectedChat, capturedDraft = draft
+    let lifetime = CancellationFlag(); callLifetime = lifetime
+    inputCompletion.invalidateGhost(); callPhase = .preparing
+    callTask = launch {
+      defer {
+        if self.callLifetime === lifetime {
+          self.call = nil; self.callID = nil; self.callLifetime = nil; self.callTask = nil
+          self.callPhase = .idle; self.callReady = false; self.callMuted = false
+        }
       }
-      let route = try await self.store.blessengerBeginCall(selection: self.state.selectedChat,
-        expectedDraftVersion: self.storedDraftVersion)
+      try lifetime.check()
+      await self.inputCompletion.join(); try lifetime.check()
+      try await self.flushDraft(); try lifetime.check()
+      guard self.state.selectedChat == selection, self.draft.id == capturedDraft.id,
+        self.draft.version == capturedDraft.version else {
+        throw BoomError.stale("The call destination changed during preparation. Nothing was called.")
+      }
+      let route = try await self.store.blessengerBeginCall(selection: selection,
+        expectedDraftVersion: capturedDraft.version)
       self.callID = route.id
-      let call = BlessengerCall(output: self.audio)
-      call.onReady = { [weak self] in if self?.callID == route.id { self?.callReady = true } }
-      call.onIssue = { [weak self] issue in if self?.callID == route.id { self?.callIssue = issue } }
+      let call = BlessengerCall(output: self.audio, requestMicrophone: self.requestMicrophone)
       self.call = call
+      call.onReady = { [weak self] in
+        if self?.callID == route.id, !lifetime.isCancelled { self?.callReady = true }
+      }
+      call.onIssue = { [weak self] issue in
+        if self?.callID == route.id, !lifetime.isCancelled { self?.callIssue = issue }
+      }
       call.onEnded = { [weak self] failure in
         guard let self, self.callID == route.id else { return }
-        self.isCalling = false; self.callReady = false; self.callMuted = false
-        if let failure { self.failure = failure }
-        Task { await self.store.blessengerEndCall(route.id) }
+        self.callPhase = .ending; self.callReady = false; self.callMuted = false
+        if let failure, !lifetime.isCancelled { self.failure = failure }
       }
       call.onStart = { [weak self] in
-        guard let self, self.callID == route.id else { throw CancellationError() }
+        guard let self, self.callID == route.id, !lifetime.isCancelled else { throw CancellationError() }
         let runner = try await self.model(for: route.profile.modelPath)
+        try lifetime.check()
         guard runner.supportsRawAudio else { throw BoomError.unavailable("This model cannot receive caller audio.") }
         if route.profile.useMTP != false { _ = try await runner.prepareMTP() }
-        try Task.checkCancellation()
+        try Task.checkCancellation(); try lifetime.check()
         _ = try await self.audio.prepare(route.speech)
-        try Task.checkCancellation()
+        try Task.checkCancellation(); try lifetime.check()
       }
       call.onInterrupt = { [weak self] in self?.callOperation?.cancel() }
       call.onUtterance = { [weak self] clip, _, epoch in
-        guard let self, self.callID == route.id else { throw CancellationError() }
+        guard let self, self.callID == route.id, !lifetime.isCancelled else { throw CancellationError() }
         let trace = BlessengerTrace()
         trace.record(clip.nativeInputClock ? "caller.voicedPacketEnd.native" : "caller.voicedPacketEnd.deliveryEstimate", at: clip.speechEndedUptime)
         if let time = clip.deliveredUptime { trace.record("capture.finalVoicedPacketDelivered", at: time) }
@@ -604,13 +636,19 @@ import Foundation
         try flag.check(); try await self.performSend(flag: flag, caller: turn)
       }
       do {
-        try await call.start()
-        guard self.call === call, !self.closing else { throw CancellationError() }
-        self.isCalling = call.active
+        try lifetime.check()
+        try await withTaskCancellationHandler {
+          try await call.start(cancellation: lifetime)
+          try lifetime.check()
+          guard self.call === call, !self.closing else { throw CancellationError() }
+          self.callPhase = call.active ? .active : .ending
+          await call.waitUntilEnded()
+        } onCancel: { lifetime.cancel() }
       } catch {
         call.stop(); await call.join(); await self.store.blessengerEndCall(route.id)
-        self.call = nil; self.callID = nil; throw error
+        throw error
       }
+      call.stop(); await call.join(); await self.store.blessengerEndCall(route.id)
     }
   }
   var completionContext: BlessengerCompletion.Context {
@@ -620,7 +658,7 @@ import Foundation
   }
   var completionAvailable: Bool {
     state.autocomplete && !closed && !closing && !navigating && !loading && !preparing && active.isEmpty
-      && !isCalling && !callStarting && noteState == .idle && !hasUnstoredVoiceNote && !templateSelected && runner != nil
+      && !callInProgress && noteState == .idle && !hasUnstoredVoiceNote && !templateSelected && runner != nil
       && runnerPath == ((product.addresses[draft.id]?.profile ?? product.defaultProfile).modelPath ?? ModelPacks.cached(.consultation)?.path)
   }
   func inputSuggestions(document: DocumentSnapshot, caret: Int, context: BlessengerCompletion.Context,
@@ -660,7 +698,7 @@ import Foundation
     return values
   }
   func toggleVoiceNote() {
-    guard !navigating, !isCalling, !callStarting, !closing, !hasUnstoredVoiceNote else { return }
+    guard !navigating, !callInProgress, !closing, !hasUnstoredVoiceNote else { return }
     switch noteState {
     case .idle:
       guard !preparing, active.isEmpty, !templateSelected else { return }
@@ -699,7 +737,7 @@ import Foundation
   }
   func discardUnstoredVoiceNote() { unstoredVoiceNote = nil; hasUnstoredVoiceNote = false }
   func replayAudio(_ id: UUID) {
-    guard !isCalling, !callStarting, active.isEmpty, let record = product.audio[id],
+    guard !callInProgress, active.isEmpty, let record = product.audio[id],
       let original = state.attachments.first(where: { $0.id == record.attachmentID }) else { return }
     launch {
       let bytes = try await detachedWork { try self.store.vault.get(.attachment, id: record.attachmentID, limit: 67_108_864) }
@@ -713,7 +751,7 @@ import Foundation
     }
   }
   func clearModel() async {
-    guard active.isEmpty, !preparing, !isCalling, !callStarting, !loading else { return }
+    guard active.isEmpty, !preparing, !callInProgress, !loading else { return }
     let id = state.selectedChat
     await change { _, product in
       if let id, var address = product.addresses[id] { address.profile.modelPath = nil; address.profile.id = UUID(); product.addresses[id] = address }
@@ -721,7 +759,7 @@ import Foundation
     }
   }
   func setProfile(sampling: SamplingProfile? = nil, mtp: Bool?? = nil) async {
-    guard !isCalling, !callStarting else { return }
+    guard !callInProgress else { return }
     let id = state.selectedChat
     await change { _, product in
       var profile = id.flatMap { product.addresses[$0]?.profile } ?? product.defaultProfile
@@ -745,7 +783,7 @@ import Foundation
     launch { await self.change { state, _ in state.autocomplete = value } }
   }
   func recoverDraft() {
-    guard !navigating, active.isEmpty, !preparing, !isCalling, !callStarting else { return }
+    guard !navigating, active.isEmpty, !preparing, !callInProgress else { return }
     let authored = draft, previous = storedDraftVersion
     launch {
       self.navigating = true; defer { self.navigating = false }
@@ -764,7 +802,7 @@ import Foundation
   func setCallMuted(_ value: Bool) { call?.setMuted(value); callMuted = value }
   func submitCallTurn() { call?.submitPausedTurn() }
   func runSetup(_ work: @escaping @Sendable (CancellationFlag, @escaping @Sendable (String) -> Void) async throws -> Void) {
-    guard !loading, active.isEmpty, !isCalling, !callStarting, !closing else { return }
+    guard !loading, active.isEmpty, !callInProgress, !closing else { return }
     loading = true
     launch {
       let flag = CancellationFlag(); self.setupFlags[flag.operationID] = flag
@@ -790,10 +828,8 @@ import Foundation
     for flag in flags.values { flag.cancel() }
     for operation in operations.values { operation.cancel() }
     for flag in childFlags.values { flag.cancel() }
-    speechActionFlag?.cancel(); audio.stop(); voiceNote.cancel(); noteState = .idle; call?.stop(); callOperation?.cancel()
-    if let callID { await store.blessengerEndCall(callID) }
-    if let call { await call.join() }
-    isCalling = false
+    speechActionFlag?.cancel(); audio.stop(); voiceNote.cancel(); noteState = .idle
+    await endCall()
     searchTask?.cancel(); await inputCompletion.join()
     if actionCount > 0 { await withCheckedContinuation { actionWaiters.append($0) } }
     if let searchTask { await searchTask.value }

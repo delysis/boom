@@ -20,7 +20,7 @@ struct BlessengerView: View {
         header
         Divider()
         issueBar
-        if model.isCalling || model.callStarting { callBar }
+        if model.callInProgress { callBar }
         if model.settingsOpen { settings }
         else {
           if model.state.selectedChat == nil { addressing }
@@ -124,10 +124,10 @@ struct BlessengerView: View {
         Text(model.title).lineLimit(1)
       }
       Spacer()
-      Button { model.toggleCall() } label: { Image(systemName: model.isCalling ? "phone.down.fill" : "phone") }
-        .buttonStyle(GlassControl()).help(model.isCalling ? "End Call" : "Call")
-        .accessibilityLabel(model.isCalling ? "End Call" : "Call")
-        .disabled(!model.canCall && !model.isCalling)
+      Button { model.toggleCall() } label: { Image(systemName: model.callInProgress ? "phone.down.fill" : "phone") }
+        .buttonStyle(GlassControl()).help(model.callInProgress ? "End Call" : "Call")
+        .accessibilityLabel(model.callInProgress ? "End Call" : "Call")
+        .disabled(model.callEnding || (!model.canCall && !model.callInProgress))
     }.padding(.horizontal, 16).frame(height: 64)
       .background(.thinMaterial)
   }
@@ -296,13 +296,13 @@ struct BlessengerView: View {
   private var callBar: some View {
     HStack(spacing: 12) {
       if !model.callReady { ProgressView().controlSize(.small) }
-      Text(model.callReady ? (model.callMuted ? "Muted" : "Listening") : "Preparing call").font(.callout)
+      Text(model.callEnding ? "Ending call" : model.callReady ? (model.callMuted ? "Muted" : "Listening") : "Preparing call").font(.callout)
       Spacer()
       Button { model.setCallMuted(!model.callMuted) } label: { Image(systemName: model.callMuted ? "mic.slash.fill" : "mic.fill") }
         .accessibilityLabel(model.callMuted ? "Unmute microphone" : "Mute microphone")
         .disabled(!model.callReady)
       Button("Send Turn") { model.submitCallTurn() }.disabled(!model.callReady || model.callMuted)
-      Button { model.toggleCall() } label: { Image(systemName: "phone.down.fill") }.accessibilityLabel("End call")
+      Button { model.toggleCall() } label: { Image(systemName: "phone.down.fill") }.accessibilityLabel("End call").disabled(model.callEnding)
     }.padding(.horizontal, 18).padding(.vertical, 8).background(.quaternary)
   }
   private var template: some View {

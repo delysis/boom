@@ -824,27 +824,14 @@ actor MLXGemmaRunner {
     return try RawWritingInput.prepare(tokens: input.text.tokens.asArray(Int.self), media: ordered, context: context)
   }
   private static func placedChatInput(_ plan: ConsultationPlan, media: [WritingMediaData], context: ModelContext) async throws -> LMInput {
-    guard plan.messages.allSatisfy({ $0.media != nil }),
-      Set(media.map { $0.reference.id }).count == media.count else { throw BoomError.invalid("Ambiguous captured media input.") }
-    var ordered: [WritingMediaData] = []
-    let messages = try plan.messages.map { message -> Chat.Message in
-      var body = "", previous = 0
-      let bytes = Array(message.content.utf8)
-      for placement in message.media ?? [] {
-        guard message.role == "user", placement.end >= previous, placement.end <= bytes.count,
-          let prefix = String(bytes: bytes[previous..<placement.end], encoding: .utf8),
-          let payload = media.first(where: { $0.reference.id == placement.id }) else {
-          throw BoomError.stale("A captured attachment occurrence is unavailable.")
-        }
-        let link = "[Attachment](boom-attachment:\\(placement.id.uuidString))"
-        let compiled = try RawWritingInput.compiled(link, media: [payload.reference])
-        guard compiled.media.count == 1, compiled.media[0] == payload.reference else { throw BoomError.invalid("Media projection changed identity.") }
-        body += prefix + "\\n" + compiled.prompt + "\\n"; ordered.append(payload)
-        previous = placement.end
+    let expansion = try RawWritingInput.expandChatMedia(plan, media: media)
+    let ordered = expansion.media
+    let messages = expansion.messages.map { message -> Chat.Message in
+      switch message.role {
+      case "system": return .system(message.content)
+      case "assistant": return .assistant(message.content)
+      default: return .user(message.content)
       }
-      guard let suffix = String(bytes: bytes[previous...], encoding: .utf8) else { throw BoomError.invalid("A media boundary splits UTF-8.") }
-      body += suffix
-      switch message.role { case "system": return .system(body); case "assistant": return .assistant(body); default: return .user(body) }
     }
     guard ordered.isEmpty || context.model is Gemma4Unified else {
       throw BoomError.unavailable("This checkpoint cannot preserve the selected chronological raw-media context.")
