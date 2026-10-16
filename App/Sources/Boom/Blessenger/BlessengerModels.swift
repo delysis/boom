@@ -72,8 +72,10 @@ actor BlessengerQwenSpeech {
   private var weightLease: ModelWeightLease?
   private var modelIdentity: String?
   private var occupied = false
+  private var preparing = false
   func prepare() async throws -> String {
-    guard !occupied else { throw BoomError.unavailable("Speech is still generating.") }
+    guard !occupied, !preparing else { throw BoomError.unavailable("Speech is still preparing or generating.") }
+    preparing = true; defer { preparing = false }
     let specification = try BlessengerModelPackage.package(.qwen)
     if pipeline != nil, modelIdentity == specification.identity { return specification.identity }
     let directory = try await detachedWork { try specification.local() }
@@ -121,7 +123,7 @@ actor BlessengerQwenSpeech {
     } catch { await GenerationCoordinator.shared.endSpeech(ticket); throw error }
   }
   func unload() throws {
-    guard !occupied else { throw BoomError.unavailable("Join speech before unloading its model.") }
+    guard !occupied, !preparing else { throw BoomError.unavailable("Join speech before unloading its model.") }
     pipeline = nil; weightLease = nil; modelIdentity = nil
   }
 }

@@ -8,7 +8,7 @@ extension BlessengerTests {
     let a = UUID(), b = UUID()
     func payload(_ id: UUID) -> WritingMediaData {
       WritingMediaData(reference: WritingMediaReference(id: id, name: "Caller.wav",
-        rootDigest: String(repeating: "a", count: 64), kind: "audio"), bytes: Data(), samples: [0])
+        rootDigest: String(repeating: "a", count: 64), kind: "audio", sourceDigest: String(repeating: "b", count: 64)), bytes: Data(), samples: [0])
     }
     let plan = ConsultationPlan(messages: [
       .init(role: "system", content: "Keep exact instructions.", media: []),
@@ -18,6 +18,7 @@ extension BlessengerTests {
     ], rawPrompt: "captured by the core")
     let expanded = try RawWritingInput.expandChatMedia(plan, media: [payload(a), payload(b)])
     XCTAssertEqual(expanded.media.map { $0.reference.id }, [a, b, a])
+    XCTAssertEqual(expanded.media.map { $0.reference.sourceDigest }, Array(repeating: String(repeating: "b", count: 64), count: 3))
     XCTAssertEqual(expanded.messages.map(\.role), ["system", "user", "assistant", "user"])
     XCTAssertEqual(expanded.messages[0].content, "Keep exact instructions.")
     XCTAssertEqual(expanded.messages[1].content, "Old🪶\n<|audio|>\n question")

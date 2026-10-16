@@ -13,12 +13,9 @@ struct BlessengerCallerClip: Sendable {
   var nativeInputClock = false
   var deliveredUptime: Double? = nil
   func wav() throws -> Data {
-    guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false),
-      let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)),
-      let output = buffer.floatChannelData?[0] else { throw BoomError.unavailable("Caller audio could not be packaged.") }
-    buffer.frameLength = buffer.frameCapacity
-    samples.withUnsafeBufferPointer { output.update(from: $0.baseAddress!, count: $0.count) }
-    return try RecordedClip.wav(buffer)
+    // Retained caller bytes use the same full-precision samples supplied to
+    // incremental model preparation, not a second quantized representation.
+    try BlessengerWave.encode(samples, rate: 16_000)
   }
 }
 
@@ -172,7 +169,7 @@ struct BlessengerCallTransition: Decodable, Sendable {
   @Published private(set) var error: String?
   private let output: BlessengerAudioOutput
   var onStart: @MainActor () async throws -> Void
-  var onUtterance: @MainActor (BlessengerCallerClip, UUID, UInt64) async throws -> Void
+  var onUtterance: @MainActor (BlessengerCallerClip, UUID, UInt64, CancellationFlag) async throws -> Void
   var onInterrupt: @MainActor () -> Void
   var onReady: (@MainActor () -> Void)?
   var onClassify: @Sendable ([Float]) async throws -> Float
@@ -184,6 +181,7 @@ struct BlessengerCallTransition: Decodable, Sendable {
   private var poll: Task<Void, Never>?
   private var preparation: Task<Void, Never>?
   private var response: Task<Void, Never>?
+  private var responseFlags: [CancellationFlag] = []
   private var pausedUptime: Double?
   private var modelReady = false
   private var lifecycle = UUID()
@@ -192,7 +190,7 @@ struct BlessengerCallTransition: Decodable, Sendable {
   var onEnded: (@MainActor (String?) -> Void)?
   var onIssue: (@MainActor (String?) -> Void)?
   init(output: BlessengerAudioOutput, onStart: @escaping @MainActor () async throws -> Void = {},
-    onUtterance: @escaping @MainActor (BlessengerCallerClip, UUID, UInt64) async throws -> Void = { _, _, _ in },
+    onUtterance: @escaping @MainActor (BlessengerCallerClip, UUID, UInt64, CancellationFlag) async throws -> Void = { _, _, _, _ in },
     onInterrupt: @escaping @MainActor () -> Void = {},
     onClassify: (@Sendable ([Float]) async throws -> Float)? = nil,
     requestMicrophone: @escaping @MainActor () async -> Bool = { await AVCaptureDevice.requestAccess(for: .audio) }) {
@@ -264,6 +262,13 @@ struct BlessengerCallTransition: Decodable, Sendable {
               self.error = "The turn sounds unfinished. Continue speaking, or choose Send Turn."; self.onIssue?(self.error)
             }
           }
+          // A full response lane leaves the semantic gate unconsumed. Its
+          // existing level releases as soon as capacity is available; no new
+          // pause edge or synthetic retry event is required.
+          if self.responseFlags.count < 4, self.modelReady, !self.gate.admitted,
+            self.gate.decision != nil, !self.gate.speaking, !self.gate.muted {
+            try self.advance(["kind": "ready", "epoch": self.gate.epoch])
+          }
           if !self.output.engine.isRunning { throw BoomError.unavailable("The audio device stopped. The call has ended.") }
           try await Task.sleep(for: .milliseconds(20))
         } catch is CancellationError { break }
@@ -307,6 +312,10 @@ struct BlessengerCallTransition: Decodable, Sendable {
     let next: BlessengerCallTransition = try ProductCore.call(["op": "blessenger", "request": [
       "op": "call", "gate": ProductCore.object(gate), "event": event]])
     let clip: BlessengerCallerClip?
+    if next.admit, responseFlags.count >= 4 {
+      // Preserve the complete current decision but not its admission bit.
+      gate = next.gate; gate.admitted = false; return
+    }
     if next.admit {
       guard let end = next.gate.pausedAt, let paused = pausedUptime, let capture else {
         throw BoomError.invalid("A call turn lost its captured pause.")
@@ -320,13 +329,17 @@ struct BlessengerCallTransition: Decodable, Sendable {
       }
     } else { clip = nil }
     gate = next.gate
-    if next.interrupt { onInterrupt(); output.stop(); response?.cancel() }
+    if next.interrupt { onInterrupt(); output.stop(); for flag in responseFlags { flag.cancel() } }
     if let clip {
       let call = gate.call, epoch = gate.epoch, prior = response
+      let flag = CancellationFlag(); responseFlags.append(flag)
       response = Task {
+        defer { responseFlags.removeAll { $0 === flag } }
         if let prior { await prior.value }
-        guard active, gate.call == call, gate.epoch == epoch else { return }
-        do { try await onUtterance(clip, call, epoch) }
+        // Admission already happened. Even after hang-up or renewed speech,
+        // retain this authored clip once before observing response cancellation.
+        // The call route remains owned until join completes this chain.
+        do { try await onUtterance(clip, call, epoch, flag) }
         catch is CancellationError {}
         catch { self.error = error.localizedDescription; self.onIssue?(self.error) }
         // The microphone remains running; a stale completion cannot change
@@ -341,12 +354,13 @@ struct BlessengerCallTransition: Decodable, Sendable {
   }
   func stop() {
     lifecycle = UUID()
-    preparation?.cancel(); poll?.cancel(); response?.cancel(); classification?.cancel()
+    preparation?.cancel(); poll?.cancel(); classification?.cancel()
+    for flag in responseFlags { flag.cancel() }
     guard active else { return }
     active = false; listening = false
     capture?.stop(); capture = nil
     output.engine.inputNode.removeTap(onBus: 0)
-    onInterrupt(); output.stop(); response?.cancel(); preparation?.cancel(); poll?.cancel()
+    onInterrupt(); output.stop(); preparation?.cancel(); poll?.cancel()
     gate.ended = true; onEnded?(error)
     let waiters = endingWaiters; endingWaiters.removeAll()
     for waiter in waiters { waiter.resume() }

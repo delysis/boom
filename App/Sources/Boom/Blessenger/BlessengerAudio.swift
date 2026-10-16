@@ -148,6 +148,10 @@ struct BlessengerSpeechResult: Sendable {
   private var fragments: [BlessengerFragment] = []
   private var voice: BlessengerSpeechVoice?
   private var worker: Task<Void, Never>?
+  private var preparation: (id: UUID, task: Task<BlessengerSpeechVoice, Error>)?
+  private var readinessDeadline: Task<Void, Never>?
+  private let firstAudioTimeout: Duration
+  private let resolveVoice: (@MainActor (BlessengerSpeechVoice) async throws -> BlessengerSpeechVoice)?
   private var flag = CancellationFlag()
   private var externalCancellation: (CancellationFlag, UUID?)?
   private var stopped = false
@@ -168,15 +172,42 @@ struct BlessengerSpeechResult: Sendable {
   private(set) var firstScheduleUptime: Double?
   var onPacket: ((UUID, BlessengerPCM) -> Void)?
   var onEnd: ((UUID, Int, Bool) -> Void)?
-  init() { engine.attach(player) }
+  init(firstAudioTimeout: Duration = .seconds(30),
+    resolveVoice: (@MainActor (BlessengerSpeechVoice) async throws -> BlessengerSpeechVoice)? = nil) {
+    self.firstAudioTimeout = firstAudioTimeout; self.resolveVoice = resolveVoice
+    engine.attach(player)
+  }
 
   func hasPlayableAudio(_ id: UUID) -> Bool {
     (responseID == id && !samples.isEmpty) || completed.values.contains { $0.responseID == id && !$0.samples.isEmpty }
       || (terminal?.responseID == id && terminal?.samples.isEmpty == false)
   }
   func dismissError() { if responseID == nil { error = nil } }
+  var isPreparing: Bool { preparation != nil }
   func prepare(_ voice: BlessengerSpeechVoice) async throws -> BlessengerSpeechVoice {
-    guard responseID == nil, worker == nil else { throw BoomError.unavailable("Stop and join current speech before changing its voice.") }
+    guard responseID == nil, worker == nil, preparation == nil else {
+      throw BoomError.unavailable("Stop and join current speech before changing its voice.")
+    }
+    try Task.checkCancellation()
+    let id = UUID()
+    // Register before the first suspension. Stop cancels this actual task, and
+    // join waits even for a provider which cannot interrupt its native loader.
+    let task = Task { @MainActor [self] in
+      let resolved: BlessengerSpeechVoice
+      if let resolveVoice { resolved = try await resolveVoice(voice) }
+      else { resolved = try await resolveInstalledVoice(voice) }
+      try Task.checkCancellation(); return resolved
+    }
+    preparation = (id, task)
+    defer { if preparation?.id == id { preparation = nil }; wake() }
+    return try await withTaskCancellationHandler {
+      let value = try await task.value
+      try Task.checkCancellation()
+      guard preparation?.id == id else { throw CancellationError() }
+      return value
+    } onCancel: { task.cancel() }
+  }
+  private func resolveInstalledVoice(_ voice: BlessengerSpeechVoice) async throws -> BlessengerSpeechVoice {
     var resolved = voice
     switch voice.provider {
     case .qwen: resolved.identifier = try await qwen.prepare()
@@ -192,7 +223,7 @@ struct BlessengerSpeechResult: Sendable {
   }
   func begin(_ id: UUID, voice: BlessengerSpeechVoice, attempt: UUID, seed: UInt64,
     cancellation: CancellationFlag, trace: BlessengerTrace = BlessengerTrace()) throws {
-    guard responseID == nil, worker == nil, completed.count < 8 else { throw BoomError.unavailable("The prior speech producer or its retained result has not settled.") }
+    guard responseID == nil, worker == nil, preparation == nil, completed.count < 8 else { throw BoomError.unavailable("The prior speech producer or its retained result has not settled.") }
     try cancellation.check()
     responseID = id; self.voice = voice; self.attempt = attempt; self.seed = seed
     self.trace = trace; terminal = nil; cursor = BlessengerSpeechCursor()
@@ -205,6 +236,13 @@ struct BlessengerSpeechResult: Sendable {
       Task { @MainActor in if self?.epoch == current { self?.stop(responseID: id) } }
     }
     externalCancellation = (cancellation, registration)
+    readinessDeadline = Task { [weak self] in
+      guard let self else { return }
+      do { try await Task.sleep(for: self.firstAudioTimeout) } catch { return }
+      guard self.epoch == current, self.responseID == id, self.firstPCMUptime == nil else { return }
+      self.trace.record("speech.firstAudioDeadline")
+      self.fail("No playable audio arrived before the response deadline. The input and any partial response were retained.")
+    }
   }
   func append(_ text: String, responseID id: UUID, voice: BlessengerSpeechVoice, finished: Bool = false) throws {
     guard responseID == id, self.voice == voice, !stopped else {
@@ -272,7 +310,10 @@ struct BlessengerSpeechResult: Sendable {
     }
     let count = packet.samples.count, end = scheduledFrames + packet.samples.count
     samples.append(contentsOf: packet.samples); pendingFrames += count; scheduledFrames = end
-    if firstPCMUptime == nil { firstPCMUptime = ProcessInfo.processInfo.systemUptime; trace.once("pcm.firstValidated") }
+    if firstPCMUptime == nil {
+      firstPCMUptime = ProcessInfo.processInfo.systemUptime; trace.once("pcm.firstValidated")
+      readinessDeadline?.cancel(); readinessDeadline = nil
+    }
     ready = true; onPacket?(id, packet)
     player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
       Task { @MainActor in
@@ -320,14 +361,20 @@ struct BlessengerSpeechResult: Sendable {
     // buffers it unschedules. Those callbacks cannot become delivery receipts.
     epoch = UUID(); responseID = nil; speaking = false; ready = false
     renderObservation?.cancel(); renderObservation = nil
+    readinessDeadline?.cancel(); readinessDeadline = nil
     player.stop(); pendingFrames = 0; rate = nil
     if let (owner, registration) = externalCancellation { owner.removeCancellationHandler(registration) }
     externalCancellation = nil
     onEnd?(id, heardFrames, interrupted); wake()
   }
-  private func fail(_ message: String) { error = message; trace.record("speech.failed"); stop() }
+  private func fail(_ message: String) {
+    error = message; trace.record("speech.failed")
+    let owner = externalCancellation?.0
+    stop(); owner?.cancel()
+  }
   func stop(responseID id: UUID? = nil) {
     guard id == nil || responseID == id else { return }
+    preparation?.task.cancel(); readinessDeadline?.cancel(); readinessDeadline = nil
     stopped = true; flag.cancel(); synthesizer.cancel(); fragments.removeAll()
     finish(interrupted: true); wake()
   }
@@ -343,10 +390,19 @@ struct BlessengerSpeechResult: Sendable {
     result.trace.record("speech.producerJoined"); return result
   }
   func join() async throws {
+    // The preparing caller observes its own error. Cleanup still waits for the
+    // native producer instead of treating a cancellation request as release.
+    if let preparation {
+      _ = await preparation.task.result
+      while self.preparation?.id == preparation.id { await withCheckedContinuation { waiters.append($0) } }
+    }
     let expected = attempt
     if let worker { await worker.value }
     guard responseID == nil || sourceFinished else { throw BoomError.unavailable("Speech input has not reached its terminal boundary.") }
     while attempt == expected && responseID != nil { await withCheckedContinuation { waiters.append($0) } }
+  }
+  func shutdown() async throws {
+    stop(); try await join(); try await qwen.unload(); engine.stop()
   }
   func replay(_ samples: [Float], rate: Int, messageID: UUID, voice: BlessengerSpeechVoice, flag: CancellationFlag) async throws {
     stop(); try await join()

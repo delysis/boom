@@ -626,25 +626,26 @@ import Foundation
         try Task.checkCancellation(); try lifetime.check()
       }
       call.onInterrupt = { [weak self] in self?.callOperation?.cancel() }
-      call.onUtterance = { [weak self] clip, _, epoch in
-        guard let self, self.callID == route.id, !lifetime.isCancelled else { throw CancellationError() }
+      call.onUtterance = { [weak self] clip, _, epoch, flag in
+        guard let self, self.callID == route.id else { throw BoomError.stale("An admitted caller clip lost its still-owned route.") }
         let trace = BlessengerTrace()
         trace.record(clip.nativeInputClock ? "caller.voicedPacketEnd.native" : "caller.voicedPacketEnd.deliveryEstimate", at: clip.speechEndedUptime)
         if let time = clip.deliveredUptime { trace.record("capture.finalVoicedPacketDelivered", at: time) }
         trace.record("caller.turnAdmitted." + clip.decision, at: clip.admittedUptime)
-        let flag = CancellationFlag(); self.callOperation = flag
+        self.callOperation = flag
         defer { if self.callOperation === flag { self.callOperation = nil } }
         let imported = try await detachedWork {
           try AttachmentProcessor.inspect(name: "Caller audio.wav", data: clip.wav())
         }
-        try flag.check()
-        var turn = try await self.store.blessengerCallerTurn(imported, callID: route.id, epoch: epoch, flag: flag)
+        // Captured authored audio is durable before cancellation can suppress
+        // its model response. The joining call still owns this exact route.
+        var turn = try await self.store.blessengerCallerTurn(imported, callID: route.id, epoch: epoch, flag: CancellationFlag())
         turn.trace = trace
         self.accept(turn.snapshot)
         if self.state.selectedChat == turn.conversationID, self.draft.id != turn.conversationID {
           self.draft = turn.snapshot.blessenger!.draft(for: turn.conversationID); self.storedDraftVersion = self.draft.version
         }
-        try flag.check(); try await self.performSend(flag: flag, caller: turn)
+        try lifetime.check(); try flag.check(); try await self.performSend(flag: flag, caller: turn)
       }
       do {
         try lifetime.check()
@@ -853,7 +854,7 @@ import Foundation
     let pending = Array(operations.values)
     for task in pending { await task.value }
     try await flushDraft()
-    try await audio.join()
+    try await audio.shutdown()
     if let runner { await runner.cancelAndJoin() }
     runner = nil
     try await store.releaseExclusiveWorkspace()
