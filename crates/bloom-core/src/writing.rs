@@ -202,7 +202,8 @@ pub fn compile_media_prompt(text: &str, media: &[MediaReference]) -> Result<Medi
                 } else {
                     reference.text.is_none()
                         && reference.source_digest.as_ref().is_none_or(|digest| {
-                            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            digest.len() == 64
+                                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
                         })
                 },
             "Invalid writing media identity.",
