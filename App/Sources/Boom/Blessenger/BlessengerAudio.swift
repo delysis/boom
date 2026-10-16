@@ -2,6 +2,7 @@ import AppKit
 import AVFoundation
 import BoomCore
 import Foundation
+import Darwin
 
 /// Immutable, finite, mono PCM. The callback copies only this bounded packet;
 /// AVFoundation's borrowed buffer cannot outlive its producer callback.
@@ -139,6 +140,7 @@ struct BlessengerSpeechResult: Sendable {
   @Published private(set) var heardFrames = 0
   let engine = AVAudioEngine()
   private let player = AVAudioPlayerNode()
+  private let hostToUptime = ProcessInfo.processInfo.systemUptime - AVAudioTime.seconds(forHostTime: mach_absolute_time())
   private let synthesizer = BlessengerAppleSpeech()
   private let qwen = BlessengerQwenSpeech()
   private var epoch = UUID()
@@ -297,9 +299,7 @@ struct BlessengerSpeechResult: Sendable {
     guard let time = player.lastRenderTime, time.isHostTimeValid,
       let position = player.playerTime(forNodeTime: time), position.sampleTime > 0,
       position.sampleRate > 0 else { return false }
-    let rendered = min(scheduledFrames, Int(position.sampleTime))
-    heardFrames = max(heardFrames, rendered)
-    let first = AVAudioTime.seconds(forHostTime: time.hostTime) - Double(position.sampleTime) / position.sampleRate
+    let first = AVAudioTime.seconds(forHostTime: time.hostTime) + hostToUptime - Double(position.sampleTime) / position.sampleRate
     trace.once("playback.firstRendered", at: first)
     return true
   }

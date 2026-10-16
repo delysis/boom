@@ -778,7 +778,9 @@ import Foundation
   }
   func shutdown() async throws {
     guard !closed else { return }
-    guard !hasUnstoredVoiceNote else { throw BoomError.unavailable("Save or explicitly discard the retained recording before quitting.") }
+    guard noteState == .idle, !hasUnstoredVoiceNote else {
+      throw BoomError.unavailable("Finish and save, or explicitly discard, the recording before quitting.")
+    }
     closing = true; navigating = true
     defer { if !closed { closing = false; navigating = false } }
     // Revoke publication and unblock audio consumers BEFORE waiting for UI actions.

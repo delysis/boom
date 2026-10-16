@@ -35,6 +35,7 @@ final class BlessengerCaptureBuffer: @unchecked Sendable {
   private var start: UInt64?
   private var speech = false
   private var high = 0, low = 0
+  private var publishedPause: UInt64?
   private var lastVoiced: UInt64 = 0
   private var lastVoicedUptime = 0.0
   private var lastDeliveredUptime = 0.0
@@ -101,7 +102,10 @@ final class BlessengerCaptureBuffer: @unchecked Sendable {
       }
     } else if rms < 0.006 {
       low += 1; high = 0
-      if speech && low >= 6 { speech = false; emit(.pause(frame: lastVoiced, uptime: lastVoicedUptime)) }
+      if low >= 6, start != nil, publishedPause != lastVoiced {
+        speech = false; publishedPause = lastVoiced
+        emit(.pause(frame: lastVoiced, uptime: lastVoicedUptime))
+      }
     } else { high = 0; low = 0 }
   }
   private func emit(_ event: Event) {
@@ -116,6 +120,7 @@ final class BlessengerCaptureBuffer: @unchecked Sendable {
   func mute(_ muted: Bool) {
     lock.lock(); defer { lock.unlock() }
     enabled = !muted; start = nil; speech = false; high = 0; low = 0
+    publishedPause = nil; events.removeAll(keepingCapacity: true)
   }
   func semanticWindow(through end: UInt64) throws -> [Float] {
     lock.lock(); defer { lock.unlock() }
@@ -292,10 +297,22 @@ struct BlessengerCallTransition: Decodable, Sendable {
   private func advance(_ event: [String: Any]) throws {
     let next: BlessengerCallTransition = try ProductCore.call(["op": "blessenger", "request": [
       "op": "call", "gate": ProductCore.object(gate), "event": event]])
+    let clip: BlessengerCallerClip?
+    if next.admit {
+      guard let end = next.gate.pausedAt, let paused = pausedUptime, let capture else {
+        throw BoomError.invalid("A call turn lost its captured pause.")
+      }
+      do { clip = try capture.clip(through: end, ended: paused, decision: next.gate.decision ?? "unknown") }
+      catch let error as BoomError {
+        // The realtime producer may resume between its semantic result and this
+        // transaction. Leave the gate unconsumed; its next speech/pause event
+        // replaces the old decision. Never force a second pause or end the call.
+        if case .stale = error { return }; throw error
+      }
+    } else { clip = nil }
     gate = next.gate
     if next.interrupt { onInterrupt(); output.stop(); response?.cancel() }
-    if next.admit, let end = gate.pausedAt, let paused = pausedUptime, let capture {
-      let clip = try capture.clip(through: end, ended: paused, decision: gate.decision ?? "unknown")
+    if let clip {
       let call = gate.call, epoch = gate.epoch, prior = response
       response = Task {
         if let prior { await prior.value }

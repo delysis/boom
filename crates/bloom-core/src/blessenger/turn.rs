@@ -124,6 +124,9 @@ pub fn advance_call(mut gate: CallGate, event: CallEvent) -> Result<CallTransiti
                 ignored = true;
             } else {
                 gate.speaking = false;
+                if gate.paused_at != Some(frame) {
+                    gate.decision = None;
+                }
                 gate.paused_at = Some(frame);
             }
         }
@@ -263,6 +266,27 @@ mod tests {
         .expect("old pause");
         assert!(a.ignored);
         assert!(a.gate.speaking);
+    }
+    #[test]
+    fn a_new_pause_does_not_inherit_an_older_semantic_vote() {
+        let a = advance_call(gate(), CallEvent::Speech { frame: 0 }).expect("speech");
+        let a = advance_call(a.gate, CallEvent::Pause { epoch: 1, frame: 1 }).expect("pause");
+        let a = advance_call(
+            a.gate,
+            CallEvent::EndOfUtterance {
+                epoch: 1,
+                frame: 1,
+                decision: TurnDecision::Semantic,
+            },
+        )
+        .expect("classification");
+        let a = advance_call(a.gate, CallEvent::Pause { epoch: 1, frame: 2 }).expect("new pause");
+        assert!(a.gate.decision.is_none());
+        assert!(
+            !advance_call(a.gate, CallEvent::Ready { epoch: 1 })
+                .expect("ready")
+                .admit
+        );
     }
     #[test]
     fn end_and_mute_cannot_release_late_input() {

@@ -230,6 +230,76 @@ final class BlessengerTests: XCTestCase {
     capture.stop()
   }
 
+  func testPrivateBackupAuthenticatesCopiedStageAndRestoresExactDraftAndAudio() async throws {
+    let parent = try root(), original = parent.appendingPathComponent("original")
+    let source = try store(original), initial = try await source.openBlessenger(catalog: fixtureCatalog)
+    var draft = initial.blessenger!.draft(for: nil)
+    let previous = draft.version; draft.text = "  Private case\r\n🪷 e\u{301}  "; draft.version = UUID()
+    let saved = try await source.blessengerSaveDraft(draft, expectedVersion: previous)
+    let bytes = try BlessengerWave.encode([Float](repeating: 0.1, count: 1600), rate: 16000)
+    let imported = try AttachmentProcessor.inspect(name: "Authored voice note.wav", data: bytes)
+    let attached = try await source.blessengerImport(imported, draftID: draft.id,
+      expectedVersion: saved.blessenger!.draft(for: nil).version)
+    let destination = parent.appendingPathComponent("backup")
+    try await source.exportBlessengerBackup(to: destination, flag: CancellationFlag())
+    let ciphertext = try Data(contentsOf: destination.appendingPathComponent("workspace.json"))
+    XCTAssertNil(ciphertext.range(of: Data(draft.text.utf8)))
+    let recovered = parent.appendingPathComponent("restored")
+    try await source.restoreBlessengerBackup(from: destination, to: recovered, flag: CancellationFlag())
+    let reopened = try store(recovered), restored = try await reopened.openBlessenger(catalog: fixtureCatalog)
+    XCTAssertEqual(restored.blessenger!.draft(for: nil), attached.blessenger!.draft(for: nil))
+    XCTAssertEqual(try reopened.vault.get(.attachment, id: imported.record.id, limit: 67_108_864), bytes)
+    try await reopened.releaseExclusiveWorkspace(); try await source.releaseExclusiveWorkspace()
+  }
+
+  func testPrivateBackupRefusesCorruptOrWrongKeyBeforeDestinationPublication() async throws {
+    let parent = try root(), source = try store(parent.appendingPathComponent("source"))
+    _ = try await source.openBlessenger(catalog: fixtureCatalog)
+    let archive = parent.appendingPathComponent("backup")
+    try await source.exportBlessengerBackup(to: archive, flag: CancellationFlag())
+    let wrong = try WorkspaceStore(rootOverride: parent.appendingPathComponent("wrong-key"),
+      privateSession: BlessengerKeySession { _ in Data(repeating: 0x52, count: 32) })
+    let refused = parent.appendingPathComponent("refused")
+    do { try await wrong.restoreBlessengerBackup(from: archive, to: refused, flag: CancellationFlag()); XCTFail("Wrong key accepted") } catch {}
+    XCTAssertFalse(FileManager.default.fileExists(atPath: refused.path))
+    var corrupt = try Data(contentsOf: archive.appendingPathComponent("workspace.json")); corrupt[corrupt.count - 1] ^= 1
+    try corrupt.write(to: archive.appendingPathComponent("workspace.json"))
+    do { try await source.restoreBlessengerBackup(from: archive, to: refused, flag: CancellationFlag()); XCTFail("Corrupt archive accepted") } catch {}
+    XCTAssertFalse(FileManager.default.fileExists(atPath: refused.path))
+    let existing = parent.appendingPathComponent("existing")
+    try FileManager.default.createDirectory(at: existing, withIntermediateDirectories: false)
+    let sentinel = existing.appendingPathComponent("author.txt"); try Data("Keep my bytes".utf8).write(to: sentinel)
+    do { try await source.restoreBlessengerBackup(from: archive, to: existing, flag: CancellationFlag()); XCTFail("Existing data overwritten") } catch {}
+    XCTAssertEqual(try String(contentsOf: sentinel, encoding: .utf8), "Keep my bytes")
+    try await wrong.releaseExclusiveWorkspace(); try await source.releaseExclusiveWorkspace()
+  }
+
+  func testMuteRetiresQueuedCaptureEventsAndShortResumptionRefreshesPause() throws {
+    let format = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false))
+    let capture = try BlessengerCaptureBuffer(source: format)
+    func packet(_ value: Float) throws {
+      let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 480)); buffer.frameLength = 480
+      for i in 0..<480 { buffer.floatChannelData![0][i] = value }
+      capture.append(buffer, at: AVAudioTime(sampleTime: 0, atRate: 16000))
+    }
+    for _ in 0..<8 { try packet(0.1) }
+    capture.mute(true); capture.mute(false)
+    XCTAssertTrue(capture.drain().isEmpty, "Pre-mute speech must never replay as new caller input.")
+    for _ in 0..<8 { try packet(0.1) }
+    for _ in 0..<8 { try packet(0) }
+    let first = try XCTUnwrap(capture.drain().compactMap { event -> UInt64? in
+      if case .pause(let frame, _) = event { return frame }; return nil
+    }.last)
+    try packet(0.1) // Not enough voiced packets for a second Speech event.
+    for _ in 0..<8 { try packet(0) }
+    let second = try XCTUnwrap(capture.drain().compactMap { event -> UInt64? in
+      if case .pause(let frame, _) = event { return frame }; return nil
+    }.last)
+    XCTAssertGreaterThan(second, first)
+    XCTAssertFalse(capture.isPaused(through: first)); XCTAssertTrue(capture.isPaused(through: second))
+    capture.stop()
+  }
+
 }
 private final class ReadCounter: @unchecked Sendable {
   private let lock = NSLock(); private var count = 0

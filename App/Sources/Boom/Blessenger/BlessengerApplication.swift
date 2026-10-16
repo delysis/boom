@@ -36,6 +36,7 @@ import SwiftUI
       startup = Task {
         do {
           let opened = try await BlessengerModel.open()
+          NSApp.appearance = opened.state.theme == "system" ? nil : NSAppearance(named: opened.state.theme == "dark" ? .darkAqua : .aqua)
           self.model = opened; opened.settingsOpen = self.pendingSettings; self.pendingSettings = false
           window.contentView = NSHostingView(rootView: BlessengerView(model: opened))
         } catch {
@@ -82,6 +83,8 @@ import SwiftUI
       action("New Message", #selector(newMessage), "n", menu: file, target: self)
       action("Add Attachment…", #selector(attach), menu: file, target: self)
       action("Export Conversation…", #selector(exportChat), menu: file, target: self)
+      action("Back Up Private Workspace…", #selector(backupWorkspace), menu: file, target: self)
+      action("Restore Backup to New Folder…", #selector(restoreWorkspace), menu: file, target: self)
       action("Stop", #selector(stop), ".", menu: file, target: self)
       action("Close", #selector(NSWindow.performClose(_:)), "w", menu: file)
       action("Undo", Selector(("undo:")), "z", menu: edit)
@@ -103,6 +106,8 @@ import SwiftUI
     @objc private func newMessage() { if let model { Task { await model.select(nil) } } }
     @objc private func attach() { model?.pickAttachments() }
     @objc private func exportChat() { model?.exportConversation() }
+    @objc private func backupWorkspace() { model?.backupWorkspace(restoring: false) }
+    @objc private func restoreWorkspace() { model?.backupWorkspace(restoring: true) }
     @objc private func stop() { model?.stop() }
   }
 }

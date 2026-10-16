@@ -231,6 +231,23 @@ final class Vault: @unchecked Sendable {
     let bytes = try RegularFile(recordURL(kind, id), limit: Int64(limit + extra)).data()
     return try protection.map { try $0.open(bytes, binding: kind.rawValue + ":" + id.uuidString, limit: limit) } ?? bytes
   }
+  /// Read-only archive authentication with the process-owned key. This neither
+  /// creates a directory nor mutates the selected backup or asks Keychain again.
+  func readProtectedArchiveRecord(_ directory: URL, kind: Kind, id: UUID, limit: Int) throws -> Data {
+    try admit(kind, id)
+    guard let protection, limit >= 0, limit <= Self.workspaceLimit else {
+      throw BoomError.denied("A private backup requires its existing key and a bounded record.")
+    }
+    let path: URL
+    switch kind {
+    case .workspace: path = directory.appendingPathComponent("workspace.json")
+    case .workspaceIdentity: path = directory.appendingPathComponent("identity.json")
+    default: path = directory.appendingPathComponent("Objects", isDirectory: true)
+      .appendingPathComponent(kind.rawValue + "-" + id.uuidString + ".record")
+    }
+    let bytes = try RegularFile(path, limit: Int64(limit + RecordCipher.overhead)).data()
+    return try protection.open(bytes, binding: kind.rawValue + ":" + id.uuidString, limit: limit)
+  }
   func encode<T: Encodable>(_ value: T, kind: Kind, id: UUID) throws {
     let trace = PerformanceTrace.begin("Storage.Encode")
     defer { PerformanceTrace.end("Storage.Encode", trace) }
