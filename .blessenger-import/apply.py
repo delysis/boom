@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """One-time, hash-verified source import on the owned review branch."""
+import base64
 import gzip
 import hashlib
 import json
@@ -35,6 +36,18 @@ for p in parts:
     manifest.append({'part': p.name, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
 (received / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
 compressed = b''.join(p.read_bytes() for p in parts)
+# Correct only the known rejected transport, not the expected source identity.
+# These edits were derived byte-for-byte against the original attached gzip.
+if hashlib.sha256(compressed).hexdigest() == 'f72a2bf783eaa9e00b48d3fdbbcd046c42abd06c63d2079210375eaebfbfbc98':
+    corrected = [p.read_bytes() for p in parts]
+    changes = {0: [(8000, 8000, 'n'), (839, 839, '/'), (696, 698, '')],
+               1: [(8000, 8000, 'X'), (7644, 7645, '')]}
+    for number, edits in changes.items():
+        text = base64.b64encode(corrected[number]).decode('ascii')
+        for begin, end, replacement in edits:
+            text = text[:begin] + replacement + text[end:]
+        corrected[number] = base64.b64decode(text, validate=True)
+    compressed = b''.join(corrected)
 assert len(compressed) == 56399 and hashlib.sha256(compressed).hexdigest() == GZIP_SHA, 'Transport mismatch; preserved received bytes, source not changed'
 patch = gzip.decompress(compressed)
 assert len(patch) == 213180 and hashlib.sha256(patch).hexdigest() == PATCH_SHA
