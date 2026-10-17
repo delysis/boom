@@ -10,6 +10,7 @@ struct BlessengerView: View {
   @State private var renameText = ""
   @State private var removeID: UUID?
   @State private var details = false
+  @State private var voiceEdit: BlessengerVoiceEdit?
   @State private var composerHeight: CGFloat = 28
   @State private var instructionsOpen = false
   init(model: BlessengerModel) { self.model = model; audio = model.audio }
@@ -25,13 +26,30 @@ struct BlessengerView: View {
         else {
           if model.state.selectedChat == nil { addressing }
           if model.templateSelected { template }
-          else { transcript; composer }
+          else {
+            transcript
+            if model.synthesizableReplies.count >= 2 {
+              HStack {
+                Spacer()
+                Button("Synthesize Replies") { model.synthesizeReplies() }
+                  .disabled(!model.canSynthesize)
+                  .help("Compare the completed consultants' answers without replacing them")
+              }.padding(.horizontal, 18).padding(.top, 5)
+            }
+            composer
+          }
         }
       }.frame(minWidth: 380, maxWidth: .infinity, maxHeight: .infinity)
     }
     .font(.system(size: 14))
     .frame(minWidth: 640, minHeight: 480)
     .background(Color(nsColor: .textBackgroundColor))
+    .sheet(item: Binding(get: { model.mediaReview }, set: { _ in })) { review in
+      BlessengerMediaReviewView(model: model, review: review)
+    }
+    .sheet(item: $voiceEdit) { edit in
+      BlessengerVoiceEditor(model: model, edit: edit) { voiceEdit = nil }
+    }
     .sheet(isPresented: $details) {
       VStack(alignment: .leading, spacing: 16) {
         Text("Details").font(.headline)
@@ -109,7 +127,10 @@ struct BlessengerView: View {
     }.buttonStyle(.plain)
       .contextMenu {
         if contact != nil { Button("Edit") { Task { await model.select(chat.id, template: true); instructions = chat.instructions ?? "" } } }
-        else { Button("Save as Contact") { Task { await model.pin(chat.id) } } }
+        if let contact {
+          Button("Speech Voice…") { voiceEdit = BlessengerVoiceEdit(contact: contact, product: model.product) }
+        }
+        if contact == nil { Button("Save as Contact") { Task { await model.pin(chat.id) } } }
         Button("Rename") { renameText = chat.title; renameID = chat.id }
         Button("Remove", role: .destructive) { removeID = chat.id }
       }
@@ -199,6 +220,17 @@ struct BlessengerView: View {
             Button { model.preview(id) } label: { Label(attachment.name, systemImage: attachment.kind == .audio ? "waveform" : "paperclip") }
               .buttonStyle(.plain).help("Open attachment")
           }
+        }
+        if !message.sources.isEmpty {
+          DisclosureGroup("Sources") {
+            ForEach(Array(message.sources.enumerated()), id: \.offset) { _, source in
+              Button(source.title) { model.openSource(source, from: message.id) }
+                .buttonStyle(.plain)
+            }
+          }.font(.caption)
+        }
+        if message.role == .assistant, message.provider != nil, message.state != .pending {
+          Button("Context Used…") { model.showResponseContext(message) }.buttonStyle(.plain).font(.caption)
         }
         if message.state == .cancelled { Text("Interrupted").font(.caption).foregroundStyle(.secondary) }
         if message.state == .failed {

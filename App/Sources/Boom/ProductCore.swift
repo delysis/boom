@@ -685,6 +685,7 @@ struct ConsultationReceipt: Codable, Sendable {
   var media: [WritingMediaReference]? = nil
   var executionOrigin: GenerationExecutionOrigin? = nil
   var mtp: BlessengerMTPExecution? = nil
+  var contextWindow: BlessengerHistoryWindow? = nil
 }
 
 struct WritingPrompt: Codable { let prompt: String; let digest: String; let totalCharacters: Int; let omittedCharacters: Int }

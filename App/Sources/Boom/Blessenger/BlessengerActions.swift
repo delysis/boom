@@ -178,20 +178,45 @@ extension BlessengerModel {
       }
     }
   }
-  func preview(_ id: UUID) {
-    guard let captured = state.attachments.first(where: { $0.id == id }) else { return }
+  func openSource(_ source: SourceReference, from messageID: UUID) {
+    guard let chat = selected, let owner = chat.messages.first(where: { $0.id == messageID }),
+      owner.sources.contains(source) else { report(BoomError.stale("The source occurrence changed.")); return }
+    do {
+      try BlessengerSources.validate([source], in: state, conversationID: chat.id)
+      if source.kind == "attachment" { preview(source.id); return }
+      guard source.kind == BlessengerSources.consultation,
+        let reply = chat.messages.first(where: { $0.id == source.id }) else { return }
+      let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 500),
+        styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+      window.title = source.title; window.isRestorable = false; window.disableSnapshotRestoration()
+      window.contentView = NSHostingView(rootView: NativeScrollableText(text: reply.text, maximumHeight: 460).padding())
+      window.center(); window.makeKeyAndOrderFront(nil)
+    } catch { report(error) }
+  }
+  func showResponseContext(_ message: ChatMessage) {
+    guard message.role == .assistant, message.provider != nil, message.state != .pending else { return }
     launch {
-      let bytes = try await detachedWork { try self.store.vault.get(.attachment, id: id, limit: 67_108_864) }
-      guard Digest.sha256(bytes) == captured.rootDigest,
-        self.state.attachments.first(where: { $0.id == id })?.digest == captured.digest else { throw BoomError.stale("The attachment changed.") }
-      let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 500), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-      window.title = captured.name; window.isRestorable = false; window.disableSnapshotRestoration()
-      if captured.kind == .image, let image = NSImage(data: bytes) {
-        window.contentView = NSHostingView(rootView: Image(nsImage: image).resizable().scaledToFit().padding())
-      } else {
-        window.contentView = NSHostingView(rootView: NativeScrollableText(text: captured.text.isEmpty ? captured.coverage : captured.text, maximumHeight: 460).padding())
+      let receipt = try await detachedWork {
+        try self.store.vault.decode(ConsultationReceipt.self, kind: .receipt, id: message.id)
       }
+      guard receipt.responseID == message.id, receipt.model == message.provider else {
+        throw BoomError.stale("The response's captured context is not available.")
+      }
+      let summary: String
+      if let window = receipt.contextWindow {
+        summary = "Context selection\n\(window.units.count) whole earlier input/reply units included; \(window.omittedUnits) omitted (\(window.omittedMessages) messages).\n"
+          + "\(window.sourceIds.count) original sources, \(window.mediaOccurrences) chronological media occurrences.\n"
+          + "Omission reason: \(window.reason ?? "none"). Original conversation records are unchanged.\n\n"
+      } else { summary = "This earlier response has no recorded context-window summary.\n\n" }
+      let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 500),
+        styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+      window.title = "Response Context"; window.isRestorable = false; window.disableSnapshotRestoration()
+      window.contentView = NSHostingView(rootView: NativeScrollableText(text: summary + receipt.plan.rawPrompt, maximumHeight: 460).padding())
       window.center(); window.makeKeyAndOrderFront(nil)
     }
+  }
+  func preview(_ id: UUID) {
+    guard let captured = state.attachments.first(where: { $0.id == id }) else { return }
+    openMediaReview(captured)
   }
 }

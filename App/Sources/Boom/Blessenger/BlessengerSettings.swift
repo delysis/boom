@@ -6,6 +6,7 @@ import SwiftUI
 /// enormous generic expression. No shadow copy of the execution profile.
 struct BlessengerSettings: View {
   @ObservedObject var model: BlessengerModel
+  @State private var voiceEdit: BlessengerVoiceEdit?
   var body: some View {
     Form {
       modelSection
@@ -14,6 +15,9 @@ struct BlessengerSettings: View {
       librarySection
       HStack { Spacer(); Button("Done") { model.settingsOpen = false } }
     }.formStyle(.grouped).frame(maxWidth: .infinity, maxHeight: .infinity)
+      .sheet(item: $voiceEdit) { edit in
+        BlessengerVoiceEditor(model: model, edit: edit) { voiceEdit = nil }
+      }
   }
   private var mtpSelection: Binding<String> {
     Binding(get: { model.effectiveProfile.useMTP.map { $0 ? "on" : "off" } ?? "calls" }, set: { value in
@@ -52,6 +56,9 @@ struct BlessengerSettings: View {
         ForEach(BlessengerAppleSpeech.voices(), id: \.identifier) { Text($0.name).tag($0.identifier) }
       }
     }
+    Button("Edit Default Voice…") { voiceEdit = BlessengerVoiceEdit(contact: nil, product: model.product) }
+    Text("A Contact's Speech Voice menu sets its own voice without changing its instructions.")
+      .font(.caption).foregroundStyle(.secondary)
     HStack {
       Button("Install Qwen…") { model.installVoicePackage(.qwen) }
       Button("Install Turn Detector…") { model.installVoicePackage(.turn) }

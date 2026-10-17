@@ -137,7 +137,8 @@ struct BlessengerSpeechResult: Sendable {
   @Published private(set) var ready = false
   @Published private(set) var speaking = false
   @Published private(set) var error: String?
-  @Published private(set) var heardFrames = 0
+  @Published private var playback = SpeechPlaybackProgress()
+  var heardFrames: Int { playback.deliveredFrames }
   let engine = AVAudioEngine()
   private let player = AVAudioPlayerNode()
   private let hostToUptime = ProcessInfo.processInfo.systemUptime - AVAudioTime.seconds(forHostTime: mach_absolute_time())
@@ -156,12 +157,13 @@ struct BlessengerSpeechResult: Sendable {
   private var externalCancellation: (CancellationFlag, UUID?)?
   private var stopped = false
   private var rate: Int?
-  private var pendingFrames = 0
-  private var scheduledFrames = 0
   private var samples: [Float] = []
   private var boundaries: [BlessengerSpeechResult.Boundary] = []
   private var waiters: [CheckedContinuation<Void, Never>] = []
   private var sourceFinished = false
+  // One bounded cumulative source, not an unbounded queue of token deltas.
+  private var sourceText = ""
+  private static let fragmentWindow = 32
   private var terminal: BlessengerSpeechResult?
   private var completed: [UUID: BlessengerSpeechResult] = [:]
   private var attempt = UUID()
@@ -185,6 +187,7 @@ struct BlessengerSpeechResult: Sendable {
   func dismissError() { if responseID == nil { error = nil } }
   var isPreparing: Bool { preparation != nil }
   func prepare(_ voice: BlessengerSpeechVoice) async throws -> BlessengerSpeechVoice {
+    _ = try BlessengerPolicy.validate(voice)
     guard responseID == nil, worker == nil, preparation == nil else {
       throw BoomError.unavailable("Stop and join current speech before changing its voice.")
     }
@@ -228,8 +231,8 @@ struct BlessengerSpeechResult: Sendable {
     responseID = id; self.voice = voice; self.attempt = attempt; self.seed = seed
     self.trace = trace; terminal = nil; cursor = BlessengerSpeechCursor()
     epoch = UUID(); flag = CancellationFlag(); stopped = false; sourceFinished = false
-    fragments = []; ready = false; speaking = false; error = nil
-    heardFrames = 0; scheduledFrames = 0; pendingFrames = 0; samples = []; boundaries = []; rate = nil
+    fragments = []; sourceText = ""; ready = false; speaking = false; error = nil
+    playback = SpeechPlaybackProgress(); samples = []; boundaries = []; rate = nil
     firstPCMUptime = nil; firstScheduleUptime = nil
     let current = epoch
     let registration = cancellation.onCancel { [weak self] in
@@ -249,13 +252,26 @@ struct BlessengerSpeechResult: Sendable {
       if let terminal, terminal.responseID == id, let failure = terminal.failure { throw BoomError.unavailable(failure) }
       throw BoomError.stale("Another response owns speech output.")
     }
-    let next = try BlessengerPolicy.speech(text, cursor: cursor, finished: finished)
-    guard fragments.count + next.fragments.count <= 32 else {
-      fail("The response exceeded its bounded speakable-text queue."); throw BoomError.budget(error!)
+    guard !sourceFinished || (finished && sourceText.utf8.elementsEqual(text.utf8)) else {
+      throw BoomError.stale("Speech input arrived after its terminal boundary.")
     }
-    if !next.fragments.isEmpty { trace.once("text.firstSpeakable") }
-    cursor = next.cursor; fragments.append(contentsOf: next.fragments); sourceFinished = finished
+    let capacity = Self.fragmentWindow - fragments.count
+    // Validate the actual projection even when the device's look-ahead is full.
+    // Do not advance the cursor until those fragments have a native queue slot.
+    let next = try BlessengerPolicy.speech(text, cursor: cursor, finished: finished,
+      maximumFragments: max(1, capacity))
+    sourceText = text; sourceFinished = finished
+    if capacity > 0 { admit(next) }
     pump(); settleIfDrained()
+  }
+  private func admit(_ next: BlessengerSpeechEmission) {
+    if !next.fragments.isEmpty { trace.once("text.firstSpeakable") }
+    cursor = next.cursor; fragments.append(contentsOf: next.fragments)
+  }
+  private func refillFragments() throws {
+    guard !stopped, !cursor.finished, fragments.count < Self.fragmentWindow / 2 else { return }
+    admit(try BlessengerPolicy.speech(sourceText, cursor: cursor, finished: sourceFinished,
+      maximumFragments: Self.fragmentWindow - fragments.count))
   }
   private func pump() {
     guard worker == nil, responseID != nil, !stopped, !fragments.isEmpty else { return }
@@ -283,6 +299,7 @@ struct BlessengerSpeechResult: Sendable {
           }
           guard self.epoch == operation, !self.stopped else { throw CancellationError() }
           self.boundaries.append(.init(frames: self.samples.count, text: fragment.text))
+          try self.refillFragments()
         }
       } catch {
         if self.epoch == operation {
@@ -299,7 +316,7 @@ struct BlessengerSpeechResult: Sendable {
       throw BoomError.budget("One spoken response exceeds its duration or private-record limit.")
     }
     guard packet.samples.count <= packet.rate * 4 else { throw BoomError.budget("One PCM packet exceeds the playback window.") }
-    while pendingFrames + packet.samples.count > packet.rate * 4 {
+    while playback.pendingFrames + packet.samples.count > packet.rate * 4 {
       await withCheckedContinuation { waiters.append($0) }
       try flag.check(); guard epoch == expected else { throw CancellationError() }
     }
@@ -308,8 +325,8 @@ struct BlessengerSpeechResult: Sendable {
       rate = packet.rate; engine.connect(player, to: engine.mainMixerNode, format: buffer.format)
       if !engine.isRunning { try engine.start() }
     }
-    let count = packet.samples.count, end = scheduledFrames + packet.samples.count
-    samples.append(contentsOf: packet.samples); pendingFrames += count; scheduledFrames = end
+    let ticket = try playback.schedule(frames: packet.samples.count)
+    samples.append(contentsOf: packet.samples)
     if firstPCMUptime == nil {
       firstPCMUptime = ProcessInfo.processInfo.systemUptime; trace.once("pcm.firstValidated")
       readinessDeadline?.cancel(); readinessDeadline = nil
@@ -318,7 +335,7 @@ struct BlessengerSpeechResult: Sendable {
     player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
       Task { @MainActor in
         guard let self, self.epoch == expected, !self.stopped else { return }
-        self.pendingFrames -= count; self.heardFrames = max(self.heardFrames, end)
+        guard self.playback.played(ticket) else { return }
         self.observeRenderTime(); self.wake(); self.settleIfDrained()
       }
     }
@@ -346,7 +363,8 @@ struct BlessengerSpeechResult: Sendable {
   }
   private func wake() { let saved = waiters; waiters.removeAll(); for waiter in saved { waiter.resume() } }
   private func settleIfDrained() {
-    guard sourceFinished, worker == nil, fragments.isEmpty, pendingFrames == 0, responseID != nil else { return }
+    guard sourceFinished, cursor.finished, worker == nil, fragments.isEmpty,
+      playback.isDrained, responseID != nil else { return }
     if samples.isEmpty { fail("Speech completed without producing playable audio."); return }
     finish(interrupted: false)
   }
@@ -359,10 +377,10 @@ struct BlessengerSpeechResult: Sendable {
     completed[attempt] = terminal
     // Retire publication BEFORE stop: AVFoundation may invoke completions for
     // buffers it unschedules. Those callbacks cannot become delivery receipts.
-    epoch = UUID(); responseID = nil; speaking = false; ready = false
+    epoch = UUID(); playback.retire(); responseID = nil; speaking = false; ready = false
     renderObservation?.cancel(); renderObservation = nil
     readinessDeadline?.cancel(); readinessDeadline = nil
-    player.stop(); pendingFrames = 0; rate = nil
+    player.stop(); rate = nil; sourceText = ""
     if let (owner, registration) = externalCancellation { owner.removeCancellationHandler(registration) }
     externalCancellation = nil
     onEnd?(id, heardFrames, interrupted); wake()
@@ -413,7 +431,8 @@ struct BlessengerSpeechResult: Sendable {
       for start in stride(from: 0, to: samples.count, by: rate) {
         try await enqueue(BlessengerPCM(samples: Array(samples[start..<min(start + rate, samples.count)]), rate: rate), epoch: captured, flag: self.flag)
       }
-      sourceFinished = true; settleIfDrained(); _ = try await result(for: messageID)
+      sourceFinished = true; cursor.finished = true
+      settleIfDrained(); _ = try await result(for: messageID)
     } catch { stop(responseID: messageID); try await join(); _ = try? await result(for: messageID, attempt: replayAttempt); throw error }
   }
 }

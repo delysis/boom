@@ -23,6 +23,9 @@ final class RegularFile {
     self.limit = limit
   }
 
+  /// Opened-object metadata only; no content is read by admission planning.
+  var byteCount: Int64 { admitted.st_size }
+
   func chunks(_ consume: (Data) throws -> Void) throws -> Int64 {
     var total: Int64 = 0
     while try autoreleasepool(invoking: { () throws -> Bool in

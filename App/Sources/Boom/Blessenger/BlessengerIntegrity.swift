@@ -63,6 +63,7 @@ extension BlessengerState {
         Set((chat.messageVersions ?? []).map(\.id)).count == (chat.messageVersions ?? []).count else {
         throw BoomError.invalid("A conversation contains duplicate message identities.")
       }
+      try BlessengerSources.validateDerivations(in: chat)
       for message in chat.messages + (chat.messageVersions ?? []) {
         messages.insert(message.id)
         let direct = message.directAttachments ?? []
@@ -91,7 +92,7 @@ extension BlessengerState {
   }
   mutating func removeConversation(_ id: UUID, from state: inout WorkspaceState) {
     state.chats.removeAll { $0.id == id }; drafts.removeAll { $0.id == id }
-    addresses.removeValue(forKey: id)
+    addresses.removeValue(forKey: id); speechVoices.removeValue(forKey: id)
     if removedConversations == nil { removedConversations = [] }
     removedConversations?.insert(id)
     let messages = Set(state.chats.flatMap { $0.messages + ($0.messageVersions ?? []) }.map(\.id))

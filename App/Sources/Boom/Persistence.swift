@@ -222,6 +222,15 @@ final class Vault: @unchecked Sendable {
       throw failure
     }
   }
+  /// A planning hint bound to a safely opened object, not proof of authentic
+  /// content. The selected original is subsequently decrypted and hash-checked.
+  func originalByteCount(_ id: UUID) throws -> Int {
+    lock.lock(); defer { lock.unlock() }
+    let extra = protection == nil ? 0 : RecordCipher.overhead
+    let file = try RegularFile(recordURL(.attachment, id), limit: Int64(67_108_864 + extra))
+    guard file.byteCount > extra else { throw BoomError.invalid("Empty private original.") }
+    return Int(file.byteCount) - extra
+  }
   func get(_ kind: Kind, id: UUID, limit: Int = 16_777_216) throws -> Data {
     try admit(kind, id)
     guard limit >= 0 else { throw BoomError.invalid("Invalid workspace read bound.") }

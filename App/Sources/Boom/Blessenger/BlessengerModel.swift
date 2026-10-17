@@ -55,6 +55,7 @@ import Foundation
   private let voiceNote = VoiceInput()
   private var unstoredVoiceNote: (draftID: UUID, bytes: Data)?
   @Published private(set) var hasUnstoredVoiceNote = false
+  @Published var mediaReview: BlessengerMediaReview?
   @Published private(set) var callIssue: String?
   private var speechActionFlag: CancellationFlag?
   @Published var exampleRole = Role.user
@@ -142,7 +143,7 @@ import Foundation
   var templateSelected: Bool { product.selectedTemplate == state.selectedChat && state.selectedChat != nil }
   var recipients: [BlessengerContact] { product.addresses[draft.id]?.recipients ?? draft.recipients }
   var canSend: Bool {
-    !closed && !closing && !navigating && !preparing && !loading && !callInProgress && noteState == .idle && !hasUnstoredVoiceNote && !templateSelected
+    mediaReview == nil && !closed && !closing && !navigating && !preparing && !loading && !callInProgress && noteState == .idle && !hasUnstoredVoiceNote && !templateSelected
       && !(selected.map { active.contains($0.id) } ?? false)
       && ((try? BlessengerPolicy.validate(draft).sendable) == true)
   }
@@ -171,6 +172,14 @@ import Foundation
   func report(_ error: Error) {
     if error is CancellationError { return }
     failure = error.localizedDescription
+  }
+  func saveSpeechVoice(contactID: UUID?, expected: BlessengerSpeechVoice?,
+    replacement: BlessengerSpeechVoice?) async throws {
+    try beginAction(); defer { endAction() }
+    try Task.checkCancellation()
+    let next = try await store.blessengerSetSpeechVoice(contactID: contactID,
+      expected: expected, replacement: replacement)
+    accept(next)
   }
   func dismissFailure() { failure = nil; audio.dismissError() }
   private func accept(_ next: WorkspaceState) {
@@ -274,6 +283,68 @@ import Foundation
       return true
     } catch { report(error); return false }
   }
+  func openMediaReview(_ captured: AttachmentRecord) {
+    guard mediaReview == nil, !closed, !closing, !navigating, !callInProgress else { return }
+    if [.audio, .video].contains(captured.kind), preparing || !active.isEmpty || audio.responseID != nil {
+      report(BoomError.unavailable("Finish or stop the current response before opening another audio player.")); return
+    }
+    let target = templateSelected ? nil : draft
+    let insertion = target.flatMap { BlessengerTranscriptInsertion(view: inputCompletion.view, draft: $0) }
+    inputCompletion.invalidateGhost()
+    let review = BlessengerMediaReview(original: captured, destination: target, insertion: insertion)
+    mediaReview = review
+    launch {
+      await self.inputCompletion.join()
+      guard self.mediaReview === review else { return }
+      review.load(store: self.store)
+    }
+  }
+  func closeMediaReview(_ review: BlessengerMediaReview, discard: Bool) {
+    guard mediaReview === review, !review.hasOwnedEdit else { return }
+    guard discard || !review.dirty else { return }
+    launch {
+      await review.close()
+      if self.mediaReview === review { self.mediaReview = nil }
+    }
+  }
+  func saveMediaTranscript(_ review: BlessengerMediaReview) {
+    guard mediaReview === review else { return }
+    launch {
+      do { let (state, _) = try await review.save(store: self.store); self.accept(state) }
+      catch { review.report(error) }
+    }
+  }
+  func attachMediaTranscript(_ review: BlessengerMediaReview) {
+    guard mediaReview === review, let destination = review.destination, !navigating else { return }
+    launch {
+      guard self.mediaReview === review, !self.navigating, review.canSave else { return }
+      self.navigating = true; defer { self.navigating = false }
+      do {
+        try review.beginApplying(); defer { review.endApplying() }
+        guard self.draft.id == destination.id, self.draft.version == destination.version else {
+          throw BoomError.stale("The target message changed. The transcript remains available.")
+        }
+        try await self.flushDraft()
+        let (saved, version) = try await review.save(store: self.store); self.accept(saved)
+        let next = try await self.store.blessengerAttachTranscript(version, draftID: destination.id, expectedVersion: destination.version)
+        self.accept(next); self.draft = next.blessenger!.draft(for: destination.id == BlessengerDraft.unsentID ? nil : destination.id)
+        self.storedDraftVersion = self.draft.version
+        await review.close(); if self.mediaReview === review { self.mediaReview = nil }
+      } catch { review.report(error) }
+    }
+  }
+  func insertMediaTranscript(_ review: BlessengerMediaReview) {
+    guard mediaReview === review, let insertion = review.insertion else { return }
+    launch {
+      do {
+        try review.beginApplying(); defer { review.endApplying() }
+        let (saved, version) = try await review.save(store: self.store); self.accept(saved)
+        guard let record = saved.attachments.first(where: { $0.id == version.id }) else { throw BoomError.stale("The saved transcript disappeared.") }
+        try insertion.insert(record.text, current: self.draft)
+        await review.close(); if self.mediaReview === review { self.mediaReview = nil }
+      } catch { review.report(error) }
+    }
+  }
   func chooseModel(_ path: URL) async {
     guard !loading, !preparing, active.isEmpty, !closed, !callInProgress else { return }
     do { try beginAction() } catch { return }
@@ -353,6 +424,65 @@ import Foundation
       do { try await performSend(flag: flag, replay: replay) } catch { report(error) }
     }
   }
+  var synthesizableReplies: [ChatMessage] {
+    selected.map(BlessengerSynthesis.eligible(in:)) ?? []
+  }
+  var canSynthesize: Bool {
+    mediaReview == nil && !closed && !closing && !preparing && !navigating && !loading && !callInProgress
+      && !templateSelected && active.isEmpty && noteState == .idle
+      && synthesizableReplies.count >= 2
+  }
+  func synthesizeReplies() {
+    guard canSynthesize, let chat = selected else { return }
+    do {
+      let synthesis = try BlessengerSynthesis(chat: chat, responseIDs: synthesizableReplies.map(\.id))
+      inputCompletion.invalidateGhost()
+      let flag = CancellationFlag(); admitting = flag.operationID
+      flags[flag.operationID] = flag; preparing = true
+      operations[flag.operationID] = Task {
+        defer {
+          flags.removeValue(forKey: flag.operationID); operations.removeValue(forKey: flag.operationID)
+          if admitting == flag.operationID { admitting = nil; preparing = false }
+        }
+        do { try await performSynthesis(synthesis, flag: flag) } catch { report(error) }
+      }
+    } catch { report(error) }
+  }
+  private func performSynthesis(_ synthesis: BlessengerSynthesis, flag: CancellationFlag) async throws {
+    await inputCompletion.join(); try await flushDraft(); try flag.check()
+    let snapshot = try await store.blessengerSnapshot()
+    try synthesis.revalidate(in: snapshot)
+    guard let profile = snapshot.blessenger?.addresses[synthesis.chat.id]?.profile else {
+      throw BoomError.unavailable("Select this conversation's local model before synthesizing replies.")
+    }
+    try profile.requireBinding(for: synthesis.chat)
+    let runner = try await model(for: profile); try flag.check()
+    let resolved = try profile.resolvingModel(path: runner.source.path, identity: runner.identity)
+    let useMTP = profile.useMTP == true
+    if useMTP { _ = try await runner.prepareMTP(); try flag.check() }
+    let context = try synthesis.context()
+    let plan = try synthesis.plan()
+    // Synthesis never truncates the selected answers or silently substitutes a
+    // shorter subset. Ordinary model admission rejects an over-budget request.
+    _ = try await runner.preflight(plan, images: [], maxTokens: profile.maximumTokens, flag: flag)
+    try flag.check()
+    let id = UUID(), attempt = UUID()
+    let receipt = ConsultationReceipt(operationID: flag.operationID, seed: UInt64.random(in: .min ... .max),
+      state: .pending, model: runner.identity, voice: nil, plan: plan, sources: synthesis.sources,
+      promptDigest: Digest.sha256(plan.rawPrompt), tokenIDs: [], stopReason: "pending", elapsedSeconds: 0,
+      generationPolicy: runner.generationPolicy, attemptID: attempt, responseID: id)
+    var action = BlessengerDraft(id: synthesis.chat.id); action.text = "Synthesize selected replies"
+    let turn = BlessengerPreparedTurn(chatID: synthesis.chat.id, draft: action, history: synthesis.chat,
+      contacts: [], profile: profile, sourceDigests: synthesis.sources, context: context,
+      responseIDs: [id], receipts: [receipt], voices: [nil], outputLimit: profile.maximumTokens,
+      resolvedProfile: resolved, synthesis: synthesis)
+    accept(try await store.blessengerAdmit(turn, flag: flag))
+    active.insert(synthesis.chat.id); preparing = false; admitting = nil
+    childFlags[id] = flag
+    defer { active.remove(synthesis.chat.id) }
+    await runResponse(receipt, id: id, chatID: synthesis.chat.id, media: [], runner: runner,
+      profile: profile, flag: flag, voice: nil, useMTP: useMTP)
+  }
   private func performSend(flag: CancellationFlag, caller: BlessengerCallerTurn? = nil, replay: BlessengerReplay? = nil, prefix: AudioPreparation? = nil) async throws {
     await inputCompletion.join()
     if caller == nil { try await flushDraft() }
@@ -401,46 +531,44 @@ import Foundation
       let selectedVoice = caller?.speech ?? contacts.first.flatMap { snapshot.blessenger!.speechVoices[$0.id] } ?? snapshot.blessenger!.defaultSpeech
       speechVoice = try await audio.prepare(selectedVoice); try flag.check()
     }
-    let media = try await BlessengerMedia.prepare(captured.attachments, state: snapshot, store: store, runner: runner, flag: flag)
     let projectedHistory = BlessengerMedia.deliveredHistory(contextHistory, product: snapshot.blessenger!)
-    let historical: BlessengerMedia.History
-    if let prefix { historical = prefix.historical }
-    else { historical = try await BlessengerMedia.history(projectedHistory, state: snapshot, store: store, runner: runner, flag: flag) }
-    let payloads = (historical.prepared.payloads + media.payloads).reduce(into: [WritingMediaData]()) { values, item in
-      if !values.contains(where: { $0.reference.id == item.reference.id }) { values.append(item) }
-    }
-    let sourceRefs = (historical.prepared.sources + media.sources).reduce(into: [SourceReference]()) { values, item in
-      if !values.contains(item) { values.append(item) }
-    }
     let chatID = history?.id ?? UUID()
-    let fitted: (plans: [ConsultationPlan], history: [ChatMessage], omittedHistory: Int, context: String)
+    let fitted: (plans: [ConsultationPlan], history: [ChatMessage], context: String)
+    let payloads: [WritingMediaData], sourceRefs: [SourceReference]
+    let contextWindow: BlessengerHistoryWindow?
     if let prefix {
-      guard media.context.isEmpty else { throw BoomError.stale("The final caller representation changed its prompt text.") }
-      fitted = (prefix.plans, prefix.fittedHistory, projectedHistory.count - prefix.fittedHistory.count, "")
+      // The prefix owner's selected history and already prepared native state
+      // remain authoritative. Decode only the new final original, never replay
+      // the completed historical prefill or reselect against mutable UI state.
+      let current = try await BlessengerMedia.prepare(captured.attachments, state: snapshot, store: store, supportsRawAudio: runner.supportsRawAudio, flag: flag)
+      guard current.context.isEmpty else { throw BoomError.stale("The final caller representation changed its prompt text.") }
+      fitted = (prefix.plans, prefix.fittedHistory, "")
+      payloads = prefix.historical.prepared.payloads + current.payloads
+      sourceRefs = prefix.historical.prepared.sources + current.sources
+      contextWindow = prefix.historical.window
     } else {
-      // V2 carries an opaque untrusted source block, not V3 rendered-range bindings.
-      // Exact originals/representations remain in the independently validated
-      // turn receipts and final store transaction; do not mislabel them V3.
-      let result = try await runner.fittedRound(voices: voices, history: projectedHistory,
-      instructions: history?.instructions ?? "", context: media.context, request: captured.text,
-      routing: contacts.map(\.handle), images: [], media: payloads,
-      reserves: voices.map { _ in profile.maximumTokens }, flag: flag,
-      cacheOwner: PromptCacheOwner(namespace: namespace, entity: chatID, route: .consultation),
-      promptContract: .referenceHistoryV2,
-      historyMedia: historical.occurrences, currentMedia: media.payloads.map { $0.reference.id })
-      fitted = (result.plans, result.history, result.omittedHistory, result.context)
+      let admitted = try await BlessengerContext.prepare(history: projectedHistory,
+        current: captured.attachments, text: captured.text, state: snapshot, store: store, supportsRawAudio: runner.supportsRawAudio, flag: flag)
+      let round = try await BlessengerContext.fit(admitted, voices: voices, instructions: history?.instructions ?? "",
+        request: captured.text, routing: contacts.map(\.handle), reserves: voices.map { _ in profile.maximumTokens },
+        runner: runner, owner: PromptCacheOwner(namespace: namespace, entity: chatID, route: .consultation), flag: flag)
+      fitted = (round.plans, round.capture.history, round.capture.current.context)
+      payloads = round.capture.payloads
+      sourceRefs = round.capture.prior.prepared.sources + round.capture.current.sources
+      contextWindow = round.capture.window
     }
     try flag.check()
     let admittedIDs = Set(fitted.plans.flatMap { $0.placedMediaIDs })
     let admittedPayloads = payloads.filter { admittedIDs.contains($0.reference.id) }
-    let retainedHistoryIDs = Set(fitted.history.flatMap { ($0.directAttachments ?? []) + $0.sources.filter { $0.kind == "attachment" }.map(\.id) })
-    let admittedSources = sourceRefs.filter { captured.attachments.contains($0.id) || retainedHistoryIDs.contains($0.id) }
+    let admittedSources = sourceRefs.reduce(into: [SourceReference]()) { result, source in
+      if !result.contains(source) { result.append(source) }
+    }
     let ids = voices.map { _ in UUID() }
     let receipts = fitted.plans.enumerated().map { index, plan in
       ConsultationReceipt(operationID: flag.operationID, seed: UInt64.random(in: .min ... .max), state: .pending,
         model: runner.identity, voice: voices[index], plan: plan, sources: admittedSources,
         promptDigest: Digest.sha256(plan.rawPrompt), tokenIDs: [], stopReason: "pending", elapsedSeconds: 0,
-        generationPolicy: runner.generationPolicy, attemptID: UUID(), responseID: ids[index], media: admittedPayloads.map(\.reference))
+        generationPolicy: runner.generationPolicy, attemptID: UUID(), responseID: ids[index], media: admittedPayloads.map(\.reference), contextWindow: contextWindow)
     }
     let turn = BlessengerPreparedTurn(chatID: chatID, draft: captured, history: history, contacts: contacts,
       profile: profile, sourceDigests: admittedSources, context: fitted.context, responseIDs: ids,
@@ -571,6 +699,7 @@ import Foundation
     }
   }
   func readAloud(_ message: ChatMessage) {
+    guard mediaReview == nil else { return }
     guard message.state != .pending, !message.text.isEmpty, !callInProgress, !preparing, active.isEmpty else { return }
     let flag = CancellationFlag(); speechActionFlag?.cancel(); speechActionFlag = flag
     let sourceDigest = Digest.sha256(message.text), id = message.id
@@ -594,7 +723,7 @@ import Foundation
     }
   }
   var canCall: Bool {
-    !closed && !closing && !navigating && !preparing && !loading && !callInProgress
+    mediaReview == nil && !closed && !closing && !navigating && !preparing && !loading && !callInProgress
       && active.isEmpty && !templateSelected && recipients.count <= 1 && draft.recipientQuery.isEmpty && noteState == .idle && !hasUnstoredVoiceNote
   }
   /// Hang-up invalidates the lifetime synchronously. The same action owns
@@ -633,21 +762,22 @@ import Foundation
         let voices: [Voice?] = route.recipients.isEmpty ? [nil]
           : try route.recipients.map { try BlessengerPolicy.capturedVoice($0, state: snapshot) }
         let projected = BlessengerMedia.deliveredHistory(history?.messages ?? [], product: snapshot.blessenger!)
-        let historical = try await BlessengerMedia.history(projected, state: snapshot, store: store, runner: runner, flag: flag)
         // Only the placement of this provisional row is compiled. It is neither
         // persisted nor evaluated. Final admitted PCM supplies its real digest.
         let stub = try BlessengerWave.encode([Float](repeating: 0, count: 640), rate: 16_000)
         let provisional = WritingMediaData(reference: WritingMediaReference(id: chunk.captureID,
           name: "Caller audio.wav", rootDigest: Digest.sha256(stub), kind: "audio"), bytes: stub,
           samples: [Float](repeating: 0, count: 640))
-        let payloads = historical.prepared.payloads + [provisional]
         let trace = BlessengerTrace(); trace.once("audio.prefix.planning")
-        let fitted = try await runner.fittedRound(voices: voices, history: projected,
-          instructions: history?.instructions ?? "", context: "", request: "", routing: route.recipients.map(\.handle),
-          images: [], media: payloads, reserves: [profile.maximumTokens + CausalAudioPrefix.maximumSamples / 640 - 1],
-          flag: flag, cacheOwner: PromptCacheOwner(namespace: namespace, entity: history?.id ?? callID, route: .consultation),
-          promptContract: .referenceHistoryV2,
-          historyMedia: historical.occurrences, currentMedia: [chunk.captureID])
+        let admitted = try await BlessengerContext.prepare(history: projected, current: [chunk.captureID], text: "",
+          state: snapshot, store: store, supportsRawAudio: runner.supportsRawAudio, flag: flag, provisional: provisional)
+        let round = try await BlessengerContext.fit(admitted, voices: voices, instructions: history?.instructions ?? "",
+          request: "", routing: route.recipients.map(\.handle),
+          reserves: [profile.maximumTokens + CausalAudioPrefix.maximumSamples / 640 - 1], runner: runner,
+          owner: PromptCacheOwner(namespace: namespace, entity: history?.id ?? callID, route: .consultation), flag: flag)
+        let historical = round.capture.prior
+        let payloads = round.capture.payloads
+        let fitted = (plans: round.plans, history: round.capture.history)
         guard fitted.plans.count == 1 else { throw BoomError.invalid("A live call requires exactly one prepared response.") }
         let selected = Set(fitted.plans[0].placedMediaIDs)
         try lifetime.check(); try flag.check()
@@ -776,7 +906,7 @@ import Foundation
       attachments: draft.attachments.compactMap { id in state.attachments.first { $0.id == id }?.reference })
   }
   var completionAvailable: Bool {
-    state.autocomplete && !closed && !closing && !navigating && !loading && !preparing && active.isEmpty
+    mediaReview == nil && state.autocomplete && !closed && !closing && !navigating && !loading && !preparing && active.isEmpty
       && !callInProgress && noteState == .idle && !hasUnstoredVoiceNote && !templateSelected && runner != nil
       && runnerPath == ((product.addresses[draft.id]?.profile ?? product.defaultProfile).modelPath ?? ModelPacks.cached(.consultation)?.path)
       && runner?.identity == (product.addresses[draft.id]?.profile ?? product.defaultProfile).modelIdentity
@@ -785,12 +915,10 @@ import Foundation
     count: Int, flag: CancellationFlag, publish: @escaping @Sendable (String) -> Void) async throws -> [String] {
     guard completionAvailable, completionContext == context, let runner, (1...3).contains(count) else { throw CancellationError() }
     let snapshot = state, chat = selected, profile = context.profile
-    let current = try await BlessengerMedia.prepare(draft.attachments, state: snapshot, store: store, runner: runner, flag: flag)
-    let history = BlessengerMedia.deliveredHistory(chat?.messages ?? [], product: snapshot.blessenger!)
-    let prior = try await BlessengerMedia.history(history, state: snapshot, store: store, runner: runner, flag: flag)
-    let payloads = (prior.prepared.payloads + current.payloads).reduce(into: [WritingMediaData]()) { values, item in
-      if !values.contains(where: { $0.reference.id == item.reference.id }) { values.append(item) }
-    }
+    let projected = BlessengerMedia.deliveredHistory(chat?.messages ?? [], product: snapshot.blessenger!)
+    let selected = try await BlessengerContext.prepare(history: projected, current: draft.attachments,
+      text: document.text, state: snapshot, store: store, supportsRawAudio: runner.supportsRawAudio, flag: flag)
+    let current = selected.current, prior = selected.prior, history = selected.history, payloads = selected.payloads
     let compiled = try await detachedWork {
       func links(_ ids: [UUID]) -> String { ids.map { "[Attachment: media](boom-attachment:\($0.uuidString))" }.joined(separator: "\n") }
       let turns = history.map { message in
@@ -840,6 +968,7 @@ import Foundation
         self.unstoredVoiceNote = (destination, data); self.hasUnstoredVoiceNote = true
         if await self.importInputs([.bytes(name: "Voice note.wav", data: data)]) {
           self.unstoredVoiceNote = nil; self.hasUnstoredVoiceNote = false
+          if let id = self.draft.attachments.last { self.preview(id) }
         }
       }
     case .preparing, .stopping: break
@@ -857,6 +986,7 @@ import Foundation
   }
   func discardUnstoredVoiceNote() { unstoredVoiceNote = nil; hasUnstoredVoiceNote = false }
   func replayAudio(_ id: UUID) {
+    guard mediaReview == nil else { return }
     guard !callInProgress, active.isEmpty, let record = product.audio[id],
       let original = state.attachments.first(where: { $0.id == record.attachmentID }) else { return }
     launch {
@@ -940,6 +1070,9 @@ import Foundation
     guard noteState == .idle, !hasUnstoredVoiceNote else {
       throw BoomError.unavailable("Finish and save, or explicitly discard, the recording before quitting.")
     }
+    guard mediaReview?.dirty != true, mediaReview?.hasOwnedEdit != true else {
+      throw BoomError.unavailable("Save or explicitly discard the transcript edits before quitting.")
+    }
     closing = true; navigating = true
     defer { if !closed { closing = false; navigating = false } }
     // Revoke publication and unblock audio consumers BEFORE waiting for UI actions.
@@ -950,6 +1083,7 @@ import Foundation
     for operation in operations.values { operation.cancel() }
     for flag in childFlags.values { flag.cancel() }
     speechActionFlag?.cancel(); audio.stop(); voiceNote.cancel(); noteState = .idle
+    if let review = mediaReview { await review.close(); mediaReview = nil }
     await endCall()
     searchTask?.cancel(); await inputCompletion.join()
     if actionCount > 0 { await withCheckedContinuation { actionWaiters.append($0) } }

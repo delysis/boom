@@ -93,6 +93,7 @@ struct BlessengerState: Codable, Sendable {
   var branches: [UUID: UUID] = [:]
   /// Explicitly removed ancestry may remain referenced by surviving branches.
   var removedConversations: Set<UUID>? = nil
+  var transcripts: [UUID: [BlessengerTranscript]]? = nil
   var readReplies = false
   var selectedTemplate: UUID?
 
@@ -102,6 +103,7 @@ struct BlessengerState: Codable, Sendable {
   }
   func validate(in state: WorkspaceState) throws {
     try validateRelationships(in: state)
+    try validateTranscripts(in: state)
     guard schema == 1, state.composerDrafts?.isEmpty ?? true,
       drafts.count <= state.chats.count + 1, Set(drafts.map(\.id)).count == drafts.count,
       drafts.contains(where: { $0.id == BlessengerDraft.unsentID }),
@@ -122,6 +124,12 @@ struct BlessengerState: Codable, Sendable {
       try Self.validate(address.profile)
     }
     try Self.validate(defaultProfile)
+    _ = try BlessengerPolicy.validate(defaultSpeech)
+    guard speechVoices.count <= 4096, speechVoices.keys.allSatisfy(chats.contains) else {
+      throw BoomError.invalid("A speech voice has lost its Contact conversation.")
+    }
+    for voice in speechVoices.values { _ = try BlessengerPolicy.validate(voice) }
+    for voice in (spokenResponses ?? [:]).values { _ = try BlessengerPolicy.validate(voice) }
     for (id, attempt) in attempts {
       guard id == attempt.messageID, attempt.identity.recordID == id,
         let chat = state.chats.first(where: { $0.id == attempt.conversationID }),
@@ -130,6 +138,7 @@ struct BlessengerState: Codable, Sendable {
       }
     }
     for audio in audio.values {
+      _ = try BlessengerPolicy.validate(audio.voice)
       guard attachments.contains(audio.attachmentID), audio.frames > 0,
         (8000...96000).contains(audio.sampleRate), (0...audio.frames).contains(audio.heardFrames),
         audio.textDigest.utf8.count == 64 else { throw BoomError.invalid("Recorded speech metadata is inconsistent.") }
@@ -166,8 +175,11 @@ enum BlessengerPolicy {
     let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
     return Digest.sha256(try encoder.encode(value))
   }
-  private static func call<T: Decodable>(_ request: [String: Any]) throws -> T {
+  static func call<T: Decodable>(_ request: [String: Any]) throws -> T {
     try ProductCore.call(["op": "blessenger", "request": request])
+  }
+  static func validate(_ voice: BlessengerSpeechVoice) throws -> Bool {
+    try call(["op": "validate_speech_voice", "voice": ProductCore.object(voice)])
   }
   static func validate(_ draft: BlessengerDraft) throws -> BlessengerDraftAdmission {
     try call(["op": "validate_draft", "draft": ProductCore.object(draft)])
@@ -183,8 +195,10 @@ enum BlessengerPolicy {
       "library": ProductCore.object(contacts + chats), "historical": ProductCore.object(history),
       "groups": ProductCore.object(product.groups), "frozen": frozen])
   }
-  static func speech(_ text: String, cursor: BlessengerSpeechCursor, finished: Bool) throws -> BlessengerSpeechEmission {
-    try call(["op": "speech", "text": text, "cursor": ProductCore.object(cursor), "finished": finished])
+  static func speech(_ text: String, cursor: BlessengerSpeechCursor, finished: Bool,
+    maximumFragments: Int = 512) throws -> BlessengerSpeechEmission {
+    try call(["op": "speech", "text": text, "cursor": ProductCore.object(cursor), "finished": finished,
+      "maximum_fragments": maximumFragments])
   }
   static func liveContact(_ chat: ChatRecord) throws -> BlessengerContact {
     let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys

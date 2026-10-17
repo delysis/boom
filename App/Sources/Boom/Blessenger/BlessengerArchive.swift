@@ -88,9 +88,15 @@ enum BlessengerArchive {
       guard original.attemptID == attemptID, original.responseID == message.id,
         original.operationID == receipt.operationID, original.seed == receipt.seed,
         original.model == receipt.model, original.voice == receipt.voice,
+        original.sources == receipt.sources, original.contextWindow == receipt.contextWindow,
         try BlessengerPolicy.exactDigest(original.plan) == BlessengerPolicy.exactDigest(receipt.plan),
         original.generationPolicy == receipt.generationPolicy else {
         throw BoomError.invalid("The retained response and attempt disagree about captured authority.")
+      }
+      if message.sources.contains(where: { $0.kind == BlessengerSources.consultation }) {
+        guard message.sources == receipt.sources else {
+          throw BoomError.invalid("The synthesis and its receipt disagree about the consulted replies.")
+        }
       }
       if let attempt = product.attempts[message.id] {
         guard receipt.attemptID == attempt.identity.attemptID, receipt.operationID == attempt.identity.operationID,

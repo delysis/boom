@@ -47,6 +47,7 @@ struct BlessengerPreparedTurn: Sendable {
   var speech: BlessengerSpeechVoice? = nil
   var previousQuestionID: UUID? = nil
   var resolvedProfile: BlessengerProfile? = nil
+  var synthesis: BlessengerSynthesis? = nil
 }
 
 extension WorkspaceStore {
@@ -133,11 +134,53 @@ extension WorkspaceStore {
       product.drafts[index] = draft
     }.0
   }
+  /// Compare-and-replace the captured presentation binding. In-flight responses
+  /// retain their admitted sound; changing a Contact cannot rewrite those records.
+  func blessengerSetSpeechVoice(contactID: UUID?, expected: BlessengerSpeechVoice?,
+    replacement: BlessengerSpeechVoice?) throws -> WorkspaceState {
+    if let replacement { _ = try BlessengerPolicy.validate(replacement) }
+    return try blessengerTransaction { state, product in
+      if let contactID {
+        guard state.voices.contains(where: { $0.id == contactID }),
+          try BlessengerPolicy.exactDigest(product.speechVoices[contactID]) == BlessengerPolicy.exactDigest(expected) else {
+          throw BoomError.stale("The Contact or its speech binding changed. Reopen its voice settings.")
+        }
+        product.speechVoices[contactID] = replacement
+      } else {
+        guard try BlessengerPolicy.exactDigest(product.defaultSpeech) == BlessengerPolicy.exactDigest(expected), let replacement else {
+          throw BoomError.stale("The default speech binding changed. Reopen its voice settings.")
+        }
+        product.defaultSpeech = replacement
+      }
+    }.0
+  }
   func blessengerAdmit(_ turn: BlessengerPreparedTurn, flag: CancellationFlag? = nil) throws -> WorkspaceState {
     try flag?.check()
     guard turn.responseIDs.count == turn.receipts.count, turn.voices.count == turn.receipts.count,
       (1...4).contains(turn.responseIDs.count), Set(turn.responseIDs).count == turn.responseIDs.count else {
       throw BoomError.invalid("The response plan is inconsistent.")
+    }
+    if let synthesis = turn.synthesis {
+      guard turn.caller == nil, turn.previousQuestionID == nil, turn.speech == nil,
+        turn.history?.id == synthesis.chat.id, turn.chatID == synthesis.chat.id,
+        turn.responseIDs.count == 1, turn.contacts.isEmpty,
+        turn.voices.allSatisfy({ $0 == nil }), turn.sourceDigests == synthesis.sources else {
+        throw BoomError.invalid("The synthesis is not a single captured read-only response.")
+      }
+      try synthesis.revalidate(in: blessengerSnapshot())
+      guard turn.receipts[0].voice == nil, turn.receipts[0].sources == synthesis.sources,
+        try BlessengerPolicy.exactDigest(turn.receipts[0].plan) == BlessengerPolicy.exactDigest(synthesis.plan()),
+        turn.context.utf8.elementsEqual(try synthesis.context().utf8) else {
+        throw BoomError.invalid("The synthesis prompt does not match its captured question and replies.")
+      }
+      // A generated-looking message alone is not evidence of real consultation.
+      for reply in synthesis.replies {
+        let receipt = try vault.decode(ConsultationReceipt.self, kind: .receipt, id: reply.id)
+        guard receipt.state == .complete, receipt.responseID == reply.id,
+          receipt.model == reply.provider, receipt.voice?.speaker == reply.speaker else {
+          throw BoomError.invalid("A synthesis source has no matching completed consultation receipt.")
+        }
+      }
     }
     let resolved = turn.resolvedProfile ?? turn.profile
     try turn.profile.admitResolution(resolved)
@@ -164,7 +207,7 @@ extension WorkspaceStore {
     }
     let next = try blessengerTransaction { state, product in
       try flag?.check()
-      if turn.caller == nil && turn.previousQuestionID == nil {
+      if turn.caller == nil && turn.previousQuestionID == nil && turn.synthesis == nil {
       guard let retainedDraft = product.drafts.first(where: { $0.id == turn.draft.id }),
         try BlessengerPolicy.validate(retainedDraft).digest == BlessengerPolicy.validate(turn.draft).digest,
         try BlessengerPolicy.validate(turn.draft).sendable else { throw BoomError.stale("The submitted draft changed.") }
@@ -178,17 +221,18 @@ extension WorkspaceStore {
           throw BoomError.stale("The captured execution profile changed.")
         }
       }
-      var forResolution = state; forResolution.blessenger = product
-      var routed = turn.draft
-      if let address = product.addresses[turn.chatID] { routed.recipients = address.recipients }
-      let contacts = try BlessengerPolicy.resolve(host: turn.history?.id, draft: routed,
-        state: forResolution, frozen: turn.history != nil)
-      guard contacts == turn.contacts else { throw BoomError.stale("The selected Contacts changed.") }
-      for source in turn.sourceDigests {
-        guard state.attachments.first(where: { $0.id == source.id })?.reference == source else {
-          throw BoomError.stale("A submitted attachment changed.")
-        }
+      let contacts: [BlessengerContact]
+      if let synthesis = turn.synthesis {
+        try synthesis.revalidate(in: state); contacts = []
+      } else {
+        var forResolution = state; forResolution.blessenger = product
+        var routed = turn.draft
+        if let address = product.addresses[turn.chatID] { routed.recipients = address.recipients }
+        contacts = try BlessengerPolicy.resolve(host: turn.history?.id, draft: routed,
+          state: forResolution, frozen: turn.history != nil)
+        guard contacts == turn.contacts else { throw BoomError.stale("The selected Contacts changed.") }
       }
+      try BlessengerSources.validate(turn.sourceDigests, in: state, conversationID: turn.chatID)
       let index: Int
       if let history = turn.history {
         guard history.id == turn.chatID, let existing = state.chats.firstIndex(where: { $0.id == history.id }),
@@ -212,7 +256,10 @@ extension WorkspaceStore {
         try address.profile.admitResolution(resolved)
         address.profile = resolved; product.addresses[turn.chatID] = address
       }
-      if let questionID = turn.previousQuestionID {
+      if turn.synthesis != nil {
+        // This explicit action adds one synthesis, not an invented user message.
+        // Both shared and per-conversation drafts remain untouched.
+      } else if let questionID = turn.previousQuestionID {
         guard let question = state.chats[index].messages.last, question.id == questionID,
           question.role == .user, question.state == .complete,
           question.text.utf8.elementsEqual(turn.draft.text.utf8),
@@ -221,7 +268,7 @@ extension WorkspaceStore {
         }
       } else {
         state.chats[index].messages.append(ChatMessage(role: .user, text: turn.draft.text,
-          context: turn.context, sources: turn.sourceDigests, directAttachments: turn.draft.attachments,
+          context: turn.context, sources: turn.sourceDigests.filter { turn.draft.attachments.contains($0.id) }, directAttachments: turn.draft.attachments,
           consultationRouting: contacts.map(\.handle), consultationPromptContract: .referenceHistoryV2))
       }
       for i in turn.responseIDs.indices {
@@ -229,8 +276,9 @@ extension WorkspaceStore {
         let identity = GenerationIdentity(kind: .consultation, operationID: receipt.operationID,
           recordID: id, attemptID: receipt.attemptID!, model: receipt.model, seed: receipt.seed,
           requestDigest: Digest.sha256(receipt.plan.rawPrompt), maxTokens: turn.outputLimit, generationPolicy: receipt.generationPolicy)
-        state.chats[index].messages.append(ChatMessage(id: id, role: .assistant, text: "", state: .pending,
-          provider: receipt.model, speaker: turn.voices[i]?.speaker ?? Speaker(name: "Blessenger")))
+        state.chats[index].messages.append(ChatMessage(id: id, role: .assistant, text: "", sources: turn.sourceDigests, state: .pending,
+          provider: receipt.model,
+          speaker: turn.synthesis != nil ? Speaker(name: "Synthesis") : (turn.voices[i]?.speaker ?? Speaker(name: "Blessenger"))))
         if let speech = turn.speech {
           if product.spokenResponses == nil { product.spokenResponses = [:] }
           product.spokenResponses?[id] = speech
@@ -239,7 +287,7 @@ extension WorkspaceStore {
         product.attempts[id] = BlessengerAttempt(conversationID: turn.chatID, messageID: id,
           identity: identity, sourceDigests: turn.sourceDigests)
       }
-      if turn.caller == nil && turn.previousQuestionID == nil {
+      if turn.caller == nil && turn.previousQuestionID == nil && turn.synthesis == nil {
         product.drafts.removeAll { $0.id == turn.draft.id }
         product.drafts.append(BlessengerDraft(id: turn.draft.id))
       }
@@ -259,7 +307,7 @@ extension WorkspaceStore {
       let product = blessengerRuntime?.blessenger, let attempt = product.attempts[messageID],
       attempt.identity.attemptID == attemptID, attempt.identity.operationID == receipt.operationID,
       receipt.responseID == messageID, receipt.model == attempt.identity.model,
-      receipt.seed == attempt.identity.seed,
+      receipt.seed == attempt.identity.seed, receipt.sources == attempt.sourceDigests,
       Digest.sha256(receipt.plan.rawPrompt) == attempt.identity.requestDigest,
       receipt.generationPolicy == attempt.identity.generationPolicy else {
       throw BoomError.stale("This response no longer owns its message.")
@@ -291,11 +339,8 @@ extension WorkspaceStore {
       // Revocation forbids a successful publication, not cancellation/failure
       // settlement. A failed attempt must never strand a conversation as busy.
       if receipt.state == .complete {
-        for source in attempt.sourceDigests {
-          guard state.attachments.first(where: { $0.id == source.id })?.reference == source else {
-            throw BoomError.stale("A response source changed before publication.")
-          }
-        }
+        try BlessengerSources.validate(attempt.sourceDigests, in: state,
+          conversationID: attempt.conversationID)
       }
       if let audioRecord, let retainedAudio {
         state.attachments.append(audioRecord.record); product.audio[messageID] = retainedAudio

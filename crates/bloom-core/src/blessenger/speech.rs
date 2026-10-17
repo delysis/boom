@@ -149,10 +149,26 @@ fn projection(text: &str) -> String {
 }
 
 pub fn speech_fragments(
-    mut cursor: SpeechCursor,
+    cursor: SpeechCursor,
     source: &str,
     finished: bool,
 ) -> Result<SpeechEmission, Error> {
+    speech_fragments_bounded(cursor, source, finished, 512)
+}
+
+/// A consumer controls its look-ahead without splitting or truncating the
+/// source. Final input may need several admissions; `cursor.finished` means
+/// every speakable byte has actually been admitted, not just that input ended.
+pub fn speech_fragments_bounded(
+    mut cursor: SpeechCursor,
+    source: &str,
+    finished: bool,
+    maximum_fragments: usize,
+) -> Result<SpeechEmission, Error> {
+    require(
+        (1..=512).contains(&maximum_fragments),
+        "Speech admission requires between one and 512 fragment slots.",
+    )?;
     require(
         source.len() <= MAX_TEXT && cursor.bytes <= MAX_TEXT && cursor.next <= 512,
         "The speech text exceeds its bounded response.",
@@ -185,7 +201,7 @@ pub fn speech_fragments(
             .next_back()
             .is_some_and(char::is_whitespace);
     let mut fragments = Vec::new();
-    loop {
+    while fragments.len() < maximum_fragments {
         let tail = &text[cursor.bytes..];
         if tail.trim().is_empty() {
             break;
@@ -394,5 +410,56 @@ mod tests {
         )
         .expect("resolved");
         assert_eq!(next.fragments[0].text, "five six");
+    }
+    #[test]
+    fn complete_long_read_aloud_drains_through_a_bounded_window() {
+        let text = "One two three four five six seven eight. ".repeat(150);
+        let expected = speech_fragments(SpeechCursor::default(), &text, true).expect("reference");
+        assert!(expected.fragments.len() > 32);
+        for limit in [1, 2, 7, 16, 32] {
+            let mut cursor = SpeechCursor::default();
+            let mut actual = Vec::new();
+            while !cursor.finished {
+                let before = cursor.bytes;
+                let emission =
+                    speech_fragments_bounded(cursor, &text, true, limit).expect("window");
+                assert!(emission.fragments.len() <= limit);
+                assert!(emission.cursor.bytes > before || emission.cursor.finished);
+                cursor = emission.cursor;
+                actual.extend(emission.fragments);
+            }
+            assert_eq!(actual, expected.fragments, "window {limit}");
+            let repeated = speech_fragments_bounded(cursor, &text, true, limit).expect("repeat");
+            assert!(repeated.fragments.is_empty());
+            assert!(repeated.cursor.finished);
+        }
+    }
+
+    #[test]
+    fn bounded_admission_does_not_credit_unadmitted_words_or_accept_rewrites() {
+        let first = speech_fragments_bounded(
+            SpeechCursor::default(),
+            "One two three four five six seven eight.",
+            true,
+            1,
+        )
+        .expect("first window");
+        assert_eq!(first.fragments.len(), 1);
+        assert!(!first.cursor.finished);
+        assert!(speech_fragments_bounded(first.cursor.clone(), "Other text", true, 1).is_err());
+        let final_part = speech_fragments_bounded(
+            first.cursor,
+            "One two three four five six seven eight.",
+            true,
+            1,
+        )
+        .expect("last window");
+        assert_eq!(final_part.fragments[0].text, "five six seven eight.");
+        assert!(final_part.cursor.finished);
+        for invalid in [0, 513, usize::MAX] {
+            assert!(
+                speech_fragments_bounded(SpeechCursor::default(), "Yes.", true, invalid).is_err()
+            );
+        }
     }
 }
