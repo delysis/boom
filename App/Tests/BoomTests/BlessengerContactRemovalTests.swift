@@ -30,8 +30,8 @@ final class BlessengerContactRemovalTests: XCTestCase {
     let model = BlessengerModel(store: store, catalog: catalog, state: initial, namespace: UUID())
     await model.remove(first.id) // the actual library action, not a test-only mutation
     let removed = try await store.blessengerSnapshot()
-    XCTAssertEqual(try BlessengerPolicy.exactDigest(model.draft), BlessengerPolicy.exactDigest(before))
-    XCTAssertEqual(try BlessengerPolicy.exactDigest(removed.blessenger!.draft(for: nil)), BlessengerPolicy.exactDigest(before))
+    XCTAssertEqual(try BlessengerPolicy.exactDigest(model.draft), try BlessengerPolicy.exactDigest(before))
+    XCTAssertEqual(try BlessengerPolicy.exactDigest(removed.blessenger!.draft(for: nil)), try BlessengerPolicy.exactDigest(before))
     XCTAssertEqual(removed.blessenger!.groups, [group])
     XCTAssertEqual(removed.chats, initial.chats)
     XCTAssertEqual(removed.voices.map(\.id), [second.id])
