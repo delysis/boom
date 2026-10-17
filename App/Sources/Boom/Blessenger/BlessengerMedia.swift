@@ -74,11 +74,16 @@ enum BlessengerMedia {
         let samples = try await detachedWork { () throws -> [Float] in
           // Our retained Float32 caller format is already the model's 16 kHz
           // waveform. Do not resample/quantize it after incremental preparation.
-          if let exact = try? BlessengerWave.decode(bytes), exact.rate == 16_000 {
-            guard exact.samples.count <= sampleLimit else { throw BoomError.budget("Selected decoded audio exceeds its memory reservation; the original is unchanged.") }
-            return exact.samples
+          if let shape = try? BlessengerWave.geometry(bytes), shape.rate == 16_000 {
+            // A budget error or corrupt PCM in our exact format must not fall
+            // through to a second decoder with a different admission policy.
+            return try BlessengerWave.decode(bytes, maximumSamples: sampleLimit).samples
           }
           let reader = try await MemoryMedia(bytes: bytes).audioReader()
+          guard reader.duration.isFinite, reader.duration > 0,
+            reader.duration <= Double(sampleLimit) / 16_000 else {
+            throw BoomError.budget("Selected decoded audio exceeds its memory reservation; the original is unchanged.")
+          }
           var samples: [Float] = []
           while let buffer = try reader.next(flag: flag) {
             guard let values = buffer.floatChannelData?[0] else { throw BoomError.invalid("The audio contains no waveform samples.") }

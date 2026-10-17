@@ -46,17 +46,29 @@ enum BlessengerWave {
     for value in samples { append(value.bitPattern) }
     _ = try ProductCore.admitMedia(data); return data
   }
-  static func decode(_ data: Data) throws -> (samples: [Float], rate: Int) {
-    guard data.count > 44, data.count <= 64_000_044,
-      data.prefix(4) == Data("RIFF".utf8), data[8..<16] == Data("WAVEfmt ".utf8),
-      data[36..<40] == Data("data".utf8) else { throw BoomError.invalid("Not a retained Blessenger waveform.") }
-    func u32(_ start: Int) -> UInt32 { data[start..<start+4].enumerated().reduce(UInt32(0)) { $0 | UInt32($1.element) << (8 * $1.offset) } }
-    guard u32(4) == data.count - 8, u32(16) == 16, data[20] == 3, data[21] == 0,
-      data[22] == 1, data[23] == 0, data[32] == 4, data[33] == 0, data[34] == 32, data[35] == 0,
-      u32(40) == data.count - 44, (data.count - 44) % 4 == 0,
-      (8000...96000).contains(Int(u32(24))), u32(28) == u32(24) * 4 else { throw BoomError.invalid("Retained waveform geometry changed.") }
-    let samples = stride(from: 44, to: data.count, by: 4).map { Float(bitPattern: u32($0)) }
+  static func geometry(_ data: Data) throws -> (samples: Int, rate: Int) {
+    guard data.count > 44, data.count <= 64_000_044 else { throw BoomError.invalid("Not a retained Blessenger waveform.") }
+    // Data subsequences need not start at index zero. Raw byte offsets are
+    // relative to this value's own storage and cannot index a preceding slice.
+    return try data.withUnsafeBytes { raw in
+      func u32(_ start: Int) -> UInt32 { UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: start, as: UInt32.self)) }
+      guard raw[0..<4].elementsEqual("RIFF".utf8), raw[8..<16].elementsEqual("WAVEfmt ".utf8),
+        raw[36..<40].elementsEqual("data".utf8) else { throw BoomError.invalid("Not a retained Blessenger waveform.") }
+      guard u32(4) == data.count - 8, u32(16) == 16, raw[20] == 3, raw[21] == 0,
+        raw[22] == 1, raw[23] == 0, raw[32] == 4, raw[33] == 0, raw[34] == 32, raw[35] == 0,
+        u32(40) == data.count - 44, (data.count - 44) % 4 == 0,
+        (8000...96000).contains(Int(u32(24))), u32(28) == u32(24) * 4 else { throw BoomError.invalid("Retained waveform geometry changed.") }
+      return ((data.count - 44) / 4, Int(u32(24)))
+    }
+  }
+  static func decode(_ data: Data, maximumSamples: Int = 16_000_000) throws -> (samples: [Float], rate: Int) {
+    let shape = try geometry(data)
+    guard maximumSamples >= 0 else { throw BoomError.invalid("Invalid retained waveform reservation.") }
+    guard shape.samples <= maximumSamples else { throw BoomError.budget("Selected decoded audio exceeds its memory reservation; the original is unchanged.") }
+    let samples = data.withUnsafeBytes { raw in
+      (0..<shape.samples).map { Float(bitPattern: UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: 44 + $0 * 4, as: UInt32.self))) }
+    }
     guard samples.allSatisfy({ $0.isFinite && abs($0) <= 1.01 }) else { throw BoomError.invalid("Invalid retained PCM.") }
-    return (samples, Int(u32(24)))
+    return (samples, shape.rate)
   }
 }

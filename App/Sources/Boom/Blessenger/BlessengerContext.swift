@@ -52,6 +52,9 @@ enum BlessengerContext {
       }
     }
     func selecting(maximumUnits: Int, tokenLimited: Bool = false) throws -> Capture {
+      guard maximumUnits >= 0, maximumUnits <= window.units.count else {
+        throw BoomError.invalid("Context selection cannot restore an unprepared history unit.")
+      }
       var narrowed = input; narrowed.maximumUnits = maximumUnits
       var selected = try narrowed.selected()
       if tokenLimited { selected.reason = "model_context_budget" }
@@ -122,9 +125,7 @@ enum BlessengerContext {
       }
       return Input(units: grouped, sources: metadata, current: current, currentTextBytes: currentText)
     }
-    let window = try input.selected()
-    let selectedMessages = Set(window.messages)
-    let retained = history.filter { selectedMessages.contains($0.id) }
+    var window = try input.selected()
     let currentMedia: BlessengerMedia.Prepared
     if let provisional {
       guard current == [provisional.reference.id] else { throw BoomError.invalid("A provisional call has exactly one current waveform.") }
@@ -132,12 +133,42 @@ enum BlessengerContext {
     } else {
       currentMedia = try await BlessengerMedia.prepare(current, state: state, store: store, supportsRawAudio: supportsRawAudio, flag: flag)
     }
-    let priorIDs = window.sourceIds.filter { !current.contains($0) }
-    let decoded = try await BlessengerMedia.prepare(priorIDs, state: state, store: store, supportsRawAudio: supportsRawAudio, flag: flag,
-      maximumDecodedBytes: 67_108_864 - BlessengerMedia.decodedBytes(currentMedia))
+    // A live placeholder occupies one token today but can grow to the capture
+    // limit. Reserve its FULL waveform now, not just the placeholder's samples.
+    var decodedBytes = provisional == nil ? BlessengerMedia.decodedBytes(currentMedia) : CausalAudioPrefix.maximumSamples * 4
+    var preparedIDs = Set(current), allSources = currentMedia.sources, allPayloads = currentMedia.payloads
+    var preparedUnits = 0
+    let eligible = Set(window.units)
+    for unit in grouped.reversed() where eligible.contains(unit.id) {
+      try flag.check(); try Task.checkCancellation()
+      let missing = unit.sources.filter { !preparedIDs.contains($0) }
+      let decoded: BlessengerMedia.Prepared
+      do {
+        decoded = try await BlessengerMedia.prepare(missing, state: state, store: store,
+          supportsRawAudio: supportsRawAudio, flag: flag, maximumDecodedBytes: 67_108_864 - decodedBytes)
+      } catch BoomError.budget {
+        // A compressed old recording or image-only PDF can pass metadata
+        // admission yet exceed its actual decoded representation. Only this
+        // whole unit and the older prefix are omitted. Do not visit older
+        // originals, retry the mandatory input, or turn corruption into a miss.
+        try flag.check(); try Task.checkCancellation()
+        var narrowed = input; narrowed.maximumUnits = preparedUnits
+        window = try narrowed.selected(); window.reason = "media_preparation_budget"
+        break
+      }
+      decodedBytes += BlessengerMedia.decodedBytes(decoded)
+      preparedIDs.formUnion(missing); allSources.append(contentsOf: decoded.sources); allPayloads.append(contentsOf: decoded.payloads)
+      preparedUnits += 1
+    }
+    let selectedMessages = Set(window.messages)
+    let retained = history.filter { selectedMessages.contains($0.id) }
     let priorSourceIDs = Set(retained.flatMap(BlessengerMedia.directSources))
-    let allSources = decoded.sources + currentMedia.sources
-    let allPayloads = decoded.payloads + currentMedia.payloads
+    // Preparation was newest-first; receipts and model payloads remain in
+    // chronological source order. Shared occurrences reuse only their backing.
+    let sourcesByID = Dictionary(uniqueKeysWithValues: allSources.map { ($0.id, $0) })
+    let payloadsByID = Dictionary(uniqueKeysWithValues: allPayloads.map { ($0.reference.id, $0) })
+    allSources = window.sourceIds.compactMap { sourcesByID[$0] }
+    allPayloads = window.sourceIds.compactMap { payloadsByID[$0] }
     let raw = Set(window.rawSourceIds)
     var occurrences: [UUID: [UUID]] = [:]
     for message in retained where message.role == .user {
@@ -146,6 +177,7 @@ enum BlessengerContext {
     let prior = BlessengerMedia.History(prepared: .init(context: "",
       sources: allSources.filter { priorSourceIDs.contains($0.id) },
       payloads: allPayloads.filter { priorSourceIDs.contains($0.reference.id) }), occurrences: occurrences, window: window)
+    try flag.check(); try Task.checkCancellation()
     return Capture(input: input, history: retained, window: window, current: currentMedia, prior: prior)
   }
   /// Ask the real tokenizer/media route to fit. Only whole older units slide;

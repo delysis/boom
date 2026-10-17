@@ -109,4 +109,74 @@ final class BlessengerContextTests: XCTestCase {
     XCTAssertEqual(units.map(\.messages), [[user.id, first.id, second.id], [next.id]])
     XCTAssertThrowsError(try BlessengerContext.units([user, first, user]))
   }
+  func testOversizeOlderRecordingDropsItsWholeUnitWithoutDecodingOlderSourcesOrCurrentAgain() async throws {
+    let (store, before, _, current) = try await fixture()
+    // A valid Float32 original, just beyond the single-waveform model bound.
+    // Construct its payload without allocating a second huge [Float] fixture.
+    let count = 16_384 * 640 + 1
+    var bytes = try BlessengerWave.encode([0], rate: 16_000)
+    bytes.append(Data(count: (count - 1) * 4))
+    for (offset, number) in [(4, UInt32(bytes.count - 8)), (40, UInt32(count * 4))] {
+      var little = number.littleEndian
+      withUnsafeBytes(of: &little) { bytes.replaceSubrange(offset..<offset + 4, with: $0) }
+    }
+    let imported = try AttachmentProcessor.inspect(name: "Long original.wav", data: bytes)
+    try store.vault.put(bytes, kind: .attachment, id: imported.record.id)
+    try store.vault.put(imported.receipt, kind: .receipt, id: imported.record.id)
+    let state = try await store.blessengerTransaction { state, _ in state.attachments.append(imported.record) }.0
+    let old = ChatMessage(role: .user, text: "Old corrupt source", directAttachments: [before.attachments[0].id])
+    let large = ChatMessage(role: .user, text: "Long recording", directAttachments: [imported.record.id])
+    let largeReply = ChatMessage(role: .assistant, text: "Never keep this answer without its recording")
+    let recent = ChatMessage(role: .user, text: "Recent recording", directAttachments: [current])
+    let recentReply = ChatMessage(role: .assistant, text: "Keep this complete pair")
+    let history = [old, large, largeReply, recent, recentReply]
+    let capture = try await BlessengerContext.prepare(history: history, current: [current], text: "Next",
+      state: state, store: store, supportsRawAudio: true, flag: CancellationFlag())
+    XCTAssertEqual(capture.history.map(\.id), [recent.id, recentReply.id])
+    XCTAssertEqual(capture.window.reason, "media_preparation_budget")
+    XCTAssertEqual(capture.window.omittedUnits, 2)
+    XCTAssertEqual(capture.window.omittedMessages, 3)
+    XCTAssertEqual(capture.payloads.map { $0.reference.id }, [current])
+    XCTAssertEqual(capture.window.mediaOccurrences, 2, "The same original still occupies both chronological inputs")
+    XCTAssertThrowsError(try capture.selecting(maximumUnits: 2), "Never resurrect an undecoded unit")
+    // The same oversized recording is NOT optional when explicitly selected.
+    do {
+      _ = try await BlessengerContext.prepare(history: [], current: [imported.record.id], text: "Mandatory",
+        state: state, store: store, supportsRawAudio: true, flag: CancellationFlag())
+      XCTFail("Mandatory input was silently omitted")
+    } catch BoomError.budget {} catch { XCTFail("Unexpected failure: \(error)") }
+    XCTAssertEqual(try store.vault.get(.attachment, id: imported.record.id, limit: 67_108_864), bytes)
+    let after = try await store.blessengerSnapshot()
+    XCTAssertTrue(after.chats.isEmpty)
+    try await store.releaseExclusiveWorkspace()
+  }
+  func testSelectedHistoricalCorruptionIsAnErrorNotAPreparationBudgetOmission() async throws {
+    let (store, state, history, current) = try await fixture()
+    let latest = try XCTUnwrap(history.last { $0.role == .user }?.directAttachments?.first)
+    try store.vault.put(Data("changed selected source".utf8), kind: .attachment, id: latest)
+    do {
+      _ = try await BlessengerContext.prepare(history: history, current: [current], text: "Next",
+        state: state, store: store, supportsRawAudio: true, flag: CancellationFlag())
+      XCTFail("Corrupt selected original became a context omission")
+    } catch BoomError.stale {} catch { XCTFail("Unexpected failure: \(error)") }
+    try await store.releaseExclusiveWorkspace()
+  }
+  func testWaveformAdmissionChecksCountBeforeAllocationAndKeepsExactSlicedBytes() throws {
+    let input: [Float] = [0, 0.125, -0.25]
+    let bytes = try BlessengerWave.encode(input, rate: 16_000)
+    XCTAssertEqual(try BlessengerWave.geometry(bytes).samples, input.count)
+    do {
+      _ = try BlessengerWave.decode(bytes, maximumSamples: 2)
+      XCTFail("Waveform exceeded its admitted sample reservation")
+    } catch BoomError.budget {} catch { XCTFail("Unexpected failure: \(error)") }
+    XCTAssertThrowsError(try BlessengerWave.decode(bytes, maximumSamples: -1))
+    var padded = Data([0xFF, 0xFF, 0xFF]); padded.append(bytes)
+    let slice = padded.dropFirst(3)
+    XCTAssertNotEqual(slice.startIndex, 0)
+    XCTAssertEqual(try BlessengerWave.decode(slice, maximumSamples: 3).samples.map(\.bitPattern), input.map(\.bitPattern))
+    var nonfinite = bytes, nan = Float.nan.bitPattern.littleEndian
+    withUnsafeBytes(of: &nan) { nonfinite.replaceSubrange(44..<48, with: $0) }
+    XCTAssertThrowsError(try BlessengerWave.decode(nonfinite), "Valid geometry cannot authorize nonfinite PCM")
+  }
+
 }

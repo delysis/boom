@@ -182,11 +182,19 @@ import PDFKit
     guard let view, view.window != nil, view.isEditable, !view.hasMarkedText(),
       current.id == draft.id, current.version == draft.version,
       view.string.utf8.elementsEqual(draft.text.utf8), view.selectedRange() == range,
-      let target = Range(range, in: view.string), view.shouldChangeText(in: range, replacementString: text) else {
+      let target = Range(range, in: view.string) else {
       throw BoomError.stale("The target message or caret changed. The transcript remains available; nothing was inserted or sent.")
     }
+    // This validation is pure. shouldChangeText is an editing boundary, not a
+    // predicate: insertText already invokes it and registers the native undo.
+    // Calling both registered two deletions for one insertion and damaged the
+    // untouched suffix when Undo replayed them.
+    try TextInputLimit.validateReplacement(in: view.string, range: range,
+      replacement: text, maximumUTF8Bytes: view.maximumUTF8Bytes ?? 2_097_152)
     var expected = view.string; expected.replaceSubrange(target, with: text)
+    view.breakUndoCoalescing()
     view.insertText(text, replacementRange: range)
+    view.breakUndoCoalescing()
     guard view.string.utf8.elementsEqual(expected.utf8) else { throw BoomError.unavailable("The native editor refused transcript insertion.") }
     view.undoManager?.setActionName("Insert Transcript")
   }
