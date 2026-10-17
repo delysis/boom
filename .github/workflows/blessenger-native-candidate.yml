@@ -2,33 +2,29 @@ name: Blessenger native candidate
 on:
   push:
     branches: ['blessenger/port-20261016']
-    paths: ['.blessenger-repair/**', '.github/workflows/blessenger-native-candidate.yml']
+    paths: ['App/**', 'Core/**', 'crates/**', 'RustBridge/**', 'scripts/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/blessenger-native-candidate.yml']
+  pull_request:
+    paths: ['App/**', 'Core/**', 'crates/**', 'RustBridge/**', 'scripts/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/blessenger-native-candidate.yml']
 permissions:
   contents: read
 jobs:
   candidate:
-    if: github.repository == 'delysis/boom' && github.ref == 'refs/heads/blessenger/port-20261016'
+    # The owned development branch has its push run; other PRs run here too.
+    if: github.repository == 'delysis/boom' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository || github.event.pull_request.head.ref != 'blessenger/port-20261016')
     runs-on: macos-26
     timeout-minutes: 60
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          fetch-depth: 0
+          persist-credentials: false
       - name: Admit exact source
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p evidence
-          if [[ -f .blessenger-repair/apply.py ]]; then
-            python3 .blessenger-repair/apply.py
-            git config user.name 'Blessenger source import'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git commit -m 'Apply exact source-bound Blessenger repair'
-            git push origin HEAD:refs/heads/blessenger/port-20261016
-          fi
-          git config --local --unset-all http.https://github.com/.extraheader || true
+          test ! -e .blessenger-repair
+          test ! -e .blessenger-import
+          git diff --exit-code HEAD
           git rev-parse HEAD > evidence/commit.txt
           git rev-parse 'HEAD^{tree}' > evidence/tree.txt
           git archive --format=tar HEAD | gzip -n > evidence/source.tar.gz

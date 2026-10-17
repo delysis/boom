@@ -69,9 +69,10 @@ extension BlessengerModel {
       if let contact = state.voices.first(where: { $0.id == id }) {
         state.voiceVersions.append(contact); state.voices.removeAll { $0.id == id }
         product.removedCatalog.insert(id)
-        for index in product.drafts.indices where product.drafts[index].recipients.contains(where: { $0.id == id }) {
-          product.drafts[index].recipients.removeAll { $0.id == id }; product.drafts[index].version = UUID()
-        }
+        // Removing a library entry is not permission to change an unsent
+        // question's recipients. Keep the captured chips (and group members)
+        // intact so normal resolution refuses the changed Contact. Only an
+        // explicit To-field edit may reduce or replace the intended audience.
         // Unpinning preserves the source conversation and historic membership.
         if product.selectedTemplate == id { product.selectedTemplate = nil }
       } else {
