@@ -86,7 +86,7 @@ jobs:
           scripts/build-mlx-metallib.sh "$BIN/mlx.metallib" 2>&1 | tee evidence/metallib.log
           test -d "$BIN/BoomPackageTests.xctest/Contents/MacOS"
           cp "$BIN/mlx.metallib" "$BIN/BoomPackageTests.xctest/Contents/MacOS/mlx.metallib"
-          swift test --package-path App --skip-build --manifest-cache none --disable-automatic-resolution --disable-experimental-prebuilts --filter BlessengerTests 2>&1 | tee evidence/native-tests.log
+          swift test --package-path App --skip-build --manifest-cache none --disable-automatic-resolution --disable-experimental-prebuilts --filter Blessenger 2>&1 | tee evidence/native-tests.log
           git diff --exit-code -- App/Package.resolved Cargo.lock > evidence/lock-diff.txt
       - name: Require every component lane
         if: always()
