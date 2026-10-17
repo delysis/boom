@@ -17,9 +17,7 @@ result = []
 for i,p in enumerate(parts):
     data = p.read_bytes()
     assert len(data) <= 6012
-    # Exact corrections to three known transport transcription errors. The
-    # original authored chunk, compressed patch and full patch hashes below
-    # remain unchanged. Unrecognized bytes are never applied to source.
+    # Undo only known transport errors. Original source hashes stay unchanged.
     if blob(data) != EXPECTED[i]:
         encoded = base64.b64encode(data).decode()
         if i == 1:
@@ -28,6 +26,8 @@ for i,p in enumerate(parts):
         elif i == 4:
             assert blob(data) == '296e527dcff0e2173848d286b214ec87b817e3a6'
             encoded = encoded.replace('kEc2DCJkumBVNEq28DM5+moawQGmCReQyNLvrn8uFzMHiSTQaZtAsnv14u/kER7DZNGIp','kEc2DCJkumBVNEq28DM5+moawQGmCReQyNLvrn8uOXcER7DZNGIp')
+            assert len(encoded) == 7999 and encoded.endswith('14aCtufzWhD')
+            encoded += 'W'
         elif i == 6:
             assert blob(data) == '7ed4b10e2a79008ba70341eaf3b7827ece6d432d'
             encoded = encoded.rstrip('=').replace('AHTQHbs/t93rTr','AHTQHbs/t93r9Tr')
