@@ -207,9 +207,11 @@ enum ProductCore {
     voices: [Voice?], history: [ChatMessage], instructions: String, context: String, request: String, routing: [String], authority: CapturedDocumentAuthority = .readOnly,
     promptContract: ConsultationPromptContract = .referenceHistoryV2,
     renderedContext: RenderedReferenceContext? = nil, capturedSources: [SourceReference] = [],
-    workingTextBytes: Int? = nil, workingRequestBytes: Int? = nil
+    workingTextBytes: Int? = nil, workingRequestBytes: Int? = nil,
+    historyMedia: [UUID: [UUID]] = [:], currentMedia: [UUID]? = nil
   ) throws -> [ConsultationPlan] {
-    let turns = history.filter { $0.state == .complete }.map { message in
+    let retainedHistory = history.filter { $0.state == .complete }
+    let turns = retainedHistory.map { message in
       PromptTurn(role: message.role.rawValue, text: message.text,
         speaker: message.speaker ?? Speaker(name: message.role == .user ? "Human" : "Bloom"),
         context: message.consultationPromptContract == .referenceHistoryV2
@@ -233,14 +235,34 @@ enum ProductCore {
         guard ["system", "user", "assistant"].contains(message.role) else {
           throw BoomError.invalid("Invalid consultation role.")
         }
-        return ConsultationPlan.Message(role: message.role, content: try compiled.text(message.content))
+        let text = try compiled.text(message.content)
+        var placed: [ConsultationPlan.MediaPlacement]? = nil
+        if let currentMedia {
+          placed = []
+          var last = 0
+          for span in message.sourceSpans ?? [] {
+            guard span.end >= last, span.end <= text.utf8.count else { throw BoomError.invalid("Invalid captured history boundary.") }
+            let ids: [UUID]
+            if let turn = span.turn {
+              guard retainedHistory.indices.contains(turn) else { throw BoomError.invalid("A media boundary lost its captured history turn.") }
+              ids = historyMedia[retainedHistory[turn].id] ?? []
+            } else { ids = currentMedia }
+            guard ids.isEmpty || message.role == "user" else { throw BoomError.denied("Caller audio cannot become an assistant example.") }
+            placed?.append(contentsOf: ids.map { ConsultationPlan.MediaPlacement(id: $0, end: span.end) })
+            last = span.end
+          }
+        }
+        return ConsultationPlan.Message(role: message.role, content: text, media: placed)
       }, rawPrompt: try compiled.text(plan.rawPrompt), promptContract: compiled.promptContract,
         workingWindow: compiled.workingWindow)
     }
   }
   private struct CompactConsultation: Decodable {
     struct Plan: Decodable {
-      struct Message: Decodable { let role: String; let content: [Int] }
+      struct Message: Decodable {
+        struct SourceSpan: Decodable { let turn: Int?; let end: Int }
+        let role: String; let content: [Int]; let sourceSpans: [SourceSpan]?
+      }
       let messages: [Message]
       let rawPrompt: [Int]
     }
@@ -624,12 +646,23 @@ struct ManuscriptOrigin: Codable, Sendable {
 
 
 struct ConsultationPlan: Codable, Sendable {
-  struct Message: Codable, Sendable { let role: String; let content: String }
+  struct MediaPlacement: Codable, Equatable, Sendable { let id: UUID; let end: Int }
+  struct Message: Codable, Sendable { let role: String; let content: String; var media: [MediaPlacement]? = nil }
+  var hasPlacedMedia: Bool { messages.contains { $0.media != nil } }
+  var placedMediaIDs: Set<UUID> { Set(messages.flatMap { ($0.media ?? []).map(\.id) }) }
   let messages: [Message]
   let rawPrompt: String
   var promptContract: ConsultationPromptContract? = nil
   var workingWindow: ConsultationWorkingWindow? = nil
 }
+struct BlessengerMTPExecution: Codable, Equatable, Sendable {
+  let assistant: String
+  let blockSize: Int
+  let proposed: Int?
+  let accepted: Int?
+  let passthrough: String?
+}
+
 struct ConsultationReceipt: Codable, Sendable {
   let operationID: UUID
   let seed: UInt64
@@ -651,6 +684,8 @@ struct ConsultationReceipt: Codable, Sendable {
   var responseID: UUID? = nil
   var media: [WritingMediaReference]? = nil
   var executionOrigin: GenerationExecutionOrigin? = nil
+  var mtp: BlessengerMTPExecution? = nil
+  var contextWindow: BlessengerHistoryWindow? = nil
 }
 
 struct WritingPrompt: Codable { let prompt: String; let digest: String; let totalCharacters: Int; let omittedCharacters: Int }

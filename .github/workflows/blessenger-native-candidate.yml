@@ -1,0 +1,109 @@
+name: Blessenger native candidate
+on:
+  push:
+    branches: ['blessenger/port-20261016']
+    paths: ['App/**', 'Core/**', 'crates/**', 'RustBridge/**', 'scripts/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/**']
+  pull_request:
+    paths: ['App/**', 'Core/**', 'crates/**', 'RustBridge/**', 'scripts/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/**']
+permissions:
+  contents: read
+jobs:
+  candidate:
+    # The owned development branch has its push run; other PRs run here too.
+    if: github.repository == 'delysis/boom' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository || github.event.pull_request.head.ref != 'blessenger/port-20261016')
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Admit exact source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          test ! -e .blessenger-repair
+          test ! -e .blessenger-import
+          git diff --exit-code HEAD
+          git rev-parse HEAD > evidence/commit.txt
+          git rev-parse 'HEAD^{tree}' > evidence/tree.txt
+          git archive --format=tar HEAD | gzip -n > evidence/source.tar.gz
+          shasum -a 256 evidence/source.tar.gz > evidence/source.sha256
+          rustup toolchain install 1.92.0 --profile minimal --component rustfmt --component clippy
+          rustup override set 1.92.0
+          swift --version > evidence/swift-version.txt
+      - name: Rust policy regressions
+        id: rust
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check 2>&1 | tee evidence/rust-fmt.log
+          cargo test --locked -p bloom-core --features chat-layout --lib 2>&1 | tee evidence/rust-tests.log
+          cargo clippy --locked -p bloom-core --features chat-layout --all-targets -- -D warnings 2>&1 | tee evidence/rust-clippy.log
+      - name: Swift Core regressions
+        id: core
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          swift test --package-path Core 2>&1 | tee evidence/core-tests.log
+      - name: Pinned native dependencies and catalog
+        id: dependencies
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/bootstrap.sh 2>&1 | tee evidence/bootstrap.log
+          scripts/prepare-blessenger-assets.sh 2>&1 | tee evidence/catalog.log
+          uname -a > evidence/hardware.txt
+          sysctl hw.memsize hw.ncpu >> evidence/hardware.txt
+          tar -czf evidence/runtime-sources.tar.gz --exclude=.git --exclude=.build -C .deps MLXSwiftLM Qwen3TTS
+      - name: Native bridge and Blessenger regressions
+        id: native
+        if: steps.dependencies.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$PWD/target/blessenger"
+          cargo rustc -p boom-attachment-ffi --release --locked --features boom-attachment-ffi/chat-layout --lib -- --print native-static-libs 2>&1 | tee evidence/rust-native-link.log
+          mkdir -p .build-support
+          python3 - <<'PY'
+          import hashlib,json,pathlib
+          root=pathlib.Path.cwd()
+          lib=root/'target/blessenger/release/libboom_attachment_ffi.a'
+          data={'libraryDirectory':str(lib.parent),'librarySHA256':hashlib.file_digest(lib.open('rb'),'sha256').hexdigest(),'edition':'blessenger'}
+          (root/'.build-support/RustProductBuild.json').write_text(json.dumps(data,sort_keys=True)+'\n')
+          PY
+          swift scripts/record-native-libs.swift evidence/rust-native-link.log .build-support/RustNativeLink.json
+          swift build --package-path App --build-tests --jobs 3 --manifest-cache none --disable-automatic-resolution --disable-experimental-prebuilts 2>&1 | tee evidence/native-build.log
+          BIN="$(swift build --package-path App --show-bin-path --manifest-cache none --disable-automatic-resolution --disable-experimental-prebuilts)"
+          scripts/build-mlx-metallib.sh "$BIN/mlx.metallib" 2>&1 | tee evidence/metallib.log
+          test -d "$BIN/BoomPackageTests.xctest/Contents/MacOS"
+          cp "$BIN/mlx.metallib" "$BIN/BoomPackageTests.xctest/Contents/MacOS/mlx.metallib"
+          swift test --package-path App --skip-build --manifest-cache none --disable-automatic-resolution --disable-experimental-prebuilts --filter Blessenger 2>&1 | tee evidence/native-tests.log
+          git diff --exit-code -- App/Package.resolved Cargo.lock > evidence/lock-diff.txt
+      - name: Require every component lane
+        if: always()
+        env:
+          RUST_RESULT: ${{ steps.rust.outcome }}
+          CORE_RESULT: ${{ steps.core.outcome }}
+          DEPENDENCIES_RESULT: ${{ steps.dependencies.outcome }}
+          NATIVE_RESULT: ${{ steps.native.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' "Rust=$RUST_RESULT Core=$CORE_RESULT Dependencies=$DEPENDENCIES_RESULT Native=$NATIVE_RESULT" | tee evidence/results.txt
+          test "$RUST_RESULT" = success
+          test "$CORE_RESULT" = success
+          test "$DEPENDENCIES_RESULT" = success
+          test "$NATIVE_RESULT" = success
+      - name: Preserve candidate and failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: blessenger-native-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14

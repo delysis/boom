@@ -1,0 +1,52 @@
+import AppKit
+import XCTest
+@testable import Boom
+
+extension BlessengerTests {
+  @MainActor func testComposerReturnPolicyAndDisabledInput() throws {
+    _ = NSApplication.shared
+    let editor = ChatTextView(frame: NSRect(x: 0, y: 0, width: 360, height: 100))
+    editor.isRichText = false; editor.isEditable = true; editor.string = "Case note"
+    editor.setSelectedRange(NSRange(location: editor.string.utf16.count, length: 0))
+    var sends = 0; editor.onSend = { sends += 1 }
+    func key(_ flags: NSEvent.ModifierFlags = []) throws -> NSEvent {
+      try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: flags,
+        timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0, context: nil,
+        characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36))
+    }
+    // The existing Bloom default remains native newline / Command-Return send.
+    editor.keyDown(with: try key())
+    XCTAssertEqual(sends, 0)
+    editor.keyDown(with: try key(.command))
+    XCTAssertEqual(sends, 1)
+    editor.sendsOnReturn = true
+    editor.keyDown(with: try key())
+    XCTAssertEqual(sends, 2)
+    editor.keyDown(with: try key(.shift))
+    XCTAssertEqual(sends, 2)
+    editor.setMarkedText("に", selectedRange: NSRange(location: 1, length: 0),
+      replacementRange: NSRange(location: NSNotFound, length: 0))
+    XCTAssertTrue(editor.hasMarkedText())
+    editor.keyDown(with: try key())
+    XCTAssertEqual(sends, 2, "Return committing composition must not send.")
+    editor.unmarkText(); editor.isEditable = false
+    editor.keyDown(with: try key())
+    XCTAssertEqual(sends, 2)
+  }
+
+  @MainActor func testComposerByteBoundNeverTruncatesOrSplitsSurrogates() {
+    _ = NSApplication.shared
+    let editor = ChatTextView(frame: NSRect(x: 0, y: 0, width: 360, height: 100))
+    editor.isEditable = true; editor.string = "🪶e\u{301}"
+    editor.maximumUTF8Bytes = editor.string.utf8.count
+    var issues: [String] = []; editor.issue = { issues.append($0) }
+    let original = editor.string
+    XCTAssertFalse(editor.shouldChangeText(in: NSRange(location: original.utf16.count, length: 0), replacementString: "a"))
+    XCTAssertEqual(issues.count, 1)
+    XCTAssertEqual(editor.string.utf8.map { $0 }, original.utf8.map { $0 })
+    XCTAssertFalse(editor.shouldChangeText(in: NSRange(location: 1, length: 1), replacementString: "x"))
+    XCTAssertTrue(editor.shouldChangeText(in: NSRange(location: 0, length: 2), replacementString: "a"))
+    editor.maximumUTF8Bytes = Int.max
+    XCTAssertTrue(editor.shouldChangeText(in: NSRange(location: 0, length: 0), replacementString: "x"))
+  }
+}

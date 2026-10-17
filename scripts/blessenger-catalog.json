@@ -1,0 +1,119 @@
+{
+  "sourceRevision": "b2a94f258712b35888dc10dcb4a402a98c69946b",
+  "sourceSHA256": "09557b34bc9c85108ab7f901ca419fa50eb60283fb79519b6eeecccf8213ea64",
+  "entries": [
+    {
+      "id": "2AA03ACA-01AC-5D27-AE90-9886B3CA8A44",
+      "sourceID": "bessel_van_der_kolk",
+      "name": "Bessel van der Kolk",
+      "handle": "bessel-van-der-kolk",
+      "promptSHA256": "6f85a89167dd3826b6bfb5628157633f98e22c5e071424fce5375e55252f1975",
+      "portraitCell": 0
+    },
+    {
+      "id": "EA58367E-4A0B-5499-BEEA-ECA7915088E6",
+      "sourceID": "gabor_mate",
+      "name": "Gabor Maté",
+      "handle": "gabor-mate",
+      "promptSHA256": "a81ece4ef3aea97bb0b2eae34bb3f367bb55a3a2e67d6025e2cef0725d2fa241",
+      "portraitCell": 1
+    },
+    {
+      "id": "A87F4059-FE64-58C2-9F14-A15EF4F52CA3",
+      "sourceID": "peter_levine",
+      "name": "Peter Levine",
+      "handle": "peter-levine",
+      "promptSHA256": "8464156d8a323182d57bb3cc7f19f4a0cfd971a377f2333c4829b15c33dfde4d",
+      "portraitCell": 2
+    },
+    {
+      "id": "17694092-EA8C-552C-BAD3-1F4852D39594",
+      "sourceID": "judith_herman",
+      "name": "Judith Herman",
+      "handle": "judith-herman",
+      "promptSHA256": "60b491c09c24744154d9c78d08b2f8b28b2e466cdc1244c77a339868181df4b0",
+      "portraitCell": 3
+    },
+    {
+      "id": "758C6054-3729-592B-81FA-0700E90AB6B1",
+      "sourceID": "richard_schwartz",
+      "name": "Richard Schwartz",
+      "handle": "richard-schwartz",
+      "promptSHA256": "7b14a3addea12e65a899480c171cf05b1331418139fa3150505876f83dc972be",
+      "portraitCell": 4
+    },
+    {
+      "id": "65622F21-D0D2-51E1-A73C-ACEFDE841C48",
+      "sourceID": "janina_fisher",
+      "name": "Janina Fisher",
+      "handle": "janina-fisher",
+      "promptSHA256": "8de02789305c29f983d8923f5f9112663a42b04189ea12e0e59b22dd6776daf5",
+      "portraitCell": 5
+    },
+    {
+      "id": "E5900F3A-5F75-58D0-8C07-1A3E737097AB",
+      "sourceID": "ad_de_jongh",
+      "name": "Ad de Jongh",
+      "handle": "ad-de-jongh",
+      "promptSHA256": "39c16fd926ac3fcdf725b0bc5896bec7ea54aa531109f0340f9c9e42b11d54bb",
+      "portraitCell": 6
+    },
+    {
+      "id": "2675B60F-EBE0-5061-9900-4B26CD4DA843",
+      "sourceID": "christine_courtois",
+      "name": "Christine Courtois",
+      "handle": "christine-courtois",
+      "promptSHA256": "11f1ef49cef4fe99dc58cbf39380b58a576c9f7129404c09b4e97d66729aa8b9",
+      "portraitCell": 7
+    },
+    {
+      "id": "C3BC181B-E38C-5DD5-B979-4D79CFB2F7D8",
+      "sourceID": "robert_miller_fsap",
+      "name": "Robert Miller (Feeling-State Addiction Protocol)",
+      "handle": "robert-miller-fsap",
+      "promptSHA256": "117294af39d1f353e5a8ffed697c7bb50eca0091e3a994193298d4267dc2e9c9",
+      "portraitCell": 8
+    },
+    {
+      "id": "28322171-B076-5CF6-82F9-CE1F926C6CEC",
+      "sourceID": "arnold_popky_detur",
+      "name": "Arnold Popky (DeTUR)",
+      "handle": "arnold-popky-detur",
+      "promptSHA256": "2a318557cc52b2911eace264a84d64570d857a26ae702f671a3fdad23f49d401",
+      "portraitCell": 9
+    },
+    {
+      "id": "2282AAB2-51AC-59DD-A03C-2DFFE4CA2409",
+      "sourceID": "jim_knipe",
+      "name": "Jim Knipe",
+      "handle": "jim-knipe",
+      "promptSHA256": "749cea6456c8ad35dfe092d9b2787c81c9590697f52616529d063997f2ee871c",
+      "portraitCell": 10
+    },
+    {
+      "id": "BA3CA3FB-4F53-5134-98F3-55486CA92259",
+      "sourceID": "francine_shapiro",
+      "name": "Francine Shapiro",
+      "handle": "francine-shapiro",
+      "promptSHA256": "8d4db4825cd69523ef26dccf4842c506b2d65941c7e885faf1b2a967061d6e01",
+      "portraitCell": 11
+    },
+    {
+      "id": "559A8EF0-13F6-5DDD-BB46-6CEBD9B2A2CE",
+      "sourceID": "shirley_jean_schmidt_dnms",
+      "name": "Shirley Jean Schmidt (DNMS)",
+      "handle": "shirley-jean-schmidt-dnms",
+      "promptSHA256": "46812c82d4de421865b6f10e8df7a5bc140680b1b24e39ab44da9e0410ef1fc7",
+      "portraitCell": 12
+    },
+    {
+      "id": "801E2E04-BE8D-5D23-90DA-F09138FDC6C9",
+      "sourceID": "dolores_mosquera",
+      "name": "Dolores Mosquera",
+      "handle": "dolores-mosquera",
+      "promptSHA256": "0bbdb97bed527a8030f3395bb7bca30ea64ae5d647d2aadead530c92d81faace",
+      "portraitCell": 13
+    }
+  ],
+  "portraitSHA256": "f5d3d737e37821aaa39ad741dd9879512d0994604da5f6771827ebeffb29f51e"
+}

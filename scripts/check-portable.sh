@@ -12,7 +12,11 @@ fi
 (cd "$HERE" && cargo fmt --all -- --check && cargo test --workspace --locked && cargo clippy --workspace --all-targets --locked -- -D warnings)
 (cd "$HERE/Core" && swift test)
 if [[ "$(uname -s)" == Darwin ]]; then python3 "$HERE/scripts/test-notice-collector.py"; fi
-swiftc -frontend -parse "$HERE"/App/Sources/Boom/*.swift
+# Product modules may live in nested directories (including Blessenger).
+# Keep one source parse; Bash arrays retain spaces in checkout paths on macOS.
+APP_SOURCES=()
+while IFS= read -r -d '' source; do APP_SOURCES+=("$source"); done < <(find "$HERE/App/Sources/Boom" -type f -name '*.swift' -print0)
+swiftc -frontend -parse "${APP_SOURCES[@]}"
 # Each executable script has top-level statements; parse it as its own source unit.
 for script in "$HERE"/scripts/*.swift; do swiftc -frontend -parse "$script"; done
 CORE_BIN="$(cd "$HERE/Core" && swift build --show-bin-path)"

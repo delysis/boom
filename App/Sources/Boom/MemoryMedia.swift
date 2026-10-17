@@ -28,6 +28,8 @@ final class MemoryMedia: NSObject, AVAssetResourceLoaderDelegate, @unchecked Sen
   @MainActor func readyPlayer(flag: CancellationFlag) async throws -> AVPlayer {
     try flag.check(); try Task.checkCancellation()
     let item = AVPlayerItem(asset: asset), player = AVPlayer(playerItem: item)
+    var admitted = false
+    defer { if !admitted { player.pause(); player.replaceCurrentItem(with: nil) } }
     for _ in 0..<500 where item.status == .unknown {
       try flag.check(); try await Task.sleep(for: .milliseconds(10))
     }
@@ -36,6 +38,7 @@ final class MemoryMedia: NSObject, AVAssetResourceLoaderDelegate, @unchecked Sen
       player.pause()
       throw item.error ?? BoomError.unavailable("This media cannot be played locally.")
     }
+    admitted = true
     return player
   }
   private static func cafWave(_ bytes: Data) throws -> Data {

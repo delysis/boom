@@ -1282,8 +1282,8 @@ final class PromptPrefixCache: @unchecked Sendable {
   private var publicationTicket: UUID?
   private var pendingMissReason: String?
   init(byteLimit: UInt64 = PromptPrefixCache.defaultByteLimit,
-    diskByteLimit: UInt64 = 4_294_967_296, temporaryParent: URL? = nil) {
-    self.byteLimit = byteLimit; disk = PrefixKVDiskStore(byteLimit: diskByteLimit, temporaryParent: temporaryParent)
+    diskByteLimit: UInt64 = 4_294_967_296, temporaryParent: URL? = nil, protection: RecordCipher? = nil) {
+    self.byteLimit = byteLimit; disk = PrefixKVDiskStore(byteLimit: diskByteLimit, temporaryParent: temporaryParent, protection: protection)
   }
   private func spillTicketIsLive(_ ticket: UUID) -> Bool {
     lock.lock(); defer { lock.unlock() }; return publicationTicket == ticket

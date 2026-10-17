@@ -15,6 +15,10 @@ import SwiftUI
 
 @main @MainActor enum BoomMain {
   static func main() {
+    #if BLESSENGER
+    if CommandLine.arguments.count == 1 { BlessengerApplication.run(); return }
+    #endif
+
     #if BLOOM_DEVELOPER_STACK_DIAGNOSTICS
     // This branch precedes every ordinary workspace, Keychain and model path.
     // Malformed diagnostic arguments must never fall through to a normal launch.

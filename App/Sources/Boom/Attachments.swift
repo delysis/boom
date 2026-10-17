@@ -164,7 +164,7 @@ struct AttachmentImport: Sendable {
   let original: Data
 }
 enum AttachmentProcessor {
-  static func inspect(name: String, data: Data) throws -> AttachmentImport {
+  static func inspect(name: String, data: Data, id: UUID = UUID()) throws -> AttachmentImport {
     guard !data.isEmpty, data.count <= 67_108_864 else {
       throw BoomError.budget("Attachments must be nonempty and at most 64 MiB.")
     }
@@ -185,7 +185,7 @@ enum AttachmentProcessor {
     func blocked(_ reason: String) -> AttachmentImport {
       AttachmentImport(
         record: AttachmentRecord(
-          id: UUID(), name: name, rootDigest: digest, text: "", coverage: "Blocked: " + reason,
+          id: id, name: name, rootDigest: digest, text: "", coverage: "Blocked: " + reason,
           transform: nil, presentation: .unavailable), receipt: response, original: data)
     }
     guard let object = (try? JSONSerialization.jsonObject(with: response)) as? [String: Any],
@@ -221,7 +221,7 @@ enum AttachmentProcessor {
       : "Partial or blocked coverage; see processing receipt"
     return AttachmentImport(
       record: AttachmentRecord(
-        id: UUID(), name: name, rootDigest: digest, text: text, coverage: coverage, transform: nil, presentation: kind),
+        id: id, name: name, rootDigest: digest, text: text, coverage: coverage, transform: nil, presentation: kind),
       receipt: response, original: data)
   }
   static func readGranted(_ url: URL, limit: Int = 67_108_864, allowEmpty: Bool = false) throws -> Data {

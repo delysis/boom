@@ -12,6 +12,13 @@ if [[ ! -e "$HERE/.deps/MLXSwiftLM" ]]; then
   git -C "$HERE/.deps/MLXSwiftLM" checkout --detach "$MLX_RUNTIME"
 fi
 [[ "$(git -C "$HERE/.deps/MLXSwiftLM" rev-parse HEAD)" == "$MLX_RUNTIME" ]] || { echo 'Unexpected MLX Swift LM revision.' >&2; exit 1; }
+QWEN_RUNTIME=2118167c06dd93233128ccef3011188e32bebd14
+if [[ ! -e "$HERE/.deps/Qwen3TTS" ]]; then
+  git clone --filter=blob:none --no-checkout https://github.com/hamptus/mlx-swift-qwen3-tts.git "$HERE/.deps/Qwen3TTS"
+  git -C "$HERE/.deps/Qwen3TTS" fetch --depth 1 origin "$QWEN_RUNTIME"
+  git -C "$HERE/.deps/Qwen3TTS" checkout --detach "$QWEN_RUNTIME"
+fi
+[[ "$(git -C "$HERE/.deps/Qwen3TTS" rev-parse HEAD)" == "$QWEN_RUNTIME" ]] || { echo 'Unexpected Qwen Swift revision.' >&2; exit 1; }
 # Dependency resolution is a DEVELOPMENT operation, not an app runtime feature.
 # The emitted Cargo.lock and Package.resolved must be retained with Mac receipts.
 mkdir -p "$HERE/.build-support"

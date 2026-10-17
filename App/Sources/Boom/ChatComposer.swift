@@ -1,4 +1,5 @@
 import AppKit
+import BoomCore
 import SwiftUI
 
 func nativeEditEvent(_ event: String) {
@@ -14,6 +15,9 @@ func nativeEditEvent(_ event: String) {
   var onFocus: (() -> Void)?
   var onContentHeight: ((CGFloat) -> Void)?
   var minimumContentHeight: CGFloat = 50
+  var sendsOnReturn = false
+  var maximumUTF8Bytes: Int?
+  var issue: ((String) -> Void)?
   private let placeholder = NativeTextPlaceholder("Message")
 
   func preparePlaceholder(_ text: String) {
@@ -54,6 +58,17 @@ func nativeEditEvent(_ event: String) {
     super.mouseDown(with: event)
     if window?.firstResponder !== self { window?.makeFirstResponder(self) }
   }
+  override func shouldChangeText(in affectedCharRange: NSRange, replacementString: String?) -> Bool {
+    if let maximumUTF8Bytes, let replacementString {
+      do {
+        try TextInputLimit.validateReplacement(in: string, range: affectedCharRange,
+          replacement: replacementString, maximumUTF8Bytes: maximumUTF8Bytes)
+      } catch {
+        issue?(error.localizedDescription); return false
+      }
+    }
+    return super.shouldChangeText(in: affectedCharRange, replacementString: replacementString)
+  }
   override func becomeFirstResponder() -> Bool {
     let accepted = super.becomeFirstResponder()
     if accepted { onFocus?() }
@@ -75,7 +90,11 @@ func nativeEditEvent(_ event: String) {
   }
 
   override func keyDown(with event: NSEvent) {
-    if event.keyCode == 36, event.modifierFlags.contains(.command), !hasMarkedText() {
+    // Inspect the composition state before native interpretation consumes Return.
+    // A Return committing marked text must never also submit that text.
+    let modifiers = event.modifierFlags.intersection([.command, .shift, .control, .option])
+    if isEditable, [36, 76].contains(event.keyCode), !hasMarkedText(),
+      modifiers == .command || (sendsOnReturn && modifiers.isEmpty) {
       onSend?()
       return
     }
@@ -89,8 +108,8 @@ func nativeEditEvent(_ event: String) {
   override func performKeyEquivalent(with event: NSEvent) -> Bool {
     // Handle the active editor before the menu bar sees Command-Return.
     // Otherwise the writing command can consume a chat send or inline save.
-    if window?.firstResponder === self, event.keyCode == 36,
-      event.modifierFlags.contains(.command), !hasMarkedText() {
+    if isEditable, window?.firstResponder === self, [36, 76].contains(event.keyCode),
+      event.modifierFlags.intersection([.command, .shift, .control, .option]) == .command, !hasMarkedText() {
       onSend?()
       return true
     }
@@ -193,6 +212,11 @@ struct ChatComposer: NSViewRepresentable {
   var lineSpacing: CGFloat = 0
   var onContentHeight: ((CGFloat) -> Void)? = nil
   var showsEditingActions = false
+  var onIssue: ((String) -> Void)? = nil
+  var onNativeInput: ((ChatTextView) -> Void)? = nil
+  var onNativeDetach: (() -> Void)? = nil
+  var sendsOnReturn = false
+  var maximumUTF8Bytes: Int? = nil
   var completionModel: WorkspaceModel? = nil
   var completionTarget: TextInputTarget? = nil
   var textVersion: UUID? = nil
@@ -241,7 +265,12 @@ struct ChatComposer: NSViewRepresentable {
     view.onCancel = isEnabled ? onCancel : nil
     view.onAttachments = isEnabled ? onAttachments : nil
     view.onFocus = isEnabled ? onFocus : nil
+    view.sendsOnReturn = sendsOnReturn
+    view.maximumUTF8Bytes = maximumUTF8Bytes
+    view.issue = onIssue
     context.coordinator.onContentHeight = onContentHeight
+    context.coordinator.onNativeInput = isEnabled ? onNativeInput : nil
+    context.coordinator.onNativeDetach = onNativeDetach
     view.onContentHeight = { [weak coordinator = context.coordinator] height in coordinator?.measure(height) }
     view.registerForDraggedTypes(AttachmentInput.draggingTypes)
     view.setAccessibilityLabel(accessibilityLabel)
@@ -278,10 +307,15 @@ struct ChatComposer: NSViewRepresentable {
     let styleChanged = context.coordinator.lineSpacing != lineSpacing
     context.coordinator.lineSpacing = lineSpacing
     context.coordinator.onContentHeight = onContentHeight
+    context.coordinator.onNativeInput = isEnabled ? onNativeInput : nil
+    context.coordinator.onNativeDetach = onNativeDetach
     view.onSend = isEnabled ? onSend : nil
     view.onCancel = isEnabled ? onCancel : nil
     view.onAttachments = isEnabled ? onAttachments : nil
     view.onFocus = isEnabled ? onFocus : nil
+    view.sendsOnReturn = sendsOnReturn
+    view.maximumUTF8Bytes = maximumUTF8Bytes
+    view.issue = onIssue
     let source = context.coordinator.text.wrappedValue
     let version = currentTextVersion?() ?? textVersion
     if !view.nativeEditInProgress, !view.hasMarkedText() {
@@ -327,10 +361,11 @@ struct ChatComposer: NSViewRepresentable {
     } else {
       coordinator.completion?.invalidateGhost(); coordinator.completion = nil
       view.completionClient = nil
+      if isEnabled { onNativeInput?(view) }
     }
   }
   static func dismantleNSView(_ input: ChatInputView, coordinator: Coordinator) {
-    coordinator.completion?.invalidateGhost()
+    coordinator.completion?.invalidateGhost(); coordinator.onNativeDetach?()
   }
 
   @MainActor final class Coordinator: NSObject, NSTextViewDelegate {
@@ -339,6 +374,8 @@ struct ChatComposer: NSViewRepresentable {
     var appliedFocusRequest = 0
     var lineSpacing: CGFloat = 0
     var onContentHeight: ((CGFloat) -> Void)?
+    var onNativeInput: ((ChatTextView) -> Void)?
+    var onNativeDetach: (() -> Void)?
     var completion: TextInputCompletion?
     var completionTarget: TextInputTarget?
     var currentTextVersion: (() -> UUID)?
@@ -378,7 +415,9 @@ struct ChatComposer: NSViewRepresentable {
       updateCompletion()
     }
     func updateCompletion() {
-      guard let view, let completionTarget else { return }
+      guard let view else { return }
+      onNativeInput?(view)
+      guard let completionTarget else { return }
       completion?.update(selection: view.selectedRange(),
         marked: view.hasMarkedText(), target: completionTarget)
     }

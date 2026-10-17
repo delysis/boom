@@ -1,0 +1,64 @@
+name: Blessenger model manifest evidence
+on:
+  push:
+    branches: ['blessenger/port-20261016']
+    paths: ['.github/workflows/blessenger-model-manifests.yml']
+permissions:
+  contents: read
+jobs:
+  manifests:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - name: Capture public pinned file identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir evidence
+          python3 - <<'PY'
+          import hashlib,json,pathlib,urllib.request,urllib.parse
+          out=pathlib.Path('evidence')
+          models=[('qwen','mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit','5c390979e4b93af5f2932f90742ca99c7dd04687'),('mtp','mlx-community/gemma-4-12B-it-qat-assistant-8bit',None),('turn','aufklarer/Smart-Turn-v3.2-CoreML',None)]
+          def read(url,limit=20000000):
+            with urllib.request.urlopen(url,timeout=60) as stream:
+              data=stream.read(limit+1)
+              if len(data)>limit: raise ValueError('Metadata bound exceeded')
+              return data
+          manifests=[]
+          for name,repo,pin in models:
+            info=json.loads(read('https://huggingface.co/api/models/'+repo+(('/revision/'+pin) if pin else '')))
+            revision=info['sha']
+            assert len(revision)==40 and (not pin or revision==pin)
+            tree=json.loads(read('https://huggingface.co/api/models/'+repo+'/tree/'+revision+'?recursive=true&expand=false'))
+            (out/(name+'-tree.json')).write_text(json.dumps(tree,indent=2))
+            files=[]
+            for entry in tree:
+              path=entry['path']
+              if entry['type']!='file' or path.startswith('.') or path.startswith('onnx/'): continue
+              if not (path.endswith(('.json','.safetensors','.txt','.bin','.mil','.coremldata')) or '.mlmodelc/' in path or path in ('LICENSE','merges.txt','vocab.json','README.md')): continue
+              if entry.get('lfs'):
+                sha=entry['lfs']['oid']; size=entry['size']
+              else:
+                raw=read('https://huggingface.co/'+repo+'/resolve/'+revision+'/'+urllib.parse.quote(path))
+                sha=hashlib.sha256(raw).hexdigest(); size=len(raw)
+                target=out/name/path; target.parent.mkdir(parents=True,exist_ok=True); target.write_bytes(raw)
+              files.append({'path':path,'bytes':size,'sha256':sha})
+            manifests.append({'id':name,'repository':repo,'revision':revision,'files':files})
+          (out/'VoiceModels.json').write_text(json.dumps(manifests,indent=2)+'\n')
+          PY
+      - name: Record host capabilities without opening private state
+        shell: bash
+        run: |
+          set -euo pipefail
+          system_profiler SPHardwareDataType SPDisplaysDataType > evidence/host.txt
+          swift --version >> evidence/host.txt
+          printf 'import Metal\nlet d = MTLCreateSystemDefaultDevice(); print(d?.name ?? "no Metal device"); print(d?.recommendedMaxWorkingSetSize ?? 0)\n' > /tmp/blessenger-metal.swift
+          swift /tmp/blessenger-metal.swift >> evidence/host.txt
+      - name: Preserve manifests and failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: blessenger-model-manifests
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 7

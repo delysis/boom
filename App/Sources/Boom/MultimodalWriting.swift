@@ -38,6 +38,41 @@ struct CompiledMediaPrompt: Decodable {
 /// https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma4_unified/feature_extraction_gemma4_unified.py
 /// The dependency's public image preprocessor remains the vision authority.
 enum RawWritingInput {
+  /// Expand already-admitted source occurrences before the real checkpoint
+  /// template runs. Keep duplicate occurrences in chronological order; only the
+  /// input payload catalog is unique. No mutable title/path resolves a source.
+  static func expandChatMedia(_ plan: ConsultationPlan, media: [WritingMediaData]) throws
+    -> (messages: [ConsultationPlan.Message], media: [WritingMediaData]) {
+    guard !plan.messages.isEmpty, plan.messages.allSatisfy({ $0.media != nil && ["system", "user", "assistant"].contains($0.role) }),
+      Set(media.map { $0.reference.id }).count == media.count else {
+      throw BoomError.invalid("Ambiguous captured media input.")
+    }
+    var ordered: [WritingMediaData] = []
+    let messages = try plan.messages.map { message -> ConsultationPlan.Message in
+      var body = "", previous = 0
+      let bytes = Array(message.content.utf8)
+      for placement in message.media ?? [] {
+        guard message.role == "user", placement.end >= previous, placement.end <= bytes.count,
+          let prefix = String(bytes: bytes[previous..<placement.end], encoding: .utf8),
+          let payload = media.first(where: { $0.reference.id == placement.id }) else {
+          throw BoomError.stale("A captured attachment occurrence is unavailable.")
+        }
+        let link = "[Attachment](boom-attachment:\(placement.id.uuidString))"
+        let compiled = try compiled(link, media: [payload.reference])
+        guard compiled.media.count == 1, compiled.media[0] == payload.reference else {
+          throw BoomError.invalid("Media projection changed identity.")
+        }
+        body += prefix + "\n" + compiled.prompt + "\n"; ordered.append(payload)
+        previous = placement.end
+      }
+      guard let suffix = String(bytes: bytes[previous...], encoding: .utf8) else {
+        throw BoomError.invalid("A media boundary splits UTF-8.")
+      }
+      body += suffix
+      return ConsultationPlan.Message(role: message.role, content: body)
+    }
+    return (messages, ordered)
+  }
   static func compiled(_ text: String, media: [WritingMediaReference]) throws -> CompiledMediaPrompt {
     try ProductCore.call(["op": "compile_media_prompt", "text": text, "media": ProductCore.object(media)])
   }

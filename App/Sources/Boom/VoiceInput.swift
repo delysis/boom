@@ -250,34 +250,44 @@ import Speech
     request.append(buffer); request.endAudio()
     request.requiresOnDeviceRecognition = true
     request.shouldReportPartialResults = false
-    return try await withCheckedThrowingContinuation { continuation in
-      let completion = SpeechOnce(continuation)
-      let task = recognizer.recognitionTask(with: request) { result, error in
-        if let error { completion.finish(.failure(error)); return }
-        if let result, result.isFinal {
-          let text = result.bestTranscription.formattedString.trimmingCharacters(in: .whitespacesAndNewlines)
-          completion.finish(text.isEmpty
-            ? .failure(BoomError.unavailable("No words were recognized.")) : .success(text))
-        }
-      }
-      if let flag {
-        Task {
-          while !completion.isFinished {
-            if flag.isCancelled {
-              task.cancel()
-              completion.finish(.failure(CancellationError()))
-              break
+    let cancellation = flag ?? CancellationFlag()
+    var watchdog: Task<Void, Never>?, deadline: Task<Void, Never>?
+    func joinObservers() async {
+      watchdog?.cancel(); deadline?.cancel()
+      if let watchdog { await watchdog.value }
+      if let deadline { await deadline.value }
+    }
+    do {
+      let text: String = try await withTaskCancellationHandler {
+        try cancellation.check()
+        return try await withCheckedThrowingContinuation { continuation in
+          let completion = SpeechOnce(continuation)
+          let task = recognizer.recognitionTask(with: request) { result, error in
+            if let error { completion.finish(.failure(error)); return }
+            if let result, result.isFinal {
+              let text = result.bestTranscription.formattedString.trimmingCharacters(in: .whitespacesAndNewlines)
+              completion.finish(text.isEmpty ? .failure(BoomError.unavailable("No words were recognized.")) : .success(text))
             }
-            try? await Task.sleep(nanoseconds: 200_000_000)
+          }
+          watchdog = Task {
+            while !completion.isFinished, !Task.isCancelled {
+              if cancellation.isCancelled {
+                task.cancel(); completion.finish(.failure(CancellationError())); return
+              }
+              do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
+            }
+          }
+          deadline = Task {
+            do { try await Task.sleep(for: .seconds(90)) } catch { return }
+            guard !completion.isFinished else { return }
+            task.cancel(); completion.finish(.failure(BoomError.unavailable("On-device transcription timed out.")))
           }
         }
-      }
-      Task {
-        try? await Task.sleep(nanoseconds: 90_000_000_000)
-        task.cancel()
-        completion.finish(.failure(BoomError.unavailable("On-device transcription timed out.")))
-      }
-    }
+      } onCancel: { cancellation.cancel() }
+      await joinObservers(); try cancellation.check()
+      return text
+    } catch { await joinObservers(); throw error }
+
   }
 }
 

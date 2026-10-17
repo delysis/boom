@@ -16,10 +16,10 @@ case "$SIGN_PROFILE" in
 esac
 case "$EDITION" in
   author) RUST_FEATURES=(--no-default-features) ;;
-  chat) RUST_FEATURES=(--features boom-attachment-ffi/chat-layout) ;;
-  *) echo 'Choose author or chat for the second build argument.' >&2; exit 1 ;;
+  chat|blessenger) RUST_FEATURES=(--features boom-attachment-ffi/chat-layout) ;;
+  *) echo 'Choose author, chat or blessenger for the second build argument.' >&2; exit 1 ;;
 esac
-if [[ "$EDITION" == author ]]; then export CARGO_TARGET_DIR="$HERE/target"; else export CARGO_TARGET_DIR="$HERE/target/chat"; fi
+if [[ "$EDITION" == author ]]; then export CARGO_TARGET_DIR="$HERE/target"; else export CARGO_TARGET_DIR="$HERE/target/$EDITION"; fi
 
 # Clean compiler intermediates once this whole job finishes, including failures.
 JANITOR="$HOME/Library/Application Support/RustTargetJanitor/rust-target-janitor"
@@ -37,6 +37,7 @@ source_inventory() {
     { find App/Sources App/Tests Core/Sources Core/Tests RustBridge/src RustBridge/tests crates vendor scripts patches licenses -type f; printf '%s\n' App/Package.swift Core/Package.swift RustBridge/Cargo.toml Cargo.toml Info.plist Entitlements.plist LICENSE LICENSE-MIT LICENSE-APACHE NOTICE.md; } | LC_ALL=C sort | while IFS= read -r path; do shasum -a 256 "$path"; done
   )
 }
+if [[ "$EDITION" == blessenger ]]; then "$HERE/scripts/prepare-blessenger-assets.sh"; fi
 source_inventory > "$OUT/source-files-before.sha256"
 uname -a
 xcodebuild -version
@@ -63,12 +64,21 @@ with open(sys.argv[3], 'w') as stream:
 PYBUILD
 swift "$HERE/scripts/record-native-libs.swift" "$OUT/rust-native-link.log" "$HERE/.build-support/RustNativeLink.json"
 # Use locked macro sources consistently instead of experimental prebuilts.
-(cd "$HERE/App" && swift test --manifest-cache none --disable-automatic-resolution --disable-experimental-prebuilts)
+(cd "$HERE/App" && swift build --build-tests --manifest-cache none --disable-automatic-resolution --disable-experimental-prebuilts)
+DEBUG_BIN="$(cd "$HERE/App" && swift build --show-bin-path --manifest-cache none --disable-automatic-resolution --disable-experimental-prebuilts)"
+"$HERE/scripts/build-mlx-metallib.sh" "$DEBUG_BIN/mlx.metallib"
+[[ -d "$DEBUG_BIN/BoomPackageTests.xctest/Contents/MacOS" ]]
+cp "$DEBUG_BIN/mlx.metallib" "$DEBUG_BIN/BoomPackageTests.xctest/Contents/MacOS/mlx.metallib"
+(cd "$HERE/App" && swift test --skip-build --manifest-cache none --disable-automatic-resolution --disable-experimental-prebuilts)
 (cd "$HERE/App" && swift build -c release --manifest-cache none --disable-automatic-resolution --disable-experimental-prebuilts)
 BIN="$(cd "$HERE/App" && swift build -c release --manifest-cache none --disable-automatic-resolution --disable-experimental-prebuilts --show-bin-path)"
-APP="$OUT/Bloom.app"
+PRODUCT_NAME=Bloom
+[[ "$EDITION" != blessenger ]] || PRODUCT_NAME=Blessenger
+APP="$OUT/$PRODUCT_NAME.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$BIN/Boom" "$APP/Contents/MacOS/Bloom"
+cp "$BIN/Boom" "$APP/Contents/MacOS/$PRODUCT_NAME"
+# The same exact shaders used by native tests accompany the release binary.
+cp "$DEBUG_BIN/mlx.metallib" "$APP/Contents/MacOS/mlx.metallib"
 # Keep package resources in the standard sealed location. Boom's supported
 # Gemma bundles include their tokenizer configuration; the Hub package's
 # GPT/T5 fallback resources are not part of Boom's model path.
@@ -76,6 +86,12 @@ cp "$BIN/Boom" "$APP/Contents/MacOS/Bloom"
 find "$BIN" -maxdepth 1 -name '*.bundle' ! -name '*Tests.bundle' -type d -exec cp -R {} "$APP/Contents/Resources/" \;
 cp "$HERE/Info.plist" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :BloomEdition string $EDITION" "$APP/Contents/Info.plist"
+if [[ "$EDITION" == blessenger ]]; then
+  /usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier com.delysis.blessenger' "$APP/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c 'Set :CFBundleName Blessenger' "$APP/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName Blessenger' "$APP/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c 'Set :CFBundleExecutable Blessenger' "$APP/Contents/Info.plist"
+fi
 cp "$HERE/.build-support/RustProductBuild.json" "$OUT/product-build.json"
 [[ -n "$(/usr/libexec/PlistBuddy -c 'Print :NSSpeechRecognitionUsageDescription' "$APP/Contents/Info.plist")" ]]
 [[ -n "$(/usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' "$APP/Contents/Info.plist")" ]]
@@ -106,8 +122,8 @@ if [[ "$SIGN_PROFILE" != prepare ]]; then
   cat "$OUT/delivery/designated-requirement.stdout" "$OUT/delivery/designated-requirement.stderr" > "$OUT/designated-requirement.txt"
   cat "$OUT/delivery/signing-scope.stdout" "$OUT/delivery/signing-scope.stderr" > "$OUT/code-signing-scope.txt"
 fi
-otool -L "$APP/Contents/MacOS/Bloom" > "$OUT/dynamic-dependencies.txt"
-shasum -a 256 "$APP/Contents/MacOS/Bloom" > "$OUT/executable.sha256"
+otool -L "$APP/Contents/MacOS/$PRODUCT_NAME" > "$OUT/dynamic-dependencies.txt"
+shasum -a 256 "$APP/Contents/MacOS/$PRODUCT_NAME" > "$OUT/executable.sha256"
 du -sk "$APP" > "$OUT/bundle-size-kib.txt"
 echo "Built $APP ($SIGN_PROFILE profile)"
 echo 'Build success is not UI, download, media, large-file performance, or real-weight acceptance. Run the documented native gates.'

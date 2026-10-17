@@ -1,0 +1,51 @@
+name: Blessenger development inputs
+on:
+  push:
+    branches: ['blessenger/port-20261016']
+    paths: ['.github/workflows/blessenger-development-inputs.yml']
+permissions:
+  contents: read
+jobs:
+  inputs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Capture exact public dependency sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence "$RUNNER_TEMP/inputs"
+          capture() {
+            name="$1"; repository="$2"; revision="$3"
+            git init "$RUNNER_TEMP/inputs/$name"
+            git -C "$RUNNER_TEMP/inputs/$name" remote add origin "https://github.com/$repository.git"
+            git -C "$RUNNER_TEMP/inputs/$name" fetch --depth 1 origin "$revision"
+            git -C "$RUNNER_TEMP/inputs/$name" checkout --detach FETCH_HEAD
+            test "$(git -C "$RUNNER_TEMP/inputs/$name" rev-parse HEAD)" = "$revision"
+            git -C "$RUNNER_TEMP/inputs/$name" archive --format=tar --prefix="$name/" HEAD | gzip -n > "evidence/$name.tar.gz"
+          }
+          capture MLXSwiftLM ml-explore/mlx-swift-lm 9afc3b55f75a0d41a3d0c11330b9df6a036d24e4
+          capture Qwen3TTS hamptus/mlx-swift-qwen3-tts 2118167c06dd93233128ccef3011188e32bebd14
+          capture NativePlatform delysis/native-platform b2a94f258712b35888dc10dcb4a402a98c69946b
+          sha256sum evidence/*.tar.gz > evidence/input-hashes.txt
+      - name: Capture offline Rust compiler and locked dependency sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.92.0 --profile minimal --component rustfmt --component clippy
+          toolchain="$(rustup run 1.92.0 rustc --print sysroot)"
+          tar -C "$toolchain" --exclude=share --exclude=lib/rustlib/src -czf evidence/rust-toolchain.tar.gz bin lib
+          cargo +1.92.0 vendor --locked --versioned-dirs "$RUNNER_TEMP/vendor" > evidence/vendor-config.toml
+          tar -C "$RUNNER_TEMP" -czf evidence/rust-vendor.tar.gz vendor
+          sha256sum evidence/rust-*.tar.gz >> evidence/input-hashes.txt
+      - name: Preserve exact development inputs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: blessenger-development-inputs
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 7

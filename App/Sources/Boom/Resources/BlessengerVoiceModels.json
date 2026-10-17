@@ -1,0 +1,158 @@
+[
+  {
+    "id": "qwen",
+    "repository": "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit",
+    "revision": "5c390979e4b93af5f2932f90742ca99c7dd04687",
+    "files": [
+      {
+        "path": "README.md",
+        "bytes": 1068,
+        "sha256": "40d213ae6ec58c48d4362a66a8e77bc8518b87acf6cd5e54b4aa2352a588a277"
+      },
+      {
+        "path": "config.json",
+        "bytes": 5437,
+        "sha256": "37e4e0d7b2b10b8f9946734ec808eab6045a435b5ec35219b5c07a153444675d"
+      },
+      {
+        "path": "generation_config.json",
+        "bytes": 245,
+        "sha256": "f1b90b4513f3b34c62851049e2492d7b4c5940daf1276f89c82b8ef04127f3aa"
+      },
+      {
+        "path": "merges.txt",
+        "bytes": 1671839,
+        "sha256": "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3"
+      },
+      {
+        "path": "model.safetensors",
+        "bytes": 1625226859,
+        "sha256": "d8627de7ef411f6775182925059e140a9e1edb1fde8feeb540b4fba0edee1e58"
+      },
+      {
+        "path": "model.safetensors.index.json",
+        "bytes": 71786,
+        "sha256": "8ea3f7115ca2b729e5af4e83b2580d1be97dd54d80e8ef7aa27257c04d84d325"
+      },
+      {
+        "path": "preprocessor_config.json",
+        "bytes": 127,
+        "sha256": "efdde1022ea9d76928bf7a9cd53139138f5ba2e466e837f08f6105ab1af1c119"
+      },
+      {
+        "path": "speech_tokenizer/config.json",
+        "bytes": 2336,
+        "sha256": "ee65bb901c876664ab8707c487157aa1a6ee57c65969b28fb5ec9dc211e68167"
+      },
+      {
+        "path": "speech_tokenizer/configuration.json",
+        "bytes": 76,
+        "sha256": "6bc26d64eb5024b4d1dab5a52371958b429256d6c9d59787f1f5294a54e0cebd"
+      },
+      {
+        "path": "speech_tokenizer/model.safetensors",
+        "bytes": 682293092,
+        "sha256": "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258"
+      },
+      {
+        "path": "speech_tokenizer/preprocessor_config.json",
+        "bytes": 234,
+        "sha256": "fcb3805e597e786d4067706e602f6688524640f8d3396790e2e09b5942fcbdfb"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "bytes": 7344,
+        "sha256": "dc3c31c3bdaedd5016382bb3cbe07323026775ad51f5a4fb564505992ae4a670"
+      },
+      {
+        "path": "vocab.json",
+        "bytes": 2776833,
+        "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+      }
+    ]
+  },
+  {
+    "id": "mtp",
+    "repository": "mlx-community/gemma-4-12B-it-qat-assistant-8bit",
+    "revision": "fc5172f52309188eeff5db7d719dd95d48cecc70",
+    "files": [
+      {
+        "path": "README.md",
+        "bytes": 1929,
+        "sha256": "d6e746bdc3aca0e0894e4b9f48df9e7b4fc2c34a61fa2d67edceb9e7026cb235"
+      },
+      {
+        "path": "config.json",
+        "bytes": 2991,
+        "sha256": "f7e943c37cee60398ac2491d7302d2e476791ea5557b0b54889d9c97c55b156b"
+      },
+      {
+        "path": "generation_config.json",
+        "bytes": 260,
+        "sha256": "a8349d9bd64cc5841297fcb5002f0fdc4749c473c8f1b10ea337f9ce4ee7014e"
+      },
+      {
+        "path": "model.safetensors",
+        "bytes": 449313320,
+        "sha256": "f621b293dfc6f47b8d3e89fae04fa86552dd0732a32ee5409c860b4571277c43"
+      },
+      {
+        "path": "model.safetensors.index.json",
+        "bytes": 6528,
+        "sha256": "09662119cfaccd3431e6570a2121cc8e98120c8693f3167e5492d24d0c5c3c2b"
+      },
+      {
+        "path": "tokenizer.json",
+        "bytes": 32169440,
+        "sha256": "75a6583c1a418e2bbd79c60d95d28e0f5bf549ad3f2990b5bdb5238c6c2bf70c"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "bytes": 2682,
+        "sha256": "2084566efe9ae430fa5fa7f901373d9c2e027865a417e119c3598fdcc69a35f8"
+      }
+    ]
+  },
+  {
+    "id": "turn",
+    "repository": "aufklarer/Smart-Turn-v3.2-CoreML",
+    "revision": "75f069717f500947195fa1945c46ddb472559cff",
+    "files": [
+      {
+        "path": "LICENSE",
+        "bytes": 1406,
+        "sha256": "db31415d226689aaf6fa6274da0416171edb70ca7ebf97bd3d99d8d8b88cd34e"
+      },
+      {
+        "path": "README.md",
+        "bytes": 4443,
+        "sha256": "417620f5686072f108bafdd91c91d9393295c243aac0b81e6eef33d65cfcba2f"
+      },
+      {
+        "path": "config.json",
+        "bytes": 1029,
+        "sha256": "bc09d1b40285465b389dc42cef54290fa1db7b4928348018bc61d819b4914402"
+      },
+      {
+        "path": "smart_turn.mlmodelc/analytics/coremldata.bin",
+        "bytes": 243,
+        "sha256": "1646746d0029e78d26be065e62602d4f89e51013ec238b653adf7d7d21057f89"
+      },
+      {
+        "path": "smart_turn.mlmodelc/coremldata.bin",
+        "bytes": 643,
+        "sha256": "9245ac99889c9d738cba6c89da9e851fd16488bf8effbc15a109d06b401c9383"
+      },
+      {
+        "path": "smart_turn.mlmodelc/model.mil",
+        "bytes": 69968,
+        "sha256": "41a6d9ac0f7d01d738e56ecdf4435e55f139591541b7cf1a4dba6b9ce2f1c9ef"
+      },
+      {
+        "path": "smart_turn.mlmodelc/weights/weight.bin",
+        "bytes": 16714240,
+        "sha256": "b6295316741a0149e1fcab7cdf030e1b9bfb0eef778207accee91a2a9703a39c"
+      }
+    ]
+  }
+]

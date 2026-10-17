@@ -73,8 +73,9 @@ enum WorkspaceBackup {
     _ = try copyWorkspace(from: root, to: target, restoring: false)
   }
 
-  static func restore(from source: URL, into target: URL) throws {
-    _ = try copyWorkspace(from: source, to: target, restoring: true)
+  static func restore(from source: URL, into target: URL,
+    validate: @Sendable (URL) throws -> Void = { _ in }) throws {
+    _ = try copyWorkspace(from: source, to: target, restoring: true, validate: validate)
   }
 
   /// Caller holds the existing Engine writer queue and Vault lock. Native
@@ -127,11 +128,12 @@ enum WorkspaceBackup {
   /// Only the immutable clone is read during the potentially large export.
   /// Disposal is joined even on cancellation; a refusal retains both errors.
   static func export(_ captured: CapturedDirectory, to target: URL,
-    cancellation: CancellationFlag, progress: CopyProgress? = nil) throws {
+    cancellation: CancellationFlag, progress: CopyProgress? = nil,
+    validate: @Sendable (URL) throws -> Void = { _ in }) throws {
     var failure: Error?
     do {
       try admitCapture(captured)
-      _ = try copyWorkspace(from: captured.root, to: target, restoring: false, progress: progress) {
+      _ = try copyWorkspace(from: captured.root, to: target, restoring: false, progress: progress, validate: validate) {
         try Task.checkCancellation(); try cancellation.check()
       }
     } catch { failure = error }
@@ -170,6 +172,7 @@ enum WorkspaceBackup {
 
   private static func copyWorkspace(from source: URL, to target: URL, restoring: Bool,
     cloneOnly: Bool = false, progress: CopyProgress? = nil,
+    validate: @Sendable (URL) throws -> Void = { _ in },
     checkCancellation: @Sendable () throws -> Void = { try Task.checkCancellation() }) throws -> stat {
     try checkCancellation()
     guard source.isFileURL, target.isFileURL else {
@@ -232,6 +235,8 @@ enum WorkspaceBackup {
         return true
       }) {}
       if let enumerationFailure { throw enumerationFailure }
+      try checkCancellation()
+      try validate(stage) // Verify the exact unpublished copy, never a mutable source pathname.
       if !cloneOnly {
         // Files were synchronized individually. Sync nested directories before
         // the final root rename so their names belong to the published copy.

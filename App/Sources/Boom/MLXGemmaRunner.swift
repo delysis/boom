@@ -35,6 +35,22 @@ actor GenerationCoordinator {
       switch self { case .operation(let flag, _, _, _): flag?.cancel(); case .text(let value): value.request.flag.cancel() }
     }
   }
+  private var speech: (id: UUID, flag: CancellationFlag)?
+  /// Speech generation may overlap a foreground language producer, not a load
+  /// or unload. Both retain their actual producer joins and process budget.
+  func beginSpeech(flag: CancellationFlag) throws -> UUID {
+    try flag.check()
+    guard speech == nil, !occupied || activeFlag != nil else {
+      throw BoomError.unavailable("Model preparation still owns the device.")
+    }
+    if background { activeFlag?.cancel(); cancelProducer?() }
+    let id = UUID(); speech = (id, flag); return id
+  }
+  func endSpeech(_ id: UUID) {
+    guard speech?.id == id else { return }
+    speech = nil
+    if !occupied { startNext() }
+  }
   private var waiting: [Waiting] = []
   var queuedOperations: Int { waiting.count }
   private func admitOwner(flag: CancellationFlag?, background: Bool, runnerEpoch: UUID?) {
@@ -44,7 +60,8 @@ actor GenerationCoordinator {
       reason: "On-device model operation")
   }
   func enter(flag: CancellationFlag? = nil, background: Bool = false, runnerEpoch: UUID? = nil) async {
-    if !occupied { admitOwner(flag: flag, background: background, runnerEpoch: runnerEpoch); return }
+    if background, speech != nil { flag?.cancel() }
+    if !occupied, flag != nil || speech == nil { admitOwner(flag: flag, background: background, runnerEpoch: runnerEpoch); return }
     if !background, self.background { activeFlag?.cancel(); cancelProducer?() }
     await withCheckedContinuation { waiting.append(.operation(flag, background, runnerEpoch, $0)) }
   }
@@ -74,7 +91,12 @@ actor GenerationCoordinator {
   }
   private func startNext() {
     guard !waiting.isEmpty else { occupied = false; background = false; return }
-    let index = waiting.firstIndex { !$0.isBackground } ?? 0
+    func eligible(_ item: Waiting) -> Bool {
+      if case .operation(nil, _, _, _) = item { return speech == nil }
+      return true
+    }
+    guard let index = waiting.firstIndex(where: { !$0.isBackground && eligible($0) })
+      ?? waiting.firstIndex(where: eligible) else { occupied = false; background = false; return }
     switch waiting.remove(at: index) {
     case .operation(let flag, let background, let epoch, let continuation):
       admitOwner(flag: flag, background: background, runnerEpoch: epoch); continuation.resume()
@@ -164,6 +186,7 @@ actor MLXGemmaRunner {
     var setupMetrics: SetupMetrics? = nil
     var prefillCacheMetrics: PrefillCacheMetrics? = nil
     var executionOrigin: GenerationExecutionOrigin? = nil
+    var mtp: BlessengerMTPExecution? = nil
   }
   struct PrefillCacheMetrics: Codable, Sendable {
     let algorithm: String
@@ -233,6 +256,10 @@ actor MLXGemmaRunner {
     let stopReason: String?
     let stopTokenID: Int?
   }
+  private var assistant: MTPDrafterContainer?
+  private var assistantWeights: ModelWeightLease?
+  private var assistantIdentity: String?
+  private let weightLease: ModelWeightLease
   nonisolated let source: URL
   nonisolated let identity: String
   nonisolated let generationPolicy: ModelGenerationPolicy
@@ -240,10 +267,11 @@ actor MLXGemmaRunner {
   nonisolated let cacheRunnerEpoch = UUID()
   nonisolated let processorIdentity: String
   private nonisolated let verifiedStatelessTextKV: Bool
+  private nonisolated let causalAudio = CausalAudioPrefix()
   private let container: ModelContainer
   // Stored anchors are immutable; the manager synchronizes eviction and epochs.
   // Working caches remain confined to the exclusive inference executor.
-  private nonisolated let promptCache = PromptPrefixCache()
+  private nonisolated let promptCache: PromptPrefixCache
   private let cacheConfiguration: Data
   private nonisolated let verifiedContextCeiling: Int
   private let tokenizerDescription: Data
@@ -263,7 +291,7 @@ actor MLXGemmaRunner {
     let added_tokens: [Added]
     struct Added: Decodable { let id: Int; let special: Bool }
   }
-  static func load(admission: ModelPacks.Admission, prefillTokens: UInt32? = nil) async throws -> MLXGemmaRunner {
+  static func load(admission: ModelPacks.Admission, prefillTokens: UInt32? = nil, cacheProtection: RecordCipher? = nil) async throws -> MLXGemmaRunner {
     let trace = PerformanceTrace.begin("Model.Load")
     defer { PerformanceTrace.end("Model.Load", trace) }
     let directory = admission.directory
@@ -271,7 +299,7 @@ actor MLXGemmaRunner {
     do {
       try Task.checkCancellation()
       try ModelResidency.configure()
-      try ModelResidency.admit(weightBytes: admission.weightBytes)
+      let weightLease = try ModelWeightLease(bytes: admission.weightBytes)
       let configuration = try Data(contentsOf: directory.appendingPathComponent("config.json"))
       let config = try JSONDecoder().decode(Configuration.self,
         from: configuration)
@@ -326,13 +354,13 @@ actor MLXGemmaRunner {
         processorConfigurations: processorDescriptions.mapValues { Digest.sha256($0) },
         tokenizerAdapter: "checkpoint-no-cleanup-v1")
       let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
-      let runner = MLXGemmaRunner(source: directory, container: model,
+      let runner = MLXGemmaRunner(source: directory, container: model, weightLease: weightLease,
         identity: admission.identity,
         cacheConfiguration: try JSONSerialization.data(withJSONObject: cacheConfiguration),
         generationPolicy: policy, tokenizerDescription: tokenizerDescription,
         processorIdentity: Digest.sha256(try encoder.encode(processorBinding)),
         verifiedStatelessTextKV: loadedTypes.3, verifiedContextCeiling: min(16_384, text.max_position_embeddings),
-        supportsRawAudio: config.model_type == "gemma4_unified" && object["audio_config"] != nil)
+        supportsRawAudio: config.model_type == "gemma4_unified" && object["audio_config"] != nil, cacheProtection: cacheProtection)
       try ModelResidency.check()
       guard try runner.availableContext() >= 1024 else {
         throw BoomError.budget("The model leaves too little memory for a useful context.")
@@ -341,10 +369,11 @@ actor MLXGemmaRunner {
       return runner
     } catch { await GenerationCoordinator.shared.leave(); throw error }
   }
-  private init(source: URL, container: ModelContainer, identity: String,
+  private init(source: URL, container: ModelContainer, weightLease: ModelWeightLease, identity: String,
     cacheConfiguration: Data, generationPolicy: ModelGenerationPolicy, tokenizerDescription: Data,
-    processorIdentity: String, verifiedStatelessTextKV: Bool, verifiedContextCeiling: Int, supportsRawAudio: Bool) {
-    self.source = source; self.identity = identity
+    processorIdentity: String, verifiedStatelessTextKV: Bool, verifiedContextCeiling: Int, supportsRawAudio: Bool, cacheProtection: RecordCipher?) {
+    self.source = source; self.identity = identity; self.weightLease = weightLease
+    promptCache = PromptPrefixCache(protection: cacheProtection)
     self.container = container; self.cacheConfiguration = cacheConfiguration
     self.verifiedContextCeiling = verifiedContextCeiling
     self.generationPolicy = generationPolicy
@@ -751,6 +780,10 @@ actor MLXGemmaRunner {
     return (prompt, step.testedCandidates)
   }
   private static func chatInput(_ plan: ConsultationPlan, images: [Data], media: [WritingMediaData] = [], context: ModelContext) async throws -> LMInput {
+    if plan.hasPlacedMedia {
+      guard images.isEmpty else { throw BoomError.invalid("Unplaced images cannot accompany captured media history.") }
+      return try await placedChatInput(plan, media: media, context: context)
+    }
     let pictures = images.map { bytes in WritingMediaData(reference: WritingMediaReference(id: UUID(), name: "Image",
       rootDigest: Digest.sha256(bytes), kind: "image"), bytes: bytes) }
     let payloads = pictures + media
@@ -791,6 +824,22 @@ actor MLXGemmaRunner {
       additionalContext: ["enable_thinking": false]))
     return try RawWritingInput.prepare(tokens: input.text.tokens.asArray(Int.self), media: ordered, context: context)
   }
+  private static func placedChatInput(_ plan: ConsultationPlan, media: [WritingMediaData], context: ModelContext) async throws -> LMInput {
+    let expansion = try RawWritingInput.expandChatMedia(plan, media: media)
+    let ordered = expansion.media
+    let messages = expansion.messages.map { message -> Chat.Message in
+      switch message.role {
+      case "system": return .system(message.content)
+      case "assistant": return .assistant(message.content)
+      default: return .user(message.content)
+      }
+    }
+    guard ordered.isEmpty || context.model is Gemma4Unified else {
+      throw BoomError.unavailable("This checkpoint cannot preserve the selected chronological raw-media context.")
+    }
+    let input = try await context.processor.prepare(input: UserInput(chat: messages, additionalContext: ["enable_thinking": false]))
+    return try RawWritingInput.prepare(tokens: input.text.tokens.asArray(Int.self), media: ordered, context: context)
+  }
   func preflight(_ plan: ConsultationPlan, images: [Data], media: [WritingMediaData] = [], maxTokens: Int,
     flag: CancellationFlag, cacheOwner: PromptCacheOwner? = nil,
     pairedAdmission: PairedContextAdmission? = nil) async throws -> Int {
@@ -823,7 +872,8 @@ actor MLXGemmaRunner {
     authority: CapturedDocumentAuthority = .readOnly, cacheOwner: PromptCacheOwner? = nil,
     pairedAdmission: PairedContextAdmission? = nil,
     promptContract: ConsultationPromptContract = .referenceHistoryV2,
-    renderedContext: RenderedReferenceContext? = nil, capturedSources: [SourceReference] = []
+    renderedContext: RenderedReferenceContext? = nil, capturedSources: [SourceReference] = [],
+    historyMedia: [UUID: [UUID]] = [:], currentMedia: [UUID]? = nil
   ) async throws -> (plans: [ConsultationPlan], history: [ChatMessage], omittedHistory: Int,
     context: String, renderedContext: RenderedReferenceContext?, capturedSources: [SourceReference], workingTextBytes: Int?, workingRequestBytes: Int?) {
     let trace = PerformanceTrace.begin("Request.ContextFit")
@@ -845,7 +895,7 @@ actor MLXGemmaRunner {
         instructions: instructions, context: workingContext, request: request, routing: routing,
         authority: authority, promptContract: promptContract,
         renderedContext: workingRendered, capturedSources: workingSources, workingTextBytes: workingBytes,
-        workingRequestBytes: requestBytes)
+        workingRequestBytes: requestBytes, historyMedia: historyMedia, currentMedia: currentMedia)
       for (plan, reserve) in zip(plans, reserves) {
         _ = try await preflight(plan, images: images, media: media, maxTokens: reserve,
           flag: flag, cacheOwner: cacheOwner, pairedAdmission: pairedAdmission)
@@ -943,7 +993,218 @@ actor MLXGemmaRunner {
       generationPolicy: generationPolicy, sourcePrompt: compiled.media.isEmpty ? nil : selected.prompt,
       media: compiled.media.isEmpty ? nil : compiled.media)
   }
-  func run(plan: ConsultationPlan, images: [Data], media: [WritingMediaData] = [], maxTokens: Int, seed: UInt64? = nil,
+  /// A live caller prefix uses the existing executor, residency policy and
+  /// exclusive model lease. It replaces other hot cache anchors, not the
+  /// conversation or its durable records. Only immutable complete audio rows
+  /// can advance it; finalization transfers the same actual native cache.
+  func beginAudioPrefix(id: UUID, plan: ConsultationPlan, media: [WritingMediaData],
+    maxTokens: Int, flag: CancellationFlag) async throws -> CausalAudioPrefix.Observation {
+    try await ownedOperation(flag: flag, background: false) {
+      try await self.container.perform { context in
+        try await InferenceExecutor.shared.perform { _ in
+          defer { Self.synchronizeGPU() }
+          do {
+            try flag.check()
+            guard let model = context.model as? Gemma4Unified else { throw BoomError.unavailable("Incremental audio requires the unified audio model.") }
+            self.causalAudio.clear()
+            let input = try await Self.chatInput(plan, images: [], media: media, context: context)
+            let required = input.text.tokens.size + CausalAudioPrefix.maximumSamples / 640 - 1 + maxTokens
+            let admission = try self.requestCapacityOwned(required: required, forceCold: true)
+            guard required <= min(admission.capacity, self.verifiedContextCeiling) else {
+              throw BoomError.budget("The captured call history and bounded caller audio do not fit. Choose a shorter branch.")
+            }
+            let observation = try self.causalAudio.begin(id: id, model: model, plan: plan, media: media, input: input)
+            try flag.check(); try ModelResidency.check()
+            return observation
+          } catch { Self.synchronizeGPU(); self.causalAudio.clear(); throw error }
+        }
+      }
+    }
+  }
+  func appendAudioPrefix(_ chunk: BlessengerAudioSlice, maxTokens: Int,
+    flag: CancellationFlag) async throws -> CausalAudioPrefix.Observation {
+    try await ownedOperation(flag: flag, background: false) {
+      try await self.container.perform { context in
+        try await InferenceExecutor.shared.perform { _ in
+          defer { Self.synchronizeGPU() }
+          do {
+            try flag.check()
+            guard let model = context.model as? Gemma4Unified, let prior = self.causalAudio.observation else {
+              throw BoomError.stale("The live caller preparation is unavailable.")
+            }
+            let additional = chunk.samples.count / 640
+            guard prior.preparedTokens + additional + maxTokens <= self.verifiedContextCeiling,
+              additional + maxTokens <= (try self.availableContext()) else {
+              throw BoomError.budget("The next caller audio span exceeds the measured model budget.")
+            }
+            let observation = try self.causalAudio.append(id: chunk.captureID, offset: chunk.offset,
+              samples: chunk.samples, model: model)
+            try flag.check(); try ModelResidency.check(); return observation
+          } catch { Self.synchronizeGPU(); self.causalAudio.clear(); throw error }
+        }
+      }
+    }
+  }
+  func discardAudioPrefix() async {
+    await GenerationCoordinator.shared.enter(background: true)
+    await InferenceExecutor.shared.perform { _ in Self.synchronizeGPU(); self.causalAudio.clear() }
+    await GenerationCoordinator.shared.leave()
+  }
+  private nonisolated func preparedAudio(id: UUID, context: ModelContext,
+    plan: ConsultationPlan, media: [WritingMediaData], input: LMInput, maxTokens: Int) throws -> CausalAudioPrefix.Continuation {
+    guard let model = context.model as? Gemma4Unified else { throw BoomError.unavailable("The call model changed.") }
+    let prepared = try causalAudio.take(id: id, model: model, plan: plan, media: media, input: input)
+    guard prepared.promptIDs.count + maxTokens <= verifiedContextCeiling,
+      prepared.input.text.tokens.size + maxTokens <= (try availableContext()) else {
+      throw BoomError.budget("The caller's remaining input and response do not fit the measured memory budget.")
+    }
+    return prepared
+  }
+  func runPreparedAudio(id: UUID, plan: ConsultationPlan, media: [WritingMediaData],
+    maxTokens: Int, seed: UInt64, settings: SamplingSettings, useMTP: Bool, flag: CancellationFlag,
+    onCheckpoint: @escaping @Sendable (GenerationProgress, String?, Int?) async throws -> Void,
+    onText: @escaping @Sendable (String) -> Void) async throws -> Output {
+    if useMTP {
+      return try await runMTP(plan: plan, media: media, audioPrefixID: id, maxTokens: maxTokens,
+        seed: seed, settings: settings, flag: flag, onCheckpoint: onCheckpoint, onText: onText)
+    }
+    let policy = generationPolicy, prefill = try prefillParameters(nil, operationID: flag.operationID, policy: generationPolicy)
+    return try await ownedOperation(flag: flag, background: false) {
+      try await self.container.perform { context in
+        try await InferenceExecutor.shared.perform { _ in
+          defer { Self.synchronizeGPU(); self.causalAudio.clear() }
+          try flag.check()
+          let input = try await Self.chatInput(plan, images: [], media: media, context: context)
+          let prepared = try self.preparedAudio(id: id, context: context, plan: plan, media: media, input: input, maxTokens: maxTokens)
+          let parameters = GenerateParameters(maxTokens: maxTokens, temperature: settings.temperature,
+            topP: settings.topP, topK: settings.topK, minP: settings.minP, repetitionPenalty: nil, prefill: prefill, seed: seed)
+          let started = ProcessInfo.processInfo.systemUptime
+          let components = GenerationComponents(logitProcessorFactory: { CheckpointTokenMask(policy.suppressedTokenIDs) })
+          let iterator = try TokenIterator(input: prepared.input, model: context.model, cache: prepared.cache,
+            parameters: parameters, components: components)
+          let (events, producer) = generateTokenTask(promptTokenCount: prepared.promptIDs.count,
+            modelConfiguration: context.configuration, tokenizer: context.tokenizer, iterator: iterator, includeStopToken: true)
+          return try await Self.consumeVoiceTokens(events, producer: producer, ids: prepared.promptIDs, started: started,
+            context: context, policy: policy, flag: flag, assistantIdentity: nil, preparedTokens: prepared.preparedTokens,
+            onCheckpoint: onCheckpoint, onText: onText)
+        }
+      }
+    }
+  }
+
+  /// Load the actual four-layer assistant. Merely discovering its files is not
+  /// enabling MTP. A mismatched target is refused before loading any weights.
+  func prepareMTP() async throws -> String {
+    let specification = try BlessengerModelPackage.package(.mtp)
+    guard identity == "mlx-community/gemma-4-12B-it-qat-4bit@e70c6b3ba0979b3357dcd2f223ad8bde7787a6b6",
+      supportsRawAudio else { throw BoomError.unavailable("This assistant is paired only with the pinned Gemma 4 12B QAT target.") }
+    if assistant != nil, assistantIdentity == specification.identity { return specification.identity }
+    let directory = try await detachedWork { try specification.local() }
+    let requirements = try specification.requirements()
+    await GenerationCoordinator.shared.enter()
+    do {
+      try Task.checkCancellation()
+      let weights = try ModelWeightLease(bytes: requirements.weightBytes)
+      await Gemma4AssistantRegistration.register()
+      let loaded = try await MTPDrafterModelFactory.shared.loadContainer(from: directory, using: CheckpointTokenizerLoader())
+      try await detachedWork { try specification.verify(directory) }
+      try ModelResidency.check(); assistant = loaded; assistantWeights = weights; assistantIdentity = specification.identity
+      await GenerationCoordinator.shared.leave(); return specification.identity
+    } catch { await GenerationCoordinator.shared.leave(); throw error }
+  }
+
+  /// This route deliberately does not claim ordinary native-prefix retention:
+  /// the MTP iterator owns staged speculative rows, not acknowledged chat rows.
+  /// The normal Bloom cache route is unchanged for non-MTP requests.
+  func runMTP(plan: ConsultationPlan, media: [WritingMediaData], audioPrefixID: UUID? = nil, maxTokens: Int, seed: UInt64,
+    settings: SamplingSettings, flag: CancellationFlag,
+    onCheckpoint: @escaping @Sendable (GenerationProgress, String?, Int?) async throws -> Void,
+    onText: @escaping @Sendable (String) -> Void) async throws -> Output {
+    guard let assistant, let assistantIdentity else { throw BoomError.unavailable("The MTP assistant has not been loaded.") }
+    let policy = generationPolicy, prefill = try prefillParameters(nil, operationID: flag.operationID, policy: generationPolicy)
+    return try await ownedOperation(flag: flag, background: false) {
+      try await assistant.perform { drafter in
+        try await self.container.perform { context in
+          try await InferenceExecutor.shared.perform { _ in
+            defer { Self.synchronizeGPU(); if audioPrefixID != nil { self.causalAudio.clear() } }
+            try flag.check()
+            let input = try await Self.chatInput(plan, images: [], media: media, context: context)
+            let ids = input.text.tokens.asArray(Int.self)
+            let prepared = try audioPrefixID.map {
+              try self.preparedAudio(id: $0, context: context, plan: plan, media: media, input: input, maxTokens: maxTokens)
+            }
+            if prepared == nil {
+              guard ids.count + maxTokens <= (try self.availableContext()) else { throw BoomError.budget("The actual MTP input and output do not fit this Mac.") }
+            }
+            let parameters = GenerateParameters(maxTokens: maxTokens, temperature: settings.temperature,
+              topP: settings.topP, topK: settings.topK, minP: settings.minP, repetitionPenalty: nil, prefill: prefill, seed: seed)
+            let started = ProcessInfo.processInfo.systemUptime
+            let components = GenerationComponents(logitProcessorFactory: { CheckpointTokenMask(policy.suppressedTokenIDs) })
+            let iterator = try MTPSpeculativeTokenIterator(input: prepared?.input ?? input, mainModel: context.model,
+              drafter: drafter.model, mainCache: prepared?.cache, parameters: parameters, blockSize: 4, components: components)
+            let (events, producer) = generateTokenTask(promptTokenCount: ids.count,
+              modelConfiguration: context.configuration, tokenizer: context.tokenizer,
+              iterator: iterator, includeStopToken: true)
+            return try await Self.consumeVoiceTokens(events, producer: producer, ids: ids, started: started,
+              context: context, policy: policy, flag: flag, assistantIdentity: assistantIdentity, preparedTokens: prepared?.preparedTokens ?? 0,
+              onCheckpoint: onCheckpoint, onText: onText)
+          }
+        }
+      }
+    }
+  }
+  private nonisolated static func consumeVoiceTokens(_ events: AsyncStream<TokenGeneration>, producer: Task<Void, Never>,
+    ids: [Int], started: Double, context: ModelContext, policy: ModelGenerationPolicy, flag: CancellationFlag,
+    assistantIdentity: String?, preparedTokens: Int = 0, onCheckpoint: @escaping @Sendable (GenerationProgress, String?, Int?) async throws -> Void,
+    onText: @escaping @Sendable (String) -> Void) async throws -> Output {
+    let cancellation = flag.onCancel { producer.cancel() }
+    defer { flag.removeCancellationHandler(cancellation) }
+    let digest = Digest.sha256(try JSONEncoder().encode(ids))
+    let algorithm = preparedTokens > 0 ? (assistantIdentity == nil ? "causal-audio-prefix-v1" : "causal-audio-prefix-mtp-v1") : "mtp-owned-v1"
+    let origin = GenerationExecutionOrigin(schema: 1, cacheAlgorithm: algorithm,
+      cachedPromptTokens: preparedTokens, cacheMissReason: preparedTokens == 0 ? "no-live-audio-prefix" : nil)
+    var tokens: [Int] = [], text = "", first: Double?, stop: Int?, reason = "output_limit"
+    var information: GenerateCompletionInfo?
+    func progress(_ text: String) -> GenerationProgress {
+      GenerationProgress(text: text, tokenIDs: tokens, promptDigest: digest, promptTokens: ids.count,
+        firstTokenSeconds: first, elapsedSeconds: ProcessInfo.processInfo.systemUptime - started, executionOrigin: origin)
+    }
+    do {
+      for await event in events {
+        try flag.check(); try ModelResidency.check()
+        switch event {
+        case .token(let token):
+          if policy.controlTokenIDs.contains(token) || policy.eosTokenIDs.contains(token) { stop = token; continue }
+          guard !policy.suppressedTokenIDs.contains(token) else { throw BoomError.invalid("MTP emitted a suppressed control token.") }
+          if first == nil { first = ProcessInfo.processInfo.systemUptime - started }
+          tokens.append(token)
+          let decoded = context.tokenizer.decode(tokenIds: tokens)
+          if !decoded.hasSuffix("\u{FFFD}"), decoded != text {
+            try await onCheckpoint(progress(decoded), nil, nil); text = decoded; onText(decoded)
+          }
+        case .info(let value):
+          information = value
+          switch value.stopReason { case .stop: reason = "eos"; case .length: reason = "output_limit"; case .cancelled: reason = "cancelled" }
+        }
+      }
+      await producer.value; Self.synchronizeGPU()
+      try flag.check()
+      guard information != nil else { throw BoomError.invalid("The owned voice iterator returned no terminal observation.") }
+      let final = context.tokenizer.decode(tokenIds: tokens)
+      try await onCheckpoint(progress(final), reason, stop)
+      if final != text { onText(final) }
+      return Output(text: final, tokenIDs: tokens, promptDigest: digest, promptTokens: ids.count,
+        outputTokens: tokens.count, endedByEOS: reason == "eos", stopReason: reason, stopTokenID: stop,
+        firstTokenSeconds: first, elapsedSeconds: ProcessInfo.processInfo.systemUptime - started,
+        executionOrigin: origin, mtp: assistantIdentity.map { BlessengerMTPExecution(assistant: $0,
+          blockSize: 4, proposed: information?.proposedDraftTokens, accepted: information?.acceptedDraftTokens,
+          passthrough: information?.passthroughReason) })
+    } catch {
+      producer.cancel(); await producer.value; Self.synchronizeGPU(); throw error
+    }
+  }
+
+  func run(plan: ConsultationPlan, images: [Data], media: [WritingMediaData] = [], maxTokens: Int, seed: UInt64? = nil, settings: SamplingSettings? = nil,
     flag: CancellationFlag, independentIdentity: GenerationIdentity? = nil,
     cacheOwner: PromptCacheOwner? = nil, executionPolicy: ModelGenerationPolicy? = nil,
     joinedRetention: JoinedKVRetentionRequest? = nil,
@@ -961,13 +1222,13 @@ actor MLXGemmaRunner {
         throw BoomError.stale("The independent consultation lost its captured seed or prompt.")
       }
       return try await submitIndependentText(.init(identity: independentIdentity, owner: cacheOwner,
-        input: .consultation(plan), settings: try ProductCore.sampling(.standard), flag: flag, policy: policy,
+        input: .consultation(plan), settings: try settings ?? ProductCore.sampling(.standard), flag: flag, policy: policy,
         joinedRetention: joinedRetention, pairedAdmission: pairedAdmission,
         beforeCachePublication: beforeCachePublication,
         onPrefill: onPrefill, onCheckpoint: onCheckpoint, onText: onText))
     }
     return try await generate(plan: plan, raw: nil, images: images, media: media, maxTokens: maxTokens,
-      settings: ProductCore.sampling(.standard), seed: seed, flag: flag,
+      settings: settings ?? ProductCore.sampling(.standard), seed: seed, flag: flag,
       cacheOwner: cacheOwner, executionPolicy: executionPolicy, joinedRetention: joinedRetention,
       beforeCachePublication: beforeCachePublication, pairedAdmission: pairedAdmission, diagnostic: diagnostic, onPrefill: onPrefill,
       onCheckpoint: onCheckpoint, onText: onText)
@@ -2120,6 +2381,7 @@ actor MLXGemmaRunner {
     await GenerationCoordinator.shared.cancel(runnerEpoch: cacheRunnerEpoch)
     // A reclamation barrier must wait, not preempt an unrelated target producer.
     await GenerationCoordinator.shared.enter(background: true)
+    await InferenceExecutor.shared.perform { _ in Self.synchronizeGPU(); self.causalAudio.clear() }
     await GenerationCoordinator.shared.leave()
   }
   func join() async { await GenerationCoordinator.shared.enter(); await GenerationCoordinator.shared.leave() }
